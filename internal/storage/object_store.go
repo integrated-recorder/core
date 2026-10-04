@@ -50,6 +50,13 @@ type PhysicalObjectStore interface {
 	Delete(context.Context, string) error
 }
 
+// PhysicalObjectStoreIdentity is optional process metadata used only for the
+// bounded primary-storage telemetry projection. It does not grant provider
+// authority over archive semantics.
+type PhysicalObjectStoreIdentity interface {
+	StorageProviderIdentity() (id, name string)
+}
+
 // ValidateObjectKey applies the protocol's logical slash-key rules before a
 // key reaches a physical provider. Keys are opaque UTF-8 identifiers; no
 // filesystem path interpretation is performed.

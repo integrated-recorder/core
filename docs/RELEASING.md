@@ -3,7 +3,8 @@
 Official application releases are built for `linux/amd64` and `linux/arm64` from
 `v*` tags by `.github/workflows/release.yml`. The workflow runs the web checks
 and Go test suite before building the Runtime Host, Control Plane, Recorder
-Engine, and first-party Owncast adapter runtime.
+Engine, and first-party Owncast adapter runtime. The Docker image separately
+bundles the `storage.local` Storage Provider Protocol v1 executable.
 
 Each target has its own signed manifest and artifact set:
 
@@ -17,12 +18,15 @@ adapter-runtime-linux-amd64
 ```
 
 The same names use `arm64` for the other target. The `adapter-runtime` role is
-the Owncast adapter executable; generic adapter host code is part of the
-Control Plane and Recorder Engine binaries. `cmd/release-pack` uses fixed v1
-protocol/schema compatibility declarations and hashes the exact packaged
-regular files. Compatibility is not inferred from semantic version ordering.
-The published release also includes `SHA256SUMS` for all platform manifests,
-signatures, and executable artifacts.
+the Owncast source adapter executable. `storage.local` is built into the
+production Docker image as a separate executable; it is not currently part of
+the signed application update bundle. The Host imports both through their
+respective protocol-specific immutable catalog paths. Generic adapter host
+code is part of the Control Plane and Recorder Engine binaries. `cmd/release-pack` uses
+fixed protocol/schema compatibility declarations and hashes the exact
+packaged regular files. Compatibility is not inferred from semantic version
+ordering. The published release also includes `SHA256SUMS` for all platform
+manifests, signatures, and executable artifacts.
 
 The release workflow requires the repository secret
 `IR_RELEASE_SIGNING_PRIVATE_KEY_BASE64`, containing a base64-encoded Ed25519
@@ -44,14 +48,27 @@ it does not replace the Runtime Host or container image.
 Build identities are injected into Runtime Host, Control Plane, and Recorder
 Engine through `internal/buildinfo` linker variables. Local development builds
 retain their explicit `dev` identity and cannot install remote updates. The
-release's `adapter-runtime` artifact is the bundled Owncast executable. Generic
-adapter discovery is Host-owned: configured `/adapters` and
+release's `adapter-runtime` artifact is the bundled Owncast executable, and
+`storage.local` is the bundled local storage executable in the Runtime Host
+image. Generic adapter discovery is Host-owned: configured `/adapters` and
 `/external-adapters` directories are import sources, and the Host validates
 and snapshots their executables into immutable content-addressed artifacts and
-adapter sets. The application generation is the pair `(application release,
-adapter set)`, so local adapter additions, updates, and removals activate a
-new generation without restarting the Host or container. Existing Recordings
-remain pinned to their Engine and adapter artifacts until their leases drain.
+adapter sets. Bundled `storage.local` is imported into the same immutable
+storage-provider artifact/set lifecycle as Registry providers, but it does not
+require the Registry and cannot be uninstalled. The application generation is
+the tuple `(application release, adapter set, storage provider set)`, so
+changing either plugin set activates a new generation without restarting the
+Host or container. Application release updates carry the active storage set;
+the bundled provider executable changes only with the Runtime Host/container
+image maintenance class. On Host startup, a changed bundled provider artifact
+is imported and selected through the same immutable lifecycle, while existing
+Recording generations retain their pinned set. Existing Recordings remain
+pinned to their Engine, adapter artifacts, and storage-provider artifact until
+their leases drain. Existing
+`/data/recordings` archives are adopted in place as the local provider root;
+the Host-owned `/data/runtime` tree is not exposed to the provider. Application
+release activation carries or deliberately updates the provider-set identity;
+rollback must retain the exact older set while it remains a target.
 This local restartless lifecycle is implemented. Plugin Registry v1 also
 supports operator-configured curated HTTPS catalogs and manual artifact
 install/update through the same immutable import path. The registry pins

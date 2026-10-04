@@ -45,11 +45,12 @@ func TestProductionAdapterLifecycleAcceptanceE2E(t *testing.T) {
 }
 
 type runtimeAdapterLifecycleArtifacts struct {
-	root       string
-	fixtureURL string
-	bundleA    string
-	hostA      string
-	adapterDir string
+	root               string
+	fixtureURL         string
+	bundleA            string
+	hostA              string
+	adapterDir         string
+	storageLocalBinary string
 }
 
 // buildRuntimeAdapterLifecycleArtifacts builds only the production processes
@@ -91,6 +92,7 @@ func buildRuntimeAdapterLifecycleArtifacts(t *testing.T, fixtureURL string) runt
 	engineFlags := ldflags + " -X main.runtimeE2EFixtureOrigin=" + fixtureURL
 	engine := build(filepath.Join(bin, "recorder-engine"), "./cmd/recorder-engine", "runtime_e2e", engineFlags)
 	owncast := build(filepath.Join(bin, "owncast"), "./cmd/adapters/owncast", "", "")
+	storageLocal := build(filepath.Join(bin, "storage.local"), "./cmd/storage-local", "", ldflags)
 	copyRuntimeArtifact(t, control, filepath.Join(bundleA, "control-plane"), 0555)
 	copyRuntimeArtifact(t, engine, filepath.Join(bundleA, "recorder-engine"), 0555)
 	if err := os.Chmod(bundleA, 0555); err != nil {
@@ -105,7 +107,7 @@ func buildRuntimeAdapterLifecycleArtifacts(t *testing.T, fixtureURL string) runt
 	copyRuntimeArtifact(t, owncast, filepath.Join(adapterDir, "integrated-recorder-adapter-owncast"), 0555)
 	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
 	return runtimeAdapterLifecycleArtifacts{
-		root: root, fixtureURL: fixtureURL, bundleA: bundleA, hostA: hostA, adapterDir: adapterDir,
+		root: root, fixtureURL: fixtureURL, bundleA: bundleA, hostA: hostA, adapterDir: adapterDir, storageLocalBinary: storageLocal,
 	}
 }
 
@@ -155,6 +157,7 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	command.Env = minimalRuntimeE2EEnv([]string{
 		"DATA_DIR=" + dataDir,
 		"ADDR=" + listenAddr,
+		"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 		"AUTH_DISABLED=1",
 		"ADAPTER_DIR=" + artifacts.adapterDir,
 		"IR_RUNTIME_E2E_FAILPOINT=" + string(runtimehook.AfterSourceDrain),

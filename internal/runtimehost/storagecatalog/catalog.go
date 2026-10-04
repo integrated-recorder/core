@@ -216,32 +216,12 @@ func (c *Catalog) Import(ctx context.Context, sourcePath string, expected Expect
 		return Artifact{}, ErrUnsafeStore
 	}
 
-	probeDir, err := os.MkdirTemp("", "ir-storage-probe-")
-	if err != nil {
-		return Artifact{}, ErrUnsafeStore
-	}
-	defer func() { _ = removeTreeOwned(probeDir) }()
-	socketPath, tokenPath, err := createProbeCredentials(probeDir)
-	if err != nil {
-		return Artifact{}, ErrUnsafeStore
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-	client, err := storageproto.Start(probeCtx, storageproto.StartOptions{Binary: stageBinary, SocketPath: socketPath, TokenFile: tokenPath, StartupTimeout: probeTimeout})
-	if err != nil {
-		cancel()
+	descriptor, probeErr := probeExecutable(ctx, stageBinary)
+	if probeErr != nil || descriptor.ID != expected.ID || descriptor.Version != expected.Version || descriptor.ProtocolVersion != expected.ProtocolVersion {
 		if ctx.Err() != nil {
 			return Artifact{}, ctx.Err()
 		}
-		return Artifact{}, fmt.Errorf("%w: provider probe failed: %v", ErrInvalidArtifact, err)
-	}
-	descriptor, describeErr := client.Describe(probeCtx)
-	closeErr = client.Close()
-	cancel()
-	if describeErr != nil || closeErr != nil || descriptor.ID != expected.ID || descriptor.Version != expected.Version || descriptor.ProtocolVersion != expected.ProtocolVersion {
-		if ctx.Err() != nil {
-			return Artifact{}, ctx.Err()
-		}
-		return Artifact{}, fmt.Errorf("%w: descriptor probe rejected (describe=%v close=%v id=%q version=%q protocol=%d)", ErrInvalidArtifact, describeErr, closeErr, descriptor.ID, descriptor.Version, descriptor.ProtocolVersion)
+		return Artifact{}, fmt.Errorf("%w: descriptor probe rejected (probe=%v id=%q version=%q protocol=%d)", ErrInvalidArtifact, probeErr, descriptor.ID, descriptor.Version, descriptor.ProtocolVersion)
 	}
 	fingerprint, err := storageproto.Fingerprint(descriptor)
 	if err != nil {
@@ -252,6 +232,92 @@ func (c *Catalog) Import(ctx context.Context, sourcePath string, expected Expect
 		return Artifact{}, err
 	}
 	return artifact, nil
+}
+
+// ImportBundled imports a Host-image-bundled provider after deriving its
+// declared version from the executable itself. Import still snapshots, hashes,
+// and probes the exact staged bytes before publication; the initial probe is
+// only used to build the exact Expected identity for that authoritative path.
+func (c *Catalog) ImportBundled(ctx context.Context, sourcePath, expectedID string) (Artifact, error) {
+	if ctx == nil || expectedID == "" {
+		return Artifact{}, ErrInvalidConfig
+	}
+	descriptor, err := probeExecutable(ctx, sourcePath)
+	if err != nil || descriptor.ID != expectedID || descriptor.ProtocolVersion != storageproto.Version {
+		return Artifact{}, ErrInvalidArtifact
+	}
+	size, digest, err := stableExecutableDigest(ctx, sourcePath)
+	if err != nil {
+		return Artifact{}, ErrInvalidArtifact
+	}
+	return c.Import(ctx, sourcePath, Expected{
+		ID: expectedID, Version: descriptor.Version, ProtocolVersion: storageproto.Version,
+		SHA256: digest, Size: size,
+	})
+}
+
+func probeExecutable(ctx context.Context, binary string) (storageproto.Descriptor, error) {
+	if ctx == nil || !filepath.IsAbs(binary) || filepath.Clean(binary) != binary {
+		return storageproto.Descriptor{}, ErrInvalidArtifact
+	}
+	probeDir, err := os.MkdirTemp("", "ir-storage-probe-")
+	if err != nil {
+		return storageproto.Descriptor{}, ErrUnsafeStore
+	}
+	defer func() { _ = removeTreeOwned(probeDir) }()
+	socketPath, tokenPath, err := createProbeCredentials(probeDir)
+	if err != nil {
+		return storageproto.Descriptor{}, ErrUnsafeStore
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	client, err := storageproto.Start(probeCtx, storageproto.StartOptions{
+		Binary: binary, SocketPath: socketPath, TokenFile: tokenPath, StartupTimeout: probeTimeout,
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return storageproto.Descriptor{}, ctx.Err()
+		}
+		return storageproto.Descriptor{}, ErrInvalidArtifact
+	}
+	descriptor, describeErr := client.Describe(probeCtx)
+	closeErr := client.Close()
+	if describeErr != nil || closeErr != nil || storageproto.ValidateDescriptor(descriptor) != nil {
+		return storageproto.Descriptor{}, ErrInvalidArtifact
+	}
+	return descriptor, nil
+}
+
+func stableExecutableDigest(ctx context.Context, sourcePath string) (int64, string, error) {
+	if ctx == nil || !filepath.IsAbs(sourcePath) || filepath.Clean(sourcePath) != sourcePath {
+		return 0, "", ErrInvalidArtifact
+	}
+	before, err := os.Lstat(sourcePath)
+	if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Mode().Perm()&0111 == 0 || before.Size() <= 0 || before.Size() > MaxArtifactBytes {
+		return 0, "", ErrInvalidArtifact
+	}
+	input, err := openSourceNoFollow(sourcePath)
+	if err != nil {
+		return 0, "", ErrInvalidArtifact
+	}
+	defer input.Close()
+	opened, err := input.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) || opened.Size() != before.Size() {
+		return 0, "", ErrInvalidArtifact
+	}
+	h := sha256.New()
+	written, err := copyContext(ctx, h, input, make([]byte, copyBufferSize), MaxArtifactBytes)
+	if err != nil || written != before.Size() {
+		return 0, "", ErrInvalidArtifact
+	}
+	afterPath, pathErr := os.Lstat(sourcePath)
+	afterFD, fdErr := input.Stat()
+	if pathErr != nil || fdErr != nil || !afterPath.Mode().IsRegular() || afterPath.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(before, afterPath) || !os.SameFile(opened, afterFD) || afterPath.Size() != before.Size() || afterFD.Size() != opened.Size() ||
+		!afterPath.ModTime().Equal(before.ModTime()) || !afterFD.ModTime().Equal(opened.ModTime()) {
+		return 0, "", ErrInvalidArtifact
+	}
+	return written, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // CreateSet validates config against the artifact schema, canonicalizes the

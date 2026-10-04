@@ -50,10 +50,10 @@ function StorageProviderManagement() {
 }
 
 function PrimaryStorageSummary({ status }: { status: StorageProviderStatus }) {
-  const provider = status.primary.kind === 'plugin' ? status.providers.find(item => item.id === status.primary.provider_id) : undefined
-  const label = status.primary.kind === 'local' ? 'Local filesystem' : provider?.name ?? status.primary.provider_id ?? 'Storage provider'
+  const provider = status.providers.find(item => item.id === status.primary.provider_id)
+  const label = status.primary.provider_id === 'local' ? 'Local Storage' : provider?.name ?? status.primary.provider_id
   return <div className="flex flex-wrap items-center justify-between gap-3">
-    <div><p className="text-sm font-semibold">{label}{status.primary.version ? ` · ${status.primary.version}` : ''}</p><p className="mt-1 text-xs text-muted-foreground">{status.primary.kind === 'local' ? '로컬 파일 시스템' : `Provider ID: ${status.primary.provider_id ?? '—'}`}</p></div>
+    <div><p className="text-sm font-semibold">{label} · {status.primary.version}</p><p className="mt-1 text-xs text-muted-foreground">Provider ID: {status.primary.provider_id}</p></div>
     <Badge tone={status.primary.state === 'ready' ? 'green' : 'amber'}>{status.primary.state === 'ready' ? '활성 · 준비됨' : '활성 저장소 사용 불가'}</Badge>
   </div>
 }
@@ -64,7 +64,7 @@ function StorageProviderCard({ provider }: { provider: StorageProviderSummary })
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [actionMessage, setActionMessage] = useState('')
   const configKey = ['storage-provider-config', provider.id] as const
-  const configQuery = useQuery({ queryKey: configKey, queryFn: () => storageProvidersAPI.config(provider.id), staleTime: 10_000 })
+  const configQuery = useQuery({ queryKey: configKey, queryFn: () => storageProvidersAPI.config(provider.id), staleTime: 10_000, enabled: !provider.configuration_managed })
   const invalidate = async () => {
     await Promise.all([
       client.invalidateQueries({ queryKey: ['runtime-storage-provider'] }),
@@ -89,13 +89,14 @@ function StorageProviderCard({ provider }: { provider: StorageProviderSummary })
   })
   const busy = save.isPending || probe.isPending || activate.isPending
   const configuredSecrets = Object.fromEntries((configQuery.data?.configured_secrets ?? []).map(name => [name, true]))
+  const bundled = provider.distribution === 'bundled'
   return <Card className="min-w-0">
     <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border/70">
-      <div className="min-w-0"><CardTitle className="truncate text-base">{provider.name}</CardTitle><p className="mt-1 font-mono text-[11px] text-muted-foreground">{provider.id} · {provider.version}</p></div>
-      <div className="flex flex-wrap gap-1.5"><Badge tone={provider.configured ? 'green' : 'amber'}>{provider.configured ? '설정됨' : '설정 필요'}</Badge><Badge tone={healthTone(provider.health)}>{healthLabel(provider.health)}</Badge>{provider.active && <Badge tone="blue">기본 저장소</Badge>}</div>
+      <div className="min-w-0"><CardTitle className="truncate text-base">{provider.id === 'local' ? 'Local Storage' : provider.name}</CardTitle><p className="mt-1 font-mono text-[11px] text-muted-foreground">{provider.id} · {provider.version}</p></div>
+      <div className="flex flex-wrap gap-1.5">{bundled && <><Badge tone="neutral">Bundled</Badge><Badge tone="green">설치됨</Badge></>}<Badge tone={provider.configured ? 'green' : 'amber'}>{provider.configured ? '설정됨' : '설정 필요'}</Badge><Badge tone={healthTone(provider.health)}>{healthLabel(provider.health)}</Badge>{provider.active && <Badge tone="blue">기본 저장소</Badge>}</div>
     </CardHeader>
     <CardContent className="space-y-5 pt-4">
-      {configQuery.isLoading ? <LoadingState label="Provider 설정 양식을 불러오는 중입니다" /> : configQuery.error ? <div role="alert" className="space-y-2"><p className="text-sm text-muted-foreground">설정 양식을 불러오지 못했습니다.</p><Button variant="outline" onClick={() => void configQuery.refetch()}>다시 시도</Button></div> : <SchemaForm
+      {provider.configuration_managed ? <p className="text-sm text-muted-foreground">이 provider의 설정은 Runtime Host가 관리합니다. 별도의 경로나 자격 증명 설정은 필요하지 않습니다.</p> : configQuery.isLoading ? <LoadingState label="Provider 설정 양식을 불러오는 중입니다" /> : configQuery.error ? <div role="alert" className="space-y-2"><p className="text-sm text-muted-foreground">설정 양식을 불러오지 못했습니다.</p><Button variant="outline" onClick={() => void configQuery.refetch()}>다시 시도</Button></div> : <SchemaForm
         key={`${provider.id}-${JSON.stringify(configQuery.data?.values ?? {})}-${(configQuery.data?.configured_secrets ?? []).join(',')}`}
         schema={provider.configuration_schema}
         initialValues={configQuery.data?.values}
@@ -109,7 +110,7 @@ function StorageProviderCard({ provider }: { provider: StorageProviderSummary })
         <Button variant="outline" disabled={!provider.configured || busy} onClick={() => { setActionMessage(''); probe.mutate() }}>{probe.isPending ? '검사 중…' : '연결 검사'}</Button>
         <Button disabled={provider.active || !provider.configured || provider.health !== 'ready' || busy} onClick={() => { setActionMessage(''); setConfirmOpen(true) }}>{provider.active ? <><Check className="h-4 w-4" />기본 저장소</> : '기본 저장소로 활성화'}</Button>
       </div>
-      {!provider.configured && <p className="text-xs text-muted-foreground">설정을 저장한 뒤 연결 검사를 통과해야 활성화할 수 있습니다.</p>}
+      {!provider.configuration_managed && !provider.configured && <p className="text-xs text-muted-foreground">설정을 저장한 뒤 연결 검사를 통과해야 활성화할 수 있습니다.</p>}
       {actionMessage && <p role={actionMessage.includes('성공') || actionMessage.includes('활성화') || actionMessage.includes('저장했습니다') ? 'status' : 'alert'} className="text-sm text-muted-foreground">{actionMessage}</p>}
       <Dialog open={confirmOpen} onOpenChange={open => { if (!activate.isPending) setConfirmOpen(open) }}>
         <DialogContent aria-describedby={`storage-activate-description-${provider.id}`}>
@@ -158,7 +159,7 @@ export function StoragePoolCard({ pool }: { pool: StoragePool }) {
       <PoolHealth health={pool.health} />
     </CardHeader>
     <CardContent className="grid gap-5 pt-4 sm:grid-cols-2">
-      <section aria-label="파일 시스템 용량" className="min-w-0"><div className="mb-2 flex items-baseline justify-between gap-2"><span className="text-xs font-medium text-muted-foreground">파일 시스템 용량</span><span className="text-xs tabular-nums">{formatBytes(pool.capacity.used_bytes)} / {formatBytes(pool.capacity.total_bytes)}</span></div><progress className="storage-progress" value={ratio} max={1} aria-label={`사용량 ${(ratio * 100).toFixed(0)}%`} /><div className="mt-2 flex justify-between text-[11px] text-muted-foreground"><span>{(ratio * 100).toFixed(1)}% 사용</span><span>{formatBytes(pool.capacity.available_bytes)} 여유</span></div></section>
+      <section aria-label="파일 시스템 용량" className="min-w-0">{pool.capacity_known ? <><div className="mb-2 flex items-baseline justify-between gap-2"><span className="text-xs font-medium text-muted-foreground">파일 시스템 용량</span><span className="text-xs tabular-nums">{formatBytes(pool.capacity.used_bytes)} / {formatBytes(pool.capacity.total_bytes)}</span></div><progress className="storage-progress" value={ratio} max={1} aria-label={`사용량 ${(ratio * 100).toFixed(0)}%`} /><div className="mt-2 flex justify-between text-[11px] text-muted-foreground"><span>{(ratio * 100).toFixed(1)}% 사용</span><span>{formatBytes(pool.capacity.available_bytes)} 여유</span></div></> : <div className="flex items-baseline justify-between gap-2"><span className="text-xs font-medium text-muted-foreground">파일 시스템 용량</span><span className="text-xs text-muted-foreground">용량 알 수 없음</span></div>}</section>
       <div className="grid grid-cols-2 gap-3">
         <MetricValue icon={<Gauge className="h-3.5 w-3.5" />} label="Recorder 읽기" value={formatRate(pool.throughput.read_bytes_per_second)} />
         <MetricValue icon={<Waves className="h-3.5 w-3.5" />} label="Recorder 쓰기" value={formatRate(pool.throughput.write_bytes_per_second)} />
@@ -199,7 +200,7 @@ export function StoragePoolDetailPage() {
 function PoolDetailSummary({ pool }: { pool: StoragePool }) {
   const ratio = boundedRatio(pool.capacity.usage_ratio)
   return <div className="grid gap-4 xl:grid-cols-[1.1fr_1fr]">
-    <Card><CardHeader className="flex-row items-center justify-between"><CardTitle className="flex items-center gap-2"><HardDrive className="h-4 w-4 text-primary" />풀 상태</CardTitle><PoolHealth health={pool.health} /></CardHeader><CardContent className="space-y-4"><div><div className="flex justify-between gap-3 text-xs"><span className="text-muted-foreground">파일 시스템 사용량</span><span className="tabular-nums">{formatBytes(pool.capacity.used_bytes)} / {formatBytes(pool.capacity.total_bytes)}</span></div><progress className="storage-progress mt-2" value={ratio} max={1} aria-label={`용량 사용량 ${(ratio * 100).toFixed(0)}%`} /><p className="mt-1 text-right text-[11px] text-muted-foreground">{formatBytes(pool.capacity.available_bytes)} 여유 · {(ratio * 100).toFixed(1)}% 사용</p></div><dl className="grid grid-cols-2 gap-4 border-t border-border pt-4 sm:grid-cols-4">{[['유형', pool.kind], ['역할', roleLabel(pool.role)], ['총 읽기', formatBytes(pool.throughput.read_bytes_total)], ['총 쓰기', formatBytes(pool.throughput.write_bytes_total)]].map(([label, value]) => <div key={label}><dt className="text-[11px] text-muted-foreground">{label}</dt><dd className="mt-1 break-words text-sm font-medium tabular-nums">{value}</dd></div>)}</dl></CardContent></Card>
+    <Card><CardHeader className="flex-row items-center justify-between"><CardTitle className="flex items-center gap-2"><HardDrive className="h-4 w-4 text-primary" />풀 상태</CardTitle><PoolHealth health={pool.health} /></CardHeader><CardContent className="space-y-4"><div>{pool.capacity_known ? <><div className="flex justify-between gap-3 text-xs"><span className="text-muted-foreground">파일 시스템 사용량</span><span className="tabular-nums">{formatBytes(pool.capacity.used_bytes)} / {formatBytes(pool.capacity.total_bytes)}</span></div><progress className="storage-progress mt-2" value={ratio} max={1} aria-label={`용량 사용량 ${(ratio * 100).toFixed(0)}%`} /><p className="mt-1 text-right text-[11px] text-muted-foreground">{formatBytes(pool.capacity.available_bytes)} 여유 · {(ratio * 100).toFixed(1)}% 사용</p></> : <p className="text-sm text-muted-foreground">파일 시스템 용량: 용량 알 수 없음</p>}</div><dl className="grid grid-cols-2 gap-4 border-t border-border pt-4 sm:grid-cols-4">{[['유형', pool.kind], ['역할', roleLabel(pool.role)], ['총 읽기', formatBytes(pool.throughput.read_bytes_total)], ['총 쓰기', formatBytes(pool.throughput.write_bytes_total)]].map(([label, value]) => <div key={label}><dt className="text-[11px] text-muted-foreground">{label}</dt><dd className="mt-1 break-words text-sm font-medium tabular-nums">{value}</dd></div>)}</dl></CardContent></Card>
     <Card><CardHeader><CardTitle className="flex items-center gap-2"><Server className="h-4 w-4 text-primary" />기록기와 대기 상태</CardTitle></CardHeader><CardContent className="grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-3">{[
       ['Recorder 읽기', formatRate(pool.throughput.read_bytes_per_second)], ['Recorder 쓰기', formatRate(pool.throughput.write_bytes_per_second)], ['읽기 대기 시간', `${pool.throughput.read_latency_ms.toFixed(1)} ms`], ['쓰기 대기 시간', `${pool.throughput.write_latency_ms.toFixed(1)} ms`],
       ['수집 버퍼', `${formatBytes(pool.buffer.used_bytes)} / ${formatBytes(pool.buffer.capacity_bytes)}`], ['저장 대기열', `${pool.queue.objects}개 · ${formatBytes(pool.queue.bytes)}`], ['가장 오래 대기', formatDuration(pool.queue.oldest_age_seconds)],

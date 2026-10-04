@@ -479,8 +479,8 @@ func TestStorageProviderSetIdentityPersistsAcrossActivationAndRollback(t *testin
 		t.Fatal(err)
 	}
 
-	// Older generation records have no storage provider identity. Empty keeps
-	// those generations on the built-in local-primary backend.
+	// Older generation records have no storage provider identity. The Host
+	// adopts these records to storage.local before starting application code.
 	legacy := testGeneration(generationOne, StateStaging)
 	if err := r.Stage(legacy); err != nil {
 		t.Fatal(err)
@@ -580,6 +580,55 @@ func TestStorageProviderSetIdentityMustBeCanonicalSHA256(t *testing.T) {
 	legacy := testGeneration(generationOne, StateStaging)
 	if err := validateGeneration(legacy); err != nil {
 		t.Fatalf("legacy generation without a storage set was rejected: %v", err)
+	}
+}
+
+func TestAdoptLegacyStorageProviderSetIsAtomicAndPreservesPinnedSets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "generations.json")
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := testGeneration(generationOne, StateStaging)
+	stageGenerationReady(t, r, legacy)
+	if err := r.Activate(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	pinned := testGeneration(generationTwo, StateStaging)
+	pinned.StorageProviderSetID = strings.Repeat("b", 64)
+	stageGenerationReady(t, r, pinned)
+	if err := r.Activate(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	localSetID := strings.Repeat("a", 64)
+	if err := r.AdoptLegacyStorageProviderSet(localSetID); err != nil {
+		t.Fatalf("adopt legacy generations: %v", err)
+	}
+	state := r.Snapshot()
+	if got := state.Generations[generationOne].StorageProviderSetID; got != localSetID {
+		t.Fatalf("legacy generation provider set=%q, want %q", got, localSetID)
+	}
+	if got := state.Generations[generationTwo].StorageProviderSetID; got != pinned.StorageProviderSetID {
+		t.Fatalf("adoption changed pinned generation set to %q", got)
+	}
+	reloaded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Snapshot().Generations[generationOne].StorageProviderSetID; got != localSetID {
+		t.Fatalf("adopted identity was not durable: %q", got)
+	}
+	if err := r.AdoptLegacyStorageProviderSet(strings.Repeat("c", 64)); err != nil {
+		t.Fatalf("repeated adoption: %v", err)
+	}
+	if got := r.Snapshot().Generations[generationOne].StorageProviderSetID; got != localSetID {
+		t.Fatalf("repeated adoption rewrote an existing identity: %q", got)
 	}
 }
 

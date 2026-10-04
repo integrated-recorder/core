@@ -59,6 +59,10 @@ const (
 // operator-configurable at runtime.
 var defaultBundleDir = "/opt/integrated-recorder/initial"
 
+// defaultStorageLocalBinary is the image-bundled Storage Provider Protocol
+// implementation used as the mandatory local primary provider.
+var defaultStorageLocalBinary = "/usr/local/lib/integrated-recorder/plugins/storage.local"
+
 var generationPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // Config contains trusted Runtime Host startup inputs. BundleDir is deliberately
@@ -67,6 +71,7 @@ var generationPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 type Config struct {
 	DataDir            string
 	BundleDir          string
+	StorageLocalBinary string
 	ListenAddr         string
 	AdapterDirs        string
 	FFmpegPath         string
@@ -87,7 +92,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		DataDir: defaultDataDir, BundleDir: defaultBundleDir,
+		DataDir: defaultDataDir, BundleDir: defaultBundleDir, StorageLocalBinary: defaultStorageLocalBinary,
 		ListenAddr: defaultListenAddr, AdapterDirs: defaultAdapterDirs,
 		ControlReadyWait: defaultControlWait, ShutdownTimeout: defaultCloseWait,
 	}
@@ -110,6 +115,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		c.AdapterDirs = value
 	}
 	c.FFmpegPath = strings.TrimSpace(getenv("FFMPEG_PATH"))
+	if value := strings.TrimSpace(getenv("IR_STORAGE_LOCAL_PLUGIN")); value != "" {
+		c.StorageLocalBinary = value
+	}
 	c.AuthDisabled = getenv("AUTH_DISABLED") == "1"
 	c.ForceSecureCookies = getenv("COOKIE_SECURE") == "1"
 	c.ReleaseBundleDir = strings.TrimSpace(getenv("IR_RELEASE_BUNDLE_DIR"))
@@ -131,6 +139,9 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.BundleDir) == "" || !filepath.IsAbs(c.BundleDir) || filepath.Clean(c.BundleDir) != c.BundleDir || strings.ContainsRune(c.BundleDir, 0) {
 		return errors.New("bundled release directory must be an absolute clean path")
+	}
+	if strings.TrimSpace(c.StorageLocalBinary) == "" || !filepath.IsAbs(c.StorageLocalBinary) || filepath.Clean(c.StorageLocalBinary) != c.StorageLocalBinary || strings.ContainsRune(c.StorageLocalBinary, 0) {
+		return errors.New("bundled storage.local executable path must be an absolute clean path")
 	}
 	if strings.TrimSpace(c.AdapterDirs) == "" || strings.ContainsRune(c.AdapterDirs, 0) {
 		return errors.New("adapter directories are invalid")
@@ -323,6 +334,18 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return errors.New("Runtime Host storage provider catalog is unavailable")
 	}
+	localStorageSet, err := ensureBundledLocalStorage(ctx, storageCatalog, config.StorageLocalBinary, filepath.Join(config.DataDir, "recordings"))
+	if err != nil {
+		return fmt.Errorf("initialize bundled storage.local provider: %w", err)
+	}
+	// Legacy generation records omitted storage-provider identity while the
+	// Core wrote directly to /data/recordings. Adopt that exact physical archive
+	// through the bundled provider without moving any objects. Persist the
+	// immutable provider identity before application children can start.
+	if err := registry.AdoptLegacyStorageProviderSet(localStorageSet.ID); err != nil {
+		return fmt.Errorf("adopt legacy local archive into storage.local: %w", err)
+	}
+	registrySnapshot = registry.Snapshot()
 	plugins, err := pluginregistry.Open(pluginregistry.Config{
 		Root: filepath.Join(config.DataDir, "runtime", "plugin-registry"), RegistryURL: config.PluginRegistryURL,
 		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, HTTPClient: config.PluginRegistryHTTPClient,
@@ -347,14 +370,31 @@ func Run(ctx context.Context, config Config) error {
 			return errors.New("active Runtime Host adapter set is unavailable")
 		}
 	}
-	selected, startupGeneration, needsRegistryStage, err := prepareStartupGeneration(selected, registrySnapshot, adapterSet.ID)
+	storageSetID := localStorageSet.ID
+	if active, ok := registrySnapshot.Generations[registrySnapshot.ActiveGenerationID]; ok && active.StorageProviderSetID != "" {
+		activeSet, setErr := storageCatalog.LoadSet(active.StorageProviderSetID)
+		if setErr != nil {
+			return errors.New("active Runtime Host storage provider set is unavailable")
+		}
+		// A selected external primary survives app and Host restarts. A changed
+		// bundled local artifact only rolls forward generations already using
+		// storage.local; active recordings keep their prior immutable set.
+		if activeSet.Artifact.ID != "local" {
+			storageSetID = active.StorageProviderSetID
+		}
+	}
+	selected, startupGeneration, needsRegistryStage, err := prepareStartupGeneration(selected, registrySnapshot, adapterSet.ID, storageSetID)
 	if err != nil {
 		return err
 	}
-	if startupGeneration.StorageProviderSetID != "" {
-		if _, err := storageCatalog.LoadSet(startupGeneration.StorageProviderSetID); err != nil {
-			return errors.New("active Runtime Host storage provider set is unavailable")
-		}
+	if startupGeneration.StorageProviderSetID == "" {
+		return errors.New("active Runtime Host storage provider set is unavailable")
+	}
+	if _, err := storageCatalog.LoadSet(startupGeneration.StorageProviderSetID); err != nil {
+		return errors.New("active Runtime Host storage provider set is unavailable")
+	}
+	if err := probeStorageProviderSet(ctx, filepath.Join(config.DataDir, "runtime", "storage-providers"), startupGeneration.StorageProviderSetID); err != nil {
+		return errors.New("active Runtime Host storage provider is unavailable")
 	}
 	generationID := selected.generationID
 	engineToken, err := randomSecret()
@@ -737,12 +777,9 @@ func commonChildEnv(config Config, adapterDirectory string) []string {
 }
 
 // storageProviderChildEnv pins application processes to the immutable storage
-// provider set recorded in their Runtime Host generation. Empty means the
-// legacy/built-in local-primary backend.
+// provider set recorded in their Runtime Host generation. Empty set identity
+// is passed through as empty and causes OpenStore to fail closed.
 func storageProviderChildEnv(dataDir, setID string) []string {
-	if setID == "" {
-		return nil
-	}
 	return []string{
 		"STORAGE_PROVIDER_CATALOG_ROOT=" + filepath.Join(dataDir, "runtime", "storage-providers"),
 		"STORAGE_PROVIDER_SET_ID=" + setID,
@@ -857,20 +894,20 @@ func runtimeGeneration(id string, build buildinfo.Info) generation.Generation {
 	}
 }
 
-// prepareStartupGeneration binds the selected application release to the
-// reconciled immutable adapter set. A set change over an existing active
-// application allocates a new generation identity and copies the exact
-// application compatibility tuple; it never edits the old generation.
-func prepareStartupGeneration(selected runtimeRelease, registryState generation.Snapshot, adapterSetID string) (runtimeRelease, generation.Generation, bool, error) {
-	if adapterSetID == "" {
-		return runtimeRelease{}, generation.Generation{}, false, errors.New("adapter set identity is unavailable")
+// prepareStartupGeneration binds the selected application release to both
+// immutable source-adapter and physical-storage sets. A set change over an
+// existing active application allocates a new generation identity and copies
+// the exact application compatibility tuple; it never edits the old one.
+func prepareStartupGeneration(selected runtimeRelease, registryState generation.Snapshot, adapterSetID, storageProviderSetID string) (runtimeRelease, generation.Generation, bool, error) {
+	if adapterSetID == "" || storageProviderSetID == "" {
+		return runtimeRelease{}, generation.Generation{}, false, errors.New("adapter or storage provider set identity is unavailable")
 	}
 	if registryState.ActiveGenerationID != "" {
 		active, ok := registryState.Generations[registryState.ActiveGenerationID]
 		if !ok || active.State != generation.StateActive {
 			return runtimeRelease{}, generation.Generation{}, false, errors.New("active application generation is inconsistent")
 		}
-		if active.AdapterSetID != adapterSetID {
+		if active.AdapterSetID != adapterSetID || active.StorageProviderSetID != storageProviderSetID {
 			id, err := newGenerationID()
 			if err != nil {
 				return runtimeRelease{}, generation.Generation{}, false, err
@@ -878,6 +915,7 @@ func prepareStartupGeneration(selected runtimeRelease, registryState generation.
 			candidate := active
 			candidate.ID = id
 			candidate.AdapterSetID = adapterSetID
+			candidate.StorageProviderSetID = storageProviderSetID
 			candidate.InstalledAt = time.Now().UTC()
 			candidate.State = generation.StateStaging
 			candidate.EngineDormant = false
@@ -892,6 +930,7 @@ func prepareStartupGeneration(selected runtimeRelease, registryState generation.
 	}
 	candidate := runtimeGeneration(selected.generationID, selected.appBuild)
 	candidate.AdapterSetID = adapterSetID
+	candidate.StorageProviderSetID = storageProviderSetID
 	return selected, candidate, true, nil
 }
 

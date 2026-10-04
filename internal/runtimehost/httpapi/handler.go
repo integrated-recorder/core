@@ -65,6 +65,7 @@ var safeControllerErrors = map[string]safeErrorDefinition{
 	"plugin_operation_conflict":                     {http.StatusConflict, "다른 Runtime 변경 작업이 진행 중입니다."},
 	"storage_provider_not_installed":                {http.StatusNotFound, "스토리지 제공자를 찾을 수 없습니다."},
 	"storage_provider_not_configured":               {http.StatusConflict, "스토리지 제공자 설정이 필요합니다."},
+	"storage_provider_config_managed":               {http.StatusConflict, "이 번들 스토리지 제공자의 설정은 Runtime Host가 관리합니다."},
 	"storage_provider_unavailable":                  {http.StatusServiceUnavailable, "스토리지 제공자를 사용할 수 없습니다."},
 	"storage_provider_probe_failed":                 {http.StatusBadGateway, "스토리지 연결 검사를 완료하지 못했습니다."},
 	"storage_provider_identity_mismatch":            {http.StatusUnprocessableEntity, "스토리지 제공자 식별 정보가 일치하지 않습니다."},

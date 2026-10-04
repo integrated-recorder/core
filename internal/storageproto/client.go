@@ -32,6 +32,7 @@ type StartOptions struct {
 type Client struct {
 	http       *http.Client
 	transport  *http.Transport
+	tokenMu    sync.RWMutex
 	token      []byte
 	cmd        *exec.Cmd
 	parentPipe io.WriteCloser
@@ -346,7 +347,10 @@ func (c *Client) request(ctx context.Context, method, target string, body io.Rea
 	if err != nil {
 		return nil, ErrProtocol
 	}
-	req.Header.Set("Authorization", "Bearer "+string(c.token))
+	c.tokenMu.RLock()
+	authorization := "Bearer " + string(c.token)
+	c.tokenMu.RUnlock()
+	req.Header.Set("Authorization", authorization)
 	return req, nil
 }
 
@@ -414,9 +418,12 @@ func (c *Client) Close() error {
 	}
 	c.closeOnce.Do(func() {
 		defer func() {
+			c.tokenMu.Lock()
 			for i := range c.token {
 				c.token[i] = 0
 			}
+			c.token = nil
+			c.tokenMu.Unlock()
 		}()
 		if c.transport != nil {
 			c.transport.CloseIdleConnections()

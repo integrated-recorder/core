@@ -1,10 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +21,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/management"
 	"github.com/dltkddnr04/integrated-recorder/internal/preview"
+	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/server"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
@@ -154,6 +162,147 @@ func TestControlBackgroundProducersStayStoppedUntilHostInstallationReady(t *test
 	if reloaded.State != installation.StateReady || reloaded.InstallationID != state.Snapshot().InstallationID {
 		t.Fatalf("restart-equivalent installation snapshot=%+v", reloaded)
 	}
+}
+
+func TestValidateInstallationAllowsUnknownCapacityWhenProviderProbePasses(t *testing.T) {
+	objects := newSetupValidationObjects()
+	store, err := storage.NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &controlApplication{store: store, manager: &recorderengine.ManagerRouter{}, adapters: &adapterhost.Host{}}
+	if err := app.validateInstallation(context.Background()); err != nil {
+		t.Fatalf("successful provider write/durability probe with unknown capacity was rejected: %v", err)
+	}
+	result := store.RunSetupProbe()
+	if !result.WritePassed || !result.DurabilityPassed || result.CapacityKnown {
+		t.Fatalf("expected successful probe and unknown provider capacity, got %+v", result)
+	}
+}
+
+func TestValidateInstallationRejectsFailedProviderProbe(t *testing.T) {
+	objects := newSetupValidationObjects()
+	objects.failPut = true
+	store, err := storage.NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &controlApplication{store: store, manager: &recorderengine.ManagerRouter{}, adapters: &adapterhost.Host{}}
+	if err := app.validateInstallation(context.Background()); err == nil {
+		t.Fatal("failed physical provider probe was accepted")
+	}
+}
+
+type setupValidationObjects struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	failPut bool
+}
+
+func newSetupValidationObjects() *setupValidationObjects {
+	return &setupValidationObjects{objects: make(map[string][]byte)}
+}
+
+func (s *setupValidationObjects) Put(ctx context.Context, key string, body io.Reader, size int64) (storage.PhysicalObjectInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.PhysicalObjectInfo{}, err
+	}
+	if s.failPut {
+		return storage.PhysicalObjectInfo{}, errors.New("injected provider failure")
+	}
+	data, err := io.ReadAll(io.LimitReader(body, size+1))
+	if err != nil || size < 0 || int64(len(data)) != size {
+		return storage.PhysicalObjectInfo{}, errors.New("invalid provider payload")
+	}
+	s.mu.Lock()
+	s.objects[key] = append([]byte(nil), data...)
+	info := s.infoLocked(key)
+	s.mu.Unlock()
+	return info, nil
+}
+
+func (s *setupValidationObjects) Open(ctx context.Context, key string) (io.ReadCloser, storage.PhysicalObjectInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, storage.PhysicalObjectInfo{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, ok := s.objects[key]
+	if !ok {
+		return nil, storage.PhysicalObjectInfo{}, storage.ErrObjectNotFound
+	}
+	return io.NopCloser(bytes.NewReader(append([]byte(nil), data...))), s.infoLocked(key), nil
+}
+
+func (s *setupValidationObjects) OpenRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.PhysicalObjectInfo, error) {
+	reader, info, err := s.Open(ctx, key)
+	if err != nil {
+		return nil, storage.PhysicalObjectInfo{}, err
+	}
+	data, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil || offset < 0 || length < 0 || offset > int64(len(data))-length {
+		return nil, storage.PhysicalObjectInfo{}, errors.New("invalid provider range")
+	}
+	return io.NopCloser(bytes.NewReader(data[offset : offset+length])), info, nil
+}
+
+func (s *setupValidationObjects) Stat(ctx context.Context, key string) (storage.PhysicalObjectInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.PhysicalObjectInfo{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.objects[key]; !ok {
+		return storage.PhysicalObjectInfo{}, storage.ErrObjectNotFound
+	}
+	return s.infoLocked(key), nil
+}
+
+func (s *setupValidationObjects) List(ctx context.Context, prefix, cursor string, limit int) (storage.PhysicalObjectPage, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.PhysicalObjectPage{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.objects))
+	for key := range s.objects {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix && key > cursor {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	if limit < 1 {
+		return storage.PhysicalObjectPage{}, errors.New("invalid list limit")
+	}
+	page := storage.PhysicalObjectPage{}
+	if len(keys) > limit {
+		page.NextCursor = keys[limit-1]
+		keys = keys[:limit]
+	}
+	for _, key := range keys {
+		page.Items = append(page.Items, s.infoLocked(key))
+	}
+	return page, nil
+}
+
+func (s *setupValidationObjects) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.objects[key]; !ok {
+		return storage.ErrObjectNotFound
+	}
+	delete(s.objects, key)
+	return nil
+}
+
+func (s *setupValidationObjects) infoLocked(key string) storage.PhysicalObjectInfo {
+	data := s.objects[key]
+	digest := sha256.Sum256(data)
+	return storage.PhysicalObjectInfo{Key: key, Size: int64(len(data)), SHA256: hex.EncodeToString(digest[:]), ModifiedAt: time.Now().UTC()}
 }
 
 type installationGateAdapter struct{ checks atomic.Int32 }

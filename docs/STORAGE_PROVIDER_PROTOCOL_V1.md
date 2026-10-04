@@ -130,3 +130,35 @@ go run ./cmd/storage-provider-conformance --binary /absolute/path/to/provider --
 ```
 
 An optional private JSON configuration file may be passed with `--config`. The conformance runner reports only fixed check names, provider identity, and descriptor fingerprint; it never includes configuration, token, path, stderr, or arbitrary provider errors.
+
+## Bundled reference provider: `storage.local`
+
+The product bundles `storage.local`, provider ID `local`, as its first
+production Storage Provider Protocol v1 implementation. It is a separate
+executable and uses the same authenticated control plane and streaming object
+data plane as external providers. Its presence does not depend on a Plugin
+Registry, and it is a mandatory bundled plugin rather than a Core backend
+shortcut.
+
+Runtime Host supplies this provider with a fixed private archive root at the
+existing `<DATA_DIR>/recordings` location. Public storage configuration cannot
+grant it an arbitrary host path, and the provider does not receive the broader
+`/data` tree. This lets existing logical keys in the `recordings/<id>/...`
+namespace retain their physical locations during legacy adoption without
+copying recording bytes. Other logical namespaces may use a provider-private
+physical namespace under that root; such details are not part of the portable
+Protocol v1 contract. Core runtime state remains outside the provider root.
+
+`storage.local` implements safe logical-key containment, streaming reads and
+writes, bounded listing, byte ranges, idempotent deletion, and complete-object
+atomic publication/replacement. For a new object it writes to a private
+temporary file, verifies the declared size, syncs the file, atomically publishes
+the complete object, and syncs the containing directory where supported. A
+replacement is prepared and synced separately so failure leaves either the old
+complete object or the new complete object. It rejects path traversal and
+symlink escapes within its configured root. The provider still does not
+interpret Recording metadata, choose ordinals, validate ownership, or decide
+retry and recovery behavior; these remain Core responsibilities. All
+production local archive writes, reads, integrity checks, deletion, and
+recovery go through this process path, and a provider startup failure does not
+authorize Core to perform direct local filesystem I/O.

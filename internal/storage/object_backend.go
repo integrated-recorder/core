@@ -37,6 +37,9 @@ type ObjectStoreArchiveBackend struct {
 	stageDir  string
 	objects   PhysicalObjectStore
 	telemetry *telemetry
+	poolID    string
+	poolName  string
+	poolKind  string
 
 	issuesMu sync.RWMutex
 	issues   []RecoveryIssue
@@ -937,7 +940,11 @@ func (b *ObjectStoreArchiveBackend) poolMetricsAt(ingest IngestSnapshot, now tim
 	if b.telemetry.degraded() {
 		health = "degraded"
 	}
-	return PoolSnapshot{ID: "remote-primary", DisplayName: "원격 보관 저장소", Kind: "remote", Role: "primary", Health: health, CapacityKnown: false, Throughput: throughput, EstimatedCeiling: estimateCeiling(samples), ErrorsTotal: errorsTotal, Samples: samples}
+	id, name, kind := b.poolID, b.poolName, b.poolKind
+	if id == "" {
+		id, name, kind = "remote-primary", "기본 보관 저장소", "remote"
+	}
+	return PoolSnapshot{ID: id, DisplayName: name, Kind: kind, Role: "primary", Health: health, CapacityKnown: false, Throughput: throughput, EstimatedCeiling: estimateCeiling(samples), ErrorsTotal: errorsTotal, Samples: samples}
 }
 
 func (b *ObjectStoreArchiveBackend) ArchiveIndex(recording *domain.Recording) ([]ArchiveEntry, error) {

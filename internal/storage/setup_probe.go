@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 type SetupProbeResult struct {
 	FreeBytes        uint64
+	CapacityKnown    bool
 	WritePassed      bool
 	DurabilityPassed bool
 }
@@ -73,22 +75,45 @@ func (s *Store) RunSetupProbe() SetupProbeResult {
 	if s == nil || s.StorageBackend == nil {
 		return SetupProbeResult{}
 	}
-	backend, ok := s.StorageBackend.(*LocalFilesystemBackend)
-	if !ok || backend == nil {
+	switch backend := s.StorageBackend.(type) {
+	case *ObjectStoreArchiveBackend:
+		if backend == nil || backend.objects == nil {
+			return SetupProbeResult{}
+		}
+		// The provider protocol owns physical publication. Its probe exercises
+		// atomic Put, read-back, range, listing, and deletion in a reserved
+		// non-archive namespace. Capacity is intentionally unknown unless the
+		// provider exposes a reliable capacity contract.
+		if err := ProbePhysicalObjectStore(context.Background(), backend.objects); err != nil {
+			return SetupProbeResult{}
+		}
+		return SetupProbeResult{WritePassed: true, DurabilityPassed: true}
+	case *LocalFilesystemBackend:
+		if backend == nil {
+			return SetupProbeResult{}
+		}
+		return backend.runSetupProbeResult()
+	default:
 		return SetupProbeResult{}
 	}
-	backend.setupProbeMu.Lock()
-	defer backend.setupProbeMu.Unlock()
+}
+
+func (b *LocalFilesystemBackend) runSetupProbeResult() SetupProbeResult {
+	if b == nil {
+		return SetupProbeResult{}
+	}
+	b.setupProbeMu.Lock()
+	defer b.setupProbeMu.Unlock()
 	var fs syscall.Statfs_t
-	if err := syscall.Statfs(backend.root, &fs); err != nil || fs.Bsize <= 0 {
+	if err := syscall.Statfs(b.root, &fs); err != nil || fs.Bsize <= 0 {
 		return SetupProbeResult{}
 	}
 	capacity, valid := capacityFromBlocks(uint64(fs.Blocks), uint64(fs.Bfree), uint64(fs.Bavail), uint64(fs.Bsize))
 	if !valid {
 		return SetupProbeResult{}
 	}
-	result := SetupProbeResult{FreeBytes: capacity.AvailableBytes}
-	writePassed, durabilityPassed := backend.runSetupProbe()
+	result := SetupProbeResult{FreeBytes: capacity.AvailableBytes, CapacityKnown: true}
+	writePassed, durabilityPassed := b.runSetupProbe()
 	result.WritePassed = writePassed
 	result.DurabilityPassed = durabilityPassed
 	return result

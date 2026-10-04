@@ -280,9 +280,11 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 	build := buildinfoForTest()
 	id := strings.Repeat("a", 32)
 	oldSetID, newSetID := strings.Repeat("b", 64), strings.Repeat("c", 64)
+	storageSetID := strings.Repeat("d", 64)
 	registryState := generationSnapshotForTest(id, build)
 	old := registryState.Generations[id]
 	old.AdapterSetID = oldSetID
+	old.StorageProviderSetID = storageSetID
 	old.ArchiveReadCompatibility = generation.CompatibilityRange{Minimum: 2, Maximum: 7}
 	old.ArchiveWriteEpoch = 5
 	registryState.Generations[id] = old
@@ -290,7 +292,7 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepared, candidate, needsStage, err := prepareStartupGeneration(selected, registryState, newSetID)
+	prepared, candidate, needsStage, err := prepareStartupGeneration(selected, registryState, newSetID, storageSetID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,9 +306,14 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 		t.Fatalf("startup adapter reconciliation mutated existing generation: %+v", got)
 	}
 
-	unchanged, same, stage, err := prepareStartupGeneration(selected, registryState, oldSetID)
+	unchanged, same, stage, err := prepareStartupGeneration(selected, registryState, oldSetID, storageSetID)
 	if err != nil || stage || unchanged.generationID != id || same.ID != id || same.AdapterSetID != oldSetID {
 		t.Fatalf("same adapter set should reuse active generation: selected=%+v generation=%+v stage=%t err=%v", unchanged, same, stage, err)
+	}
+	changedStorage := strings.Repeat("e", 64)
+	prepared, candidate, needsStage, err = prepareStartupGeneration(selected, registryState, oldSetID, changedStorage)
+	if err != nil || !needsStage || candidate.StorageProviderSetID != changedStorage || candidate.AdapterSetID != oldSetID {
+		t.Fatalf("storage-set-only startup change did not allocate a consistent tuple: candidate=%+v stage=%t err=%v", candidate, needsStage, err)
 	}
 }
 

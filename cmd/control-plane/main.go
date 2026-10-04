@@ -666,7 +666,7 @@ func (a *controlApplication) validateInstallation(ctx context.Context) error {
 		return errors.New("Control installation dependencies are unavailable")
 	}
 	probe := a.store.RunSetupProbe()
-	if probe.FreeBytes == 0 || !probe.WritePassed || !probe.DurabilityPassed {
+	if !probe.WritePassed || !probe.DurabilityPassed {
 		return errors.New("primary storage self-test failed")
 	}
 	return nil

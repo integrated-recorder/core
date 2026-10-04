@@ -13,7 +13,7 @@ import (
 )
 
 func unixTransport(socketPath string) *http.Transport {
-	return &http.Transport{DisableCompression: true, DisableKeepAlives: false, MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+	return &http.Transport{DisableCompression: true, DisableKeepAlives: false, MaxConnsPerHost: MaxConcurrentReadStreams, MaxIdleConnsPerHost: MaxConcurrentReadStreams, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 	}}
 }

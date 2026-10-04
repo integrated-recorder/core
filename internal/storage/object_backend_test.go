@@ -35,6 +35,16 @@ type memoryPhysicalObjects struct {
 	rangeCalls         []physicalRangeCall
 }
 
+type identifiedMemoryPhysicalObjects struct {
+	*memoryPhysicalObjects
+	id   string
+	name string
+}
+
+func (m identifiedMemoryPhysicalObjects) StorageProviderIdentity() (string, string) {
+	return m.id, m.name
+}
+
 type physicalRangeCall struct {
 	key    string
 	offset int64
@@ -327,6 +337,25 @@ func TestNewWithObjectStoreArchiveContractAndCommitOrdering(t *testing.T) {
 	}
 	if pool := store.PoolMetrics(); pool.CapacityKnown || pool.Kind != "remote" {
 		t.Fatalf("pool metrics=%#v", pool)
+	}
+}
+
+func TestObjectStorePoolMetricsUsePinnedProviderIdentity(t *testing.T) {
+	for _, test := range []struct {
+		id, name, wantID, wantKind string
+	}{
+		{id: "local", name: "Local Storage", wantID: PoolIDLocalPrimary, wantKind: "local"},
+		{id: "fixture-s3", name: "Fixture S3", wantID: "storage-fixture-s3", wantKind: "remote"},
+	} {
+		objects := identifiedMemoryPhysicalObjects{memoryPhysicalObjects: newMemoryPhysicalObjects(), id: test.id, name: test.name}
+		store, err := NewWithObjectStore(t.TempDir(), objects)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool := store.PoolMetrics()
+		if pool.ID != test.wantID || pool.DisplayName != test.name && test.id != "local" || pool.Kind != test.wantKind {
+			t.Fatalf("provider %q pool = %+v, want id=%q kind=%q", test.id, pool, test.wantID, test.wantKind)
+		}
 	}
 }
 

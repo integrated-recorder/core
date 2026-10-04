@@ -107,6 +107,7 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 			"ADDR=" + listenAddr,
 			"AUTH_DISABLED=1",
 			"ADAPTER_DIR=" + artifacts.adapterDir,
+			"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 			"IR_PLUGIN_REGISTRY_URL=" + registryServer.URL + "/registry.json",
 			"IR_RUNTIME_E2E_PLUGIN_REGISTRY_CA_FILE=" + caPath,
 		})
@@ -152,8 +153,18 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 	}
 	initialRegistry := readRuntimeGenerationSnapshot(t, dataDir)
 	initialGenerationID := initialRegistry.ActiveGenerationID
-	if initialGenerationID == "" || initialRegistry.Generations[initialGenerationID].StorageProviderSetID != "" {
-		t.Fatalf("fresh product generation should start on local storage: %+v", initialRegistry)
+	initialGeneration := initialRegistry.Generations[initialGenerationID]
+	if initialGenerationID == "" || initialGeneration.StorageProviderSetID == "" {
+		t.Fatalf("fresh product generation should pin its bundled local storage provider: %+v", initialRegistry)
+	}
+	storageCatalogRoot := filepath.Join(dataDir, "runtime", "storage-providers")
+	catalog, err := storagecatalog.Open(storageCatalogRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localSet, err := catalog.LoadSet(initialGeneration.StorageProviderSetID)
+	if err != nil || localSet.Artifact.ID != "local" {
+		t.Fatalf("fresh product generation does not resolve to bundled storage.local: set=%+v err=%v", localSet, err)
 	}
 
 	// Registry refresh/install/configure/probe/activate all use the production
@@ -167,7 +178,7 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 		t.Fatalf("install provider v1 status=%d plugins=%+v", code, plugins)
 	}
 	storageStatus := runtimeStorageStatus(t, client, baseURL)
-	if storageStatus.Primary.Kind != "local" || readRuntimeGenerationSnapshot(t, dataDir).ActiveGenerationID != initialGenerationID {
+	if storageStatus.Primary.Kind != "plugin" || storageStatus.Primary.ProviderID != "local" || storageStatus.Primary.Version != localSet.Artifact.Version || readRuntimeGenerationSnapshot(t, dataDir).ActiveGenerationID != initialGenerationID {
 		t.Fatalf("verified install activated storage without explicit configuration: primary=%+v registry=%+v", storageStatus.Primary, readRuntimeGenerationSnapshot(t, dataDir))
 	}
 	configureRuntimeStorageProvider(t, client, baseURL, providerRoot)
@@ -192,8 +203,7 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 	if controlV1PID == engineV1PID {
 		t.Fatalf("storage-pinned generation reused a process boundary: control=%d engine=%d", controlV1PID, engineV1PID)
 	}
-	storageCatalogRoot := filepath.Join(dataDir, "runtime", "storage-providers")
-	catalog, err := storagecatalog.Open(storageCatalogRoot)
+	catalog, err = storagecatalog.Open(storageCatalogRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

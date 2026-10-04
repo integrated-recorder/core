@@ -40,7 +40,11 @@ func main() {
 	p := &provider{}
 	ctx, cancel := signalContext()
 	defer cancel()
-	err := storageproto.Serve(ctx, p, storageproto.ServeOptions{SocketPath: *socket, TokenFile: *token})
+	err := storageproto.Serve(ctx, p, storageproto.ServeOptions{
+		SocketPath:         *socket,
+		TokenFile:          *token,
+		MaxConcurrentReads: storageproto.MaxConcurrentReadStreams,
+	})
 	p.cleanup()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "storage fixture stopped:", err)

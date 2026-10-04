@@ -112,6 +112,7 @@ export type Dashboard = {
 export type StorageInfo = { archive_root: string; filesystem_total_bytes: number; filesystem_used_bytes: number; filesystem_available_bytes: number; recordings_bytes: number; recording_count: number; segment_count: number; init_segment_count: number; manifest_count: number }
 export type StoragePool = {
   id: string; display_name: string; kind: string; role: string; health: string;
+  capacity_known: boolean;
   capacity: { total_bytes: number; used_bytes: number; available_bytes: number; usage_ratio: number };
   throughput: { read_bytes_per_second: number; write_bytes_per_second: number; read_bytes_total: number; write_bytes_total: number; read_latency_ms: number; write_latency_ms: number };
   estimated_ceiling: { read_bytes_per_second?: number; write_bytes_per_second?: number; source: 'observed' | 'unknown' | 'configured' | 'benchmarked' };
@@ -124,10 +125,11 @@ export type StorageMetricSample = { at: string; read_bytes_per_second: number; w
 export type StoragePoolsResponse = { items: StoragePool[] }
 export type StorageMetricsResponse = { pool_id: string; sample_interval_ms: number; sample_interval_seconds: number; items: StorageMetricSample[] }
 export type StorageProviderHealth = 'ready' | 'unknown' | 'failed'
-export type StoragePrimaryProvider = { kind: 'local' | 'plugin'; provider_id?: string; version?: string; state: 'ready' | 'unavailable' }
+export type StoragePrimaryProvider = { kind: 'plugin'; provider_id: string; version: string; state: 'ready' | 'unavailable' }
 export type StorageProviderSummary = {
   id: string; name: string; version: string; configured: boolean; active: boolean;
-  health: StorageProviderHealth; configuration_schema: Schema
+  health: StorageProviderHealth; configuration_schema: Schema;
+  distribution: 'bundled' | 'registry'; configuration_managed: boolean; uninstallable: boolean
 }
 export type StorageProviderStatus = { primary: StoragePrimaryProvider; providers: StorageProviderSummary[] }
 export type StorageProviderConfig = { values: Record<string, unknown>; configured_secrets: string[] }
@@ -186,7 +188,8 @@ export type InstallationStatus = {
 }
 export type SetupStorageTest = {
   status: 'ready' | 'warning' | 'error'
-  free_bytes: number
+  capacity_known: boolean
+  free_bytes?: number
   write_test: 'passed' | 'failed'
   durability_test: 'passed' | 'failed'
   diagnostic_code?: string

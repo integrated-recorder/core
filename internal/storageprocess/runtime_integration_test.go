@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +22,19 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
 )
+
+func TestOpenStoreRejectsGenerationWithoutProviderSetInsteadOfUsingDirectLocalStorage(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dataDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if store, provider, err := OpenStore(context.Background(), dataDir, "", ""); err == nil || store != nil || provider != nil {
+		t.Fatalf("OpenStore silently accepted an unpinned generation: store=%v provider=%v err=%v", store, provider, err)
+	}
+	if _, err := os.Lstat(filepath.Join(dataDir, "recordings")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected unpinned startup mutated/created the legacy archive root: %v", err)
+	}
+}
 
 // TestExternalProviderArchiveRoundTrip is an acceptance-level process-boundary
 // test: Core's archive facade talks to an immutable catalog executable over
@@ -226,6 +241,181 @@ func TestExternalProviderArchiveRoundTrip(t *testing.T) {
 	}
 	if _, err := os.Lstat(localRecordingPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("read/recovery materialized a local canonical recording: %v", err)
+	}
+}
+
+// TestBundledLocalProviderArchiveRoundTrip builds the production storage.local
+// executable and exercises its real Protocol v1 process boundary. The
+// provider is pointed at the legacy recordings root so this also proves
+// in-place adoption without rewriting the archive layout.
+func TestBundledLocalProviderArchiveRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	testRoot := t.TempDir()
+	t.Cleanup(func() {
+		if err := makeTestTreeRemovable(testRoot); err != nil {
+			t.Errorf("prepare local-provider acceptance tree cleanup: %v", err)
+		}
+	})
+	dataDir := filepath.Join(testRoot, "data")
+	if err := os.Mkdir(dataDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Seed the archive through the previous Core-owned filesystem backend
+	// before storage.local exists. The plugin must adopt these exact objects in
+	// place rather than making an existing archive appear empty.
+	legacyStore, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatalf("create legacy archive fixture: %v", err)
+	}
+	const recordingID = "abcdef0123456789abcdef0123456789"
+	const legacyPayloadKey = "tracks/main/00000006.m4s"
+	const payloadPath = "tracks/main/00000007.m4s"
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	title, description := "Legacy local archive", "Adopted without moving canonical objects"
+	legacyRecording := &domain.Recording{
+		FormatVersion: 1, ID: recordingID, Title: title, State: domain.StateStopped,
+		CreatedAt: now, StartedAt: now,
+		Tracks:           map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}, InitSegments: []domain.Segment{}}},
+		MetadataTimeline: []domain.MetadataRevision{{ObservedAt: now, Title: &title, Description: &description}},
+	}
+	if err := legacyStore.CreateRecording(legacyRecording); err != nil {
+		t.Fatalf("create legacy recording metadata: %v", err)
+	}
+	legacyPayload := bytes.Repeat([]byte("legacy-local-source-segment/"), 8192)
+	legacyResult, err := legacyStore.SavePayloadExact(recordingID, legacyPayloadKey, bytes.NewReader(legacyPayload), int64(len(legacyPayload)), int64(len(legacyPayload)))
+	if err != nil {
+		t.Fatalf("write legacy archive payload: %v", err)
+	}
+	legacySegment := domain.Segment{ID: "segment-6", TrackID: "main", Sequence: 6, ArchiveOrdinal: 6,
+		SourceURI: "fixture://source/session/segment-6", Duration: 4, StoragePath: legacyPayloadKey,
+		PayloadSize: legacyResult.Size, SHA256: legacyResult.SHA256}
+	if err := legacyStore.SaveSidecar(recordingID, legacyPayloadKey, legacySegment); err != nil {
+		t.Fatalf("write legacy archive sidecar: %v", err)
+	}
+	legacyRecording.Tracks["main"].Segments = append(legacyRecording.Tracks["main"].Segments, legacySegment)
+	if err := legacyStore.SaveRecording(legacyRecording); err != nil {
+		t.Fatalf("publish legacy recording metadata: %v", err)
+	}
+	legacyPhysicalPath := filepath.Join(dataDir, "recordings", recordingID, filepath.FromSlash(legacyPayloadKey))
+	legacyPhysical, err := os.ReadFile(legacyPhysicalPath)
+	if err != nil || !bytes.Equal(legacyPhysical, legacyPayload) || payloadSHA256(legacyPhysical) != legacyResult.SHA256 {
+		t.Fatalf("legacy fixture bytes are not stable: size=%d err=%v", len(legacyPhysical), err)
+	}
+	binary := buildStorageLocalProvider(t, ctx)
+	catalogRoot := filepath.Join(dataDir, "runtime", "storage-providers")
+	catalog, err := storagecatalog.Open(catalogRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := catalog.ImportBundled(ctx, binary, "local")
+	if err != nil {
+		t.Fatalf("import and Protocol-probe production storage.local: %v", err)
+	}
+	if err := catalog.Install(artifact); err != nil {
+		t.Fatal(err)
+	}
+	archiveRoot := filepath.Join(dataDir, "recordings")
+	rootJSON, err := json.Marshal(archiveRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := catalog.CreateSet(artifact.Digest, storagecatalog.SetConfig{Values: map[string]json.RawMessage{"root": rootJSON}})
+	if err != nil {
+		t.Fatalf("create Host-controlled local provider set: %v", err)
+	}
+	if err := catalog.SelectDesiredSet("local", set.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	openStore := func() (*storage.Store, *Runtime) {
+		t.Helper()
+		openCtx, openCancel := context.WithTimeout(ctx, 20*time.Second)
+		defer openCancel()
+		store, runtime, openErr := OpenStore(openCtx, dataDir, catalogRoot, set.ID)
+		if openErr != nil {
+			t.Fatalf("open Core archive over production storage.local process: %v", openErr)
+		}
+		return store, runtime
+	}
+
+	store, provider := openStore()
+	adopted, err := store.LoadAllReadOnly()
+	if err != nil || len(adopted) != 1 || adopted[0].ID != recordingID || adopted[0].SegmentCount() != 1 || adopted[0].Title != title {
+		t.Fatalf("storage.local failed to adopt existing legacy archive: recordings=%+v err=%v", adopted, err)
+	}
+	if segment := adopted[0].Tracks["main"].Segments[0]; segment.Sequence != 6 || segment.SHA256 != legacyResult.SHA256 || segment.StoragePath != legacyPayloadKey {
+		t.Fatalf("legacy archive metadata changed during adoption: %+v", segment)
+	}
+	payload := bytes.Repeat([]byte("storage.local-streamed-source-segment/"), 32<<10)
+	result, err := store.SavePayloadExact(recordingID, payloadPath, bytes.NewReader(payload), int64(len(payload)), int64(len(payload)))
+	if err != nil {
+		t.Fatalf("stream exact payload through storage.local: %v", err)
+	}
+	if result.Size != int64(len(payload)) || result.SHA256 != payloadSHA256(payload) {
+		t.Fatalf("local provider result=%+v, want size=%d exact SHA-256", result, len(payload))
+	}
+	recording := adopted[0]
+	segment := domain.Segment{ID: "segment-7", TrackID: "main", Sequence: 7, ArchiveOrdinal: 7,
+		SourceURI: "fixture://source/session/segment-7", Duration: 4, StoragePath: payloadPath,
+		PayloadSize: result.Size, SHA256: result.SHA256}
+	if err := store.SaveSidecar(recordingID, payloadPath, segment); err != nil {
+		t.Fatal(err)
+	}
+	recording.Tracks["main"].Segments = append(recording.Tracks["main"].Segments, segment)
+	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	physicalPath := filepath.Join(dataDir, "recordings", recordingID, filepath.FromSlash(payloadPath))
+	physical, err := os.ReadFile(physicalPath)
+	if err != nil || !bytes.Equal(physical, payload) || payloadSHA256(physical) != result.SHA256 {
+		t.Fatalf("storage.local did not preserve exact bytes at legacy archive path: size=%d err=%v", len(physical), err)
+	}
+	legacyPhysical, err = os.ReadFile(legacyPhysicalPath)
+	if err != nil || !bytes.Equal(legacyPhysical, legacyPayload) || payloadSHA256(legacyPhysical) != legacyResult.SHA256 {
+		t.Fatalf("storage.local adoption rewrote a previous canonical object: size=%d err=%v", len(legacyPhysical), err)
+	}
+	if err := provider.Close(); err != nil {
+		t.Fatalf("close production local provider process: %v", err)
+	}
+
+	store, provider = openStore()
+	defer func() {
+		if err := provider.Close(); err != nil {
+			t.Errorf("close restarted local provider process: %v", err)
+		}
+	}()
+	loaded, err := store.LoadAllReadOnly()
+	if err != nil || len(loaded) != 1 || loaded[0].ID != recordingID || loaded[0].SegmentCount() != 2 || loaded[0].Title != title {
+		t.Fatalf("legacy recording recovery through storage.local=%+v err=%v", loaded, err)
+	}
+	if segments := loaded[0].Tracks["main"].Segments; len(segments) != 2 || segments[0].SHA256 != legacyResult.SHA256 || segments[1].SHA256 != result.SHA256 {
+		t.Fatalf("legacy/current payload hash metadata changed: %+v", segments)
+	}
+	if integrity := store.VerifyRecording(loaded[0]); integrity.Status != storage.IntegrityVerified || integrity.ObjectsVerified != 2 || integrity.ObjectsMissing != 0 || integrity.ObjectsCorrupt != 0 {
+		t.Fatalf("local provider integrity verification=%+v", integrity)
+	}
+	reader, err := store.OpenPayloadRangeReaderContext(ctx, recordingID, payloadPath, 1024, 4096)
+	if err != nil {
+		t.Fatalf("open range through restarted local provider: %v", err)
+	}
+	ranged, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || !bytes.Equal(ranged, payload[1024:1024+4096]) {
+		t.Fatalf("local provider range mismatch: read=%v close=%v size=%d", readErr, closeErr, len(ranged))
+	}
+	if err := store.DeleteRecordingData(recordingID); err != nil {
+		t.Fatalf("delete canonical recording through provider protocol: %v", err)
+	}
+	if _, err := os.Lstat(physicalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider-backed deletion left canonical payload object: %v", err)
+	}
+	if _, err := os.Lstat(legacyPhysicalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider-backed deletion left adopted legacy payload object: %v", err)
+	}
+	remaining, err := store.LoadAllReadOnly()
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("provider-backed deletion left canonical recordings: count=%d err=%v", len(remaining), err)
 	}
 }
 
@@ -445,6 +635,351 @@ func TestExternalProviderChildCrashRecoversThroughCoreOutcomeVerification(t *tes
 	}
 }
 
+func TestReadStreamsAreConcurrentBoundedAndReleasePermits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	runtime, key, payload := startFixtureRuntime(t, ctx)
+	objects := runtime.ObjectStore()
+
+	// Keep several response bodies open without consuming them. Every Open call
+	// must return its headers while prior bodies still own read permits.
+	const concurrent = 4
+	type result struct {
+		reader io.ReadCloser
+		want   []byte
+		err    error
+	}
+	opened := make(chan result, concurrent)
+	for index := 0; index < concurrent; index++ {
+		index := index
+		go func() {
+			var reader io.ReadCloser
+			var err error
+			want := payload
+			if index%2 == 0 {
+				reader, _, err = objects.Open(ctx, key)
+			} else {
+				reader, _, err = objects.OpenRange(ctx, key, 128, 4096)
+				want = payload[128 : 128+4096]
+			}
+			opened <- result{reader: reader, want: want, err: err}
+		}()
+	}
+	streams := make([]result, 0, concurrent)
+	for index := 0; index < concurrent; index++ {
+		select {
+		case result := <-opened:
+			if result.err != nil {
+				t.Fatalf("concurrent stream open %d: %v", index, result.err)
+			}
+			streams = append(streams, result)
+		case <-time.After(20 * time.Second):
+			t.Fatalf("only %d of %d response bodies opened while prior streams remained held", len(streams), concurrent)
+		}
+	}
+	if got := len(runtime.readGate); got != concurrent {
+		t.Fatalf("active read permits=%d, want %d", got, concurrent)
+	}
+	for index, stream := range streams {
+		got, err := io.ReadAll(stream.reader)
+		if err != nil {
+			t.Fatalf("consume held stream %d: %v", index, err)
+		}
+		if !bytes.Equal(got, stream.want) {
+			t.Fatalf("stream %d returned %d bytes, want %d", index, len(got), len(stream.want))
+		}
+		if gotPermits := len(runtime.readGate); gotPermits != concurrent-index-1 {
+			t.Fatalf("EOF did not release exactly one read permit: after stream %d got %d", index, gotPermits)
+		}
+		if err := stream.reader.Close(); err != nil {
+			t.Fatalf("close consumed stream %d: %v", index, err)
+		}
+		if gotPermits := len(runtime.readGate); gotPermits != concurrent-index-1 {
+			t.Fatalf("Close released a permit more than once after EOF: got %d", gotPermits)
+		}
+	}
+
+	// Fill the entire bounded stream budget, then prove a seventeenth request
+	// reaches the semaphore wait and is canceled without acquiring/leaking one.
+	held := make([]io.ReadCloser, 0, maxConcurrentReadStreams)
+	for index := 0; index < maxConcurrentReadStreams; index++ {
+		reader, _, err := objects.Open(ctx, key)
+		if err != nil {
+			t.Fatalf("open bounded stream %d: %v", index, err)
+		}
+		held = append(held, reader)
+	}
+	if got := len(runtime.readGate); got != maxConcurrentReadStreams {
+		t.Fatalf("read gate occupancy=%d, want limit %d", got, maxConcurrentReadStreams)
+	}
+	waitCtx, cancelWait := context.WithTimeout(ctx, time.Second)
+	waitResult := make(chan error, 1)
+	waitStarted := make(chan struct{})
+	go func() {
+		close(waitStarted)
+		reader, _, err := objects.Open(waitCtx, key)
+		if reader != nil {
+			_ = reader.Close()
+		}
+		waitResult <- err
+	}()
+	<-waitStarted
+	select {
+	case err := <-waitResult:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("seventeenth Open wait error=%v, want context deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("seventeenth Open did not leave the read permit wait after cancellation")
+	}
+	cancelWait()
+	if got := len(runtime.readGate); got != maxConcurrentReadStreams {
+		t.Fatalf("canceled waiter changed held permit count to %d", got)
+	}
+	for _, reader := range held {
+		if err := reader.Close(); err != nil {
+			t.Errorf("close held stream: %v", err)
+		}
+	}
+	if got := len(runtime.readGate); got != 0 {
+		t.Fatalf("Close leaked read permits: %d remain", got)
+	}
+
+	// Parent-context cancellation aborts a live response and frees its permit
+	// even if the caller has not yet read or closed the body.
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	stream, _, err := objects.Open(streamCtx, key)
+	if err != nil {
+		t.Fatalf("open stream for cancellation: %v", err)
+	}
+	cancelStream()
+	waitCtx, cancelWait = context.WithTimeout(ctx, 5*time.Second)
+	defer cancelWait()
+	for index := 0; index < maxConcurrentReadStreams; index++ {
+		if err := runtime.acquireReadStream(waitCtx); err != nil {
+			for released := 0; released < index; released++ {
+				runtime.releaseReadStream()
+			}
+			_ = stream.Close()
+			t.Fatalf("caller cancellation did not release stream permit %d: %v", index+1, err)
+		}
+	}
+	for index := 0; index < maxConcurrentReadStreams; index++ {
+		runtime.releaseReadStream()
+	}
+	_ = stream.Close()
+	if got := len(runtime.readGate); got != 0 {
+		t.Fatalf("cancellation followed by Close leaked/double-released permits: %d remain", got)
+	}
+
+	// Runtime lifetime cancellation also closes an outstanding body and returns
+	// its permit without requiring the owner to call Close on that body.
+	lifetimeStream, _, err := objects.Open(ctx, key)
+	if err != nil {
+		t.Fatalf("open stream for runtime shutdown: %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("close runtime with open response stream: %v", err)
+	}
+	if got := len(runtime.readGate); got != 0 {
+		t.Fatalf("runtime lifetime cancellation leaked an open read permit: %d remain", got)
+	}
+	if err := lifetimeStream.Close(); err != nil {
+		t.Fatalf("close body after runtime shutdown: %v", err)
+	}
+	if got := len(runtime.readGate); got != 0 {
+		t.Fatalf("body Close after runtime cancellation released a permit twice: %d remain", got)
+	}
+}
+
+func TestNonReadOperationsWaitForOpenReadStreams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	runtime, key, _ := startFixtureRuntime(t, ctx)
+	objects := runtime.ObjectStore()
+	reader, _, err := objects.Open(ctx, key)
+	if err != nil {
+		t.Fatalf("open stream before Stat: %v", err)
+	}
+	defer reader.Close()
+
+	waitCtx, cancelWait := context.WithTimeout(ctx, 100*time.Millisecond)
+	_, err = objects.Stat(waitCtx, key)
+	cancelWait()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stat overlapped an active object stream or returned the wrong error: %v", err)
+	}
+	if got := len(runtime.readGate); got != 1 {
+		t.Fatalf("timed-out exclusive Stat disturbed active read stream permits: %d", got)
+	}
+
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close read stream before retrying Stat: %v", err)
+	}
+	if _, err := objects.Stat(ctx, key); err != nil {
+		t.Fatalf("Stat did not proceed after read stream closed: %v", err)
+	}
+}
+
+func TestPutOperationsRemainSerializedWhileReadsCanStream(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	markerPath := filepath.Join(t.TempDir(), "provider-put-attempts")
+	runtime, _, _ := startFixtureRuntimeWithConfig(t, ctx, map[string]json.RawMessage{
+		"crash_key":      mustJSON(t, "recordings/serial/second.bin"),
+		"attempt_marker": mustJSON(t, markerPath),
+	})
+	objects := runtime.ObjectStore()
+	firstBody := &blockingBody{started: make(chan struct{}), release: make(chan struct{})}
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := objects.Put(ctx, "recordings/serial/first.bin", firstBody, 1)
+		firstResult <- err
+	}()
+	select {
+	case <-firstBody.started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("first PUT did not enter the provider body stream")
+	}
+	if got := len(runtime.opGate); got != 1 {
+		t.Fatalf("first PUT does not hold the existing exclusive operation gate: %d", got)
+	}
+
+	var secondReads atomic.Int32
+	secondBody := &observedBody{reads: &secondReads}
+	secondResult := make(chan error, 1)
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		_, err := objects.Put(ctx, "recordings/serial/second.bin", secondBody, 1)
+		secondResult <- err
+	}()
+	<-secondStarted
+	if got := secondReads.Load(); got != 0 {
+		t.Fatalf("second PUT body was consumed before the first serialized PUT completed: reads=%d", got)
+	}
+	close(firstBody.release)
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatalf("first serialized PUT: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("first serialized PUT did not complete")
+	}
+	select {
+	case err := <-secondResult:
+		if err != nil {
+			t.Fatalf("second serialized PUT: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("second serialized PUT did not run after the first completed")
+	}
+	if got := secondReads.Load(); got == 0 {
+		t.Fatal("second PUT body was never consumed")
+	}
+}
+
+type blockingBody struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	sent    bool
+}
+
+func (r *blockingBody) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	buffer[0] = 'x'
+	return 1, nil
+}
+
+type observedBody struct {
+	reads *atomic.Int32
+	sent  bool
+}
+
+func (r *observedBody) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+	r.reads.Add(1)
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	buffer[0] = 'y'
+	return 1, nil
+}
+
+func startFixtureRuntime(t *testing.T, ctx context.Context) (*Runtime, string, []byte) {
+	return startFixtureRuntimeWithConfig(t, ctx, nil)
+}
+
+func startFixtureRuntimeWithConfig(t *testing.T, ctx context.Context, extraValues map[string]json.RawMessage) (*Runtime, string, []byte) {
+	t.Helper()
+	testRoot := t.TempDir()
+	t.Cleanup(func() {
+		if err := makeTestTreeRemovable(testRoot); err != nil {
+			t.Errorf("prepare fixture runtime tree cleanup: %v", err)
+		}
+	})
+	binary := buildExternalFixtureProvider(t, ctx)
+	binaryBytes, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatalf("read provider executable: %v", err)
+	}
+	digest := sha256.Sum256(binaryBytes)
+	catalogRoot := filepath.Join(testRoot, "runtime", "storage-providers")
+	catalog, err := storagecatalog.Open(catalogRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := catalog.Import(ctx, binary, storagecatalog.Expected{
+		ID: "fixture-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version,
+		SHA256: hex.EncodeToString(digest[:]), Size: int64(len(binaryBytes)),
+	})
+	if err != nil {
+		t.Fatalf("import real child provider: %v", err)
+	}
+	artifactPath, err := catalog.ArtifactPath(artifact.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, descriptor, err := catalog.DescribeArtifact(artifact.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectRoot := filepath.Join(testRoot, "objects")
+	values := map[string]json.RawMessage{"root": mustJSON(t, objectRoot)}
+	for key, value := range extraValues {
+		values[key] = append(json.RawMessage(nil), value...)
+	}
+	config := storageproto.Config{Values: values}
+	provider, err := Start(ctx, artifactPath, descriptor, config)
+	if err != nil {
+		t.Fatalf("start real child provider: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := provider.Close(); err != nil {
+			t.Errorf("close real child provider: %v", err)
+		}
+	})
+	key := "recordings/concurrent/stream.bin"
+	payload := bytes.Repeat([]byte("concurrent-read-stream/"), 128<<10)
+	if _, err := provider.ObjectStore().Put(ctx, key, bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatalf("seed provider object for concurrent streams: %v", err)
+	}
+	return provider, key, payload
+}
+
 func nonemptyLines(value string) []string {
 	var lines []string
 	for _, line := range strings.Split(strings.TrimSpace(value), "\n") {
@@ -464,6 +999,19 @@ func buildExternalFixtureProvider(t *testing.T, ctx context.Context) string {
 	command.Stderr = output
 	if err := command.Run(); err != nil {
 		t.Fatalf("build external storage provider fixture: %v (%s)", err, output.String())
+	}
+	return binary
+}
+
+func buildStorageLocalProvider(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "integrated-recorder-storage-local")
+	command := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", binary, "../../cmd/storage-local")
+	command.Stdout = &boundedTestOutput{}
+	output := command.Stdout.(*boundedTestOutput)
+	command.Stderr = output
+	if err := command.Run(); err != nil {
+		t.Fatalf("build production storage.local executable: %v (%s)", err, output.String())
 	}
 	return binary
 }

@@ -62,6 +62,9 @@ func (c *updateController) RefreshPlugins(ctx context.Context) (httpapi.PluginSt
 }
 
 func (c *updateController) InstallPlugin(ctx context.Context, id string) (httpapi.PluginStatus, error) {
+	if id == "local" {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_operation_conflict")
+	}
 	if c.pluginType(id) == pluginregistry.TypeStorage {
 		return c.installStoragePlugin(ctx, id, false)
 	}
@@ -69,6 +72,9 @@ func (c *updateController) InstallPlugin(ctx context.Context, id string) (httpap
 }
 
 func (c *updateController) UpdatePlugin(ctx context.Context, id string) (httpapi.PluginStatus, error) {
+	if id == "local" {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_operation_conflict")
+	}
 	if c.pluginType(id) == pluginregistry.TypeStorage {
 		return c.installStoragePlugin(ctx, id, true)
 	}
@@ -76,6 +82,9 @@ func (c *updateController) UpdatePlugin(ctx context.Context, id string) (httpapi
 }
 
 func (c *updateController) UninstallPlugin(ctx context.Context, id string) (httpapi.PluginStatus, error) {
+	if id == "local" {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_operation_conflict")
+	}
 	if c.isStoragePluginInstalled(id) {
 		return c.uninstallStoragePlugin(ctx, id)
 	}
@@ -334,6 +343,11 @@ func (c *updateController) pluginStatus() httpapi.PluginStatus {
 		installed, err := c.storageCatalog.Installed()
 		if err == nil {
 			for _, artifact := range installed {
+				if artifact.ID == "local" {
+					// storage.local is a mandatory image-bundled provider, not a
+					// Registry-managed plugin entry.
+					continue
+				}
 				index, exists := byID[artifact.ID]
 				if exists {
 					item := &status.Plugins[index]

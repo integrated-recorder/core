@@ -41,13 +41,16 @@ type PrimaryStorageStatus struct {
 }
 
 type StorageProviderSummary struct {
-	ID                  string              `json:"id"`
-	Name                string              `json:"name"`
-	Version             string              `json:"version"`
-	Configured          bool                `json:"configured"`
-	Active              bool                `json:"active"`
-	Health              string              `json:"health"`
-	ConfigurationSchema storageproto.Schema `json:"configuration_schema"`
+	ID                   string              `json:"id"`
+	Name                 string              `json:"name"`
+	Version              string              `json:"version"`
+	Distribution         string              `json:"distribution,omitempty"`
+	ConfigurationManaged bool                `json:"configuration_managed,omitempty"`
+	Uninstallable        bool                `json:"uninstallable"`
+	Configured           bool                `json:"configured"`
+	Active               bool                `json:"active"`
+	Health               string              `json:"health"`
+	ConfigurationSchema  storageproto.Schema `json:"configuration_schema"`
 }
 
 type StorageConfigRequest struct {
@@ -80,6 +83,12 @@ func (s StorageProviderStatus) Validate() error {
 	for _, item := range s.Providers {
 		if !pluginIDPattern.MatchString(item.ID) || seen[item.ID] || !safePluginText(item.Name, 128) || !safePluginText(item.Version, 128) || item.Health != "ready" && item.Health != "unknown" && item.Health != "failed" {
 			return errors.New("storage provider item is invalid")
+		}
+		if item.Distribution != "" && item.Distribution != "bundled" && item.Distribution != "registry" {
+			return errors.New("storage provider distribution is invalid")
+		}
+		if item.Distribution == "bundled" && (!item.ConfigurationManaged || item.Uninstallable) {
+			return errors.New("bundled storage provider management policy is invalid")
 		}
 		seen[item.ID] = true
 		if storageproto.ValidateSchema(item.ConfigurationSchema) != nil {

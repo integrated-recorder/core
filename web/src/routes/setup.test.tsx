@@ -5,7 +5,7 @@ import { SetupPage } from './setup'
 
 const mocks = vi.hoisted(() => ({
   status: vi.fn(), session: vi.fn(), bootstrap: vi.fn(), login: vi.fn(), begin: vi.fn(), storageTest: vi.fn(), complete: vi.fn(),
-  storage: vi.fn(), info: vi.fn(), adapters: vi.fn(), navigate: vi.fn(),
+  info: vi.fn(), adapters: vi.fn(), navigate: vi.fn(),
 }))
 vi.mock('@/api', async importOriginal => {
   const actual = await importOriginal<typeof import('@/api')>()
@@ -13,7 +13,7 @@ vi.mock('@/api', async importOriginal => {
     ...actual,
     authAPI: { ...actual.authAPI, session: mocks.session, bootstrap: mocks.bootstrap, login: mocks.login },
     setupAPI: { status: mocks.status, begin: mocks.begin, storageTest: mocks.storageTest, complete: mocks.complete },
-    dashboardAPI: { ...actual.dashboardAPI, storage: mocks.storage, info: mocks.info },
+    dashboardAPI: { ...actual.dashboardAPI, info: mocks.info },
     adaptersAPI: { ...actual.adaptersAPI, list: mocks.adapters },
   }
 })
@@ -25,7 +25,8 @@ const status = (state: 'uninitialized' | 'setup_in_progress' | 'ready' | 'recove
 })
 const session = (authenticated: boolean) => ({ auth_enabled: true, authenticated, needs_bootstrap: !authenticated, csrf_token: authenticated ? 'session-csrf' : 'initial-csrf' })
 const adapterReady = [{ status: { id: 'owncast', name: 'Owncast', state: 'running' }, descriptor: { id: 'owncast', name: 'Owncast' } }]
-const storagePassed = { status: 'ready' as const, free_bytes: 4_000_000_000, write_test: 'passed' as const, durability_test: 'passed' as const }
+const storagePassed = { status: 'ready' as const, capacity_known: true, free_bytes: 4_000_000_000, write_test: 'passed' as const, durability_test: 'passed' as const }
+const storageCapacityUnknown = { status: 'warning' as const, capacity_known: false, write_test: 'passed' as const, durability_test: 'passed' as const }
 
 function renderSetup() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
@@ -41,7 +42,6 @@ beforeEach(() => {
   mocks.begin.mockResolvedValue(status('setup_in_progress'))
   mocks.storageTest.mockResolvedValue(storagePassed)
   mocks.complete.mockResolvedValue(status('ready'))
-  mocks.storage.mockResolvedValue({ filesystem_available_bytes: 5_000_000_000 })
   mocks.info.mockResolvedValue({ version: '1.2.3' })
   mocks.adapters.mockResolvedValue(adapterReady)
 })
@@ -104,6 +104,20 @@ describe('first-run setup flow', () => {
     fireEvent.click(screen.getByRole('button', { name: '저장소 검사 실행' }))
     expect(await screen.findByText('기본 저장소 진단')).toBeInTheDocument()
     expect(screen.getAllByText('정상').length).toBeGreaterThan(0)
+  })
+
+  it('shows unknown provider capacity as a warning and still permits setup completion', async () => {
+    mocks.status.mockResolvedValue(status('setup_in_progress'))
+    mocks.session.mockResolvedValue(session(true))
+    mocks.storageTest.mockResolvedValue(storageCapacityUnknown)
+    renderSetup()
+    fireEvent.click(await screen.findByRole('button', { name: '저장소 검사 실행' }))
+    expect(await screen.findByText('저장소가 사용 가능 용량을 제공하지 않아 용량은 알 수 없습니다. 쓰기와 내구성 검사는 정상입니다.')).toBeInTheDocument()
+    expect(screen.getAllByText('알 수 없음').length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('button', { name: '계속' }))
+    fireEvent.click(await screen.findByRole('button', { name: '계속' }))
+    fireEvent.click(await screen.findByRole('button', { name: '설치 완료' }))
+    await waitFor(() => expect(mocks.complete).toHaveBeenCalledTimes(1))
   })
 
   it('shows adapter warnings while allowing installation to continue', async () => {

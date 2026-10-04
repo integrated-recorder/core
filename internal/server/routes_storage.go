@@ -18,6 +18,7 @@ type storagePoolView struct {
 	Role             string                `json:"role"`
 	Health           string                `json:"health"`
 	Capacity         storage.PoolCapacity  `json:"capacity"`
+	CapacityKnown    bool                  `json:"capacity_known"`
 	Throughput       storageThroughputView `json:"throughput"`
 	EstimatedCeiling storageCeilingView    `json:"estimated_ceiling"`
 	Buffer           storageBufferView     `json:"buffer"`
@@ -68,11 +69,12 @@ type storageMetricsResponse struct {
 }
 
 type setupStorageTestResponse struct {
-	Status         string `json:"status"`
-	FreeBytes      uint64 `json:"free_bytes"`
-	WriteTest      string `json:"write_test"`
-	DurabilityTest string `json:"durability_test"`
-	DiagnosticCode string `json:"diagnostic_code,omitempty"`
+	Status         string  `json:"status"`
+	CapacityKnown  bool    `json:"capacity_known"`
+	FreeBytes      *uint64 `json:"free_bytes,omitempty"`
+	WriteTest      string  `json:"write_test"`
+	DurabilityTest string  `json:"durability_test"`
+	DiagnosticCode string  `json:"diagnostic_code,omitempty"`
 }
 
 func (s *Server) setupStorageTest(w http.ResponseWriter, _ *http.Request) {
@@ -82,7 +84,11 @@ func (s *Server) setupStorageTest(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	probe := s.storage.RunSetupProbe()
-	response.FreeBytes = probe.FreeBytes
+	response.CapacityKnown = probe.CapacityKnown
+	if probe.CapacityKnown {
+		freeBytes := probe.FreeBytes
+		response.FreeBytes = &freeBytes
+	}
 	if probe.WritePassed {
 		response.WriteTest = "passed"
 	}
@@ -91,7 +97,7 @@ func (s *Server) setupStorageTest(w http.ResponseWriter, _ *http.Request) {
 	}
 	if !probe.WritePassed {
 		response.Status = "error"
-	} else if !probe.DurabilityPassed || probe.FreeBytes < 1<<30 {
+	} else if !probe.DurabilityPassed || !probe.CapacityKnown || probe.FreeBytes < 1<<30 {
 		response.Status = "warning"
 		response.DiagnosticCode = "storage_probe_warning"
 	} else {
@@ -124,7 +130,7 @@ func (s *Server) storagePoolMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	poolID := r.PathValue("pool_id")
-	if poolID != storage.PoolIDLocalPrimary {
+	if poolID != s.storage.PoolMetrics().ID {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "storage_pool_not_found"})
 		return
 	}
@@ -167,7 +173,7 @@ func poolView(snapshot storage.PoolSnapshot) storagePoolView {
 	}
 	return storagePoolView{
 		ID: snapshot.ID, DisplayName: snapshot.DisplayName, Kind: snapshot.Kind,
-		Role: snapshot.Role, Health: snapshot.Health, Capacity: snapshot.Capacity,
+		Role: snapshot.Role, Health: snapshot.Health, Capacity: snapshot.Capacity, CapacityKnown: snapshot.CapacityKnown,
 		Throughput: storageThroughputView{
 			ReadBytesPerSecond:  snapshot.Throughput.ReadBytesPerSecond,
 			WriteBytesPerSecond: snapshot.Throughput.WriteBytesPerSecond,

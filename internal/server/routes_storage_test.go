@@ -45,7 +45,7 @@ func TestStoragePoolAPIProjectsOnlyBoundedRecorderMetrics(t *testing.T) {
 		t.Fatalf("pool list=%+v", pools.Items)
 	}
 	pool := pools.Items[0]
-	if pool.Writers.Limit != 1 || pool.Buffer.CapacityBytes <= 0 || pool.Capacity.TotalBytes == 0 {
+	if pool.Writers.Limit != 1 || pool.Buffer.CapacityBytes <= 0 || pool.Capacity.TotalBytes == 0 || !pool.CapacityKnown {
 		t.Fatalf("pool omits actual capacity or writer/buffer state: %+v", pool)
 	}
 	if strings.Contains(list.Body.String(), root) || strings.Contains(list.Body.String(), "recordings/") {
@@ -83,6 +83,24 @@ func TestStoragePoolAPIProjectsOnlyBoundedRecorderMetrics(t *testing.T) {
 		if response.Code != test.want {
 			t.Errorf("GET %s status=%d want=%d body=%s", test.path, response.Code, test.want, response.Body.String())
 		}
+	}
+}
+
+func TestStoragePoolProjectionPreservesUnknownCapacity(t *testing.T) {
+	view := poolView(storage.PoolSnapshot{ID: "remote-primary", CapacityKnown: false})
+	if view.CapacityKnown {
+		t.Fatal("unknown provider capacity was projected as known")
+	}
+	body, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projected map[string]json.RawMessage
+	if err := json.Unmarshal(body, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(projected["capacity_known"]); got != "false" {
+		t.Fatalf("capacity_known JSON=%q, want false: %s", got, body)
 	}
 }
 

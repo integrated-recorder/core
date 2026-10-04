@@ -16,20 +16,22 @@ COPY go.mod ./
 COPY . .
 COPY --from=web-build /src/internal/server/static/ui ./internal/server/static/ui
 RUN set -eu; \
-    mkdir -p /out/initial /out/adapters; \
+	mkdir -p /out/initial /out/adapters /out/plugins; \
     app_ldflags="-s -w -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.version=${VERSION} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.commit=${COMMIT} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.buildTime=${BUILD_TIME} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.releaseChannel=${RELEASE_CHANNEL}"; \
     CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/runtime-host ./cmd/runtime-host; \
-    CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/initial/control-plane ./cmd/control-plane; \
-    CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/initial/recorder-engine ./cmd/recorder-engine; \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast; \
-    chmod 0555 /out/runtime-host /out/initial/control-plane /out/initial/recorder-engine
+	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/initial/control-plane ./cmd/control-plane; \
+	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/initial/recorder-engine ./cmd/recorder-engine; \
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast; \
+	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/plugins/storage.local ./cmd/storage-local; \
+	chmod 0555 /out/runtime-host /out/initial/control-plane /out/initial/recorder-engine /out/plugins/storage.local
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates ffmpeg && adduser -D -H -u 10001 archiver && mkdir -p /data /opt/integrated-recorder/initial && chown archiver:archiver /data
+RUN apk add --no-cache ca-certificates ffmpeg && adduser -D -H -u 10001 archiver && mkdir -p /data /opt/integrated-recorder/initial /usr/local/lib/integrated-recorder/plugins && chown archiver:archiver /data
 COPY --from=build /out/runtime-host /usr/local/bin/runtime-host
 COPY --from=build /out/initial/ /opt/integrated-recorder/initial/
 COPY --from=build /out/adapters/ /adapters/
-RUN chmod 0555 /usr/local/bin/runtime-host /opt/integrated-recorder/initial/control-plane /opt/integrated-recorder/initial/recorder-engine && chown -R root:root /opt/integrated-recorder /adapters
+COPY --from=build /out/plugins/storage.local /usr/local/lib/integrated-recorder/plugins/storage.local
+RUN chmod 0555 /usr/local/bin/runtime-host /opt/integrated-recorder/initial/control-plane /opt/integrated-recorder/initial/recorder-engine /usr/local/lib/integrated-recorder/plugins/storage.local && chown -R root:root /opt/integrated-recorder /usr/local/lib/integrated-recorder /adapters
 USER 10001:10001
 ENV ADDR=:8080 DATA_DIR=/data ADAPTER_DIR=/adapters:/external-adapters
 EXPOSE 8080

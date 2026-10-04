@@ -1,8 +1,11 @@
 # Storage Provider lifecycle and Plugin Registry v2
 
-This guide describes how Runtime Host installs and activates an external
-Storage Provider Protocol v1 executable. For wire details and provider-side
-requirements, see [Storage Provider Protocol v1](STORAGE_PROVIDER_PROTOCOL_V1.md).
+This guide describes the bundled `storage.local` provider and how Runtime Host
+installs and activates external Storage Provider Protocol v1 executables. The
+local provider is the first production plugin and reference implementation; it
+uses the same process, protocol, immutable catalog, and generation path as an
+external provider. For wire details and provider-side requirements, see
+[Storage Provider Protocol v1](STORAGE_PROVIDER_PROTOCOL_V1.md).
 
 ## Responsibility boundary
 
@@ -13,15 +16,20 @@ object keys. A storage provider only maps a validated logical key to physical
 bytes. It does not receive a Core Recording model, contact source adapters,
 allocate ordinals, or authorize a canonical write.
 
-When no provider set is selected, Core uses its built-in local filesystem
-backend. Provider-backed generations use the same Core archive layer through
-the `PhysicalObjectStore` boundary. A provider process is a trusted executable
-running under the same OS account; this protocol does not sandbox it.
+There is no special Core local-storage backend in the production archive path.
+Every production generation pins an immutable storage-provider set, including
+the default local primary. Core and `PhysicalObjectStore` own archive
+semantics; `storage.local` and other providers only map logical keys to
+physical objects and stream their bytes. The local executable is bundled with
+the product and available without Registry configuration. A provider process is
+trusted executable code running under the same OS account; this protocol does
+not sandbox it.
 
 ```text
                     ┌── source adapter executable
 Plugin Registry ────┤     Adapter Protocol v1
-                    └── storage provider executable
+                    ├── bundled `storage.local`
+                    └── Registry storage provider executable
                           Storage Provider Protocol v1
                                    │
                                    ▼
@@ -30,6 +38,32 @@ Plugin Registry ────┤     Adapter Protocol v1
                                    ▼
 Core archive model ── logical keys, canonical commits, ownership fencing
 ```
+
+The Runtime Host imports the bundled `storage.local` executable through the
+normal storage catalog: descriptor probe, content-addressed artifact, immutable
+provider set, and generation pin. It is represented as provider ID `local`,
+distribution `bundled`, and cannot be uninstalled. Registry connectivity is
+not needed to install, select, or run it. A provider failure is explicit and
+fails the selected generation closed; Core never bypasses Protocol v1 to open
+local files directly.
+
+The Host supplies a fixed private archive root at the existing
+`<DATA_DIR>/recordings`. The API cannot set an arbitrary filesystem path for
+`storage.local`, and the provider is not granted the `/data` root. Existing
+recordings stay in place: logical keys in the `recordings/<id>/...` namespace
+retain their legacy physical locations beneath that root. Non-recording object
+namespaces are stored beneath a provider-private namespace under the same root
+so they cannot collide with legacy recording files. This is an adoption of the
+old layout, not a byte-copy migration. Core runtime state, including generations,
+owners, catalogs, desired state, secrets, IPC files, and recovery coordination,
+remains under `/data/runtime` and is never part of the provider archive root.
+
+On Host startup the bundled executable is imported and probed before the
+archive is loaded. Legacy generation records without a provider-set identity
+are adopted into the Host-selected local provider set without rewriting the
+archive. The exact provider process and configuration for the selected set
+must be ready before LoadAll/recovery or application readiness proceeds. A
+missing or unavailable provider does not trigger direct-local fallback.
 
 ## Plugin Registry compatibility and v2
 
@@ -87,6 +121,8 @@ are illustrative and do not identify a published provider):
 ```
 
 The storage filename is exactly `integrated-recorder-storage-<plugin-id>`.
+The ID `local` is reserved for the bundled provider and must not be published
+as a Registry plugin.
 Runtime Host downloads only catalog-selected HTTPS URLs using bounded,
 cancelable requests and restricted redirects, verifies exact size and SHA-256,
 then probes the executable. The probe checks descriptor ID, version, Protocol
@@ -96,7 +132,25 @@ storage (or the reverse) fails the type-specific descriptor check.
 
 ## Install, configure, probe, activate
 
-These are separate operations:
+### Bundled local provider
+
+Registry providers follow separate install, configure, probe, and activate
+operations. The bundled local provider is already installed by the Host and has
+a Host-managed root rather than user-editable filesystem configuration:
+
+1. **Bundled import** — Runtime Host locates the packaged `storage.local`
+   executable, probes its descriptor, imports its exact bytes into the immutable
+   catalog, and creates/selects its configured set. This does not require a
+   Registry and does not move existing archive files.
+2. **Default selection** — a fresh installation selects the imported local set
+   as its primary. Existing legacy generations with an empty storage-set field
+   are adopted to the same selected set as a one-time runtime-state migration.
+   The local provider is mandatory and cannot be uninstalled or assigned an
+   arbitrary root through a public API.
+
+### Registry providers
+
+Registry providers then use these separate operations:
 
 1. **Install/update** (`POST /api/runtime/plugins/{id}/install` or
    `/update`) verifies and imports the executable. Storage artifacts enter
@@ -121,7 +175,9 @@ These are separate operations:
 
 Runtime Host serializes application updates, source-plugin reconciliation,
 storage-plugin installation/update, and backend activation through its common
-operation gate. Public status contains bounded IDs, versions, and health
+operation gate. The local bundled executable is reported as a plugin with
+`distribution: bundled`; remote plugins use `distribution: registry`. Public
+status contains bounded IDs, versions, and health
 states; it does not expose artifact paths/digests, registry URLs, provider
 endpoints, IPC credentials, or secret values. Mutations use the normal Runtime
 Host authentication and CSRF checks.
@@ -151,7 +207,8 @@ generation-pinned immutable executable with the same private configuration
 and a fresh private IPC identity. Runtime does not replay the failed object
 operation. Core owns retries and resolves an ambiguous `Put` only after
 independent size and SHA-256 verification of the complete object. A provider
-failure never falls back to the built-in local archive.
+failure never falls back to direct local filesystem access. The local provider
+itself is a Protocol v1 child process, not a Core fast path.
 
 Protocol v1 supports bounded list pagination, stat, full and byte-range reads,
 idempotent delete, and complete-object atomic replacement. The Control
@@ -165,8 +222,11 @@ archive.
 ## Primary backend and generations
 
 An application generation is identified by
-`(application release, adapter set, storage provider set)`. The empty storage
-set identity means the built-in local backend. Provider artifacts and their
+`(application release, adapter set, storage provider set)`. A production
+generation always has a non-empty provider-set identity; the local default is
+an ordinary immutable set that references the imported `local` artifact. An
+empty set in an older generation record is a legacy marker adopted by Runtime
+Host before that generation is used. Provider artifacts and their
 configuration snapshots are immutable and generation-pinned. A storage
 provider update can therefore activate a new generation while existing
 Recordings remain on their original Engine and provider executable. Old sets
@@ -176,8 +236,10 @@ Recording references need them.
 V1 permits one canonical primary backend per installation. Switching to a
 different physical backend is rejected while Recording leases exist and
 unless both the current archive and target backend are proven empty. There is
-no implicit migration. A new provider set using the same provider ID and
-configuration can represent a provider executable update. After configuring
+no implicit migration between physical backend kinds. The one-time legacy
+local adoption preserves the existing `/data/recordings` root and does not move
+objects. A new provider set using the same provider ID and configuration can
+represent a provider executable update. After configuring
 and probing that set, an administrator explicitly activates it as a new
 generation; existing generations remain pinned. Active Recording handover is
 eligible only when both the adapter-set identity and storage-provider-set
@@ -193,9 +255,10 @@ runtime dependency.
 
 ## Current scope
 
-This release provides the Storage Provider Protocol, executable lifecycle,
-Registry v2 type support, and a conformance runner. It does not include a
-production S3, Backblaze B2, WebDAV, or SFTP provider. It also does not provide
+This release provides the Storage Provider Protocol, the bundled `storage.local`
+reference/production plugin, executable lifecycle, Registry v2 type support,
+and a conformance runner. It does not include a production S3, Backblaze B2,
+WebDAV, or SFTP provider. It also does not provide
 publisher PKI or plugin signatures, sandboxing, automatic plugin updates,
 archive migration, multi-pool placement, tiering, replication/mirroring,
 provider dependency resolution, or cross-storage-set Recording handover.

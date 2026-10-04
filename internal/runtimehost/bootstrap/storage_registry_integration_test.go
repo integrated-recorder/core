@@ -85,6 +85,7 @@ func TestStorageRegistryInstallConfigureProbeActivate(t *testing.T) {
 	fixture.controller.pluginRegistry = registry
 	fixture.controller.storageCatalog = catalog
 	fixture.controller.installation = readyInstallation(t, fixture.root)
+	localSet := installBundledLocalProviderForTest(t, fixture, catalog)
 
 	hostAPI, err := httpapi.New(nil, true, false, fixture.controller, http.NotFoundHandler())
 	if err != nil {
@@ -108,10 +109,15 @@ func TestStorageRegistryInstallConfigureProbeActivate(t *testing.T) {
 		t.Fatal("storage install activated a backend before explicit configuration and activation")
 	}
 	artifacts, err := catalog.Installed()
-	if err != nil || len(artifacts) != 1 {
+	if err != nil || len(artifacts) != 2 {
 		t.Fatalf("catalog installed artifacts=%+v err=%v", artifacts, err)
 	}
-	artifact := artifacts[0]
+	var artifact storagecatalog.Artifact
+	for _, installed := range artifacts {
+		if installed.ID == "fixture-storage" {
+			artifact = installed
+		}
+	}
 	if artifact.ID != "fixture-storage" || artifact.Version != "1.0.0" || artifact.Digest != digestHex || artifact.Size != int64(len(binaryBytes)) {
 		t.Fatalf("installed artifact=%+v, want exact registry identity and bytes", artifact)
 	}
@@ -127,8 +133,12 @@ func TestStorageRegistryInstallConfigureProbeActivate(t *testing.T) {
 		t.Fatal("storage install created desired configuration before Configure")
 	}
 	localStatus := callStorageStatus(t, hostAPI)
-	if localStatus.Primary.Kind != "local" || localStatus.Primary.ProviderID != "" {
-		t.Fatalf("install changed primary storage before activation: %+v", localStatus.Primary)
+	if localStatus.Primary.Kind != "plugin" || localStatus.Primary.ProviderID != "local" || localStatus.Primary.Version != localSet.Artifact.Version {
+		t.Fatalf("install changed bundled local primary before activation: %+v", localStatus.Primary)
+	}
+	localSummary, ok := storageProviderSummary(localStatus, "local")
+	if !ok || localSummary.Distribution != "bundled" || !localSummary.ConfigurationManaged || localSummary.Uninstallable || !localSummary.Active {
+		t.Fatalf("bundled local provider projection=%+v found=%t", localSummary, ok)
 	}
 
 	objectRoot := filepath.Join(t.TempDir(), "objects")
@@ -300,6 +310,7 @@ func TestStorageProviderUpdateKeepsInstalledAndPinnedVersionsDistinct(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	installBundledLocalProviderForTest(t, fixture, catalog)
 	fixture.controller.pluginRegistry = pluginManager
 	fixture.controller.storageCatalog = catalog
 	fixture.controller.installation = readyInstallation(t, fixture.root)
@@ -511,6 +522,45 @@ func buildStorageProviderFixture(t *testing.T) string {
 	return binaryPath
 }
 
+func installBundledLocalProviderForTest(t *testing.T, fixture *controllerFixture, catalog *storagecatalog.Catalog) storagecatalog.Set {
+	t.Helper()
+	packageDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(t.TempDir(), "storage.local")
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "../../../cmd/storage-local")
+	command.Dir = packageDir
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build bundled storage.local fixture: %v\n%s", err, output)
+	}
+	artifact, err := catalog.ImportBundled(ctx, binaryPath, "local")
+	if err != nil {
+		t.Fatalf("import bundled storage.local fixture: %v", err)
+	}
+	if err := catalog.Install(artifact); err != nil {
+		t.Fatalf("install bundled storage.local fixture: %v", err)
+	}
+	rootValue, err := json.Marshal(filepath.Join(fixture.root, "recordings"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := catalog.CreateSet(artifact.Digest, storagecatalog.SetConfig{Values: map[string]json.RawMessage{"root": rootValue}})
+	if err != nil {
+		t.Fatalf("create bundled local provider set: %v", err)
+	}
+	if err := catalog.SelectDesiredSet("local", set.ID); err != nil {
+		t.Fatalf("select bundled local provider set: %v", err)
+	}
+	if err := fixture.registry.AdoptLegacyStorageProviderSet(set.ID); err != nil {
+		t.Fatalf("adopt initial generation onto bundled local provider: %v", err)
+	}
+	return set
+}
+
 func storageRegistryItem(status httpapi.PluginStatus, id, pluginType, version string, installed bool) bool {
 	for _, item := range status.Plugins {
 		if item.ID == id {
@@ -703,6 +753,7 @@ func setupStorageRegistryController(t *testing.T, fixture *controllerFixture, se
 	if err != nil {
 		t.Fatal(err)
 	}
+	installBundledLocalProviderForTest(t, fixture, catalog)
 	fixture.controller.pluginRegistry = pluginManager
 	fixture.controller.storageCatalog = catalog
 	fixture.controller.installation = readyInstallation(t, fixture.root)

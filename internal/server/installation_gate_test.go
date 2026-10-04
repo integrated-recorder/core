@@ -29,6 +29,11 @@ func newManagedSetupServer(t *testing.T) (*Server, string, authn.Session) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return newManagedSetupServerWithStorage(t, root, archive)
+}
+
+func newManagedSetupServerWithStorage(t *testing.T, root string, archive *storage.Store) (*Server, string, authn.Session) {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Join(root, "runtime", "state"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +129,7 @@ func TestSetupStorageTestRequiresAuthAndCSRFAndReturnsBoundedProjection(t *testi
 	if got.Status != "ready" && got.Status != "warning" {
 		t.Fatalf("storage self-test failed: %+v", got)
 	}
-	if got.WriteTest != "passed" || got.DurabilityTest != "passed" || got.FreeBytes == 0 {
+	if got.WriteTest != "passed" || got.DurabilityTest != "passed" || !got.CapacityKnown || got.FreeBytes == nil || *got.FreeBytes == 0 {
 		t.Fatalf("storage self-test did not verify bytes: %+v", got)
 	}
 	if strings.Contains(response.Body.String(), root) || strings.Contains(response.Body.String(), "permission denied") {
@@ -133,5 +138,44 @@ func TestSetupStorageTestRequiresAuthAndCSRFAndReturnsBoundedProjection(t *testi
 	entries, err := os.ReadDir(filepath.Join(root, "runtime", "state"))
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("storage test left diagnostic artifacts: %+v err=%v", entries, err)
+	}
+}
+
+func TestSetupStorageTestReportsUnknownProviderCapacityWithoutFailingProbe(t *testing.T) {
+	base := os.TempDir()
+	if resolved, resolveErr := filepath.EvalSymlinks(base); resolveErr == nil {
+		base = resolved
+	}
+	root, err := os.MkdirTemp(base, "control-installation-object-store-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	objects := newRangeTrackingObjects()
+	archive, err := storage.NewWithObjectStore(root, objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, _, session := newManagedSetupServerWithStorage(t, root, archive)
+	request := httptest.NewRequest(http.MethodPost, "/api/setup/storage-test", strings.NewReader(`{}`))
+	request.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: session.Token})
+	request.Header.Set("X-CSRF-Token", session.CSRFToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("storage test status=%d body=%s", response.Code, response.Body.String())
+	}
+	var got setupStorageTestResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "warning" || got.CapacityKnown || got.FreeBytes != nil {
+		t.Fatalf("unknown provider capacity should be a warning with no numeric claim: %+v body=%s", got, response.Body.String())
+	}
+	if got.WriteTest != "passed" || got.DurabilityTest != "passed" {
+		t.Fatalf("provider-backed write/durability probe did not pass: %+v", got)
+	}
+	if strings.Contains(response.Body.String(), `"free_bytes"`) || strings.Contains(response.Body.String(), root) {
+		t.Fatalf("unknown capacity or private path leaked as numeric/path data: %s", response.Body.String())
 	}
 }

@@ -36,9 +36,10 @@ var ErrPayloadSizeMismatch = errors.New("payload size mismatch")
 var ErrReadOnlyListLimit = errors.New("read-only recording list exceeds limit")
 
 // StorageBackend is the set of canonical archive operations currently needed
-// by the application. Store is the stable archive facade; New wires the
-// default LocalFilesystemBackend, while NewWithObjectStore keeps these same
-// archive semantics over a physical object provider.
+// by the application. Store is the stable archive facade. New preserves the
+// legacy single-process development/test backend; production Control and
+// Recorder Engine processes use NewWithObjectStore with a generation-pinned
+// Storage Provider Protocol process.
 //
 // The methods speak recording IDs and logical recording-relative paths. Root
 // is retained for internal diagnostics and existing tests only; it is not a
@@ -83,8 +84,10 @@ type Store struct {
 	runtimeTelemetry RuntimeStorageTelemetry
 }
 
-// LocalFilesystemBackend owns physical filesystem paths and crash-safe local
-// publication. Canonical metadata stores only logical relative paths.
+// LocalFilesystemBackend is retained for the legacy monolithic development
+// command and unit tests. Production Runtime Host generations never instantiate
+// it; their physical object I/O always crosses the pinned provider protocol.
+// Canonical metadata stores only logical relative paths in either backend.
 type LocalFilesystemBackend struct {
 	root         string
 	telemetry    *telemetry
@@ -129,8 +132,9 @@ func New(root string) (*Store, error) {
 // NewWithObjectStore creates a Store whose canonical archive semantics remain
 // owned by Core while physical logical-key placement is delegated to objects.
 // The provider is never given recording/domain objects, only validated keys
-// and byte streams. The ordinary New constructor and its local filesystem
-// behavior are deliberately unchanged.
+// and byte streams. Production Control and Recorder Engine processes use this
+// constructor with the exact Storage Provider Protocol set pinned by Runtime
+// Host generation state.
 func NewWithObjectStore(root string, objects PhysicalObjectStore) (*Store, error) {
 	if strings.TrimSpace(root) == "" || objects == nil {
 		return nil, errors.New("object storage configuration is invalid")
@@ -155,6 +159,18 @@ func NewWithObjectStore(root string, objects PhysicalObjectStore) (*Store, error
 	// directory; opening a new generation must never clean another Engine's
 	// admitted in-flight payload.
 	backend := &ObjectStoreArchiveBackend{root: abs, stageDir: stageDir, objects: objects, telemetry: newTelemetry()}
+	if identity, ok := objects.(PhysicalObjectStoreIdentity); ok {
+		id, name := identity.StorageProviderIdentity()
+		if id == "local" {
+			backend.poolID = PoolIDLocalPrimary
+			backend.poolName = "기본 보관 저장소"
+			backend.poolKind = "local"
+		} else if id != "" && name != "" {
+			backend.poolID = "storage-" + id
+			backend.poolName = name
+			backend.poolKind = "remote"
+		}
+	}
 	return &Store{StorageBackend: backend, root: abs, ingestOptions: DefaultIngestOptions()}, nil
 }
 

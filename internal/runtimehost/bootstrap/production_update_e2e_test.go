@@ -36,6 +36,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
@@ -155,14 +156,15 @@ func TestProductionHandoverHostCrashRecoveryE2E(t *testing.T) {
 }
 
 type runtimeUpdateArtifacts struct {
-	root       string
-	fixtureURL string
-	bundleA    string
-	hostA      string
-	adapterDir string
-	packageB   string
-	publicKeys string
-	manifestB  release.Manifest
+	root               string
+	fixtureURL         string
+	bundleA            string
+	hostA              string
+	storageLocalBinary string
+	adapterDir         string
+	packageB           string
+	publicKeys         string
+	manifestB          release.Manifest
 }
 
 func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateArtifacts {
@@ -204,6 +206,7 @@ func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateA
 	engineFlagsB := ldflags(e2eVersionB, e2eCommitB) + " -X main.runtimeE2EFixtureOrigin=" + fixtureURL
 	engineB := build(filepath.Join(bin, "engine-b"), "./cmd/recorder-engine", "runtime_e2e", engineFlagsB)
 	adapterRuntime := build(filepath.Join(bin, "adapter-runtime"), "./cmd/adapters/owncast", "", "")
+	storageLocalBinary := build(filepath.Join(bin, "storage-local"), "./cmd/storage-local", "", "")
 	packager := build(filepath.Join(bin, "release-pack"), "./cmd/release-pack", "", "")
 	fixtureAdapter := build(filepath.Join(root, "adapters", "integrated-recorder-adapter-runtime-update-fixture"), "./web/e2e/runtime_update_adapter", "", "")
 	_ = fixtureAdapter
@@ -249,7 +252,8 @@ func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateA
 	verifyTestPackageArtifacts(t, packageB, manifestB)
 	return runtimeUpdateArtifacts{
 		root: root, fixtureURL: fixtureURL, bundleA: bundleA, hostA: hostA,
-		adapterDir: filepath.Join(root, "adapters"), packageB: packageB,
+		storageLocalBinary: storageLocalBinary,
+		adapterDir:         filepath.Join(root, "adapters"), packageB: packageB,
 		publicKeys: string(publicKeys), manifestB: manifestB,
 	}
 }
@@ -822,6 +826,7 @@ func runTargetRefreshPreflightScenario(t *testing.T, artifacts runtimeUpdateArti
 		"ADDR=" + listenAddr,
 		"AUTH_DISABLED=1",
 		"ADAPTER_DIR=" + artifacts.adapterDir,
+		"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 		"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
 		"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
 		"IR_RUNTIME_E2E_FAILPOINT=" + string(runtimehook.AfterSourceDrain),
@@ -1281,6 +1286,7 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 			"ADDR=" + listenAddr,
 			"AUTH_DISABLED=1",
 			"ADAPTER_DIR=" + artifacts.adapterDir,
+			"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 			"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
 			"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
 		}
@@ -1608,6 +1614,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	controlBBinary := filepath.Join(installedDir, fmt.Sprintf("%s-%s-%s", release.RoleControlPlane, runtime.GOOS, runtime.GOARCH))
 	engineBBinary := filepath.Join(installedDir, fmt.Sprintf("%s-%s-%s", release.RoleRecorderEngine, runtime.GOOS, runtime.GOARCH))
 	fixtureAdapterBinary := filepath.Join(artifacts.adapterDir, "integrated-recorder-adapter-runtime-update-fixture")
+	var localStorageArtifact string
 
 	listenAddr := reserveRuntimeAddress(t)
 	command := exec.Command(artifacts.hostA)
@@ -1616,6 +1623,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		"ADDR=" + listenAddr,
 		"AUTH_DISABLED=1",
 		"ADAPTER_DIR=" + artifacts.adapterDir,
+		"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 		"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
 		"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
 	})
@@ -1630,7 +1638,11 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	}()
 	t.Cleanup(func() {
 		stopRuntimeHostProcess(process)
-		for _, executable := range []string{artifacts.hostA, controlABinary, engineABinary, controlBBinary, engineBBinary, fixtureAdapterBinary} {
+		executables := []string{artifacts.hostA, controlABinary, engineABinary, controlBBinary, engineBBinary, fixtureAdapterBinary}
+		if localStorageArtifact != "" {
+			executables = append(executables, localStorageArtifact)
+		}
+		for _, executable := range executables {
 			if err := waitProcessAbsent(t, executable, 10*time.Second); err != nil {
 				t.Errorf("acceptance cleanup left product process running for %s: %v", filepath.Base(executable), err)
 			}
@@ -1658,6 +1670,11 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if controlAPID == engineAPID || controlAPID == command.Process.Pid || engineAPID == command.Process.Pid {
 		t.Fatalf("Host/Control A/Engine A are not separate production processes: host=%d control=%d engine=%d", command.Process.Pid, controlAPID, engineAPID)
 	}
+	localStorageArtifact = pinnedLocalStorageArtifact(t, dataDir, status.DefaultEngine.ID)
+	localStoragePID := waitDirectChildForBinary(t, engineAPID, localStorageArtifact, 20*time.Second)
+	if localStoragePID == engineAPID || localStoragePID == command.Process.Pid {
+		t.Fatalf("storage.local is not a separate immutable provider child of Engine A: host=%d engine=%d provider=%d artifact=%s", command.Process.Pid, engineAPID, localStoragePID, localStorageArtifact)
+	}
 
 	inputR := map[string]string{"source_url": artifacts.fixtureURL + "/source/" + streamR}
 	recordingR := createRuntimeRecording(t, client, baseURL, "Recording R", inputR)
@@ -1676,6 +1693,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if !equalSequenceRange(baselineSequences, 1, 20) {
 		t.Fatalf("pre-update source sequence baseline is not contiguous: %v", baselineSequences)
 	}
+	assertRuntimeStorageRange(t, client, baseURL, baseline, streamR)
 	metadataBaseline := waitMetadataTimeline(t, ctx, client, baseURL, recordingR.ID, 1, 35*time.Second)
 	if len(metadataBaseline.Items) != 1 || stringValue(metadataBaseline.Items[0].Title) != "Before update" || stringValue(metadataBaseline.Items[0].Description) != "Before update" {
 		t.Fatalf("unexpected source metadata baseline: %+v", metadataBaseline.Items)
@@ -1774,6 +1792,15 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if controlBPID == controlAPID || engineBPID == engineAPID || controlBPID == engineBPID {
 		releaseRefresh()
 		t.Fatalf("release B did not spawn distinct product Control/Engine processes: A=(%d,%d) B=(%d,%d)", controlAPID, engineAPID, controlBPID, engineBPID)
+	}
+	localStorageArtifactB := pinnedLocalStorageArtifact(t, dataDir, activateStatus.DefaultEngine.ID)
+	if localStorageArtifactB != localStorageArtifact {
+		releaseRefresh()
+		t.Fatalf("application-only update changed the pinned bundled storage.local artifact: A=%s B=%s", localStorageArtifact, localStorageArtifactB)
+	}
+	if providerPID := waitDirectChildForBinary(t, engineBPID, localStorageArtifactB, 20*time.Second); providerPID == engineBPID || providerPID == command.Process.Pid {
+		releaseRefresh()
+		t.Fatalf("storage.local is not a separate immutable provider child of Engine B: host=%d engine=%d provider=%d", command.Process.Pid, engineBPID, providerPID)
 	}
 	if processForBinary(engineABinary) == 0 {
 		releaseRefresh()
@@ -1937,6 +1964,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	stopRecording(t, client, baseURL, recordingS.ID)
 	stopRecording(t, client, baseURL, recordingR.ID)
 	waitRuntimeRecordingState(t, client, baseURL, recordingR.ID, domain.StateStopped, 20*time.Second)
+	assertRuntimeStorageIntegrity(t, client, baseURL, recordingR.ID)
 	waitLeaseAbsent(t, dataDir, recordingR.ID, 20*time.Second)
 	if err := waitProcessAbsent(t, engineABinary, 30*time.Second); err != nil {
 		t.Fatalf("A Engine was not already retired after R handover and final lease drain: %v", err)
@@ -1981,6 +2009,28 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		t.Fatalf("post-update Recording S identity/state is invalid: %+v", recordingS)
 	}
 	t.Logf("production process E2E iteration %d: host pid=%d; Control A pid=%d exited; Engine A pid=%d handed R to Engine B and retired; Control B pid=%d; Engine B pid=%d; R %s sequence=1..60 on A→B with metadata/refresh continuity; S %s on B; Watch session %s produced %s", iteration, command.Process.Pid, controlAPID, engineAPID, controlBPID, engineBPID, recordingR.ID, recordingS.ID, fmt.Sprintf("session-w-%d", iteration), watchRecordingID)
+}
+
+func pinnedLocalStorageArtifact(t *testing.T, dataDir, generationID string) string {
+	t.Helper()
+	snapshot := readRuntimeGenerationSnapshot(t, dataDir)
+	generationRecord, ok := snapshot.Generations[generationID]
+	if !ok || generationRecord.StorageProviderSetID == "" {
+		t.Fatalf("generation %q does not pin a storage provider set: %+v", generationID, generationRecord)
+	}
+	catalog, err := storagecatalog.OpenReadOnly(filepath.Join(dataDir, "runtime", "storage-providers"))
+	if err != nil {
+		t.Fatalf("open Host-owned storage provider catalog: %v", err)
+	}
+	set, err := catalog.LoadSet(generationRecord.StorageProviderSetID)
+	if err != nil || set.Artifact.ID != "local" {
+		t.Fatalf("generation %q is not pinned to storage.local: set=%+v err=%v", generationID, set, err)
+	}
+	path, err := catalog.ArtifactPath(set.Artifact.Digest)
+	if err != nil {
+		t.Fatalf("resolve immutable storage.local artifact: %v", err)
+	}
+	return path
 }
 
 func verifyInstalledRuntimeRelease(directory string, manifest release.Manifest) error {

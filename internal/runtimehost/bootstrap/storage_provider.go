@@ -21,6 +21,58 @@ import (
 
 var _ httpapi.StorageController = (*updateController)(nil)
 
+func ensureBundledLocalStorage(ctx context.Context, catalog *storagecatalog.Catalog, binary, archiveRoot string) (storagecatalog.Set, error) {
+	if ctx == nil || ctx.Err() != nil || catalog == nil || !filepath.IsAbs(binary) || filepath.Clean(binary) != binary ||
+		!filepath.IsAbs(archiveRoot) || filepath.Clean(archiveRoot) != archiveRoot {
+		return storagecatalog.Set{}, errors.New("bundled local storage configuration is invalid")
+	}
+	artifact, err := catalog.ImportBundled(ctx, binary, "local")
+	if err != nil {
+		return storagecatalog.Set{}, errors.New("bundled storage.local artifact failed validation")
+	}
+	if err := catalog.Install(artifact); err != nil {
+		return storagecatalog.Set{}, errors.New("bundled storage.local artifact could not be installed")
+	}
+	rootValue, err := json.Marshal(archiveRoot)
+	if err != nil {
+		return storagecatalog.Set{}, errors.New("bundled storage.local configuration is invalid")
+	}
+	set, err := catalog.CreateSet(artifact.Digest, storagecatalog.SetConfig{
+		Values: map[string]json.RawMessage{"root": rootValue},
+	})
+	if err != nil {
+		return storagecatalog.Set{}, errors.New("bundled storage.local set could not be created")
+	}
+	if err := catalog.SelectDesiredSet("local", set.ID); err != nil {
+		return storagecatalog.Set{}, errors.New("bundled storage.local set could not be selected")
+	}
+	return set, nil
+}
+
+func probeStorageProviderSet(ctx context.Context, catalogRoot, setID string) error {
+	if ctx == nil || ctx.Err() != nil || setID == "" {
+		return errors.New("storage provider probe could not start")
+	}
+	provider, err := storageprocess.StartSet(ctx, catalogRoot, setID)
+	if err != nil {
+		return errors.New("storage provider process probe failed")
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = provider.Close()
+		}
+	}()
+	if err := storage.ProbePhysicalObjectStore(ctx, provider.ObjectStore()); err != nil {
+		return errors.New("storage provider object probe failed")
+	}
+	if err := provider.Close(); err != nil {
+		return errors.New("storage provider process cleanup failed")
+	}
+	closed = true
+	return nil
+}
+
 func (c *updateController) StorageStatus(ctx context.Context) (httpapi.StorageProviderStatus, error) {
 	if ctx == nil || ctx.Err() != nil || c.registry == nil {
 		return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("internal_error")
@@ -31,24 +83,19 @@ func (c *updateController) StorageStatus(ctx context.Context) (httpapi.StoragePr
 		return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
 	}
 	status := httpapi.StorageProviderStatus{
-		Primary:   httpapi.PrimaryStorageStatus{Kind: "local", State: "ready"},
+		Primary:   httpapi.PrimaryStorageStatus{Kind: "plugin", ProviderID: "local", State: "ready"},
 		Providers: []httpapi.StorageProviderSummary{},
 	}
 	activeSet := storagecatalog.Set{}
-	if active.StorageProviderSetID != "" {
-		if c.storageCatalog == nil {
-			return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
-		}
-		set, err := c.storageCatalog.LoadSet(active.StorageProviderSetID)
-		if err != nil {
-			return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
-		}
-		activeSet = set
-		status.Primary = httpapi.PrimaryStorageStatus{Kind: "plugin", ProviderID: set.Artifact.ID, Version: set.Artifact.Version, State: "ready"}
+	if c.storageCatalog == nil || active.StorageProviderSetID == "" {
+		return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
 	}
-	if c.storageCatalog == nil {
-		return status, nil
+	set, err := c.storageCatalog.LoadSet(active.StorageProviderSetID)
+	if err != nil {
+		return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
 	}
+	activeSet = set
+	status.Primary = httpapi.PrimaryStorageStatus{Kind: "plugin", ProviderID: set.Artifact.ID, Version: set.Artifact.Version, State: "ready"}
 	installed, err := c.storageCatalog.Installed()
 	if err != nil {
 		return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
@@ -109,15 +156,28 @@ func (c *updateController) StorageStatus(ctx context.Context) (httpapi.StoragePr
 		if activeProvider {
 			health = "ready" // Engine and Control readiness require a successful provider Probe.
 		}
-		status.Providers = append(status.Providers, httpapi.StorageProviderSummary{
+		summary := httpapi.StorageProviderSummary{
 			ID: id, Name: descriptor.Name, Version: artifact.Version, Configured: configured,
 			Active: activeProvider, Health: health, ConfigurationSchema: descriptor.ConfigurationSchema,
-		})
+			Distribution: "registry", Uninstallable: true,
+		}
+		if id == "local" {
+			summary.Distribution = "bundled"
+			summary.ConfigurationManaged = true
+			summary.Uninstallable = false
+			// The provider configuration contains the Host-selected archive root.
+			// Do not publish even its schema in a public response.
+			summary.ConfigurationSchema = storageproto.Schema{Fields: []storageproto.Field{}}
+		}
+		status.Providers = append(status.Providers, summary)
 	}
 	return status, nil
 }
 
 func (c *updateController) StorageConfig(ctx context.Context, id string) (httpapi.StorageConfigView, error) {
+	if id == "local" {
+		return httpapi.StorageConfigView{Values: map[string]json.RawMessage{}, ConfiguredSecrets: []string{}}, nil
+	}
 	if ctx == nil || ctx.Err() != nil || c.storageCatalog == nil || !pluginregistryIDValid(id) {
 		return httpapi.StorageConfigView{}, httpapi.NewControllerError("storage_provider_not_installed")
 	}
@@ -149,6 +209,9 @@ func (c *updateController) StorageConfig(ctx context.Context, id string) (httpap
 }
 
 func (c *updateController) ConfigureStorage(ctx context.Context, id string, request httpapi.StorageConfigRequest) (httpapi.StorageConfigView, error) {
+	if id == "local" {
+		return httpapi.StorageConfigView{}, httpapi.NewControllerError("storage_provider_config_managed")
+	}
 	operationCtx, cancel, err := c.beginStorageOperation(ctx)
 	if err != nil {
 		return httpapi.StorageConfigView{}, err
@@ -232,26 +295,6 @@ func (c *updateController) ActivateStorage(ctx context.Context, id string) (http
 	if snapshot.StagedGenerationID != "" {
 		return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_operation_conflict")
 	}
-	if id == "local" {
-		if active.StorageProviderSetID == "" {
-			return c.StorageStatus(operationCtx)
-		}
-		if len(snapshot.Leases) > 0 {
-			return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_backend_in_use")
-		}
-		activeEmpty, activeErr := c.archiveEmpty(operationCtx, active.StorageProviderSetID)
-		localEmpty, localErr := c.archiveEmpty(operationCtx, "")
-		if activeErr != nil || localErr != nil {
-			return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
-		}
-		if !activeEmpty || !localEmpty {
-			return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_backend_switch_requires_empty_archive")
-		}
-		if err := c.activateStorageGeneration(operationCtx, active, ""); err != nil {
-			return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_activation_failed")
-		}
-		return c.StorageStatus(operationCtx)
-	}
 	if c.storageCatalog == nil {
 		return httpapi.StorageProviderStatus{}, httpapi.NewControllerError("storage_provider_not_installed")
 	}
@@ -289,27 +332,7 @@ func (c *updateController) ActivateStorage(ctx context.Context, id string) (http
 }
 
 func (c *updateController) probeStorageProvider(ctx context.Context, setID string) error {
-	if ctx == nil || ctx.Err() != nil || setID == "" {
-		return errors.New("storage provider probe could not start")
-	}
-	provider, err := storageprocess.StartSet(ctx, filepath.Join(c.config.DataDir, "runtime", "storage-providers"), setID)
-	if err != nil {
-		return errors.New("storage provider process probe failed")
-	}
-	closed := false
-	defer func() {
-		if !closed {
-			_ = provider.Close()
-		}
-	}()
-	if err := storage.ProbePhysicalObjectStore(ctx, provider.ObjectStore()); err != nil {
-		return errors.New("storage provider object probe failed")
-	}
-	if err := provider.Close(); err != nil {
-		return errors.New("storage provider process cleanup failed")
-	}
-	closed = true
-	return nil
+	return probeStorageProviderSet(ctx, filepath.Join(c.config.DataDir, "runtime", "storage-providers"), setID)
 }
 
 func (c *updateController) beginStorageOperation(ctx context.Context) (context.Context, context.CancelFunc, error) {
@@ -420,14 +443,7 @@ func (c *updateController) archiveEmpty(ctx context.Context, storageSetID string
 		return false, nil
 	}
 	if storageSetID == "" {
-		entries, err := readDirIfPresent(filepath.Join(c.config.DataDir, "recordings"))
-		if err != nil {
-			return false, err
-		}
-		if len(entries) != 0 {
-			return false, nil
-		}
-		return true, nil
+		return false, errors.New("storage provider generation identity is unavailable")
 	}
 	provider, err := storageprocess.StartSet(ctx, filepath.Join(c.config.DataDir, "runtime", "storage-providers"), storageSetID)
 	if err != nil {
@@ -458,7 +474,7 @@ func readDirIfPresent(path string) ([]os.DirEntry, error) {
 }
 
 func (c *updateController) activateStorageGeneration(ctx context.Context, active generation.Generation, storageSetID string) error {
-	if ctx == nil || storageSetID != "" && !validStorageProviderSetIdentity(storageSetID) {
+	if ctx == nil || !validStorageProviderSetIdentity(storageSetID) {
 		return errors.New("storage generation identity is invalid")
 	}
 	id, err := newGenerationID()

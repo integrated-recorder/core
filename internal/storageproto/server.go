@@ -17,12 +17,19 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+const MaxConcurrentReadStreams = 16
 
 type ServeOptions struct {
 	SocketPath string
 	TokenFile  string
+	// MaxConcurrentReads opts a provider into overlapping object GET/range
+	// streams. All other operations remain exclusive with reads and each other.
+	// Zero preserves the original fully serialized request behavior.
+	MaxConcurrentReads int
 	// ParentLiveness is a pipe owned by the supervising parent. EOF is a
 	// cancellation boundary: Serve closes active requests and exits. The
 	// provider executable should leave this nil or pass os.Stdin, which Start
@@ -31,7 +38,7 @@ type ServeOptions struct {
 }
 
 func Serve(ctx context.Context, provider Provider, options ServeOptions) error {
-	if ctx == nil || ctx.Err() != nil || provider == nil || !filepath.IsAbs(options.SocketPath) || !filepath.IsAbs(options.TokenFile) {
+	if ctx == nil || ctx.Err() != nil || provider == nil || !filepath.IsAbs(options.SocketPath) || !filepath.IsAbs(options.TokenFile) || !validConcurrentReadLimit(options.MaxConcurrentReads) {
 		return fmt.Errorf("storage provider server configuration is invalid")
 	}
 	descriptor := provider.Descriptor()
@@ -65,7 +72,7 @@ func Serve(ctx context.Context, provider Provider, options ServeOptions) error {
 		return fmt.Errorf("protect storage provider socket: %w", err)
 	}
 	server := &http.Server{
-		Handler:           providerHandler(provider, token),
+		Handler:           providerHandler(provider, token, options.MaxConcurrentReads),
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    MaxControlFrameBytes,
 		ErrorLog:          log.New(io.Discard, "", 0),
@@ -114,9 +121,9 @@ func Serve(ctx context.Context, provider Provider, options ServeOptions) error {
 	return err
 }
 
-func providerHandler(provider Provider, token []byte) http.Handler {
+func providerHandler(provider Provider, token []byte, maxConcurrentReads int) http.Handler {
 	mux := http.NewServeMux()
-	requestGate := make(chan struct{}, 1)
+	requestGate := newProviderRequestGate(maxConcurrentReads)
 	descriptor := provider.Descriptor()
 	mux.HandleFunc("/v1/descriptor", func(w http.ResponseWriter, r *http.Request) {
 		if !method(w, r, http.MethodGet) {
@@ -298,15 +305,127 @@ func providerHandler(provider Provider, token []byte) http.Handler {
 			writeError(w, http.StatusNotFound, "not_found", "route not found")
 			return
 		}
-		select {
-		case requestGate <- struct{}{}:
-			defer func() { <-requestGate }()
-		case <-r.Context().Done():
+		readRequest := concurrentObjectRead(maxConcurrentReads, r.Method, r.URL.Path)
+		release, err := requestGate.acquire(r.Context(), readRequest)
+		if err != nil {
 			writeProviderError(w, r.Context().Err())
 			return
 		}
+		defer release()
 		mux.ServeHTTP(w, r)
 	})
+}
+
+func concurrentObjectRead(maxConcurrentReads int, method, path string) bool {
+	return maxConcurrentReads > 0 && path == "/v1/objects" && method == http.MethodGet
+}
+
+func validConcurrentReadLimit(limit int) bool {
+	return limit >= 0 && limit <= MaxConcurrentReadStreams
+}
+
+// providerRequestGate allows a bounded number of read streams to share the
+// provider while mutations/control operations take an exclusive turn. Waiting
+// writers prevent new reads from entering, so an endless playback workload
+// cannot starve object publication or control operations. A configured zero
+// is represented as one reader and therefore preserves full serialization.
+type providerRequestGate struct {
+	mu             sync.Mutex
+	changed        chan struct{}
+	readers        int
+	waitingWriters int
+	writer         bool
+	maxReaders     int
+}
+
+func newProviderRequestGate(maxReaders int) *providerRequestGate {
+	if maxReaders == 0 {
+		maxReaders = 1
+	}
+	return &providerRequestGate{changed: make(chan struct{}), maxReaders: maxReaders}
+}
+
+func (g *providerRequestGate) acquire(ctx context.Context, read bool) (func(), error) {
+	if ctx == nil {
+		return nil, errors.New("storage provider request context is unavailable")
+	}
+	if read {
+		return g.acquireRead(ctx)
+	}
+	return g.acquireWrite(ctx)
+}
+
+func (g *providerRequestGate) acquireRead(ctx context.Context) (func(), error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		g.mu.Lock()
+		if !g.writer && g.waitingWriters == 0 && g.readers < g.maxReaders {
+			g.readers++
+			g.signalLocked()
+			g.mu.Unlock()
+			return g.releaseRead, nil
+		}
+		changed := g.changed
+		g.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (g *providerRequestGate) acquireWrite(ctx context.Context) (func(), error) {
+	g.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		g.mu.Unlock()
+		return nil, err
+	}
+	g.waitingWriters++
+	g.signalLocked()
+	for {
+		if err := ctx.Err(); err != nil {
+			g.waitingWriters--
+			g.signalLocked()
+			g.mu.Unlock()
+			return nil, err
+		}
+		if !g.writer && g.readers == 0 {
+			g.waitingWriters--
+			g.writer = true
+			g.signalLocked()
+			g.mu.Unlock()
+			return g.releaseWrite, nil
+		}
+		changed := g.changed
+		g.mu.Unlock()
+		select {
+		case <-ctx.Done():
+		case <-changed:
+		}
+		g.mu.Lock()
+	}
+}
+
+func (g *providerRequestGate) releaseRead() {
+	g.mu.Lock()
+	g.readers--
+	g.signalLocked()
+	g.mu.Unlock()
+}
+
+func (g *providerRequestGate) releaseWrite() {
+	g.mu.Lock()
+	g.writer = false
+	g.signalLocked()
+	g.mu.Unlock()
+}
+
+func (g *providerRequestGate) signalLocked() {
+	close(g.changed)
+	g.changed = make(chan struct{})
 }
 
 type countReader struct {

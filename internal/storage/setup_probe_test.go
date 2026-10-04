@@ -81,6 +81,52 @@ func TestRunSetupProbeRejectsSymlinkedRuntimeState(t *testing.T) {
 	}
 }
 
+func TestRunSetupProbeUsesPhysicalObjectStoreAndLeavesCapacityUnknown(t *testing.T) {
+	objects := newMemoryPhysicalObjects()
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := store.RunSetupProbe()
+	if !result.WritePassed || !result.DurabilityPassed {
+		t.Fatalf("object-backed provider probe failed: %+v", result)
+	}
+	if result.CapacityKnown || result.FreeBytes != 0 {
+		t.Fatalf("provider without capacity reporting should remain unknown: %+v", result)
+	}
+	objects.mu.Lock()
+	defer objects.mu.Unlock()
+	if len(objects.putKeys) == 0 {
+		t.Fatal("setup probe did not exercise the physical object provider")
+	}
+	for _, key := range objects.putKeys {
+		if !strings.HasPrefix(key, "_integrated-recorder/system-probes/v1/") {
+			t.Fatalf("setup probe wrote outside its reserved namespace: %q", key)
+		}
+	}
+	for key := range objects.objects {
+		if strings.HasPrefix(key, "recordings/") {
+			t.Fatalf("setup probe mutated canonical archive namespace: %q", key)
+		}
+	}
+}
+
+func TestRunSetupProbeFailsWhenPhysicalObjectProviderFails(t *testing.T) {
+	objects := newMemoryPhysicalObjects()
+	objects.failPutBefore = true
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := store.RunSetupProbe()
+	if result.WritePassed || result.DurabilityPassed {
+		t.Fatalf("failed provider write was accepted: %+v", result)
+	}
+	if result.CapacityKnown {
+		t.Fatalf("provider failure must not synthesize capacity: %+v", result)
+	}
+}
+
 func TestStorageOpenCleansOnlyStaleSetupProbeDirectories(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "runtime", "state")

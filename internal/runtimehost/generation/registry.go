@@ -78,8 +78,8 @@ type Generation struct {
 	// became part of generation identity.
 	AdapterSetID string `json:"adapter_set_id,omitempty"`
 	// StorageProviderSetID pins this generation to an immutable Storage
-	// Provider executable set. Empty remains valid for existing generations
-	// and represents the built-in local-primary backend.
+	// Provider executable set. Empty is read only for legacy registry records
+	// and must be adopted by Runtime Host before any production process starts.
 	StorageProviderSetID string    `json:"storage_provider_set_id,omitempty"`
 	InstalledAt          time.Time `json:"installed_at"`
 	State                State     `json:"state"`
@@ -211,6 +211,27 @@ func (r *Registry) Snapshot() Snapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return cloneSnapshot(r.state)
+}
+
+// AdoptLegacyStorageProviderSet pins generations created before storage
+// provider sets were part of generation identity to the verified bundled
+// local provider set. The operation is one durable registry transaction: it
+// only fills empty legacy fields and never changes an already-pinned set.
+// Hosts call this before starting application processes, so no generation can
+// continue through the former unpinned local-filesystem path.
+func (r *Registry) AdoptLegacyStorageProviderSet(setID string) error {
+	if !storageSetIDPattern.MatchString(setID) {
+		return invalid("legacy storage provider set identity is invalid")
+	}
+	return r.change(func(next *Snapshot) error {
+		for id, item := range next.Generations {
+			if item.StorageProviderSetID == "" {
+				item.StorageProviderSetID = setID
+				next.Generations[id] = item
+			}
+		}
+		return nil
+	})
 }
 
 // Stage records an installed but not yet verified candidate generation.

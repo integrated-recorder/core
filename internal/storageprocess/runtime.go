@@ -23,10 +23,11 @@ import (
 )
 
 const (
-	callTimeout           = 5 * time.Minute
-	initialRestartBackoff = 100 * time.Millisecond
-	maximumRestartBackoff = 5 * time.Second
-	exitObservationWindow = 100 * time.Millisecond
+	callTimeout              = 5 * time.Minute
+	initialRestartBackoff    = 100 * time.Millisecond
+	maximumRestartBackoff    = 5 * time.Second
+	exitObservationWindow    = 100 * time.Millisecond
+	maxConcurrentReadStreams = storageproto.MaxConcurrentReadStreams
 )
 
 // Runtime owns one generation-pinned provider child and the private IPC
@@ -37,6 +38,9 @@ const (
 type Runtime struct {
 	mu     sync.Mutex
 	opGate chan struct{}
+	// readGate bounds response bodies retained after their serialized open
+	// operation has returned. Provider control operations still use opGate.
+	readGate chan struct{}
 
 	client     *storageproto.Client
 	directory  string
@@ -85,6 +89,7 @@ func Start(ctx context.Context, binary string, expected storageproto.Descriptor,
 		client: child.client, directory: child.directory, descriptor: actual,
 		binary: binary, expectedFingerprint: wantFingerprint, config: cloneConfig(config),
 		lifetime: lifetime, cancelLifetime: cancel, opGate: make(chan struct{}, 1),
+		readGate: make(chan struct{}, maxConcurrentReadStreams),
 	}
 	runtime.objects = &objectStore{runtime: runtime}
 	return runtime, nil
@@ -227,22 +232,12 @@ func StartSet(ctx context.Context, catalogRoot, setID string) (*Runtime, error) 
 	return Start(ctx, binary, descriptor, storageproto.Config{Values: set.Config.Values, Secrets: set.Config.Secrets})
 }
 
-// OpenStore selects built-in local storage only when a generation has no
-// provider-set identity. A malformed or unavailable selected set is an error;
-// it never falls back to a fresh local archive.
+// OpenStore opens the exact provider set pinned by a Runtime Host generation.
+// Empty set identity is rejected: the production application path has no
+// direct-local or fresh-archive fallback.
 func OpenStore(ctx context.Context, dataDir, catalogRoot, setID string) (*storage.Store, *Runtime, error) {
-	if strings.TrimSpace(dataDir) == "" {
+	if strings.TrimSpace(dataDir) == "" || setID == "" || catalogRoot == "" {
 		return nil, nil, errors.New("archive storage root is unavailable")
-	}
-	if setID == "" {
-		if catalogRoot != "" {
-			return nil, nil, errors.New("storage provider generation identity is incomplete")
-		}
-		store, err := storage.New(dataDir)
-		if err != nil {
-			return nil, nil, err
-		}
-		return store, nil, nil
 	}
 	if !filepath.IsAbs(dataDir) || filepath.Clean(dataDir) != dataDir || !filepath.IsAbs(catalogRoot) || filepath.Clean(catalogRoot) != catalogRoot {
 		return nil, nil, errors.New("storage provider catalog root is invalid")
@@ -310,6 +305,14 @@ func (r *Runtime) Close() error {
 
 type objectStore struct{ runtime *Runtime }
 
+func (s *objectStore) StorageProviderIdentity() (id, name string) {
+	if s == nil || s.runtime == nil {
+		return "", ""
+	}
+	descriptor := s.runtime.Descriptor()
+	return descriptor.ID, descriptor.Name
+}
+
 func (s *objectStore) Put(ctx context.Context, key string, body io.Reader, size int64) (storage.PhysicalObjectInfo, error) {
 	var info storageproto.ObjectInfo
 	err := s.runtime.call(ctx, func(callCtx context.Context, client *storageproto.Client) error {
@@ -341,13 +344,19 @@ func (s *objectStore) open(ctx context.Context, key string, open func(context.Co
 	}
 	r := s.runtime
 	callCtx, cancel := r.operationContext(ctx)
+	if err := r.acquireReadStream(callCtx); err != nil {
+		cancel()
+		return nil, storage.PhysicalObjectInfo{}, err
+	}
 	if err := r.acquireOperation(callCtx); err != nil {
+		r.releaseReadStream()
 		cancel()
 		return nil, storage.PhysicalObjectInfo{}, err
 	}
 	client, err := r.ensureClient(callCtx)
 	if err != nil {
 		r.releaseOperation()
+		r.releaseReadStream()
 		cancel()
 		return nil, storage.PhysicalObjectInfo{}, err
 	}
@@ -355,14 +364,18 @@ func (s *objectStore) open(ctx context.Context, key string, open func(context.Co
 	if err != nil {
 		r.recoverAfterOperationError(callCtx, client)
 		r.releaseOperation()
+		r.releaseReadStream()
 		cancel()
 		return nil, storage.PhysicalObjectInfo{}, normalizeProviderObjectError(err)
 	}
 	r.markOperationSucceeded()
-	return &operationReadCloser{ReadCloser: reader, release: func() {
+	stream := &operationReadCloser{ReadCloser: reader, release: func() {
 		cancel()
-		r.releaseOperation()
-	}}, storage.PhysicalObjectInfo{Key: key, Size: info.Size, SHA256: info.SHA256}, nil
+		r.releaseReadStream()
+	}}
+	stream.watchContext(callCtx)
+	r.releaseOperation()
+	return stream, storage.PhysicalObjectInfo{Key: key, Size: info.Size, SHA256: info.SHA256}, nil
 }
 
 func (s *objectStore) Stat(ctx context.Context, key string) (storage.PhysicalObjectInfo, error) {
@@ -463,8 +476,26 @@ func (r *Runtime) acquireOperation(ctx context.Context) error {
 	}
 }
 
+func (r *Runtime) acquireReadStream(ctx context.Context) error {
+	if r == nil || r.readGate == nil {
+		return storageproto.ErrClosed
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.lifetime.Done():
+		return storageproto.ErrClosed
+	case r.readGate <- struct{}{}:
+		return nil
+	}
+}
+
 func (r *Runtime) releaseOperation() {
 	<-r.opGate
+}
+
+func (r *Runtime) releaseReadStream() {
+	<-r.readGate
 }
 
 func (r *Runtime) ensureClient(ctx context.Context) (*storageproto.Client, error) {
@@ -610,22 +641,44 @@ func cloneDescriptor(descriptor storageproto.Descriptor) storageproto.Descriptor
 
 type operationReadCloser struct {
 	io.ReadCloser
-	release func()
-	once    sync.Once
+	release  func()
+	once     sync.Once
+	stopMu   sync.Mutex
+	stop     func() bool
+	closeErr error
+}
+
+func (r *operationReadCloser) watchContext(ctx context.Context) {
+	stop := context.AfterFunc(ctx, func() { _ = r.Close() })
+	r.stopMu.Lock()
+	r.stop = stop
+	r.stopMu.Unlock()
+}
+
+func (r *operationReadCloser) finish() {
+	r.once.Do(func() {
+		r.stopMu.Lock()
+		stop := r.stop
+		r.stopMu.Unlock()
+		if stop != nil {
+			stop()
+		}
+		r.closeErr = r.ReadCloser.Close()
+		r.release()
+	})
 }
 
 func (r *operationReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	if err != nil {
-		r.once.Do(r.release)
+		r.finish()
 	}
 	return n, err
 }
 
 func (r *operationReadCloser) Close() error {
-	err := r.ReadCloser.Close()
-	r.once.Do(r.release)
-	return err
+	r.finish()
+	return r.closeErr
 }
 
 func normalizeProviderObjectError(err error) error {

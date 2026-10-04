@@ -2,7 +2,7 @@
 
 package main
 
-import "github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap"
+import "github.com/integrated-recorder/core/internal/runtimehost/bootstrap"
 
 // Production hosts always use the normal public HTTPS client. The local
 // registry trust seam exists only in runtime_e2e builds.

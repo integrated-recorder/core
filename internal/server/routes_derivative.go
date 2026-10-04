@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
-	"github.com/dltkddnr04/integrated-recorder/internal/management"
+	"github.com/integrated-recorder/core/internal/derivative"
+	"github.com/integrated-recorder/core/internal/management"
 )
 
 func (s *Server) registerDerivativeRoutes() {

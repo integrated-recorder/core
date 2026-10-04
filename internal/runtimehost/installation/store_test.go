@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
-	"github.com/dltkddnr04/integrated-recorder/internal/watch"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/watch"
 )
 
 func testRoot(t *testing.T) string {

@@ -3,9 +3,9 @@ package resources
 import (
 	"errors"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
+	"github.com/integrated-recorder/core/internal/runtimehook"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
 )
 
 // Transfer moves one active Recording's Host-authorized writer from a paused

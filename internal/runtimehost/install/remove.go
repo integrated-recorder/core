@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
+	"github.com/integrated-recorder/core/internal/runtimehost/release"
 )
 
 var ErrReleaseNotFound = errors.New("installed release was not found")

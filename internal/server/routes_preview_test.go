@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/preview"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/preview"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func TestPreviewAPIRoutesRequireAuthAndServePrivateJPEG(t *testing.T) {

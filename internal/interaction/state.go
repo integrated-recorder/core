@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/adapterproto"
 )
 
 var ErrNotFound = errors.New("interaction not found")

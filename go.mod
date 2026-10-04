@@ -1,4 +1,4 @@
-module github.com/dltkddnr04/integrated-recorder
+module github.com/integrated-recorder/core
 
 go 1.23.0
 

@@ -3,9 +3,9 @@ package bootstrap
 import (
 	"errors"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/source"
+	"github.com/integrated-recorder/core/internal/buildinfo"
+	"github.com/integrated-recorder/core/internal/runtimehost/install"
+	"github.com/integrated-recorder/core/internal/runtimehost/source"
 )
 
 func configuredReleaseSourceFactory(config Config, applicationBuild buildinfo.Info) func() (install.Source, error) {

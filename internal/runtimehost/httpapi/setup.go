@@ -8,9 +8,9 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
-	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/buildinfo"
+	"github.com/integrated-recorder/core/internal/runtimehost/installation"
 )
 
 const SetupEndpoint = "/api/setup"

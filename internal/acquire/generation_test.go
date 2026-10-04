@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func TestFreshManagerObservesActiveArchiveWithoutRecoveryOrOwnership(t *testing.T) {

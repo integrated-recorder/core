@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/integrated-recorder/core/internal/domain"
 )
 
 func TestReadOnlyLoadDoesNotRecoverActiveArchive(t *testing.T) {

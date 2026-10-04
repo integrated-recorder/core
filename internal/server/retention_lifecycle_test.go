@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
+	"github.com/integrated-recorder/core/internal/controlplane"
 )
 
 func TestScheduledRetentionWaitsAcrossControlFenceAndResumes(t *testing.T) {

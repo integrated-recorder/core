@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 var (

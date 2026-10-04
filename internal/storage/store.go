@@ -21,7 +21,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/integrated-recorder/core/internal/domain"
 )
 
 var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)

@@ -10,8 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/pluginconfig"
 )
 
 const hostCloseTimeout = 20 * time.Second

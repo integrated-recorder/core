@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/pluginregistry"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
-	"github.com/dltkddnr04/integrated-recorder/internal/storageprocess"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
+	"github.com/integrated-recorder/core/internal/runtimehost/pluginregistry"
+	"github.com/integrated-recorder/core/internal/runtimehost/storagecatalog"
+	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storageprocess"
 )
 
 func TestStorageRegistryInstallConfigureProbeActivate(t *testing.T) {

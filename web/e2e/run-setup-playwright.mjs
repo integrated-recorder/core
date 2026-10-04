@@ -63,10 +63,10 @@ function build() {
     GOMODCACHE: process.env.GOMODCACHE || moduleCache,
   }
   const infoFlags = [
-    '-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.version=0.0.0-setup-e2e',
-    '-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.commit=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-    '-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.buildTime=2026-10-01T00:00:00Z',
-    '-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.releaseChannel=prerelease',
+    '-X github.com/integrated-recorder/core/internal/buildinfo.version=0.0.0-setup-e2e',
+    '-X github.com/integrated-recorder/core/internal/buildinfo.commit=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+    '-X github.com/integrated-recorder/core/internal/buildinfo.buildTime=2026-10-01T00:00:00Z',
+    '-X github.com/integrated-recorder/core/internal/buildinfo.releaseChannel=prerelease',
   ]
   const output = (name, packagePath, extra = '') => {
     const path = join(binDir, name)
@@ -87,7 +87,7 @@ function build() {
   copyFileSync(adapter, join(adapterDir, 'integrated-recorder-adapter-owncast'))
   chmodSync(join(adapterDir, 'integrated-recorder-adapter-owncast'), 0o700)
 
-  const hostExtra = `-X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir=${bundleDir}`
+  const hostExtra = `-X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir=${bundleDir}`
   return output('runtime-host', './cmd/runtime-host', hostExtra)
 }
 

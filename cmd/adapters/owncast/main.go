@@ -4,7 +4,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapters/owncast"
+	"github.com/integrated-recorder/core/internal/adapters/owncast"
 )
 
 func main() {

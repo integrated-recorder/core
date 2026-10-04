@@ -15,7 +15,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/adapterproto"
 )
 
 type Scope struct {

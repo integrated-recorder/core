@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
+	"github.com/integrated-recorder/core/internal/runtimehook"
 )
 
 const (

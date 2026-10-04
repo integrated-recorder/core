@@ -5,14 +5,14 @@ import (
 	"errors"
 	"sort"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/pluginregistry"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
+	"github.com/integrated-recorder/core/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/runtimehost/pluginregistry"
+	"github.com/integrated-recorder/core/internal/runtimehost/storagecatalog"
+	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 type sourceAwareAdapterCatalog interface {

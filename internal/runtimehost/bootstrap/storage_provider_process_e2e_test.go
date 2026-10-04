@@ -20,12 +20,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/integrity"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
+	"github.com/integrated-recorder/core/internal/runtimehost/storagecatalog"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 const storageProcessE2EProviderID = "fixture-storage"

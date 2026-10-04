@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
+	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 const (

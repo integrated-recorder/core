@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 const playbackRangeRecordingID = "0123456789abcdef0123456789abcdef"

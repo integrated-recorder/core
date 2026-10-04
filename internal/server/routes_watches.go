@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/watch"
+	"github.com/integrated-recorder/core/internal/watch"
 )
 
 func (s *Server) registerWatchRoutes() {

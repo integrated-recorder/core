@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/preview"
+	"github.com/integrated-recorder/core/internal/preview"
 	"unicode"
 	"unicode/utf8"
 )

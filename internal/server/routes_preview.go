@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/preview"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/preview"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func (s *Server) registerPreviewRoutes() {

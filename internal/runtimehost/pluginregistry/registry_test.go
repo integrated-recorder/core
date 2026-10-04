@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
+	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 )
 
 var (

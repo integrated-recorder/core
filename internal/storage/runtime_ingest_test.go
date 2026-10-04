@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
+	"github.com/integrated-recorder/core/internal/runtimehost/resources"
 )
 
 type sharedRuntimeCoordinator struct {

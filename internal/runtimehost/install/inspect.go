@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
+	"github.com/integrated-recorder/core/internal/runtimehost/release"
 )
 
 var installedReleaseIDPattern = regexp.MustCompile(`^release-[0-9a-f]{64}$`)

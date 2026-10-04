@@ -15,7 +15,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
+	"github.com/integrated-recorder/core/internal/runtimehost/release"
 )
 
 const (

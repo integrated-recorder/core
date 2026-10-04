@@ -5,7 +5,7 @@ package storagelocal
 import (
 	"os"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
+	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 func openFilesystemRoot() (int, error)                      { return -1, storageproto.ErrUnsupported }

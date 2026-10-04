@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 type storagePoolsResponse struct {

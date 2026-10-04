@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/runtimehost/installation"
 )
 
 const csrfCookieName = "ir_csrf"

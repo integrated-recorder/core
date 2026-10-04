@@ -14,9 +14,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
+	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 const (

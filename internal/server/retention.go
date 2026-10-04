@@ -8,10 +8,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/management"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 const (

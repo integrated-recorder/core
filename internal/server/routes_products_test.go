@@ -13,17 +13,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
-	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
-	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
-	"github.com/dltkddnr04/integrated-recorder/internal/management"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
-	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/buildinfo"
+	"github.com/integrated-recorder/core/internal/derivative"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/integrity"
+	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/systemsettings"
 )
 
 func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {

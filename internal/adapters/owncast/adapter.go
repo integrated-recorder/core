@@ -16,9 +16,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/network"
-	"github.com/dltkddnr04/integrated-recorder/internal/streammeta"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/network"
+	"github.com/integrated-recorder/core/internal/streammeta"
 )
 
 const StreamPath = "/hls/stream.m3u8"

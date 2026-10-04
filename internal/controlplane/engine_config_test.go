@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/recorderengine"
+	"github.com/integrated-recorder/core/internal/runtimeipc"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func TestDecodeEngineCatalogStrictAndBounded(t *testing.T) {

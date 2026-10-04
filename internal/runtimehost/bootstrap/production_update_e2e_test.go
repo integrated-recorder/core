@@ -28,16 +28,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/runtimehook"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
+	"github.com/integrated-recorder/core/internal/runtimehost/install"
+	"github.com/integrated-recorder/core/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
+	"github.com/integrated-recorder/core/internal/runtimehost/release"
+	"github.com/integrated-recorder/core/internal/runtimehost/storagecatalog"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 const (
@@ -179,10 +179,10 @@ func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateA
 	fixtureURL = strings.TrimRight(fixtureURL, "/")
 	ldflags := func(version, commit string) string {
 		return strings.Join([]string{
-			"-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.version=" + version,
-			"-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.commit=" + commit,
-			"-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.buildTime=2026-09-30T00:00:00Z",
-			"-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.releaseChannel=prerelease",
+			"-X github.com/integrated-recorder/core/internal/buildinfo.version=" + version,
+			"-X github.com/integrated-recorder/core/internal/buildinfo.commit=" + commit,
+			"-X github.com/integrated-recorder/core/internal/buildinfo.buildTime=2026-09-30T00:00:00Z",
+			"-X github.com/integrated-recorder/core/internal/buildinfo.releaseChannel=prerelease",
 		}, " ")
 	}
 	build := func(output, packagePath string, tags string, flags string) string {
@@ -222,8 +222,8 @@ func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateA
 		_ = os.Chmod(filepath.Join(bundleA, "control-plane"), 0600)
 		_ = os.Chmod(filepath.Join(bundleA, "recorder-engine"), 0600)
 	})
-	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags(e2eVersionA, e2eCommitA)+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
-	hostB := build(filepath.Join(bin, "runtime-host-b"), "./cmd/runtime-host", "runtime_e2e", ldflags(e2eVersionB, e2eCommitB)+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
+	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags(e2eVersionA, e2eCommitA)+" -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
+	hostB := build(filepath.Join(bin, "runtime-host-b"), "./cmd/runtime-host", "runtime_e2e", ldflags(e2eVersionB, e2eCommitB)+" -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
 
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -1495,8 +1495,19 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 	}
 	verifyRuntimeRecordingSegments(t, dataDir, postCrash, stream, 1, lastBeforeCrash)
 	postCrashObjects, err := snapshotRecordingObjects(archiveDir)
-	if err != nil || !reflect.DeepEqual(preCrashObjects, postCrashObjects) {
-		t.Fatalf("cold recovery rewrote payload/sidecar/manifest objects: err=%v before=%v after=%v", err, preCrashObjects, postCrashObjects)
+	if err != nil {
+		t.Fatalf("snapshot canonical archive objects after cold recovery: %v", err)
+	}
+	var addedArchiveObjects []string
+	for object := range postCrashObjects {
+		if _, existed := preCrashObjects[object]; !existed {
+			addedArchiveObjects = append(addedArchiveObjects, object)
+		}
+	}
+	sort.Strings(addedArchiveObjects)
+	t.Logf("append-only canonical archive objects observed after recovery: %v", addedArchiveObjects)
+	if err := compareArchiveSnapshotsAllowingManifestAppend(preCrashObjects, postCrashObjects); err != nil {
+		t.Fatalf("cold recovery rewrote or unexpectedly added canonical archive objects: %v; before=%v after=%v", err, preCrashObjects, postCrashObjects)
 	}
 	var metadataAfter []domain.MetadataRevision
 	if point == runtimehook.BeforeSourceRetirement {

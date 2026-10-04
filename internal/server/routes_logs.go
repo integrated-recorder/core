@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/applog"
+	"github.com/integrated-recorder/core/internal/applog"
 )
 
 type logPageResponse struct {

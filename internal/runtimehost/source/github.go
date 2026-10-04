@@ -21,12 +21,12 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
+	"github.com/integrated-recorder/core/internal/runtimehost/release"
 )
 
 const (
-	officialOwner      = "dltkddnr04"
-	officialRepository = "Integrated-Recorder"
+	officialOwner      = "integrated-recorder"
+	officialRepository = "core"
 	officialAPIBase    = "https://api.github.com"
 	requestTimeout     = 30 * time.Second
 	maxAPIResponse     = 2 << 20

@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/runtimehook"
+	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
 )
 
 const addedFixtureAdapterID = "runtime-added-fixture"
@@ -70,10 +70,10 @@ func buildRuntimeAdapterLifecycleArtifacts(t *testing.T, fixtureURL string) runt
 	}
 	fixtureURL = strings.TrimRight(fixtureURL, "/")
 	ldflags := strings.Join([]string{
-		"-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.version=" + e2eVersionA,
-		"-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.commit=" + e2eCommitA,
-		"-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.buildTime=2026-09-30T00:00:00Z",
-		"-X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.releaseChannel=prerelease",
+		"-X github.com/integrated-recorder/core/internal/buildinfo.version=" + e2eVersionA,
+		"-X github.com/integrated-recorder/core/internal/buildinfo.commit=" + e2eCommitA,
+		"-X github.com/integrated-recorder/core/internal/buildinfo.buildTime=2026-09-30T00:00:00Z",
+		"-X github.com/integrated-recorder/core/internal/buildinfo.releaseChannel=prerelease",
 	}, " ")
 	build := func(output, packagePath, tags, flags string) string {
 		t.Helper()
@@ -105,7 +105,7 @@ func buildRuntimeAdapterLifecycleArtifacts(t *testing.T, fixtureURL string) runt
 		}
 	})
 	copyRuntimeArtifact(t, owncast, filepath.Join(adapterDir, "integrated-recorder-adapter-owncast"), 0555)
-	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
+	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags+" -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
 	return runtimeAdapterLifecycleArtifacts{
 		root: root, fixtureURL: fixtureURL, bundleA: bundleA, hostA: hostA, adapterDir: adapterDir, storageLocalBinary: storageLocal,
 	}

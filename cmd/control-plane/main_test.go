@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
-	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/integrated-recorder/core/internal/controlplane"
+	"github.com/integrated-recorder/core/internal/recorderengine"
 )
 
 func TestNormalizeEngineDetachResultIsIdempotentOnlyWhenAlreadyAbsent(t *testing.T) {

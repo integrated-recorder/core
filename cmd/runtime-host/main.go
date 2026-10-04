@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap"
+	"github.com/integrated-recorder/core/internal/runtimehost/bootstrap"
 )
 
 func main() {

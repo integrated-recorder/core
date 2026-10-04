@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
 )
 
 const (

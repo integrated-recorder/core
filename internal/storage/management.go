@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/integrated-recorder/core/internal/domain"
 )
 
 var deletionTombstonePattern = regexp.MustCompile(`^\.deleting-([a-f0-9]{32})-([a-f0-9]{32})$`)

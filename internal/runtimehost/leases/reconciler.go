@@ -10,7 +10,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
 )
 
 var ErrInvalidInventory = errors.New("invalid Recorder Engine inventory")

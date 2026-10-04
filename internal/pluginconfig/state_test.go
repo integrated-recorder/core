@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/adapterproto"
 )
 
 func TestAdapterStateAndSecretStatePersistSeparatelyAcrossServiceRestart(t *testing.T) {

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func TestConfigureRuntimeResourcesRequiresAllOrNone(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/adapterproto"
 )
 
 // TestExternalSDKExampleAcceptance is an opt-in cross-repository acceptance

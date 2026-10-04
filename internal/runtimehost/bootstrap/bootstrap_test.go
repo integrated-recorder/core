@@ -19,13 +19,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
-	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/buildinfo"
+	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/runtimehost/resources"
+	"github.com/integrated-recorder/core/internal/runtimehost/supervisor"
 )
 
 func TestConfigRejectsAuthDisabledOnPublicListener(t *testing.T) {

@@ -16,17 +16,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/management"
-	"github.com/dltkddnr04/integrated-recorder/internal/preview"
-	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
-	"github.com/dltkddnr04/integrated-recorder/internal/server"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
-	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
-	"github.com/dltkddnr04/integrated-recorder/internal/watch"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/preview"
+	"github.com/integrated-recorder/core/internal/recorderengine"
+	"github.com/integrated-recorder/core/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/server"
+	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/systemsettings"
+	"github.com/integrated-recorder/core/internal/watch"
 )
 
 func TestControlBackgroundProducersStayStoppedUntilHostInstallationReady(t *testing.T) {

@@ -16,11 +16,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/hls"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/hls"
+	"github.com/integrated-recorder/core/internal/runtimehook"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 const (

@@ -19,10 +19,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/network"
-	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/network"
+	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 const (

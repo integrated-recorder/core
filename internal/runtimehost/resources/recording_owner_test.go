@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
+	"github.com/integrated-recorder/core/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
 )
 
 func newOwnerAuthorityTest(t *testing.T) (*RecordingOwnerAuthority, *recordingowner.Store, *generation.Registry, string, string, string) {

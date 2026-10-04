@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/integrated-recorder/core/internal/domain"
 )
 
 const MaxManifestBytes = 4 << 20

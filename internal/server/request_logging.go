@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/applog"
+	"github.com/integrated-recorder/core/internal/applog"
 )
 
 // requestLogMiddleware records only bounded request metadata. It never stores

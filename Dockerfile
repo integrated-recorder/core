@@ -17,7 +17,7 @@ COPY . .
 COPY --from=web-build /src/internal/server/static/ui ./internal/server/static/ui
 RUN set -eu; \
 	mkdir -p /out/initial /out/adapters /out/plugins; \
-    app_ldflags="-s -w -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.version=${VERSION} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.commit=${COMMIT} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.buildTime=${BUILD_TIME} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.releaseChannel=${RELEASE_CHANNEL}"; \
+    app_ldflags="-s -w -X github.com/integrated-recorder/core/internal/buildinfo.version=${VERSION} -X github.com/integrated-recorder/core/internal/buildinfo.commit=${COMMIT} -X github.com/integrated-recorder/core/internal/buildinfo.buildTime=${BUILD_TIME} -X github.com/integrated-recorder/core/internal/buildinfo.releaseChannel=${RELEASE_CHANNEL}"; \
     CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/runtime-host ./cmd/runtime-host; \
 	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/initial/control-plane ./cmd/control-plane; \
 	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/initial/recorder-engine ./cmd/recorder-engine; \

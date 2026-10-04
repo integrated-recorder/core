@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func TestDoMediaRequestDefaultsToSameOriginHeaders(t *testing.T) {

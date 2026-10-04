@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
-	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
+	"github.com/integrated-recorder/core/internal/buildinfo"
+	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 func TestDescriptorAndRequiredRootConfiguration(t *testing.T) {

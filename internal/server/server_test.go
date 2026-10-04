@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
-	"github.com/dltkddnr04/integrated-recorder/internal/preview"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/pluginconfig"
+	"github.com/integrated-recorder/core/internal/preview"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func TestMain(m *testing.M) {

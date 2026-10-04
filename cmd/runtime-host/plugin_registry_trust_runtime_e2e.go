@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap"
+	"github.com/integrated-recorder/core/internal/runtimehost/bootstrap"
 )
 
 const runtimeE2ERegistryCAEnv = "IR_RUNTIME_E2E_PLUGIN_REGISTRY_CA_FILE"

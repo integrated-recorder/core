@@ -25,8 +25,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
+	"github.com/integrated-recorder/core/internal/runtimehost/install"
+	"github.com/integrated-recorder/core/internal/runtimehost/release"
 )
 
 func TestGitHubSourceDiscoversStableAndPrerelease(t *testing.T) {
@@ -389,7 +389,7 @@ func TestProductionSourceRedirectAllowlistRejectsPrivateAndLookalikeHosts(t *tes
 		t.Fatal(err)
 	}
 	for _, raw := range []string{
-		"https://api.github.com/repos/dltkddnr04/Integrated-Recorder/releases/latest",
+		"https://api.github.com/repos/integrated-recorder/core/releases/latest",
 		"https://release-assets.githubusercontent.com/path?token=opaque",
 		"https://github.com/path",
 	} {

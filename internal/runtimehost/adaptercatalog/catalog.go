@@ -22,8 +22,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/adapterproto"
 )
 
 const (

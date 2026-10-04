@@ -17,16 +17,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
-	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
-	"github.com/dltkddnr04/integrated-recorder/internal/storageprocess"
-	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/pluginconfig"
+	"github.com/integrated-recorder/core/internal/recorderengine"
+	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
+	"github.com/integrated-recorder/core/internal/runtimehost/resources"
+	"github.com/integrated-recorder/core/internal/runtimeipc"
+	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storageprocess"
+	"github.com/integrated-recorder/core/internal/systemsettings"
 )
 
 func main() {

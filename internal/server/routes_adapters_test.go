@@ -14,9 +14,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
-	"github.com/dltkddnr04/integrated-recorder/internal/management"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/management"
 )
 
 func TestAdapterBrandingAPIUsesAuthenticatedIconProjection(t *testing.T) {

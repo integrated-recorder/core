@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/integrated-recorder/core/internal/authn"
 )
 
 type storageSecurityController struct {

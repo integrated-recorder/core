@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/integrated-recorder/core/internal/authn"
 )
 
 const (

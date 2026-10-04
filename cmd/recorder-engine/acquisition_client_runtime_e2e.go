@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
+	"github.com/integrated-recorder/core/internal/acquire"
 )
 
 // runtimeE2EFixtureOrigin is empty unless the acceptance-test build explicitly

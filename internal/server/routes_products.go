@@ -20,15 +20,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
-	"github.com/dltkddnr04/integrated-recorder/internal/management"
-	"github.com/dltkddnr04/integrated-recorder/internal/recordquery"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/derivative"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/integrity"
+	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/recordquery"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 const (

@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
+	"github.com/integrated-recorder/core/internal/runtimeipc"
 )
 
 const (

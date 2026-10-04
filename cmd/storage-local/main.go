@@ -8,8 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/storagelocal"
-	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
+	"github.com/integrated-recorder/core/internal/storagelocal"
+	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 func main() {

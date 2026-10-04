@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/authn"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func newManagedSetupServer(t *testing.T) (*Server, string, authn.Session) {

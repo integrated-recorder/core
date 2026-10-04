@@ -13,11 +13,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/pluginregistry"
-	productserver "github.com/dltkddnr04/integrated-recorder/internal/server"
+	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
+	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
+	"github.com/integrated-recorder/core/internal/runtimehost/pluginregistry"
+	productserver "github.com/integrated-recorder/core/internal/server"
 )
 
 func TestPluginRegistryInstallUpdateUninstallUsesImmutableGenerationLifecycle(t *testing.T) {

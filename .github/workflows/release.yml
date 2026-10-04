@@ -62,7 +62,7 @@ jobs:
             export GOOS=linux GOARCH="${ARCH}" CGO_ENABLED=0
             TARGET="linux-${ARCH}"
             mkdir -p "dist/bin-${TARGET}"
-            LDFLAGS="-s -w -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.version=${VERSION} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.commit=${GITHUB_SHA} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.buildTime=${BUILD_TIME} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.releaseChannel=${CHANNEL}"
+            LDFLAGS="-s -w -X github.com/integrated-recorder/core/internal/buildinfo.version=${VERSION} -X github.com/integrated-recorder/core/internal/buildinfo.commit=${GITHUB_SHA} -X github.com/integrated-recorder/core/internal/buildinfo.buildTime=${BUILD_TIME} -X github.com/integrated-recorder/core/internal/buildinfo.releaseChannel=${CHANNEL}"
             go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/runtime-host" ./cmd/runtime-host
             go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/control-plane" ./cmd/control-plane
             go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/recorder-engine" ./cmd/recorder-engine

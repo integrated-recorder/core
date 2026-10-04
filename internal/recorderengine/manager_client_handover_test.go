@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
+	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
+	"github.com/integrated-recorder/core/internal/runtimeipc"
 )
 
 func TestManagerClientHandoverAcknowledgementChecksRecordingAndEngineIdentity(t *testing.T) {

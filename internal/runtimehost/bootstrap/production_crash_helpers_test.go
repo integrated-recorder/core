@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
+	"github.com/integrated-recorder/core/internal/runtimehook"
 )
 
 func writeRuntimeHookArm(directory string, arm runtimehook.Arm) error {
@@ -118,6 +118,10 @@ func snapshotRecordingObjects(root string) (map[string]string, error) {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("canonical archive contains non-regular object %q", filepath.Base(path))
 		}
+		if strings.HasPrefix(filepath.Base(path), "\x1f.ir-storage-local-tmp-") {
+			// These are incomplete atomic-Put staging objects, not canonical logical objects.
+			return nil
+		}
 		relative, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
@@ -137,6 +141,66 @@ func snapshotRecordingObjects(root string) (map[string]string, error) {
 		return nil
 	})
 	return objects, err
+}
+
+// compareArchiveSnapshotsAllowingManifestAppend proves that the durable
+// pre-crash archive remains byte-for-byte intact while allowing complete
+// append-only source manifest snapshots published by the still-authoritative
+// source Engine during cold recovery.
+func compareArchiveSnapshotsAllowingManifestAppend(before, after map[string]string) error {
+	for object, digest := range before {
+		actual, ok := after[object]
+		if !ok {
+			return fmt.Errorf("pre-crash archive object %q was removed", object)
+		}
+		if actual != digest {
+			return fmt.Errorf("pre-crash archive object %q changed digest", object)
+		}
+	}
+
+	added := make(map[string]struct{})
+	for object := range after {
+		if _, existed := before[object]; !existed {
+			added[object] = struct{}{}
+		}
+	}
+	for object := range added {
+		partner, ok := manifestSnapshotPartner(object)
+		if !ok {
+			return fmt.Errorf("unexpected archive object addition %q", object)
+		}
+		if _, exists := added[partner]; !exists {
+			return fmt.Errorf("new manifest snapshot %q has no matching pair %q", object, partner)
+		}
+	}
+	return nil
+}
+
+func manifestSnapshotPartner(object string) (string, bool) {
+	const prefix = "manifests/main-"
+	if !strings.HasPrefix(object, prefix) {
+		return "", false
+	}
+	remainder := strings.TrimPrefix(object, prefix)
+	if remainder == "" || strings.Contains(remainder, "/") {
+		return "", false
+	}
+	switch {
+	case strings.HasSuffix(remainder, ".m3u8.json"):
+		stem := strings.TrimSuffix(remainder, ".m3u8.json")
+		if stem == "" {
+			return "", false
+		}
+		return strings.TrimSuffix(object, ".json"), true
+	case strings.HasSuffix(remainder, ".m3u8"):
+		stem := strings.TrimSuffix(remainder, ".m3u8")
+		if stem == "" {
+			return "", false
+		}
+		return object + ".json", true
+	default:
+		return "", false
+	}
 }
 
 func readRuntimeE2EChildDiagnostics(directory string) string {

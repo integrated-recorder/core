@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
-	"github.com/dltkddnr04/integrated-recorder/internal/network"
+	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/network"
 )
 
 // newAcquisitionClient preserves the normal public-network policy for all

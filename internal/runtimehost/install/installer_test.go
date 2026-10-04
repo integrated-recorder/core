@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
+	"github.com/integrated-recorder/core/internal/runtimehost/release"
 )
 
 func TestStageLocalSignedBundlePublishesPrivateImmutableRelease(t *testing.T) {

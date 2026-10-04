@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
+	"github.com/integrated-recorder/core/internal/systemsettings"
 )
 
 type settingsPutRequest struct {

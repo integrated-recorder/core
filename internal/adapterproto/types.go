@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/streammeta"
+	"github.com/integrated-recorder/core/internal/streammeta"
 )
 
 type Descriptor struct {

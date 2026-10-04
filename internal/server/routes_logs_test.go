@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/applog"
+	"github.com/integrated-recorder/core/internal/applog"
 )
 
 func TestLogHandlerReturnsBoundedJSONPage(t *testing.T) {

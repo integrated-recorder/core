@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/interaction"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/interaction"
 )
 
 func TestListWorkflowsReturnsSafeOrderedSummaries(t *testing.T) {

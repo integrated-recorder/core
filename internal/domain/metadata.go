@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/streammeta"
+	"github.com/integrated-recorder/core/internal/streammeta"
 )
 
 func ValidateMetadataTimeline(items []MetadataRevision) error {

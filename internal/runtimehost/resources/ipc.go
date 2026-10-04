@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
+	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
+	"github.com/integrated-recorder/core/internal/runtimeipc"
 )
 
 const (

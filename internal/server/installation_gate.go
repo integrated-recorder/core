@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/runtimehost/installation"
 )
 
 func (s *Server) installationIsReady() bool {

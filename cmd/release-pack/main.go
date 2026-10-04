@@ -18,10 +18,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
-	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
+	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/buildinfo"
+	"github.com/integrated-recorder/core/internal/runtimehost/release"
+	"github.com/integrated-recorder/core/internal/runtimeipc"
 )
 
 const signingKeyEnv = "IR_RELEASE_SIGNING_PRIVATE_KEY_BASE64"

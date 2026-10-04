@@ -9,7 +9,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/adapterproto"
 )
 
 var (

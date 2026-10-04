@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/domain"
-	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
-	"github.com/dltkddnr04/integrated-recorder/internal/storage"
-	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
+	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/runtimehost/storagecatalog"
+	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 func TestOpenStoreRejectsGenerationWithoutProviderSetInsteadOfUsingDirectLocalStorage(t *testing.T) {

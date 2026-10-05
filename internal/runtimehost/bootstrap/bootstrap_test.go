@@ -21,6 +21,7 @@ import (
 
 	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/buildinfo"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 	"github.com/integrated-recorder/core/internal/runtimehost/generation"
 	"github.com/integrated-recorder/core/internal/runtimehost/installation"
@@ -41,6 +42,146 @@ func TestConfigRejectsAuthDisabledOnPublicListener(t *testing.T) {
 		t.Fatalf("loopback auth-disabled config rejected: %v", err)
 	}
 }
+
+func TestConfigFromEnvOperatorPluginOptIn(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  bool
+		bad   bool
+	}{
+		{name: "unset defaults off"},
+		{name: "explicit disabled", value: "0"},
+		{name: "explicit enabled", value: "1", want: true},
+		{name: "malformed value", value: "true", bad: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := ConfigFromEnv(func(key string) string {
+				if key == "IR_ALLOW_OPERATOR_PLUGINS" {
+					return test.value
+				}
+				return ""
+			})
+			if test.bad {
+				if err == nil {
+					t.Fatal("malformed operator plugin opt-in was accepted")
+				}
+				return
+			}
+			if err != nil || config.AllowOperatorPlugins != test.want {
+				t.Fatalf("ConfigFromEnv() = (allow=%t, err=%v), want allow=%t", config.AllowOperatorPlugins, err, test.want)
+			}
+			if config.AdapterDirs != "/external-adapters" {
+				t.Fatalf("default operator source = %q, want /external-adapters", config.AdapterDirs)
+			}
+		})
+	}
+}
+
+func TestConfiguredAdapterSourcesKeepBundledAndOperatorProvenanceSeparate(t *testing.T) {
+	root := t.TempDir()
+	bundled := filepath.Join(root, "bundled", "integrated-recorder-adapter-hls")
+	operator := filepath.Join(root, "operator")
+	registryBinary := filepath.Join(root, "registry", "integrated-recorder-adapter-example")
+	config := DefaultConfig()
+	config.BundledHLSBinary = bundled
+	config.AdapterDirs = operator
+	registrySources := []adaptercatalog.Source{{
+		Path: registryBinary, Attestation: plugintrust.NewOfficialRegistry(plugintrust.ThirdParty), AllowedIDs: []string{"example"},
+	}}
+
+	sources, err := configuredAdapterSources(config, registrySources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 || sources[0].Path != bundled || sources[0].Attestation != plugintrust.NewBundled() || len(sources[0].AllowedIDs) != 1 || sources[0].AllowedIDs[0] != "hls" {
+		t.Fatalf("operator-disabled classified sources = %+v, want bundled HLS and Registry only", sources)
+	}
+	if sources[1].Attestation != plugintrust.NewOfficialRegistry(plugintrust.ThirdParty) || len(sources[1].AllowedIDs) != 1 || sources[1].AllowedIDs[0] != "example" {
+		t.Fatalf("Registry source classification changed: %+v", sources[1])
+	}
+
+	config.AllowOperatorPlugins = true
+	sources, err = configuredAdapterSources(config, registrySources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 3 || sources[2].Path != operator || sources[2].Attestation != plugintrust.NewOperator() {
+		t.Fatalf("operator-enabled classified sources = %+v, want operator source appended with local provenance", sources)
+	}
+}
+
+func TestUpdateReconciliationPassesOnlyAllowedClassifiedSources(t *testing.T) {
+	root := t.TempDir()
+	bundled := filepath.Join(root, "bundled", "integrated-recorder-adapter-hls")
+	operator := filepath.Join(root, "operator")
+	catalog := &classifiedSourceCapture{}
+	controller := &updateController{config: Config{BundledHLSBinary: bundled, AdapterDirs: operator}, adapterCatalog: catalog}
+	if _, err := controller.reconcileCatalog(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.sources) != 1 || catalog.sources[0].Path != bundled || catalog.sources[0].Attestation != plugintrust.NewBundled() || len(catalog.sources[0].AllowedIDs) != 1 || catalog.sources[0].AllowedIDs[0] != "hls" {
+		t.Fatalf("operator-disabled update reconciliation sources = %+v", catalog.sources)
+	}
+
+	controller.config.AllowOperatorPlugins = true
+	if _, err := controller.reconcileCatalog(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.sources) != 2 || catalog.sources[1].Path != operator || catalog.sources[1].Attestation != plugintrust.NewOperator() {
+		t.Fatalf("operator-enabled update reconciliation sources = %+v", catalog.sources)
+	}
+}
+
+type classifiedSourceCapture struct {
+	sources []adaptercatalog.Source
+}
+
+func (c *classifiedSourceCapture) Reconcile(context.Context, string) (adaptercatalog.Snapshot, error) {
+	return adaptercatalog.Snapshot{}, nil
+}
+func (c *classifiedSourceCapture) ReconcileClassified(_ context.Context, _ string, sources []adaptercatalog.Source) (adaptercatalog.Snapshot, error) {
+	c.sources = append([]adaptercatalog.Source(nil), sources...)
+	return adaptercatalog.Snapshot{ID: strings.Repeat("a", 64)}, nil
+}
+func (c *classifiedSourceCapture) Empty() (adaptercatalog.Snapshot, error) {
+	return adaptercatalog.Snapshot{}, nil
+}
+func (c *classifiedSourceCapture) Load(string) (adaptercatalog.Snapshot, error) {
+	return adaptercatalog.Snapshot{}, adaptercatalog.ErrSetNotFound
+}
+func (c *classifiedSourceCapture) Collect([]string) error { return nil }
+
+func TestBundledHLSCannotBeShadowedByOperatorSourceDirectory(t *testing.T) {
+	config := DefaultConfig()
+	config.BundledHLSBinary = "/adapters/integrated-recorder-adapter-hls"
+	for _, directory := range []string{"/adapters", "/external-adapters/../adapters"} {
+		config.AdapterDirs = directory
+		if err := config.Validate(); err == nil {
+			t.Fatalf("operator source directory %q could overlap the bundled namespace", directory)
+		}
+	}
+}
+
+func TestMarshalAdapterTrustUsesImmutableSnapshotAttestationOnly(t *testing.T) {
+	snapshot := adaptercatalog.Snapshot{
+		ID:        strings.Repeat("a", 64),
+		Directory: "/private/not-for-control",
+		Entries: []adaptercatalog.Entry{{
+			AdapterID: "hls", Version: "1.2.3", ArtifactSHA256: strings.Repeat("b", 64),
+			Attestation: attestationPointer(plugintrust.NewBundled()),
+		}},
+	}
+	got, err := marshalAdapterTrust(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `"provenance":"bundled"`) || !strings.Contains(got, `"publisher":"first_party"`) || strings.Contains(got, snapshot.Directory) || strings.Contains(got, strings.Repeat("b", 64)) {
+		t.Fatalf("Control trust projection leaked set internals or lost provenance: %s", got)
+	}
+}
+
+func attestationPointer(value plugintrust.Attestation) *plugintrust.Attestation { return &value }
 
 func TestInitialEngineRecoveryIsGatedByInstallationReadiness(t *testing.T) {
 	tests := []struct {

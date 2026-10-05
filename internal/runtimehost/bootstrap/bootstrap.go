@@ -24,9 +24,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/buildinfo"
 	"github.com/integrated-recorder/core/internal/controlplane"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/recorderengine"
 	"github.com/integrated-recorder/core/internal/runtimehook"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
@@ -46,11 +48,12 @@ import (
 const (
 	defaultDataDir       = "/data"
 	defaultListenAddr    = ":8080"
-	defaultAdapterDirs   = "/adapters:/external-adapters"
+	defaultAdapterDirs   = "/external-adapters"
 	defaultControlWait   = 45 * time.Second
 	controlPrepareWait   = 2 * time.Minute
 	defaultCloseWait     = 20 * time.Second
 	maximumTokenFileSize = 32
+	maxControlTrustBytes = 64 << 10
 )
 
 // defaultBundleDir is a linker-overridable build input so process-level tests
@@ -63,22 +66,29 @@ var defaultBundleDir = "/opt/integrated-recorder/initial"
 // implementation used as the mandatory local primary provider.
 var defaultStorageLocalBinary = "/usr/local/lib/integrated-recorder/plugins/storage.local"
 
+// defaultBundledHLSBinary is the only bundled source adapter executable. The
+// Runtime Host imports this exact path with Host-assigned provenance; it never
+// scans /adapters as a directory.
+var defaultBundledHLSBinary = "/adapters/integrated-recorder-adapter-hls"
+
 var generationPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // Config contains trusted Runtime Host startup inputs. BundleDir is deliberately
 // not read from the environment: production executables come from the image's
 // immutable initial-release directory.
 type Config struct {
-	DataDir            string
-	BundleDir          string
-	StorageLocalBinary string
-	ListenAddr         string
-	AdapterDirs        string
-	FFmpegPath         string
-	AuthDisabled       bool
-	ForceSecureCookies bool
-	TrustedReleaseKeys map[string]ed25519.PublicKey
-	PluginRegistryURL  string
+	DataDir              string
+	BundleDir            string
+	StorageLocalBinary   string
+	BundledHLSBinary     string
+	ListenAddr           string
+	AdapterDirs          string
+	AllowOperatorPlugins bool
+	FFmpegPath           string
+	AuthDisabled         bool
+	ForceSecureCookies   bool
+	TrustedReleaseKeys   map[string]ed25519.PublicKey
+	PluginRegistryURL    string
 	// PluginRegistryHTTPClient is a deterministic test seam. Production hosts
 	// leave it nil and use the bounded public HTTPS client.
 	PluginRegistryHTTPClient *http.Client
@@ -92,7 +102,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		DataDir: defaultDataDir, BundleDir: defaultBundleDir, StorageLocalBinary: defaultStorageLocalBinary,
+		DataDir: defaultDataDir, BundleDir: defaultBundleDir, StorageLocalBinary: defaultStorageLocalBinary, BundledHLSBinary: defaultBundledHLSBinary,
 		ListenAddr: defaultListenAddr, AdapterDirs: defaultAdapterDirs,
 		ControlReadyWait: defaultControlWait, ShutdownTimeout: defaultCloseWait,
 	}
@@ -113,6 +123,14 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if value := strings.TrimSpace(getenv("ADAPTER_DIR")); value != "" {
 		c.AdapterDirs = value
+	}
+	switch strings.TrimSpace(getenv("IR_ALLOW_OPERATOR_PLUGINS")) {
+	case "", "0":
+		c.AllowOperatorPlugins = false
+	case "1":
+		c.AllowOperatorPlugins = true
+	default:
+		return Config{}, errors.New("IR_ALLOW_OPERATOR_PLUGINS must be 1 when enabled")
 	}
 	c.FFmpegPath = strings.TrimSpace(getenv("FFMPEG_PATH"))
 	if value := strings.TrimSpace(getenv("IR_STORAGE_LOCAL_PLUGIN")); value != "" {
@@ -143,8 +161,14 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.StorageLocalBinary) == "" || !filepath.IsAbs(c.StorageLocalBinary) || filepath.Clean(c.StorageLocalBinary) != c.StorageLocalBinary || strings.ContainsRune(c.StorageLocalBinary, 0) {
 		return errors.New("bundled storage.local executable path must be an absolute clean path")
 	}
+	if strings.TrimSpace(c.BundledHLSBinary) == "" || !filepath.IsAbs(c.BundledHLSBinary) || filepath.Clean(c.BundledHLSBinary) != c.BundledHLSBinary || strings.ContainsRune(c.BundledHLSBinary, 0) {
+		return errors.New("bundled source.hls executable path must be an absolute clean path")
+	}
 	if strings.TrimSpace(c.AdapterDirs) == "" || strings.ContainsRune(c.AdapterDirs, 0) {
 		return errors.New("adapter directories are invalid")
+	}
+	if err := validateOperatorAdapterDirs(c.AdapterDirs, c.BundledHLSBinary); err != nil {
+		return err
 	}
 	if c.ReleaseBundleDir != "" && (!filepath.IsAbs(c.ReleaseBundleDir) || filepath.Clean(c.ReleaseBundleDir) != c.ReleaseBundleDir || strings.ContainsRune(c.ReleaseBundleDir, 0)) {
 		return errors.New("IR_RELEASE_BUNDLE_DIR must be an absolute clean path")
@@ -322,11 +346,9 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	adapterSourceDirs, err := configuredAdapterSourceDirs(config.AdapterDirs)
-	if err != nil {
-		return errors.New("configured adapter source directories are invalid")
-	}
-	adapterCatalog, err := adaptercatalog.Open(filepath.Join(config.DataDir, "runtime", "adapters"), adapterSourceDirs)
+	// Production imports are explicitly classified below. In particular, the
+	// catalog does not scan /adapters or any mutable source directory by default.
+	adapterCatalog, err := adaptercatalog.Open(filepath.Join(config.DataDir, "runtime", "adapters"), nil)
 	if err != nil {
 		return errors.New("Runtime Host adapter catalog is unavailable")
 	}
@@ -353,11 +375,15 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return errors.New("Runtime Host plugin registry state is unavailable")
 	}
-	pluginSourceDirs, err := plugins.DesiredSourceDirs()
+	registrySources, err := plugins.DesiredSources()
 	if err != nil {
 		return errors.New("Runtime Host plugin source state is unavailable")
 	}
-	adapterSet, activeGeneration, activeExists, err := reconcileStartupAdapterSet(ctx, adapterCatalog, registrySnapshot, pluginSourceDirs...)
+	adapterSources, err := configuredAdapterSources(config, registrySources)
+	if err != nil {
+		return errors.New("Runtime Host adapter source configuration is invalid")
+	}
+	adapterSet, activeGeneration, activeExists, err := reconcileStartupAdapterSetClassified(ctx, adapterCatalog, registrySnapshot, adapterSources)
 	if err != nil {
 		return err
 	}
@@ -503,6 +529,11 @@ func Run(ctx context.Context, config Config) error {
 		"ACTIVE_ENGINE_GENERATION="+generationID,
 		"COOKIE_SECURE="+boolEnv(config.ForceSecureCookies),
 	)
+	trustJSON, err := marshalAdapterTrust(adapterSet)
+	if err != nil {
+		return errors.New("generation adapter trust projection is unavailable")
+	}
+	controlEnv = append(controlEnv, "CONTROL_ADAPTER_TRUST_JSON="+trustJSON)
 	controlEnv = append(controlEnv, storageProviderChildEnv(config.DataDir, startupGeneration.StorageProviderSetID)...)
 	if config.AuthDisabled {
 		controlEnv = append(controlEnv, "AUTH_DISABLED=1")
@@ -802,11 +833,80 @@ func configuredAdapterSourceDirs(value string) ([]string, error) {
 	return dirs, nil
 }
 
+func validateOperatorAdapterDirs(value, bundledHLSBinary string) error {
+	dirs, err := configuredAdapterSourceDirs(value)
+	if err != nil {
+		return errors.New("configured adapter source directories are invalid")
+	}
+	bundledDir := filepath.Dir(bundledHLSBinary)
+	for _, dir := range dirs {
+		// /adapters is an image-owned namespace, not an operator source. Also
+		// reject the exact bundled executable's parent so an operator directory
+		// override cannot introduce a same-name candidate beside it.
+		if dir == "/adapters" || dir == bundledDir {
+			return errors.New("operator adapter sources may not overlap the bundled source directory")
+		}
+	}
+	return nil
+}
+
+func configuredAdapterSources(config Config, registrySources []adaptercatalog.Source) ([]adaptercatalog.Source, error) {
+	sources := make([]adaptercatalog.Source, 0, 1+len(registrySources)+8)
+	sources = append(sources, adaptercatalog.Source{
+		Path: config.BundledHLSBinary, Attestation: plugintrust.NewBundled(), AllowedIDs: []string{"hls"},
+	})
+	sources = append(sources, registrySources...)
+	if !config.AllowOperatorPlugins {
+		return sources, nil
+	}
+	dirs, err := configuredAdapterSourceDirs(config.AdapterDirs)
+	if err != nil || validateOperatorAdapterDirs(config.AdapterDirs, config.BundledHLSBinary) != nil {
+		return nil, errors.New("configured adapter source directories are invalid")
+	}
+	for _, dir := range dirs {
+		sources = append(sources, adaptercatalog.Source{Path: dir, Attestation: plugintrust.NewOperator()})
+	}
+	return sources, nil
+}
+
+func marshalAdapterTrust(snapshot adaptercatalog.Snapshot) (string, error) {
+	if snapshot.ID == "" || len(snapshot.Entries) > 256 {
+		return "", errors.New("adapter trust snapshot is invalid")
+	}
+	projection := make(map[string]plugintrust.Attestation, len(snapshot.Entries))
+	for _, entry := range snapshot.Entries {
+		if !adapterproto.IsValidIdentifier(entry.AdapterID) {
+			return "", errors.New("adapter trust identity is invalid")
+		}
+		attestation := entry.EffectiveAttestation()
+		if attestation != plugintrust.Legacy() && attestation.Validate() != nil {
+			return "", errors.New("adapter trust attestation is invalid")
+		}
+		if _, exists := projection[entry.AdapterID]; exists {
+			return "", errors.New("adapter trust identity is duplicated")
+		}
+		projection[entry.AdapterID] = attestation
+	}
+	data, err := json.Marshal(projection)
+	if err != nil || len(data) > maxControlTrustBytes {
+		return "", errors.New("adapter trust projection exceeds its bound")
+	}
+	return string(data), nil
+}
+
 // reconcileStartupAdapterSet uses only a previously persisted active
 // generation's immutable set as a rejection fallback. A fresh installation
 // has no good set to preserve yet, so valid candidates must still be imported
 // when a different source binary is rejected.
 func reconcileStartupAdapterSet(ctx context.Context, catalog hostAdapterCatalog, registryState generation.Snapshot, additionalSources ...string) (adaptercatalog.Snapshot, generation.Generation, bool, error) {
+	sources := make([]adaptercatalog.Source, 0, len(additionalSources))
+	for _, path := range additionalSources {
+		sources = append(sources, adaptercatalog.Source{Path: path, Attestation: plugintrust.NewOperator()})
+	}
+	return reconcileStartupAdapterSetClassified(ctx, catalog, registryState, sources)
+}
+
+func reconcileStartupAdapterSetClassified(ctx context.Context, catalog hostAdapterCatalog, registryState generation.Snapshot, additionalSources []adaptercatalog.Source) (adaptercatalog.Snapshot, generation.Generation, bool, error) {
 	if catalog == nil {
 		return adaptercatalog.Snapshot{}, generation.Generation{}, false, errors.New("Runtime Host adapter catalog is unavailable")
 	}
@@ -822,10 +922,10 @@ func reconcileStartupAdapterSet(ctx context.Context, catalog hostAdapterCatalog,
 	}
 	var selected adaptercatalog.Snapshot
 	var err error
-	if withSources, ok := catalog.(interface {
-		ReconcileWithSources(context.Context, string, []string) (adaptercatalog.Snapshot, error)
+	if classified, ok := catalog.(interface {
+		ReconcileClassified(context.Context, string, []adaptercatalog.Source) (adaptercatalog.Snapshot, error)
 	}); ok {
-		selected, err = withSources.ReconcileWithSources(ctx, fallbackSetID, additionalSources)
+		selected, err = classified.ReconcileClassified(ctx, fallbackSetID, additionalSources)
 	} else {
 		if len(additionalSources) > 0 {
 			return adaptercatalog.Snapshot{}, generation.Generation{}, false, errors.New("adapter catalog does not support Host-owned plugin sources")

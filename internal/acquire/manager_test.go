@@ -573,9 +573,9 @@ func TestExternalAdapterSubprocessAcquireReloadAndVOD(t *testing.T) {
 	}
 }
 
-func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
-	const firstPayload = "owncast-original-segment-one"
-	const secondPayload = "owncast-original-segment-two"
+func TestBundledHLSBinaryAcquireStopRestartAndVOD(t *testing.T) {
+	const firstPayload = "hls-original-segment-one"
+	const secondPayload = "hls-original-segment-two"
 	source := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/hls/stream.m3u8":
@@ -596,11 +596,11 @@ func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
 	}
 	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", ".."))
 	adapterDir := t.TempDir()
-	adapterBinary := filepath.Join(adapterDir, "integrated-recorder-adapter-owncast")
-	build := exec.Command("go", "build", "-o", adapterBinary, "./cmd/adapters/owncast")
+	adapterBinary := filepath.Join(adapterDir, "integrated-recorder-adapter-hls")
+	build := exec.Command("go", "build", "-o", adapterBinary, "./cmd/adapters/hls")
 	build.Dir = repoRoot
 	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build Owncast adapter: %v\n%s", err, output)
+		t.Fatalf("build HLS adapter: %v\n%s", err, output)
 	}
 
 	dataDir := t.TempDir()
@@ -620,9 +620,9 @@ func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := host.List(); len(got) != 1 || got[0].Status.ID != "owncast" || got[0].Status.State != "ready" {
+	if got := host.List(); len(got) != 1 || got[0].Status.ID != "hls" || got[0].Status.State != "ready" {
 		host.Close()
-		t.Fatalf("actual Owncast binary was not discovered: %#v", got)
+		t.Fatalf("actual HLS binary was not discovered: %#v", got)
 	}
 	validateLocalFixture := func(context.Context, string) error { return nil }
 	manager, err := acquire.NewManager(store, source.Client(), host, validateLocalFixture)
@@ -630,8 +630,8 @@ func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
 		host.Close()
 		t.Fatal(err)
 	}
-	input, _ := json.Marshal(map[string]string{"source_url": source.URL})
-	recording, err := manager.Start(context.Background(), "owncast", input, nil, "actual adapter binary")
+	input, _ := json.Marshal(map[string]string{"manifest_url": source.URL + "/hls/stream.m3u8"})
+	recording, err := manager.Start(context.Background(), "hls", input, nil, "actual adapter binary")
 	if err != nil {
 		host.Close()
 		t.Fatal(err)
@@ -648,7 +648,7 @@ func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
 	if completed == nil || completed.State != domain.StateCompleted {
 		manager.Close(context.Background())
 		host.Close()
-		t.Fatalf("Owncast recording did not complete: %#v", completed)
+		t.Fatalf("HLS recording did not complete: %#v", completed)
 	}
 	if err = manager.Close(context.Background()); err != nil {
 		host.Close()
@@ -677,7 +677,7 @@ func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
 	}
 	previous, err := reloaded.Get(recording.ID)
 	if err != nil || previous.State != domain.StateCompleted || len(previous.Tracks["main"].Segments) != 2 {
-		t.Fatalf("Owncast recording reload = %#v, err=%v", previous, err)
+		t.Fatalf("HLS recording reload = %#v, err=%v", previous, err)
 	}
 	api := newIPv4TestServer(t, server.New(reloaded, host, configs))
 	defer api.Close()
@@ -690,7 +690,7 @@ func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
 	playlist := string(playlistBytes)
 	firstID, secondID := previous.Tracks["main"].Segments[0].ID, previous.Tracks["main"].Segments[1].ID
 	if response.StatusCode != http.StatusOK || !strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE:VOD") || strings.Index(playlist, firstID) < 0 || strings.Index(playlist, firstID) > strings.Index(playlist, secondID) || !strings.Contains(playlist, "#EXT-X-ENDLIST") {
-		t.Fatalf("Owncast VOD playlist invalid (status %d):\n%s", response.StatusCode, playlist)
+		t.Fatalf("HLS VOD playlist invalid (status %d):\n%s", response.StatusCode, playlist)
 	}
 	for index, expected := range []string{firstPayload, secondPayload} {
 		segment := previous.Tracks["main"].Segments[index]
@@ -701,11 +701,11 @@ func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
 		got, _ := io.ReadAll(segmentResponse.Body)
 		segmentResponse.Body.Close()
 		if segmentResponse.StatusCode != http.StatusOK || string(got) != expected {
-			t.Fatalf("Owncast playback segment %d = %q (status %d)", index, got, segmentResponse.StatusCode)
+			t.Fatalf("HLS playback segment %d = %q (status %d)", index, got, segmentResponse.StatusCode)
 		}
 		digest := sha256.Sum256([]byte(expected))
 		if segment.SHA256 != fmt.Sprintf("%x", digest[:]) || segment.PayloadSize != int64(len(expected)) {
-			t.Fatalf("Owncast payload integrity mismatch: %#v", segment)
+			t.Fatalf("HLS payload integrity mismatch: %#v", segment)
 		}
 	}
 }

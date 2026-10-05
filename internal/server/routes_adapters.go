@@ -11,11 +11,13 @@ import (
 
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 )
 
 type adapterAPIView struct {
 	Descriptor *adapterDescriptorAPIView `json:"descriptor,omitempty"`
 	Status     adapterhost.Status        `json:"status"`
+	Trust      *plugintrust.Attestation  `json:"trust,omitempty"`
 }
 
 type adapterDescriptorAPIView struct {
@@ -37,8 +39,17 @@ type adapterBrandingAPIView struct {
 
 // projectAdapter keeps the existing status/descriptor API shape while
 // replacing protocol-owned image bytes with a same-origin authenticated URL.
-func projectAdapter(adapter adapterhost.Adapter) adapterAPIView {
+func (s *Server) projectAdapter(adapter adapterhost.Adapter) adapterAPIView {
 	view := adapterAPIView{Status: adapter.Status}
+	if s.adapterTrust == nil {
+		// Monolithic/development mode has no Runtime Host attestation snapshot.
+		// Discovered binaries remain explicitly operator supplied.
+		attestation := plugintrust.NewOperator()
+		view.Trust = &attestation
+	} else if attestation, exists := s.adapterTrust[adapter.Status.ID]; exists && attestation.Provenance != plugintrust.LegacyUnclassified {
+		copy := attestation
+		view.Trust = &copy
+	}
 	if descriptor := adapter.Descriptor; descriptor != nil {
 		view.Descriptor = &adapterDescriptorAPIView{
 			ID: descriptor.ID, Name: descriptor.Name, Version: descriptor.Version,
@@ -123,7 +134,7 @@ func (s *Server) adapterRestart(w http.ResponseWriter, r *http.Request) {
 	}
 	auditErr := s.appendAudit("adapter_restarted", adapter.Status.ID)
 	setAdapterAuditHeader(w, s.products != nil, auditErr, true)
-	writeJSON(w, http.StatusOK, projectAdapter(adapter))
+	writeJSON(w, http.StatusOK, s.projectAdapter(adapter))
 }
 
 func (s *Server) adapterEnable(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +186,7 @@ func (s *Server) adapterSetEnabled(w http.ResponseWriter, r *http.Request, enabl
 		writeError(w, http.StatusServiceUnavailable, "adapter status is unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, projectAdapter(adapter))
+	writeJSON(w, http.StatusOK, s.projectAdapter(adapter))
 }
 
 func setAdapterAuditHeader(w http.ResponseWriter, available bool, err error, attempted bool) {

@@ -3,10 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -18,8 +20,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/buildinfo"
 	"github.com/integrated-recorder/core/internal/controlplane"
@@ -27,6 +31,7 @@ import (
 	"github.com/integrated-recorder/core/internal/integrity"
 	"github.com/integrated-recorder/core/internal/management"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/preview"
 	"github.com/integrated-recorder/core/internal/recorderengine"
 	"github.com/integrated-recorder/core/internal/runtimehost/installation"
@@ -149,7 +154,10 @@ type processConfig struct {
 	authDisabled        bool
 	forceSecureCookies  bool
 	installationManaged bool
+	adapterTrust        map[string]plugintrust.Attestation
 }
+
+const maxAdapterTrustProjectionBytes = 64 << 10
 
 func loadProcessConfig() (processConfig, error) {
 	c := processConfig{
@@ -159,6 +167,13 @@ func loadProcessConfig() (processConfig, error) {
 		activeEngine: strings.TrimSpace(os.Getenv("ACTIVE_ENGINE_GENERATION")), authDisabled: os.Getenv("AUTH_DISABLED") == "1", forceSecureCookies: os.Getenv("COOKIE_SECURE") == "1", installationManaged: os.Getenv("RUNTIME_INSTALLATION_MANAGED") == "1",
 		resourceSocket: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_SOCKET_PATH")), resourceTokenFile: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_TOKEN_FILE")), resourceOwner: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_OWNER")),
 		storageCatalogRoot: strings.TrimSpace(os.Getenv("STORAGE_PROVIDER_CATALOG_ROOT")), storageProviderSet: strings.TrimSpace(os.Getenv("STORAGE_PROVIDER_SET_ID")),
+	}
+	var err error
+	if value := os.Getenv("CONTROL_ADAPTER_TRUST_JSON"); value != "" {
+		c.adapterTrust, err = parseAdapterTrustProjection(value)
+		if err != nil {
+			return processConfig{}, errors.New("Control adapter trust projection is invalid")
+		}
 	}
 	if c.dataDir == "" || c.controlAddr == "" || c.generationID == "" || c.controlIPCSocket == "" || c.controlTokenFile == "" || c.engineCatalog == "" || c.activeEngine == "" {
 		return processConfig{}, errors.New("required Control Plane runtime configuration is missing")
@@ -188,6 +203,92 @@ func loadProcessConfig() (processConfig, error) {
 	}
 	c.adapterDirs = filepath.SplitList(adapterDirsValue)
 	return c, nil
+}
+
+func parseAdapterTrustProjection(value string) (map[string]plugintrust.Attestation, error) {
+	if len(value) == 0 || len(value) > maxAdapterTrustProjectionBytes {
+		return nil, errors.New("adapter trust projection size is invalid")
+	}
+	data := []byte(value)
+	if !utf8.Valid(data) || rejectDuplicateTrustJSONKeys(data) != nil {
+		return nil, errors.New("adapter trust projection JSON is invalid")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var projection map[string]plugintrust.Attestation
+	if err := decoder.Decode(&projection); err != nil || projection == nil {
+		return nil, errors.New("adapter trust projection is invalid")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, errors.New("adapter trust projection has trailing data")
+	}
+	if len(projection) > 256 {
+		return nil, errors.New("adapter trust projection count is invalid")
+	}
+	for id, attestation := range projection {
+		if !adapterproto.IsValidIdentifier(id) || (attestation != plugintrust.Legacy() && attestation.Validate() != nil) {
+			return nil, errors.New("adapter trust projection identity is invalid")
+		}
+	}
+	return projection, nil
+}
+
+func rejectDuplicateTrustJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := scanTrustJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON")
+	}
+	return nil
+}
+
+func scanTrustJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := map[string]bool{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok || seen[key] {
+				return errors.New("duplicate or invalid JSON object key")
+			}
+			seen[key] = true
+			if err := scanTrustJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim('}') {
+			return errors.New("invalid JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanTrustJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim(']') {
+			return errors.New("invalid JSON array")
+		}
+	default:
+		return errors.New("invalid JSON delimiter")
+	}
+	return nil
 }
 
 type controlApplicationRuntime interface {
@@ -533,6 +634,7 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 		ForceSecureCookies: config.forceSecureCookies, StartedAt: time.Now().UTC(), BuildInfo: buildinfo.Current(),
 		MutationGate: gate, BackgroundMutationGate: gate,
 		InstallationManaged: config.installationManaged,
+		AdapterTrust:        config.adapterTrust,
 	})
 	cleanupAdapters, cleanupIntegrity, cleanupExport, cleanupPreview, cleanupWatch = false, false, false, false, false
 	cleanupStorageRuntime = false

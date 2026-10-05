@@ -2,15 +2,61 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/integrated-recorder/core/internal/controlplane"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/recorderengine"
 )
+
+func TestParseAdapterTrustProjectionStrictly(t *testing.T) {
+	input := map[string]plugintrust.Attestation{
+		"hls":  plugintrust.NewBundled(),
+		"soop": plugintrust.NewOfficialRegistry(plugintrust.FirstParty),
+		"old":  plugintrust.Legacy(),
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseAdapterTrustProjection(string(encoded))
+	if err != nil || len(got) != len(input) {
+		t.Fatalf("valid projection parse = (%+v, %v)", got, err)
+	}
+	for id, want := range input {
+		if got[id] != want {
+			t.Fatalf("projection[%q] = %+v, want %+v", id, got[id], want)
+		}
+	}
+
+	for name, value := range map[string]string{
+		"unknown field":      `{"hls":{"provenance":"bundled","authority":"core_release","publisher":"first_party","reviewed":true,"path":"/private"}}`,
+		"duplicate id":       `{"hls":{"provenance":"operator","authority":"local","publisher":"unknown","reviewed":false},"hls":{"provenance":"operator","authority":"local","publisher":"unknown","reviewed":false}}`,
+		"invalid tuple":      `{"hls":{"provenance":"bundled","authority":"local","publisher":"first_party","reviewed":true}}`,
+		"invalid legacy":     `{"hls":{"provenance":"legacy_unclassified","authority":"official","publisher":"unknown","reviewed":false}}`,
+		"invalid identifier": `{"bad/id":{"provenance":"bundled","authority":"core_release","publisher":"first_party","reviewed":true}}`,
+		"trailing JSON":      `{"hls":{"provenance":"bundled","authority":"core_release","publisher":"first_party","reviewed":true}} {}`,
+		"non-object":         `[]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseAdapterTrustProjection(value); err == nil {
+				t.Fatal("invalid trust projection was accepted")
+			}
+		})
+	}
+	if _, err := parseAdapterTrustProjection(strings.Repeat(" ", maxAdapterTrustProjectionBytes+1)); err == nil {
+		t.Fatal("oversized trust projection was accepted")
+	}
+	if _, err := parseAdapterTrustProjection(string([]byte{'{', 0xff, '}'})); err == nil {
+		t.Fatal("invalid UTF-8 trust projection was accepted")
+	}
+}
 
 func TestNormalizeEngineDetachResultIsIdempotentOnlyWhenAlreadyAbsent(t *testing.T) {
 	if err := normalizeEngineDetachResult(recorderengine.ErrGenerationNotAttached); err != nil {

@@ -14,11 +14,17 @@ export type AdapterDescriptor = {
   branding?: { icon_url?: string }; input_schema: Schema; configuration_schema: Schema; resource_types?: { type: string; parent_types?: string[]; configuration_schema?: Schema }[]; media_types: string[]
 }
 export type AdapterStatus = { id: string; name?: string; version?: string; protocol_version?: number; state: string; error?: string; generation?: number; restart_attempts?: number }
-export type Adapter = { descriptor?: AdapterDescriptor; status: AdapterStatus }
+export type PluginTrust = {
+  provenance: 'bundled' | 'registry' | 'operator'
+  authority: 'core_release' | 'official' | 'custom' | 'local'
+  publisher: 'first_party' | 'third_party' | 'unknown'
+  reviewed: boolean
+}
+export type Adapter = { descriptor?: AdapterDescriptor; status: AdapterStatus; trust?: PluginTrust }
 export type AdapterReconcileResult = { state: 'unchanged' | 'activated' | 'rejected' | 'failed'; active_adapter_count: number; rejected_count: number; failure_code?: string; generation_id?: string }
 export type PluginRegistryStatus = {
   state: 'ready' | 'unavailable' | 'not_configured'; failure_code?: 'plugin_registry_unavailable';
-  plugins: { id: string; type: 'source' | 'storage'; name: string; available_version?: string; installed_version?: string; installed: boolean; update_available: boolean }[]
+  plugins: { id: string; type: 'source' | 'storage'; name: string; available_version?: string; installed_version?: string; installed: boolean; update_available: boolean; trust?: PluginTrust }[]
 }
 export type WatchState = 'disabled' | 'offline' | 'checking' | 'starting' | 'recording' | 'backoff' | 'attention_required' | 'suppressed'
 export type WatchView = {

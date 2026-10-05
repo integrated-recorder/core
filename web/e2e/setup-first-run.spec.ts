@@ -89,7 +89,7 @@ test('fresh installation completes through product APIs and remains ready after 
   const adapterResponse = await page.request.get('/api/adapters')
   expect(adapterResponse.ok()).toBeTruthy()
   const adapters = await adapterResponse.json() as Array<{ descriptor?: { id?: string }; status?: { id?: string } }>
-  expect(adapters.some(adapter => adapter.descriptor?.id === 'owncast' || adapter.status?.id === 'owncast')).toBe(true)
+  expect(adapters.some(adapter => adapter.descriptor?.id === 'hls' || adapter.status?.id === 'hls')).toBe(true)
   await page.getByRole('button', { name: '계속' }).click()
 
   await expect(page.getByRole('heading', { name: '마지막으로 확인' })).toBeVisible()

@@ -23,7 +23,9 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
-Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. Runtime Host가 설정된 source directory를 주기적으로 import source로 확인하고 새 executable을 검증해 immutable artifact/set으로 보관합니다. Application generation은 `(application release, adapter set, storage provider set)`의 조합으로 구분됩니다. Adapter reconciliation과 명시적인 storage backend activation은 Host나 container 재시작 없이 새 generation을 활성화합니다. Application release update는 현재 두 set을 이어 씁니다. 기존 녹화는 시작 당시 Engine, adapter artifact, storage provider artifact를 lease가 끝날 때까지 유지합니다. 부분 복사를 피하려면 adapter binary를 임시 이름으로 복사한 뒤 `integrated-recorder-adapter-*` 최종 이름으로 atomic rename하세요. 관리자가 HTTPS `IR_PLUGIN_REGISTRY_URL`을 설정하면 `/adapters` 화면에서 승인된 stable plugin을 수동으로 설치·업데이트할 수 있습니다. Registry v1은 기존 source adapter 형식을 유지하고, v2는 source/storage plugin type과 protocol을 명시합니다. Registry는 빌드나 publisher 서명 체계가 아니며, 승인된 artifact의 크기와 SHA-256을 고정합니다. 실행 파일은 신뢰된 로컬 코드이며 sandbox되지 않습니다. 기본 file secret store와 storage provider 설정은 private 권한으로 저장하지만 저장 시 암호화되지 않습니다.
+Plugin admission provenance와 publisher affiliation은 별도 metadata입니다. Host가 결정하는 provenance는 `bundled`, `registry`, `operator`이며 publisher는 `first_party`, `third_party`, `unknown`입니다. Bundled plugins는 `source.hls`와 `storage.local`입니다. Owncast는 first-party 소프트웨어지만 Core image에는 포함되지 않으며, 공개 release와 Registry 승인 이후에만 공식 Registry plugin으로 설치할 수 있습니다. Registry v3는 publisher affiliation을 기록하고 artifact URL, size, SHA-256, descriptor identity, protocol을 고정합니다. Custom Registry와 `/external-adapters`에서 온 로컬 executable은 project-reviewed plugin으로 표시되지 않습니다. 모든 plugin은 native executable이고 sandbox가 없습니다. 자세한 내용은 [Plugin Trust Model](docs/PLUGIN_TRUST_MODEL.md)을 참고하세요.
+
+Runtime Host는 `IR_PLUGIN_REGISTRY_URL`로 설정된 Registry를 수동 refresh/install/update에 사용합니다. 공식 catalog는 `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`이고, Registry v1/v2 custom catalog도 호환됩니다. Registry는 빌드 서버나 publisher 서명 체계가 아닙니다. 기존 녹화는 시작 당시 Engine, adapter artifact/set, storage provider artifact/set을 계속 사용합니다. 기본 file secret store와 storage provider 설정은 private 권한으로 저장하지만 저장 시 암호화되지는 않습니다.
 
 Core는 archive 형식과 쓰기 권한을 계속 소유합니다. `storage.local`은 Storage Provider Protocol v1을 사용하는 첫 bundled reference storage plugin이며, Registry 없이도 기본 primary로 제공됩니다. Core의 recording write, playback, integrity, delete, recovery 경로는 local 저장소에서도 provider executable을 통과합니다. Provider는 logical object key의 bytes를 물리적으로 배치·전달할 뿐 Recording, segment ordinal, metadata, gap, ownership semantics를 결정하지 않습니다. Runtime Host는 bundled executable을 일반 immutable artifact/set lifecycle로 import하고 application generation에 pin합니다. Local provider에는 Host가 통제하는 기존 `/data/recordings` root만 전달하며, API를 통해 arbitrary filesystem path를 지정할 수 없습니다. 기존 archive는 이 root에서 이동 없이 채택됩니다. `/data/runtime`은 generation, owner, catalog, settings, secret, IPC 및 recovery 상태 등 Core runtime state 전용입니다. v1은 한 번에 하나의 primary backend만 사용하며 기존 archive가 있을 때 물리 backend 종류를 바꾸는 자동 migration은 없습니다. 실제 S3/B2/WebDAV provider는 아직 포함되지 않습니다. 자세한 내용은 [Storage Provider Protocol v1](docs/STORAGE_PROVIDER_PROTOCOL_V1.md), [storage provider lifecycle](docs/STORAGE_PROVIDER_V1.md), [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
@@ -39,7 +41,7 @@ React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 
 
 현재 지원:
 
-- Core와 분리된 실행 파일 adapter 구조. Core는 platform semantics를 알지 않으며 Owncast가 첫 adapter입니다.
+- Core와 분리된 실행 파일 adapter 구조. Core는 platform semantics를 알지 않으며 direct HLS 입력은 bundled `source.hls`, 플랫폼 integration은 Registry plugin으로 제공합니다.
 - Adapter schema로 입력 및 설정 form을 생성하고, resource discovery와 설정 challenge를 generic workflow로 이어가는 기반.
 - plugin 및 parent resource 설정을 합성하고, 현재 scope의 저장값과 effective 값을 구분해 노출.
 - timeout/crash 후 다음 요청에서 backoff와 describe 재검증을 거쳐 adapter process를 lazy restart.
@@ -54,14 +56,14 @@ React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 
 - 브라우저 playback 및 seek
 - Core-owned archive semantics 위에서 동작하는 Storage Provider Protocol v1. `storage.local`은 Registry와 무관하게 배포되는 bundled production plugin이자 reference implementation입니다. Production cloud provider는 포함되지 않습니다.
 
-첫 실제 acceptance test는 공개 Owncast TV 예제 방송으로 수행했습니다. media segment 90개, 약 270초 VOD, detected gap 0개를 기록했고, 재시작/reload 및 0:00, 2:15, 4:27 seek에 성공했습니다. 저장 segment의 hash도 source 재요청본과 일치했습니다.
+이전 Owncast TV 예제 방송 acceptance는 당시 Core에 bundled된 구현으로 수행했습니다. media segment 90개, 약 270초 VOD, detected gap 0개를 기록했고 재시작/reload 및 0:00, 2:15, 4:27 seek에 성공했습니다. 이번 작업은 Owncast를 Core에서 분리하고 Registry 배포를 준비하지만, 실제 release와 Registry 승인이 끝나기 전에는 공식 catalog에서 설치할 수 없습니다.
 
 아직 미지원:
 
 - chat timeline
 - finalized TAR/index archive format
 - HDD/NAS/LTO tiering, multi-pool placement, archive migration, replication/mirroring
-- 추가 platform adapter
+- platform-specific adapter 추가 등록
 - external audio rendition synchronization
 - 암호화 HLS 및 partial-only/delta LL-HLS
 - DRM workflow
@@ -74,7 +76,7 @@ Go 1.23 이상이 필요합니다.
 
 ```sh
 mkdir -p adapters
-go build -o adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast
+go build -o adapters/integrated-recorder-adapter-hls ./cmd/adapters/hls
 DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=127.0.0.1:8080 go run ./cmd/archiver
 ```
 
@@ -94,7 +96,9 @@ docker compose up -d
 docker compose exec archiver runtime-host setup-code
 ```
 
-컨테이너는 named `/data` volume을 사용하며 Runtime Host listener를 host loopback에 공개합니다. Image에는 Runtime Host, initial Control/Engine release, `/adapters`의 Owncast source adapter, 그리고 `storage.local` executable이 포함됩니다. Host는 시작할 때 local executable을 Protocol v1로 probe하고 immutable storage artifact/set으로 import한 뒤 기존 `/data/recordings`를 archive root로 사용합니다. archive bytes 이동은 없습니다. `/data/runtime`은 이 archive와 분리된 Core runtime state로 유지됩니다. 추가 executable adapter를 `./adapter-binaries`에 임시 이름으로 복사한 뒤 `integrated-recorder-adapter-*` 이름으로 atomic rename하면 `/external-adapters` read-only mount를 Runtime Host가 자동으로 확인·검증하고 새 immutable adapter set을 활성화합니다. Host나 container를 재시작할 필요가 없으며 이미 진행 중인 녹화는 시작 당시 Engine 및 adapter/storage provider generation을 계속 사용합니다. 원격 curated registry를 사용할 때는 `IR_PLUGIN_REGISTRY_URL=https://<registry-host>/<catalog>.json`을 Runtime Host 환경에 설정하세요. `/adapters` 화면에서 원격 source/storage plugin을 관리할 수 있지만 `storage.local`은 bundled mandatory plugin이므로 Registry 설치나 제거 대상이 아닙니다. Registry는 승인된 artifact의 exact size/SHA-256을 제공하며 다운로드한 binary는 해당 Protocol v1 probe와 immutable catalog lifecycle을 통과합니다. community catalog, publisher signing, automatic plugin updates, sandboxing은 제공하지 않습니다. 선택된 storage provider가 시작되지 않으면 generation readiness가 실패하며 Core는 direct-local I/O로 fallback하지 않습니다. 원격 애플리케이션 update에는 별도로 provision한 Ed25519 public trust key가 필요하며, trust key가 없는 배포는 fail-closed됩니다. 인증 없는 control API는 신뢰하는 host/private network 또는 인증 reverse proxy 안에서만 사용하고 untrusted network에 직접 공개하지 마세요.
+컨테이너는 named `/data` volume을 사용하며 Runtime Host listener를 host loopback에 공개합니다. Image에는 Runtime Host, initial Control/Engine release, Host manifest에 등록된 bundled `/adapters/integrated-recorder-adapter-hls`, 그리고 `storage.local` executable이 포함됩니다. Owncast executable은 Core image에 포함되지 않습니다. Host는 시작할 때 storage.local을 Protocol v1로 probe하고 immutable storage artifact/set으로 import한 뒤 기존 `/data/recordings`를 archive root로 사용합니다. archive bytes 이동은 없습니다. `/data/runtime`은 이 archive와 분리된 Core runtime state로 유지됩니다.
+
+로컬 개발용 executable은 `./adapter-binaries`에 `integrated-recorder-adapter-*` 이름으로 원자적으로 설치하고, production Runtime Host에서 사용하려면 `IR_ALLOW_OPERATOR_PLUGINS=1`을 명시적으로 설정하세요. Runtime Host가 `/external-adapters` read-only mount에서 이를 probe/hash/import하고 새 immutable adapter set을 활성화합니다. 이들은 `Local / Operator trusted`, `Not reviewed by Integrated Recorder`로 표시됩니다. Host나 container 재시작 없이 generation이 바뀌며 진행 중인 녹화는 원래 set을 계속 사용합니다. 공식 Registry에서 설치하려면 HTTPS Registry 주소를 `IR_PLUGIN_REGISTRY_URL`로 설정하세요. Core가 설정 없이 사용하는 공식 catalog URL은 `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`입니다. `/adapters` 화면에서 Registry source/storage plugin을 관리할 수 있지만 `storage.local`은 bundled mandatory plugin이므로 Registry 설치·제거 대상이 아닙니다. Registry exact size/SHA-256와 descriptor/protocol을 검증한 뒤 기존 immutable import lifecycle을 사용합니다. Custom catalog는 official review로 간주되지 않습니다. publisher PKI, automatic plugin updates, sandboxing은 제공하지 않습니다. 선택된 storage provider가 시작되지 않으면 generation readiness가 실패하며 Core는 direct-local I/O로 fallback하지 않습니다. 원격 애플리케이션 update에는 별도로 provision한 Ed25519 public trust key가 필요하며, trust key가 없는 배포는 fail-closed됩니다. 인증 없는 control API는 신뢰하는 host/private network 또는 인증 reverse proxy 안에서만 사용하고 untrusted network에 직접 공개하지 마세요.
 
 ## API
 
@@ -133,12 +137,12 @@ docker compose exec archiver runtime-host setup-code
 | `GET` | `/api/recordings/{id}/play/tracks/{track}/playlist.m3u8` | 생성된 VOD media playlist |
 | `GET` | `/api/recordings/{id}/play/segments/{segmentID}` | 저장된 원본 payload |
 
-첫 adapter로 녹화 시작 예시:
+bundled direct-HLS adapter로 녹화 시작 예시:
 
 ```sh
 curl -X POST http://localhost:8080/api/recordings \
   -H 'Content-Type: application/json' \
-  -d '{"adapter_id":"owncast","input":{"source_url":"https://watch.owncast.online"},"title":"optional title","preview_mode":"segment"}'
+  -d '{"adapter_id":"hls","input":{"manifest_url":"https://media.example/live/index.m3u8"},"title":"optional title","preview_mode":"segment"}'
 ```
 
 `preview_mode`는 선택 사항이며 생략하면 `disabled`입니다. `segment`를 지정하면 canonical segment가 저장된 뒤 별도 bounded background worker가 장면 미리보기를 생성합니다.
@@ -174,7 +178,9 @@ go vet ./...
 ## Roadmap
 
 - [x] 원본 segment acquisition + restart-safe VOD playback
-- [x] platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
+- [x] platform-agnostic Core + Adapter Protocol v1 + bundled HLS bridge
+- [ ] Owncast source plugin release and official Registry approval
+- [x] three-tier plugin admission provenance, separate publisher affiliation, and trust-aware runtime projection
 - [x] restartless immutable adapter lifecycle (Host import, adapter-set generations, recording pinning)
 - [x] resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] chat timeline

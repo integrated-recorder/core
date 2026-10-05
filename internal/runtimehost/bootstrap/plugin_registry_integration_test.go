@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
 	"github.com/integrated-recorder/core/internal/runtimehost/pluginregistry"
@@ -68,19 +69,15 @@ func TestPluginRegistryInstallUpdateUninstallUsesImmutableGenerationLifecycle(t 
 	if err := registry.Refresh(context.Background()); err != nil {
 		t.Fatalf("refresh registry v1: %v", err)
 	}
-	localSources := filepath.Join(root, "local-adapters")
-	if err := os.Mkdir(localSources, 0700); err != nil {
-		t.Fatal(err)
-	}
-	catalog, err := adaptercatalog.Open(filepath.Join(fixture.root, "runtime", "adapters"), []string{localSources})
+	catalog, err := adaptercatalog.Open(filepath.Join(fixture.root, "runtime", "adapters"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pluginSources, err := registry.DesiredSourceDirs()
+	pluginSources, err := registry.DesiredSources()
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialSet, err := catalog.ReconcileWithSources(context.Background(), "", pluginSources)
+	initialSet, err := catalog.ReconcileClassified(context.Background(), "", pluginSources)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +107,7 @@ func TestPluginRegistryInstallUpdateUninstallUsesImmutableGenerationLifecycle(t 
 	}
 	v1SetID := fixture.registry.Snapshot().Generations[v1Generation].AdapterSetID
 	assertCatalogPlugin(t, catalog, v1SetID, "registry_fixture", "1.0.0", sha256Hex(v1))
+	assertCatalogPluginTrust(t, catalog, v1SetID, "registry_fixture", plugintrust.NewCustomRegistry())
 	assertPluginAdapterAPI(t, catalog, v1SetID, "registry_fixture", "1.0.0", true)
 
 	mu.Lock()
@@ -134,6 +132,7 @@ func TestPluginRegistryInstallUpdateUninstallUsesImmutableGenerationLifecycle(t 
 		t.Fatal("adapter update reused the old immutable adapter set")
 	}
 	assertCatalogPlugin(t, catalog, v2SetID, "registry_fixture", "2.0.0", sha256Hex(v2))
+	assertCatalogPluginTrust(t, catalog, v2SetID, "registry_fixture", plugintrust.NewCustomRegistry())
 	assertCatalogPlugin(t, catalog, v1SetID, "registry_fixture", "1.0.0", sha256Hex(v1))
 	assertPluginAdapterAPI(t, catalog, v2SetID, "registry_fixture", "2.0.0", true)
 
@@ -172,13 +171,30 @@ func TestPluginRegistryInstallUpdateUninstallUsesImmutableGenerationLifecycle(t 
 
 type rejectedFallbackCatalog struct{ *adaptercatalog.Catalog }
 
-func (c rejectedFallbackCatalog) ReconcileWithSources(_ context.Context, fallbackSetID string, _ []string) (adaptercatalog.Snapshot, error) {
+func (c rejectedFallbackCatalog) ReconcileClassified(_ context.Context, fallbackSetID string, _ []adaptercatalog.Source) (adaptercatalog.Snapshot, error) {
 	selected, err := c.Load(fallbackSetID)
 	if err != nil {
 		return adaptercatalog.Snapshot{}, err
 	}
 	selected.RejectedCount = 1
 	return selected, nil
+}
+
+func assertCatalogPluginTrust(t *testing.T, catalog *adaptercatalog.Catalog, setID, adapterID string, want plugintrust.Attestation) {
+	t.Helper()
+	set, err := catalog.Load(setID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range set.Entries {
+		if entry.AdapterID == adapterID {
+			if got := entry.EffectiveAttestation(); got != want {
+				t.Fatalf("adapter %q trust = %+v, want %+v", adapterID, got, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("adapter %q missing from set %s", adapterID, setID)
 }
 
 func TestPluginRegistryBadDigestDoesNotChangeDesiredOrActiveGeneration(t *testing.T) {

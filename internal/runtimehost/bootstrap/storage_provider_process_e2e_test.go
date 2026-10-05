@@ -107,6 +107,7 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 			"ADDR=" + listenAddr,
 			"AUTH_DISABLED=1",
 			"ADAPTER_DIR=" + artifacts.adapterDir,
+			"IR_ALLOW_OPERATOR_PLUGINS=1",
 			"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 			"IR_PLUGIN_REGISTRY_URL=" + registryServer.URL + "/registry.json",
 			"IR_RUNTIME_E2E_PLUGIN_REGISTRY_CA_FILE=" + caPath,

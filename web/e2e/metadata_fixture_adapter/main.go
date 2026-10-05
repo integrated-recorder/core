@@ -1,6 +1,6 @@
 // Command metadata-fixture-adapter is an E2E-only Protocol v1 adapter. It
 // exercises Core metadata polling with a mutable local fixture, without
-// weakening the production Owncast adapter's public-network checks.
+// weakening production public-network checks.
 package main
 
 import (

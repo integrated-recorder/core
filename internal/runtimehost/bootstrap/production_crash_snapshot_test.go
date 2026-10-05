@@ -1,6 +1,10 @@
 package bootstrap
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/integrated-recorder/core/internal/domain"
+)
 
 func TestCompareArchiveSnapshotsAllowingManifestAppend(t *testing.T) {
 	const (
@@ -22,6 +26,27 @@ func TestCompareArchiveSnapshotsAllowingManifestAppend(t *testing.T) {
 		after[addedJSON] = "new-sidecar-hash"
 		if err := compareArchiveSnapshotsAllowingManifestAppend(before, after); err != nil {
 			t.Fatalf("complete append rejected: %v", err)
+		}
+	})
+
+	t.Run("allows an unreferenced manifest payload interrupted before its sidecar", func(t *testing.T) {
+		after := copySnapshot(before)
+		after[addedM3U8] = "new-manifest-hash"
+		if err := compareArchiveSnapshotsAllowingManifestAppend(before, after); err != nil {
+			t.Fatalf("atomic but unreferenced manifest payload rejected: %v", err)
+		}
+	})
+
+	t.Run("accepts only complete manifest objects referenced by the archive root", func(t *testing.T) {
+		recording := &domain.Recording{Snapshots: []domain.ManifestSnapshot{{StoragePath: manifest}}}
+		if err := validateManifestSnapshotReferences(recording, before); err != nil {
+			t.Fatalf("complete root-referenced snapshot rejected: %v", err)
+		}
+		recording.Snapshots = append(recording.Snapshots, domain.ManifestSnapshot{StoragePath: addedM3U8})
+		if err := validateManifestSnapshotReferences(recording, map[string]string{
+			addedM3U8: "new-manifest-hash",
+		}); err == nil {
+			t.Fatal("root reference to an orphan manifest payload accepted")
 		}
 	})
 
@@ -49,11 +74,11 @@ func TestCompareArchiveSnapshotsAllowingManifestAppend(t *testing.T) {
 		}
 	})
 
-	t.Run("rejects incomplete pair", func(t *testing.T) {
+	t.Run("rejects an orphan manifest sidecar", func(t *testing.T) {
 		after := copySnapshot(before)
-		after[addedM3U8] = "new-manifest-hash"
+		after[addedJSON] = "new-sidecar-hash"
 		if err := compareArchiveSnapshotsAllowingManifestAppend(before, after); err == nil {
-			t.Fatal("unpaired manifest accepted")
+			t.Fatal("manifest sidecar without its payload accepted")
 		}
 	})
 

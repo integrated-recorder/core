@@ -29,6 +29,7 @@ import (
 	"github.com/integrated-recorder/core/internal/integrity"
 	"github.com/integrated-recorder/core/internal/management"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/preview"
 	"github.com/integrated-recorder/core/internal/storage"
 	"github.com/integrated-recorder/core/internal/systemsettings"
@@ -39,6 +40,7 @@ type Server struct {
 	manager                     recordingManager
 	storage                     *storage.Store
 	adapters                    *adapterhost.Host
+	adapterTrust                map[string]plugintrust.Attestation
 	configs                     *pluginconfig.Service
 	products                    *management.Store
 	integrity                   *integrity.Service
@@ -100,7 +102,11 @@ type Options struct {
 	Commit                      string
 	BuildInfo                   buildinfo.Info
 	InstallationManaged         bool
-	MutationGate                interface {
+	// AdapterTrust is the admission evidence from this Control generation's
+	// immutable adapter-set snapshot. A nil map means a standalone/development
+	// Control process and is projected conservatively as local operator input.
+	AdapterTrust map[string]plugintrust.Attestation
+	MutationGate interface {
 		Wrap(http.Handler) http.Handler
 	}
 	BackgroundMutationGate interface {
@@ -161,7 +167,7 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 			archiveStore = local.Store()
 		}
 	}
-	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, installationManaged: options.InstallationManaged, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
+	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, adapterTrust: validatedAdapterTrust(options.AdapterTrust), configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, installationManaged: options.InstallationManaged, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
 	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
@@ -206,6 +212,23 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 	handler = requestLogMiddleware(s.logs, handler)
 	s.handler = securityHeaders(handler)
 	return s
+}
+
+func validatedAdapterTrust(input map[string]plugintrust.Attestation) map[string]plugintrust.Attestation {
+	if input == nil {
+		return nil
+	}
+	output := make(map[string]plugintrust.Attestation, len(input))
+	for id, attestation := range input {
+		if !adapterproto.IsValidIdentifier(id) {
+			continue
+		}
+		if attestation != plugintrust.Legacy() && attestation.Validate() != nil {
+			continue
+		}
+		output[id] = attestation
+	}
+	return output
 }
 
 // ServeHTTP makes the configured Server usable directly by net/http while
@@ -473,7 +496,7 @@ func (s *Server) adapterList(w http.ResponseWriter, r *http.Request) {
 	adapters := s.adapters.List()
 	views := make([]adapterAPIView, 0, len(adapters))
 	for _, adapter := range adapters {
-		views = append(views, projectAdapter(adapter))
+		views = append(views, s.projectAdapter(adapter))
 	}
 	writeJSON(w, http.StatusOK, views)
 }
@@ -487,7 +510,7 @@ func (s *Server) adapterGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "adapter not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, projectAdapter(adapter))
+	writeJSON(w, http.StatusOK, s.projectAdapter(adapter))
 }
 func (s *Server) adapterSchema(w http.ResponseWriter, r *http.Request) {
 	if s.adapters == nil {

@@ -47,7 +47,7 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
     } else if (path === '/api/system/info') {
       await route.fulfill({ json: { version: '1.2.3', commit: 'test', go_version: 'go', goos: 'linux', goarch: 'amd64', started_at: new Date().toISOString(), uptime_seconds: 1, export_available: true } })
     } else if (path === '/api/adapters') {
-      await route.fulfill({ json: [{ status: { id: 'owncast', name: 'Owncast', state: 'running' }, descriptor: { id: 'owncast', name: 'Owncast', version: '1', protocol_version: 1, capabilities: [], input_schema: { fields: [] }, configuration_schema: { fields: [] }, media_types: [] } }] })
+      await route.fulfill({ json: [{ status: { id: 'hls', name: 'HLS', state: 'running' }, descriptor: { id: 'hls', name: 'HLS', version: '1', protocol_version: 1, capabilities: [], input_schema: { fields: [] }, configuration_schema: { fields: [] }, media_types: [] } }] })
     } else if (path === '/api/setup/complete') {
       expect(request.headers()['x-csrf-token']).toBe('csrf-after-bootstrap')
       installationState = 'ready'
@@ -80,7 +80,7 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
   await expect(page.getByText('기본 저장소 진단')).toBeVisible()
   await page.getByRole('button', { name: '계속' }).click()
   await expect(page.getByRole('heading', { name: '어댑터 확인' })).toBeVisible()
-  await expect(page.getByText('Owncast', { exact: false }).first()).toBeVisible()
+  await expect(page.getByText('HLS', { exact: false }).first()).toBeVisible()
   await page.getByRole('button', { name: '계속' }).click()
   await expect(page.getByRole('heading', { name: '마지막으로 확인' })).toBeVisible()
   await page.getByRole('button', { name: '설치 완료' }).click()

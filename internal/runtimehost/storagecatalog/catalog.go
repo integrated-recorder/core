@@ -18,26 +18,29 @@ import (
 	"sync"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
 const (
-	SchemaVersion    = 1
-	MaxArtifactBytes = 512 << 20
-	maxManifestBytes = 64 << 10
-	maxStateBytes    = 1 << 20
-	maxCatalogItems  = 4096
-	probeTimeout     = 6 * time.Second
-	copyBufferSize   = 256 << 10
+	SchemaVersion           = 1
+	MaxArtifactBytes        = 512 << 20
+	maxManifestBytes        = 64 << 10
+	maxStateBytes           = 1 << 20
+	maxCatalogItems         = 4096
+	maxArtifactAttestations = 5
+	probeTimeout            = 6 * time.Second
+	copyBufferSize          = 256 << 10
 )
 
 var (
-	ErrInvalidConfig   = errors.New("storage catalog configuration is invalid")
-	ErrUnsafeStore     = errors.New("storage catalog is unsafe")
-	ErrInvalidArtifact = errors.New("storage provider artifact is invalid")
-	ErrArtifactMissing = errors.New("storage provider artifact is unavailable")
-	ErrInvalidSet      = errors.New("storage provider set is invalid")
-	ErrSetMissing      = errors.New("storage provider set is unavailable")
+	ErrInvalidConfig      = errors.New("storage catalog configuration is invalid")
+	ErrUnsafeStore        = errors.New("storage catalog is unsafe")
+	ErrInvalidArtifact    = errors.New("storage provider artifact is invalid")
+	ErrArtifactMissing    = errors.New("storage provider artifact is unavailable")
+	ErrInvalidSet         = errors.New("storage provider set is invalid")
+	ErrSetMissing         = errors.New("storage provider set is unavailable")
+	ErrAttestationMissing = errors.New("storage provider admission attestation is unavailable")
 )
 
 // Expected is the exact provider identity and byte identity required when
@@ -70,15 +73,26 @@ type SetConfig struct {
 
 // Set pins one validated artifact to one private configuration snapshot.
 type Set struct {
-	ID       string    `json:"id"`
-	Artifact Artifact  `json:"artifact"`
-	Config   SetConfig `json:"config"`
+	ID          string                   `json:"id"`
+	Artifact    Artifact                 `json:"artifact"`
+	Config      SetConfig                `json:"config"`
+	Attestation *plugintrust.Attestation `json:"attestation,omitempty"`
+}
+
+// EffectiveAttestation returns the persisted Host attestation, or the
+// conservative legacy marker for a pre-provenance provider set.
+func (s Set) EffectiveAttestation() plugintrust.Attestation {
+	if s.Attestation == nil {
+		return plugintrust.Legacy()
+	}
+	return *s.Attestation
 }
 
 type setManifest struct {
-	SchemaVersion int      `json:"schema_version"`
-	Artifact      Artifact `json:"artifact"`
-	ConfigSHA256  string   `json:"config_sha256"`
+	SchemaVersion int                      `json:"schema_version"`
+	Artifact      Artifact                 `json:"artifact"`
+	ConfigSHA256  string                   `json:"config_sha256"`
+	Attestation   *plugintrust.Attestation `json:"attestation,omitempty"`
 }
 
 // Catalog serializes mutations to the private provider catalog. Runtime Host
@@ -89,9 +103,11 @@ type Catalog struct {
 }
 
 type catalogState struct {
-	SchemaVersion int               `json:"schema_version"`
-	Installed     []Artifact        `json:"installed"`
-	DesiredSets   map[string]string `json:"desired_sets"`
+	SchemaVersion         int                                  `json:"schema_version"`
+	Installed             []Artifact                           `json:"installed"`
+	DesiredSets           map[string]string                    `json:"desired_sets"`
+	ArtifactAttestations  map[string][]plugintrust.Attestation `json:"artifact_attestations,omitempty"`
+	InstalledAttestations map[string]plugintrust.Attestation   `json:"installed_attestations,omitempty"`
 }
 
 // Open creates or validates the private catalog and removes only owned
@@ -323,11 +339,50 @@ func stableExecutableDigest(ctx context.Context, sourcePath string) (int64, stri
 // CreateSet validates config against the artifact schema, canonicalizes the
 // private snapshot, and publishes it under its content identity.
 func (c *Catalog) CreateSet(artifactDigest string, config SetConfig) (Set, error) {
+	return c.CreateSetWithAttestation(artifactDigest, config, plugintrust.NewOperator())
+}
+
+// CreateSetWithAttestation publishes an immutable provider configuration set
+// with Host-selected admission provenance. The attestation is kept in the set
+// manifest, separate from the content-addressed executable artifact.
+func (c *Catalog) CreateSetWithAttestation(artifactDigest string, config SetConfig, attestation plugintrust.Attestation) (Set, error) {
 	if c == nil || !validDigest(artifactDigest) {
+		return Set{}, ErrInvalidConfig
+	}
+	if attestation.Validate() != nil {
 		return Set{}, ErrInvalidConfig
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.createSetLocked(artifactDigest, config, attestation)
+}
+
+// CreateInstalledSet atomically snapshots the currently installed artifact
+// and its durable selected admission attestation. It is intended for the
+// configure/probe path after installation, including when the Registry is
+// unavailable.
+func (c *Catalog) CreateInstalledSet(providerID string, config SetConfig) (Set, error) {
+	if c == nil || !validProviderID(providerID) {
+		return Set{}, ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state, err := c.readState()
+	if err != nil {
+		return Set{}, err
+	}
+	artifact, found := installedArtifact(state.Installed, providerID)
+	if !found {
+		return Set{}, ErrInvalidArtifact
+	}
+	attestation, found := state.InstalledAttestations[providerID]
+	if !found {
+		return Set{}, ErrAttestationMissing
+	}
+	return c.createSetLocked(artifact.Digest, config, attestation)
+}
+
+func (c *Catalog) createSetLocked(artifactDigest string, config SetConfig, attestation plugintrust.Attestation) (Set, error) {
 	artifact, descriptor, err := c.loadArtifact(artifactDigest)
 	if err != nil {
 		return Set{}, err
@@ -340,12 +395,13 @@ func (c *Catalog) CreateSet(artifactDigest string, config SetConfig) (Set, error
 		return Set{}, ErrInvalidConfig
 	}
 	configSum := sha256.Sum256(configBytes)
-	manifestBytes, err := encodeSetManifest(artifact, hex.EncodeToString(configSum[:]))
+	attestationCopy := attestation
+	manifestBytes, err := encodeSetManifest(artifact, hex.EncodeToString(configSum[:]), &attestationCopy)
 	if err != nil || len(manifestBytes) > maxManifestBytes {
 		return Set{}, ErrInvalidConfig
 	}
 	id := digestBytes(manifestBytes)
-	set := Set{ID: id, Artifact: artifact, Config: canonicalConfig}
+	set := Set{ID: id, Artifact: artifact, Config: canonicalConfig, Attestation: &attestationCopy}
 	setRoot := filepath.Join(c.root, "sets")
 	target := filepath.Join(setRoot, id)
 	if _, err := os.Lstat(target); err == nil {
@@ -434,6 +490,20 @@ func (c *Catalog) DescribeArtifact(digest string) (Artifact, storageproto.Descri
 // Install adds or replaces the provider's durable desired-artifact marker.
 // The artifact must already have been imported into this catalog.
 func (c *Catalog) Install(artifact Artifact) error {
+	return c.install(artifact, nil)
+}
+
+// InstallWithAttestation persists the selected admission evidence separately
+// from the content-only Artifact. The evidence is available to a later
+// configuration operation even if the Registry is no longer reachable.
+func (c *Catalog) InstallWithAttestation(artifact Artifact, attestation plugintrust.Attestation) error {
+	if attestation.Validate() != nil {
+		return ErrInvalidConfig
+	}
+	return c.install(artifact, &attestation)
+}
+
+func (c *Catalog) install(artifact Artifact, attestation *plugintrust.Attestation) error {
 	if c == nil {
 		return ErrInvalidConfig
 	}
@@ -447,8 +517,60 @@ func (c *Catalog) Install(artifact Artifact) error {
 	if err != nil {
 		return err
 	}
+	previous, previouslyInstalled := installedArtifact(state.Installed, artifact.ID)
 	state.Installed = replaceArtifact(state.Installed, artifact)
+	if attestation != nil {
+		if err := rememberArtifactAttestation(&state, artifact.Digest, *attestation); err != nil {
+			return err
+		}
+		if state.InstalledAttestations == nil {
+			state.InstalledAttestations = map[string]plugintrust.Attestation{}
+		}
+		state.InstalledAttestations[artifact.ID] = *attestation
+	} else if !previouslyInstalled || previous.Digest != artifact.Digest {
+		// An unclassified replacement must not inherit the old artifact's trust.
+		delete(state.InstalledAttestations, artifact.ID)
+	}
 	return c.writeState(state)
+}
+
+// InstalledAttestation returns the source evidence selected for the currently
+// installed artifact identity. found is false for pre-provenance or otherwise
+// unclassified installed records; callers must not infer a stronger class.
+func (c *Catalog) InstalledAttestation(providerID string) (attestation plugintrust.Attestation, found bool, err error) {
+	if c == nil || !validProviderID(providerID) {
+		return plugintrust.Attestation{}, false, ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state, err := c.readState()
+	if err != nil {
+		return plugintrust.Attestation{}, false, err
+	}
+	if _, ok := installedArtifact(state.Installed, providerID); !ok {
+		return plugintrust.Attestation{}, false, ErrInvalidConfig
+	}
+	attestation, found = state.InstalledAttestations[providerID]
+	return attestation, found, nil
+}
+
+// AttestationsForArtifact returns the distinct Host admission evidence
+// recorded for exact immutable bytes. The digest identifies bytes only and
+// never selects or promotes one attestation over another.
+func (c *Catalog) AttestationsForArtifact(digest string) ([]plugintrust.Attestation, error) {
+	if c == nil || !validDigest(digest) {
+		return nil, ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, _, err := c.loadArtifact(digest); err != nil {
+		return nil, err
+	}
+	state, err := c.readState()
+	if err != nil {
+		return nil, err
+	}
+	return append([]plugintrust.Attestation(nil), state.ArtifactAttestations[digest]...), nil
 }
 
 // Installed returns the durable desired provider inventory sorted by ID.
@@ -485,6 +607,7 @@ func (c *Catalog) Uninstall(id string) error {
 	}
 	state.Installed = installed
 	delete(state.DesiredSets, id)
+	delete(state.InstalledAttestations, id)
 	return c.writeState(state)
 }
 
@@ -621,6 +744,21 @@ func (c *Catalog) CollectGarbage(protectedSetIDs []string) error {
 			keepArtifacts[set.set.Artifact.Digest] = true
 		}
 	}
+	metadataPruned := false
+	for digest := range state.ArtifactAttestations {
+		if !keepArtifacts[digest] {
+			delete(state.ArtifactAttestations, digest)
+			metadataPruned = true
+		}
+	}
+	// Persist metadata pruning before deleting the now-unreferenced bytes. A
+	// crash can leave collectible artifact residue, but cannot leave a trusted
+	// selection record pointing at bytes that GC already removed.
+	if metadataPruned {
+		if err := c.writeState(state); err != nil {
+			return err
+		}
+	}
 	for _, item := range artifactItems {
 		if keepArtifacts[item.Name()] {
 			continue
@@ -705,7 +843,10 @@ func (c *Catalog) loadSet(id string) (Set, error) {
 	if decodeStrict(manifestBytes, &stored) != nil || stored.SchemaVersion != SchemaVersion || !validDigest(stored.ConfigSHA256) {
 		return Set{}, ErrInvalidSet
 	}
-	canonicalManifest, err := encodeSetManifest(stored.Artifact, stored.ConfigSHA256)
+	if stored.Attestation != nil && stored.Attestation.Validate() != nil {
+		return Set{}, ErrInvalidSet
+	}
+	canonicalManifest, err := encodeSetManifest(stored.Artifact, stored.ConfigSHA256, stored.Attestation)
 	if err != nil || !bytes.Equal(manifestBytes, canonicalManifest) || digestBytes(manifestBytes) != id {
 		return Set{}, ErrInvalidSet
 	}
@@ -730,7 +871,12 @@ func (c *Catalog) loadSet(id string) (Set, error) {
 		storageproto.ValidateConfigForSchema(descriptor.ConfigurationSchema, toProtocolConfig(canonical)) != nil {
 		return Set{}, ErrInvalidSet
 	}
-	return Set{ID: id, Artifact: artifact, Config: canonical}, nil
+	var attestation *plugintrust.Attestation
+	if stored.Attestation != nil {
+		copy := *stored.Attestation
+		attestation = &copy
+	}
+	return Set{ID: id, Artifact: artifact, Config: canonical, Attestation: attestation}, nil
 }
 
 func (c *Catalog) loadArtifact(digest string) (Artifact, storageproto.Descriptor, error) {
@@ -861,7 +1007,7 @@ func (c *Catalog) readState() (catalogState, error) {
 		return catalogState{}, ErrUnsafeStore
 	}
 	var state catalogState
-	if decodeStrict(data, &state) != nil || state.SchemaVersion != SchemaVersion || state.Installed == nil || state.DesiredSets == nil || len(state.Installed) > maxCatalogItems || len(state.DesiredSets) > maxCatalogItems {
+	if decodeStrict(data, &state) != nil || state.SchemaVersion != SchemaVersion || state.Installed == nil || state.DesiredSets == nil || len(state.Installed) > maxCatalogItems || len(state.DesiredSets) > maxCatalogItems || len(state.ArtifactAttestations) > maxCatalogItems || len(state.InstalledAttestations) > maxCatalogItems {
 		return catalogState{}, ErrUnsafeStore
 	}
 	canonical, err := encodeState(state)
@@ -876,6 +1022,21 @@ func (c *Catalog) readState() (catalogState, error) {
 		lastID = artifact.ID
 		stored, _, loadErr := c.loadArtifact(artifact.Digest)
 		if loadErr != nil || stored != artifact {
+			return catalogState{}, ErrUnsafeStore
+		}
+	}
+	for digest, attestations := range state.ArtifactAttestations {
+		if !validDigest(digest) || len(attestations) == 0 || len(attestations) > maxArtifactAttestations {
+			return catalogState{}, ErrUnsafeStore
+		}
+		for index, attestation := range attestations {
+			if attestation.Validate() != nil || index > 0 && !attestationLess(attestations[index-1], attestation) {
+				return catalogState{}, ErrUnsafeStore
+			}
+		}
+	}
+	for providerID, attestation := range state.InstalledAttestations {
+		if !validProviderID(providerID) || !hasInstalledID(state.Installed, providerID) || attestation.Validate() != nil {
 			return catalogState{}, ErrUnsafeStore
 		}
 	}
@@ -938,19 +1099,39 @@ func (c *Catalog) writeState(state catalogState) error {
 }
 
 func encodeState(state catalogState) ([]byte, error) {
-	copy := catalogState{SchemaVersion: SchemaVersion, Installed: append([]Artifact{}, state.Installed...), DesiredSets: make(map[string]string, len(state.DesiredSets))}
+	copy := catalogState{
+		SchemaVersion: SchemaVersion, Installed: append([]Artifact{}, state.Installed...),
+		DesiredSets: make(map[string]string, len(state.DesiredSets)),
+	}
 	sort.Slice(copy.Installed, func(i, j int) bool { return copy.Installed[i].ID < copy.Installed[j].ID })
 	for id, setID := range state.DesiredSets {
 		copy.DesiredSets[id] = setID
 	}
+	if len(state.ArtifactAttestations) > 0 {
+		copy.ArtifactAttestations = make(map[string][]plugintrust.Attestation, len(state.ArtifactAttestations))
+		for digest, attestations := range state.ArtifactAttestations {
+			ordered := append([]plugintrust.Attestation(nil), attestations...)
+			sort.Slice(ordered, func(i, j int) bool { return attestationLess(ordered[i], ordered[j]) })
+			copy.ArtifactAttestations[digest] = ordered
+		}
+	}
+	if len(state.InstalledAttestations) > 0 {
+		copy.InstalledAttestations = make(map[string]plugintrust.Attestation, len(state.InstalledAttestations))
+		for providerID, attestation := range state.InstalledAttestations {
+			copy.InstalledAttestations[providerID] = attestation
+		}
+	}
 	return json.Marshal(copy)
 }
 
-func encodeSetManifest(artifact Artifact, configSHA string) ([]byte, error) {
+func encodeSetManifest(artifact Artifact, configSHA string, attestation *plugintrust.Attestation) ([]byte, error) {
 	if !validArtifact(artifact) || !validDigest(configSHA) {
 		return nil, ErrInvalidSet
 	}
-	return json.Marshal(setManifest{SchemaVersion: SchemaVersion, Artifact: artifact, ConfigSHA256: configSHA})
+	if attestation != nil && attestation.Validate() != nil {
+		return nil, ErrInvalidSet
+	}
+	return json.Marshal(setManifest{SchemaVersion: SchemaVersion, Artifact: artifact, ConfigSHA256: configSHA, Attestation: attestation})
 }
 
 func canonicalConfig(config SetConfig) (SetConfig, []byte, error) {
@@ -1043,8 +1224,45 @@ func hasInstalledID(artifacts []Artifact, id string) bool {
 	return false
 }
 
+func installedArtifact(artifacts []Artifact, id string) (Artifact, bool) {
+	for _, artifact := range artifacts {
+		if artifact.ID == id {
+			return artifact, true
+		}
+	}
+	return Artifact{}, false
+}
+
+func rememberArtifactAttestation(state *catalogState, digest string, attestation plugintrust.Attestation) error {
+	if state == nil || !validDigest(digest) || attestation.Validate() != nil {
+		return ErrInvalidConfig
+	}
+	if state.ArtifactAttestations == nil {
+		state.ArtifactAttestations = make(map[string][]plugintrust.Attestation)
+	}
+	attestations := state.ArtifactAttestations[digest]
+	for _, existing := range attestations {
+		if existing == attestation {
+			return nil
+		}
+	}
+	if len(attestations) >= maxArtifactAttestations {
+		return ErrInvalidConfig
+	}
+	attestations = append(attestations, attestation)
+	sort.Slice(attestations, func(i, j int) bool { return attestationLess(attestations[i], attestations[j]) })
+	state.ArtifactAttestations[digest] = attestations
+	return nil
+}
+
+func attestationLess(left, right plugintrust.Attestation) bool {
+	leftKey := string(left.Provenance) + "\x00" + string(left.Authority) + "\x00" + string(left.Publisher) + "\x00" + fmt.Sprint(left.Reviewed)
+	rightKey := string(right.Provenance) + "\x00" + string(right.Authority) + "\x00" + string(right.Publisher) + "\x00" + fmt.Sprint(right.Reviewed)
+	return leftKey < rightKey
+}
+
 func sameSetContent(a, b Set) bool {
-	if a.ID != b.ID || a.Artifact != b.Artifact || len(a.Config.Values) != len(b.Config.Values) || len(a.Config.Secrets) != len(b.Config.Secrets) {
+	if a.ID != b.ID || a.Artifact != b.Artifact || !sameAttestation(a.Attestation, b.Attestation) || len(a.Config.Values) != len(b.Config.Values) || len(a.Config.Secrets) != len(b.Config.Secrets) {
 		return false
 	}
 	for key, value := range a.Config.Values {
@@ -1058,6 +1276,13 @@ func sameSetContent(a, b Set) bool {
 		}
 	}
 	return true
+}
+
+func sameAttestation(a, b *plugintrust.Attestation) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 func validArtifact(artifact Artifact) bool {

@@ -78,16 +78,20 @@ function build() {
 
   const control = output('control-plane', './cmd/control-plane')
   const engine = output('recorder-engine', './cmd/recorder-engine')
-  const adapter = output('integrated-recorder-adapter-owncast', './cmd/adapters/owncast')
+  const adapter = output('integrated-recorder-adapter-hls', './cmd/adapters/hls')
   copyFileSync(control, join(bundleDir, 'control-plane'))
   copyFileSync(engine, join(bundleDir, 'recorder-engine'))
   chmodSync(join(bundleDir, 'control-plane'), 0o555)
   chmodSync(join(bundleDir, 'recorder-engine'), 0o555)
   chmodSync(bundleDir, 0o700)
-  copyFileSync(adapter, join(adapterDir, 'integrated-recorder-adapter-owncast'))
-  chmodSync(join(adapterDir, 'integrated-recorder-adapter-owncast'), 0o700)
+  copyFileSync(adapter, join(adapterDir, 'integrated-recorder-adapter-hls'))
+  chmodSync(join(adapterDir, 'integrated-recorder-adapter-hls'), 0o700)
 
-  const hostExtra = `-X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir=${bundleDir}`
+  const bundledHLSPath = join(adapterDir, 'integrated-recorder-adapter-hls')
+  const hostExtra = [
+    `-X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir=${bundleDir}`,
+    `-X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundledHLSBinary=${bundledHLSPath}`,
+  ].join(' ')
   return output('runtime-host', './cmd/runtime-host', hostExtra)
 }
 

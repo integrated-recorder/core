@@ -9,6 +9,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/integrated-recorder/core/internal/plugintrust"
 )
 
 const PluginsEndpoint = "/api/runtime/plugins"
@@ -27,13 +29,14 @@ type PluginStatus struct {
 }
 
 type PluginStatusItem struct {
-	ID               string `json:"id"`
-	Type             string `json:"type"`
-	Name             string `json:"name"`
-	AvailableVersion string `json:"available_version,omitempty"`
-	InstalledVersion string `json:"installed_version,omitempty"`
-	Installed        bool   `json:"installed"`
-	UpdateAvailable  bool   `json:"update_available"`
+	ID               string                  `json:"id"`
+	Type             string                  `json:"type"`
+	Name             string                  `json:"name"`
+	AvailableVersion string                  `json:"available_version,omitempty"`
+	InstalledVersion string                  `json:"installed_version,omitempty"`
+	Installed        bool                    `json:"installed"`
+	UpdateAvailable  bool                    `json:"update_available"`
+	Trust            plugintrust.Attestation `json:"trust"`
 }
 
 func (s PluginStatus) Validate() error {
@@ -48,7 +51,7 @@ func (s PluginStatus) Validate() error {
 	}
 	seen := make(map[string]struct{}, len(s.Plugins))
 	for _, item := range s.Plugins {
-		if !pluginIDPattern.MatchString(item.ID) || (item.Type != "" && item.Type != "source" && item.Type != "storage") || !safePluginText(item.Name, 128) || item.AvailableVersion != "" && !safePluginText(item.AvailableVersion, 128) || item.InstalledVersion != "" && !safePluginText(item.InstalledVersion, 128) {
+		if !pluginIDPattern.MatchString(item.ID) || (item.Type != "" && item.Type != "source" && item.Type != "storage") || !safePluginText(item.Name, 128) || item.AvailableVersion != "" && !safePluginText(item.AvailableVersion, 128) || item.InstalledVersion != "" && !safePluginText(item.InstalledVersion, 128) || item.Trust.Validate() != nil {
 			return errInvalidPluginStatus
 		}
 		if _, exists := seen[item.ID]; exists {

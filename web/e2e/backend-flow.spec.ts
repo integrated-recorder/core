@@ -29,8 +29,9 @@ type CSPViolation = { effectiveDirective: string; violatedDirective: string; blo
 
 test.describe.configure({ mode: 'serial' })
 
-test('actual Go backend: Owncast capture, VOD, management, and delete', async ({ page }) => {
+test('actual Go backend: direct HLS capture, VOD, management, and delete', async ({ page }) => {
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
+  const manifestURL = `${sourceURL}/hls/stream.m3u8`
   const expectedSegmentSHA256 = createHash('sha256').update(readFileSync(join(dataDir, 'e2e-source-segment'))).digest('hex')
   const requests: string[] = []
   const cspViolations: CSPViolation[] = []
@@ -39,7 +40,6 @@ test('actual Go backend: Owncast capture, VOD, management, and delete', async ({
   const pageErrors: string[] = []
   const staticAssetFailures: string[] = []
   const unexpectedRequestFailures: string[] = []
-  const iconStatuses: number[] = []
   await page.exposeBinding('__recordCspViolation', (_source, violation: CSPViolation) => cspViolations.push(violation))
   await page.addInitScript(() => {
     document.addEventListener('securitypolicyviolation', event => {
@@ -65,7 +65,6 @@ test('actual Go backend: Owncast capture, VOD, management, and delete', async ({
   })
   page.on('response', response => {
     const path = new URL(response.url()).pathname
-    if (path === '/api/adapters/owncast/icon') iconStatuses.push(response.status())
     if (path.startsWith('/static/ui/') && response.status() >= 400) staticAssetFailures.push(`${path}: ${response.status()}`)
     if (path.startsWith('/api/') && [401, 404, 501].includes(response.status())) expectedAPIResponseFailures.push({ path, status: response.status() })
   })
@@ -80,10 +79,9 @@ test('actual Go backend: Owncast capture, VOD, management, and delete', async ({
   await page.getByRole('button', { name: '로그인' }).click()
   await expect(page).toHaveURL('/')
   await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
-  await expectOwncastLogo(page)
   expect(requests.some(path => path.includes('bootstrap-token'))).toBe(false)
 
-  for (const route of ['/', '/recordings', '/new', '/adapters', '/adapters/owncast', '/workflows', '/settings', '/storage', '/storage/local-primary']) {
+  for (const route of ['/', '/recordings', '/new', '/adapters', '/adapters/hls', '/workflows', '/settings', '/storage', '/storage/local-primary']) {
     await page.goto(route)
     await assertResponsive(page)
     await assertNoCSPViolations(cspViolations)
@@ -121,11 +119,10 @@ test('actual Go backend: Owncast capture, VOD, management, and delete', async ({
   await exerciseTopbarPopovers(page)
   await assertNoCSPViolations(cspViolations)
   await page.goto('/new')
-  await expectOwncastLogo(page)
-  await page.getByRole('button', { name: /Owncast/ }).click()
+  await page.getByRole('button', { name: /HLS/ }).click()
   await page.getByRole('button', { name: /입력 설정/ }).click()
-  await page.getByLabel('Owncast 인스턴스 URL').fill(sourceURL)
-  await page.getByLabel('녹화 제목').fill('Browser E2E Owncast capture')
+  await page.getByLabel('HLS manifest URL').fill(manifestURL)
+  await page.getByLabel('녹화 제목').fill('Browser E2E HLS capture')
   const previewToggle = page.getByRole('checkbox', { name: '장면 미리보기 생성' })
   await expect(previewToggle).not.toBeChecked()
   await page.getByRole('button', { name: '입력 확인' }).click()
@@ -179,19 +176,17 @@ test('actual Go backend: Owncast capture, VOD, management, and delete', async ({
 
   const pageWire = await getJSON<RecordingPageWire>(page, '/api/v2/recordings?state=stopped&limit=25')
   const listItem = pageWire.items.find(item => item.id === recordingID)
-  expect(listItem).toMatchObject({ id: recordingID, adapter_id: 'owncast', adapter_name: 'Owncast', state: 'stopped', tags: ['browser-e2e', 'source-preserved'] })
+  expect(listItem).toMatchObject({ id: recordingID, adapter_id: 'hls', adapter_name: 'HLS', state: 'stopped', tags: ['browser-e2e', 'source-preserved'] })
   expect('adapter' in listItem).toBe(false)
   expect('resource' in listItem).toBe(false)
   await page.goto('/recordings?state=stopped')
-  await expectOwncastLogo(page)
-  await expect(page.getByRole('link', { name: 'Browser E2E Owncast capture' }).first()).toBeVisible()
-  await expect(page.getByRole('row').filter({ hasText: 'Browser E2E Owncast capture' }).getByText('중지됨', { exact: true })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Browser E2E HLS capture' }).first()).toBeVisible()
+  await expect(page.getByRole('row').filter({ hasText: 'Browser E2E HLS capture' }).getByText('중지됨', { exact: true })).toBeVisible()
   await expect(
-    page.getByRole('row').filter({ hasText: 'Browser E2E Owncast capture' }).getByText('Owncast', { exact: true }),
+    page.getByRole('row').filter({ hasText: 'Browser E2E HLS capture' }).getByText('HLS', { exact: true }),
   ).toBeVisible()
-  await page.getByRole('link', { name: /Browser E2E Owncast capture/ }).click()
+  await page.getByRole('link', { name: /Browser E2E HLS capture/ }).click()
   await expect(page).toHaveURL(new RegExp(`/recordings/${recordingID}$`))
-  await expectOwncastLogo(page)
 
   await page.goto('/storage/local-primary')
   await expect.poll(async () => {
@@ -206,7 +201,7 @@ test('actual Go backend: Owncast capture, VOD, management, and delete', async ({
   await assertResponsive(page)
 
   await page.goto(`/recordings/${recordingID}`)
-  await expect(page.getByRole('heading', { name: 'Browser E2E Owncast capture' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Browser E2E HLS capture' })).toBeVisible()
 
   await page.getByRole('button', { name: '삭제' }).click()
   await expect(page.getByRole('alertdialog')).toContainText('되돌릴 수 없습니다')
@@ -218,12 +213,10 @@ test('actual Go backend: Owncast capture, VOD, management, and delete', async ({
   expect(expectedAPIResponseFailures).toEqual([])
   await page.getByRole('alertdialog').getByRole('button', { name: '보관 데이터 삭제' }).click()
   await expect(page).toHaveURL(/\/recordings(?:\?.*)?$/)
-  expect(iconStatuses).toContain(200)
-  expect(iconStatuses.every(status => status === 200 || status === 304)).toBe(true)
-  await expect(page.getByText('Browser E2E Owncast capture')).toHaveCount(0)
+  await expect(page.getByText('Browser E2E HLS capture')).toHaveCount(0)
   expect((await page.request.get(`/api/recordings/${recordingID}`)).status()).toBe(404)
 
-  for (const path of ['/login', '/', '/recordings', '/recordings/demo', '/new', '/adapters', '/adapters/owncast', '/workflows', '/workflows/demo', '/settings', '/storage', '/storage/local-primary']) {
+  for (const path of ['/login', '/', '/recordings', '/recordings/demo', '/new', '/adapters', '/adapters/hls', '/workflows', '/workflows/demo', '/settings', '/storage', '/storage/local-primary']) {
     const response = await page.request.get(path, { headers: { accept: 'text/html' } })
     expect(response.status(), `${path} should be served as an SPA route`).toBe(200)
     expect(response.headers()['content-type']).toContain('text/html')
@@ -320,12 +313,6 @@ test('actual Go backend: storage ingest settings persist, show restart state, an
   expect((message as string).length).toBeGreaterThan(0)
 })
 
-async function expectOwncastLogo(page: Page) {
-  const image = page.locator('img[src="/api/adapters/owncast/icon"]').first()
-  await expect(image).toBeVisible()
-  await expect.poll(() => image.evaluate(element => (element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
-}
-
 async function assertNoCSPViolations(violations: CSPViolation[]) {
   await expect.poll(() => violations).toEqual([])
 }
@@ -361,6 +348,7 @@ async function exerciseTopbarPopovers(page: Page) {
 
 test('actual Go backend: opt-in segment previews, live/recent frames, storyboard seek, and screenshots', async ({ page }) => {
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
+  const manifestURL = `${sourceURL}/hls/stream.m3u8`
   const screenshots = fileURLToPath(new URL('../../artifacts/preview-frame-index/', import.meta.url))
   const consoleErrors: string[] = []
   const pageErrors: string[] = []
@@ -386,9 +374,9 @@ test('actual Go backend: opt-in segment previews, live/recent frames, storyboard
   await page.setViewportSize({ width: 1440, height: 900 })
   await login(page)
   await page.goto('/new')
-  await page.getByRole('button', { name: /Owncast/ }).click()
+  await page.getByRole('button', { name: /HLS/ }).click()
   await page.getByRole('button', { name: /입력 설정/ }).click()
-  await page.getByLabel('Owncast 인스턴스 URL').fill(sourceURL)
+  await page.getByLabel('HLS manifest URL').fill(manifestURL)
   await page.getByLabel('녹화 제목').fill('Preview Frame Index E2E')
   const previewToggle = page.getByRole('checkbox', { name: '장면 미리보기 생성' })
   await expect(previewToggle).toBeVisible()

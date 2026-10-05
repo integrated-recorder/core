@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 	"github.com/integrated-recorder/core/internal/storageproto"
 )
@@ -22,6 +23,8 @@ import (
 const (
 	SchemaVersion        = 1
 	SchemaVersionV2      = 2
+	SchemaVersionV3      = 3
+	OfficialCatalogV3URL = "https://integrated-recorder.github.io/plugin-registry/catalog-v3.json"
 	TypeSource           = "source"
 	TypeStorage          = "storage"
 	StorageBinaryPrefix  = "integrated-recorder-storage-"
@@ -69,10 +72,18 @@ type registryDocument struct {
 type registryPlugin struct {
 	ID         string            `json:"id"`
 	Type       string            `json:"type,omitempty"`
+	Publisher  *PublisherInfo    `json:"publisher,omitempty"`
 	Name       string            `json:"name"`
 	Repository string            `json:"repository"`
 	Channels   map[string]string `json:"channels"`
 	Releases   []registryRelease `json:"releases"`
+}
+
+// PublisherInfo is a Registry v3 affiliation assertion. The effective trust
+// attestation still depends on the configured Registry authority, not only on
+// this document field.
+type PublisherInfo struct {
+	Kind string `json:"kind"`
 }
 
 type registryRelease struct {
@@ -117,13 +128,14 @@ type View struct {
 }
 
 type PluginView struct {
-	ID               string `json:"id"`
-	Type             string `json:"type"`
-	Name             string `json:"name"`
-	AvailableVersion string `json:"available_version,omitempty"`
-	InstalledVersion string `json:"installed_version,omitempty"`
-	Installed        bool   `json:"installed"`
-	UpdateAvailable  bool   `json:"update_available"`
+	ID               string                  `json:"id"`
+	Type             string                  `json:"type"`
+	Name             string                  `json:"name"`
+	AvailableVersion string                  `json:"available_version,omitempty"`
+	InstalledVersion string                  `json:"installed_version,omitempty"`
+	Installed        bool                    `json:"installed"`
+	UpdateAvailable  bool                    `json:"update_available"`
+	Trust            plugintrust.Attestation `json:"trust"`
 }
 
 type selectedRelease struct {
@@ -169,7 +181,7 @@ func validateRegistryWireShape(data []byte) error {
 	if err := json.Unmarshal(root["schema_version"], &schemaVersion); err != nil {
 		return ErrUnavailable
 	}
-	if schemaVersion != SchemaVersion && schemaVersion != SchemaVersionV2 {
+	if schemaVersion != SchemaVersion && schemaVersion != SchemaVersionV2 && schemaVersion != SchemaVersionV3 {
 		return ErrUnavailable
 	}
 	plugins, err := strictJSONArray(root["plugins"], MaxPlugins)
@@ -178,8 +190,11 @@ func validateRegistryWireShape(data []byte) error {
 	}
 	for _, rawPlugin := range plugins {
 		pluginFields := []string{"id", "name", "repository", "channels", "releases"}
-		if schemaVersion == SchemaVersionV2 {
+		if schemaVersion == SchemaVersionV2 || schemaVersion == SchemaVersionV3 {
 			pluginFields = []string{"id", "type", "name", "repository", "channels", "releases"}
+		}
+		if schemaVersion == SchemaVersionV3 {
+			pluginFields = []string{"id", "type", "publisher", "name", "repository", "channels", "releases"}
 		}
 		plugin, err := strictJSONObject(rawPlugin, pluginFields...)
 		if err != nil {
@@ -190,8 +205,14 @@ func validateRegistryWireShape(data []byte) error {
 				return ErrUnavailable
 			}
 		}
-		if schemaVersion == SchemaVersionV2 && !validJSONStringShape(plugin["type"]) {
+		if (schemaVersion == SchemaVersionV2 || schemaVersion == SchemaVersionV3) && !validJSONStringShape(plugin["type"]) {
 			return ErrUnavailable
+		}
+		if schemaVersion == SchemaVersionV3 {
+			publisher, err := strictJSONObject(plugin["publisher"], "kind")
+			if err != nil || !validJSONStringShape(publisher["kind"]) {
+				return ErrUnavailable
+			}
 		}
 		channels, err := strictJSONObjectAny(plugin["channels"], 3)
 		if err != nil {
@@ -208,7 +229,7 @@ func validateRegistryWireShape(data []byte) error {
 		}
 		for _, rawRelease := range releases {
 			releaseFields := []string{"version", "protocol_version", "source_commit", "artifacts"}
-			if schemaVersion == SchemaVersionV2 {
+			if schemaVersion == SchemaVersionV2 || schemaVersion == SchemaVersionV3 {
 				releaseFields = []string{"version", "protocol", "source_commit", "artifacts"}
 			}
 			release, err := strictJSONObject(rawRelease, releaseFields...)
@@ -357,7 +378,7 @@ func requireJSONEOF(decoder *json.Decoder) error {
 }
 
 func validateRegistry(document registryDocument) error {
-	if (document.SchemaVersion != SchemaVersion && document.SchemaVersion != SchemaVersionV2) || len(document.Plugins) > MaxPlugins {
+	if (document.SchemaVersion != SchemaVersion && document.SchemaVersion != SchemaVersionV2 && document.SchemaVersion != SchemaVersionV3) || len(document.Plugins) > MaxPlugins {
 		return ErrUnavailable
 	}
 	plugins := make(map[string]bool, len(document.Plugins))
@@ -372,6 +393,13 @@ func validateRegistry(document registryDocument) error {
 		} else if pluginType != TypeSource && pluginType != TypeStorage {
 			return ErrUnavailable
 		}
+		if document.SchemaVersion == SchemaVersionV3 {
+			if plugin.Publisher == nil || (plugin.Publisher.Kind != string(plugintrust.FirstParty) && plugin.Publisher.Kind != string(plugintrust.ThirdParty)) {
+				return ErrUnavailable
+			}
+		} else if plugin.Publisher != nil {
+			return ErrUnavailable
+		}
 		if !validPluginID(plugin.ID) || plugins[plugin.ID] || !validText(plugin.Name, maxNameBytes) || !validRepositoryURL(plugin.Repository) || len(plugin.Releases) == 0 || len(plugin.Releases) > MaxReleasesPerPlugin || len(plugin.Channels) == 0 || len(plugin.Channels) > 3 {
 			return ErrUnavailable
 		}
@@ -379,6 +407,9 @@ func validateRegistry(document registryDocument) error {
 		// the Storage API. A remote provider with this ID would be impossible
 		// to activate or address unambiguously.
 		if pluginType == TypeStorage && plugin.ID == "local" {
+			return ErrUnavailable
+		}
+		if pluginType == TypeSource && plugin.ID == "hls" {
 			return ErrUnavailable
 		}
 		plugins[plugin.ID] = true
@@ -521,6 +552,40 @@ func stableRelease(plugin registryPlugin) (registryRelease, bool) {
 		}
 	}
 	return registryRelease{}, false
+}
+
+func isOfficialCatalogResponse(configuredURL, finalURL string) bool {
+	return configuredURL == OfficialCatalogV3URL && finalURL == OfficialCatalogV3URL
+}
+
+func registryAttestation(schemaVersion int, authority plugintrust.Authority, publisher *PublisherInfo) plugintrust.Attestation {
+	if schemaVersion == SchemaVersionV3 && authority == plugintrust.Official && publisher != nil {
+		return plugintrust.NewOfficialRegistry(plugintrust.Publisher(publisher.Kind))
+	}
+	// Older schemas have no publisher affiliation. Custom registries may
+	// include v3 publisher claims, but those claims do not establish official
+	// authority or first-party status.
+	return plugintrust.NewCustomRegistry()
+}
+
+func desiredAttestation(plugin DesiredPlugin) plugintrust.Attestation {
+	if plugin.Attestation == nil {
+		return plugintrust.Legacy()
+	}
+	return *plugin.Attestation
+}
+
+func projectedDesiredAttestation(plugin DesiredPlugin) plugintrust.Attestation {
+	attestation := desiredAttestation(plugin)
+	if attestation.Provenance == plugintrust.LegacyUnclassified {
+		return plugintrust.NewOperator()
+	}
+	return attestation
+}
+
+func attestationPointer(value plugintrust.Attestation) *plugintrust.Attestation {
+	copy := value
+	return &copy
 }
 
 func selectArtifact(release registryRelease, goos, goarch string) (registryArtifact, bool) {

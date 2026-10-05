@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 )
 
 type fakeController struct {
@@ -181,7 +182,7 @@ func TestRoutesDispatchAndFallback(t *testing.T) {
 }
 
 func TestPluginRoutesDispatchAndRejectMalformedIdentifiers(t *testing.T) {
-	controller := &fakeController{pluginStatus: PluginStatus{State: "ready", Plugins: []PluginStatusItem{{ID: "demo", Name: "Demo", AvailableVersion: "1.2.0", Installed: false}}}}
+	controller := &fakeController{pluginStatus: PluginStatus{State: "ready", Plugins: []PluginStatusItem{{ID: "demo", Name: "Demo", AvailableVersion: "1.2.0", Installed: false, Trust: plugintrust.NewCustomRegistry()}}}}
 	api, err := New(nil, true, false, controller, http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
@@ -221,9 +222,19 @@ func TestPluginStatusAcceptsMaximumRegistryVersionLength(t *testing.T) {
 	version := strings.Repeat("v", 128)
 	status := PluginStatus{State: "ready", Plugins: []PluginStatusItem{{
 		ID: "demo", Name: "Demo", AvailableVersion: version, InstalledVersion: "v", Installed: true, UpdateAvailable: true,
+		Trust: plugintrust.NewOperator(),
 	}}}
 	if err := status.Validate(); err != nil {
 		t.Fatalf("valid bounded registry version rejected: %v", err)
+	}
+}
+
+func TestPluginStatusRejectsInvalidTrustTuple(t *testing.T) {
+	status := PluginStatus{State: "ready", Plugins: []PluginStatusItem{{
+		ID: "demo", Name: "Demo", Trust: plugintrust.Attestation{Provenance: plugintrust.Registry, Authority: plugintrust.Custom, Publisher: plugintrust.FirstParty, Reviewed: true},
+	}}}
+	if err := status.Validate(); err == nil {
+		t.Fatal("invalid registry/custom first-party trust tuple accepted")
 	}
 }
 

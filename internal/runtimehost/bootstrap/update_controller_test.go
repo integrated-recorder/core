@@ -24,6 +24,7 @@ import (
 
 	"github.com/integrated-recorder/core/internal/buildinfo"
 	"github.com/integrated-recorder/core/internal/controlplane"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/recorderengine"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 	"github.com/integrated-recorder/core/internal/runtimehost/generation"
@@ -90,8 +91,16 @@ func newControllerFixture(t *testing.T, badSignature bool) *controllerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	adapterCatalog, err := adaptercatalog.Open(filepath.Join(dataDir, "runtime", "adapters"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyAdapterSet, err := adapterCatalog.Empty()
+	if err != nil {
+		t.Fatal(err)
+	}
 	initialID := strings.Repeat("a", 32)
-	initial := generation.Generation{ID: initialID, Version: "1.0.0", Commit: strings.Repeat("a", 40), InstalledAt: time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC), State: generation.StateStaging, ControlProtocol: 1, EngineProtocol: 1, ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1}
+	initial := generation.Generation{ID: initialID, Version: "1.0.0", Commit: strings.Repeat("a", 40), InstalledAt: time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC), State: generation.StateStaging, ControlProtocol: 1, EngineProtocol: 1, AdapterSetID: emptyAdapterSet.ID, ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1}
 	if err := registry.Stage(initial); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +160,8 @@ func newControllerFixture(t *testing.T, badSignature bool) *controllerFixture {
 	identity := buildinfo.Info{Version: "1.0.0", Commit: strings.Repeat("a", 40), BuildTime: "2026-09-29T00:00:00Z", ReleaseChannel: "stable", RuntimeProtocolVersion: buildinfo.RuntimeProtocolVersion}
 	controller, err := newUpdateController(updateControllerOptions{
 		Config: config, HostBuild: identity, ApplicationBuild: identity, Registry: registry,
-		Supervisor: sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
+		AdapterCatalog: adapterCatalog,
+		Supervisor:     sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
 		EngineDetacher: detacher,
 		Coordinator:    resourceCoordinator, Installer: installer,
 		TrustedKeys: map[string]ed25519.PublicKey{"test-key": public}, Compatibility: compatibility,
@@ -316,15 +326,17 @@ func assertStagedAdapterReconcileDidNotTouchCatalog(t *testing.T, fixture *contr
 func TestAdapterReconcileActivatesPinnedSetAndRollbackRestoresTuple(t *testing.T) {
 	fixture := newControllerFixture(t, false)
 	oldSetID, newSetID := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	oldTrust := plugintrust.NewOperator()
+	newTrust := plugintrust.NewOfficialRegistry(plugintrust.FirstParty)
 	bindActiveAdapterSet(t, fixture, oldSetID)
 	store := readyInstallation(t, fixture.root)
 	fixture.controller.installation = store
 	oldDir, newDir := t.TempDir(), t.TempDir()
 	catalog := &testHostAdapterCatalog{
-		desired: adaptercatalog.Snapshot{ID: newSetID, Directory: newDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "2.0.0"}}},
+		desired: adaptercatalog.Snapshot{ID: newSetID, Directory: newDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "2.0.0", Attestation: attestationPointer(newTrust)}}},
 		sets: map[string]adaptercatalog.Snapshot{
-			oldSetID: {ID: oldSetID, Directory: oldDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "1.0.0"}}},
-			newSetID: {ID: newSetID, Directory: newDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "2.0.0"}}},
+			oldSetID: {ID: oldSetID, Directory: oldDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "1.0.0", Attestation: attestationPointer(oldTrust)}}},
+			newSetID: {ID: newSetID, Directory: newDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "2.0.0", Attestation: attestationPointer(newTrust)}}},
 		},
 	}
 	fixture.controller.adapterCatalog = catalog
@@ -356,6 +368,7 @@ func TestAdapterReconcileActivatesPinnedSetAndRollbackRestoresTuple(t *testing.T
 	if got := childEnvValue(fixture.sup.controlSpecs[len(fixture.sup.controlSpecs)-1].Env, "ADAPTER_DIR"); got != newDir {
 		t.Fatalf("new Control ADAPTER_DIR = %q, want immutable set directory", got)
 	}
+	assertChildAdapterTrust(t, fixture.sup.controlSpecs[len(fixture.sup.controlSpecs)-1].Env, "fixture", newTrust)
 
 	// Rollback reuses the retained generation's original adapter set.
 	if _, err := fixture.controller.Rollback(context.Background()); err != nil {
@@ -367,6 +380,16 @@ func TestAdapterReconcileActivatesPinnedSetAndRollbackRestoresTuple(t *testing.T
 	}
 	if got := childEnvValue(fixture.sup.controlSpecs[len(fixture.sup.controlSpecs)-1].Env, "ADAPTER_DIR"); got != oldDir {
 		t.Fatalf("rollback Control ADAPTER_DIR = %q, want retained old set", got)
+	}
+	assertChildAdapterTrust(t, fixture.sup.controlSpecs[len(fixture.sup.controlSpecs)-1].Env, "fixture", oldTrust)
+}
+
+func assertChildAdapterTrust(t *testing.T, environment []string, adapterID string, want plugintrust.Attestation) {
+	t.Helper()
+	value := childEnvValue(environment, "CONTROL_ADAPTER_TRUST_JSON")
+	var projection map[string]plugintrust.Attestation
+	if value == "" || json.Unmarshal([]byte(value), &projection) != nil || projection[adapterID] != want {
+		t.Fatalf("Control child trust projection = %q, want %s=%+v", value, adapterID, want)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/generation"
 	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
 	"github.com/integrated-recorder/core/internal/runtimehost/installation"
@@ -30,14 +31,14 @@ func ensureBundledLocalStorage(ctx context.Context, catalog *storagecatalog.Cata
 	if err != nil {
 		return storagecatalog.Set{}, errors.New("bundled storage.local artifact failed validation")
 	}
-	if err := catalog.Install(artifact); err != nil {
-		return storagecatalog.Set{}, errors.New("bundled storage.local artifact could not be installed")
-	}
 	rootValue, err := json.Marshal(archiveRoot)
 	if err != nil {
 		return storagecatalog.Set{}, errors.New("bundled storage.local configuration is invalid")
 	}
-	set, err := catalog.CreateSet(artifact.Digest, storagecatalog.SetConfig{
+	if err := catalog.InstallWithAttestation(artifact, plugintrust.NewBundled()); err != nil {
+		return storagecatalog.Set{}, errors.New("bundled storage.local artifact could not be installed")
+	}
+	set, err := catalog.CreateInstalledSet("local", storagecatalog.SetConfig{
 		Values: map[string]json.RawMessage{"root": rootValue},
 	})
 	if err != nil {
@@ -247,7 +248,7 @@ func (c *updateController) ConfigureStorage(ctx context.Context, id string, requ
 	if err := operationCtx.Err(); err != nil {
 		return httpapi.StorageConfigView{}, httpapi.NewControllerError("storage_operation_conflict")
 	}
-	set, err := c.storageCatalog.CreateSet(artifact.Digest, config)
+	set, err := c.storageCatalog.CreateInstalledSet(id, config)
 	if err != nil {
 		return httpapi.StorageConfigView{}, httpapi.NewControllerError("storage_provider_not_configured")
 	}

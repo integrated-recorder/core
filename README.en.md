@@ -23,7 +23,9 @@ Integrated Recorder follows the source manifest, stores original media segments 
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
-Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. The Runtime Host treats configured source directories as import sources, validates executable adapters, and stores immutable artifacts and adapter sets. An application generation is the tuple `(application release, adapter set, storage provider set)`. Adapter reconciliation and explicit storage-backend activation can activate a new generation without restarting the Host or container; application release updates carry forward both selected sets. Existing recordings remain pinned to their original Engine, adapter artifacts, and storage provider artifact until their leases drain. Install an adapter binary by copying it under a temporary name and atomically renaming it to `integrated-recorder-adapter-*`. When an administrator configures an HTTPS `IR_PLUGIN_REGISTRY_URL`, the `/adapters` page can manually install or update curated stable plugins. Registry v1 retains the existing source-adapter format; v2 identifies each plugin type and protocol explicitly. The registry is approval metadata, not a build or publisher-signing service; it pins exact artifact size and SHA-256. Installed executables are trusted local code and are not sandboxed. The default file secret stores and storage-provider configuration use restricted permissions but do not encrypt values at rest.
+Plugin admission provenance and publisher affiliation are independent metadata. Runtime Host assigns `bundled`, `registry`, or `operator` provenance; publisher affiliation is `first_party`, `third_party`, or `unknown`. The bundled plugins are `source.hls` and `storage.local`. Owncast is first-party software, but it is not included in the Core image and will be installable from the official Registry only after its public release and Registry approval. Registry v3 records publisher affiliation and pins the exact artifact URL, size, SHA-256, descriptor identity, and protocol. Custom Registries and locally supplied `/external-adapters` executables are not presented as project-reviewed. Plugins are native executables and are not sandboxed. See the [Plugin Trust Model](docs/PLUGIN_TRUST_MODEL.md).
+
+The Runtime Host uses the Registry configured in `IR_PLUGIN_REGISTRY_URL` for manual refresh/install/update. The official catalog is `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`; Registry v1/v2 custom catalogs remain compatible. The Registry is not a build service or publisher-signing system. Existing recordings continue to use the Engine, adapter artifact/set, and storage-provider artifact/set pinned when they started. The default file secret store and storage-provider configuration use restricted permissions but do not encrypt values at rest.
 
 Core continues to own archive format and write authority. `storage.local` is the first bundled reference Storage Provider Protocol v1 plugin and the default primary provider, available without a Plugin Registry. Recording writes, playback, integrity checks, deletion, and recovery use the same provider process path for local and remote storage. The provider only maps logical object keys to physical bytes; it does not decide Recording, segment ordinals, metadata, gaps, or ownership semantics. Runtime Host imports the bundled executable into its ordinary immutable artifact/set catalog and pins the set in each application generation. The local provider receives only the Host-controlled existing `/data/recordings` archive root; public APIs cannot grant it an arbitrary filesystem path. Existing archive files are adopted in place, without moving their bytes. Core runtime state remains separate under `/data/runtime`. V1 has one primary backend at a time; changing physical backend kind when an archive exists requires a future explicit migration and is not performed automatically. No production S3/B2/WebDAV provider is included. See [Storage Provider Protocol v1](docs/STORAGE_PROVIDER_PROTOCOL_V1.md), the [storage-provider lifecycle guide](docs/STORAGE_PROVIDER_V1.md), and the [architecture](docs/ARCHITECTURE.md).
 
@@ -39,7 +41,7 @@ Scene previews are an opt-in derivative per recording and default to disabled. A
 
 Currently supported:
 
-- external executable adapters, with a platform-agnostic Core and Owncast as the first adapter;
+- external executable adapters, with generic direct HLS in bundled `source.hls` and platform integrations distributed by Registry;
 - schema-rendered input and settings forms with generic resource discovery and configuration challenge/resume;
 - hierarchical settings with separate stored and effective projections;
 - lazy adapter-process restart with bounded backoff and a fresh describe handshake;
@@ -54,14 +56,14 @@ Currently supported:
 - browser playback and seek;
 - Storage Provider Protocol v1 over Core-owned archive semantics, with `storage.local` as the bundled production/reference plugin. No production cloud provider is included.
 
-The first live acceptance test used the public Owncast TV example stream: 90 segments, about 270 seconds of VOD, zero detected gaps, successful restart/reload, and successful seeks at 0:00, 2:15, and 4:27. Stored segment hashes matched re-fetched source objects.
+The earlier Owncast TV example acceptance used the implementation bundled at that time: 90 media segments, about 270 seconds of VOD, zero detected gaps, successful restart/reload, and seeks at 0:00, 2:15, and 4:27. This work separates Owncast from Core and prepares Registry distribution. It is not installable from the official catalog until the public release and Registry approval are complete.
 
 Not supported yet:
 
 - chat timeline;
 - finalized TAR/index archive format;
 - HDD/NAS/LTO tiering, multi-pool placement, archive migration, and replication/mirroring;
-- additional platform adapters;
+- additional platform-specific adapter submissions;
 - external audio rendition synchronization;
 - encrypted HLS and partial-only/delta LL-HLS;
 - DRM workflows;
@@ -74,7 +76,7 @@ Requires Go 1.23+.
 
 ```sh
 mkdir -p adapters
-go build -o adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast
+go build -o adapters/integrated-recorder-adapter-hls ./cmd/adapters/hls
 DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=127.0.0.1:8080 go run ./cmd/archiver
 ```
 
@@ -94,7 +96,9 @@ Open `http://localhost:8080/` in a browser to complete setup. Obtain the one-tim
 docker compose exec archiver runtime-host setup-code
 ```
 
-The container uses a named `/data` volume and publishes the Runtime Host listener on host loopback. The image includes the Runtime Host, initial Control/Engine release, the Owncast source adapter under `/adapters`, and the standalone `storage.local` provider executable. At startup the Host probes and imports `storage.local` through its normal immutable storage artifact/set lifecycle and uses the existing `/data/recordings` root, so legacy archive bytes need no move. `/data/runtime` remains reserved for Host-owned generations, catalogs, owners, secrets, IPC files, and recovery state. Extra executable adapters in `./adapter-binaries` are mounted read-only at `/external-adapters`; the Runtime Host periodically imports and validates them into immutable adapter artifacts and activates a new adapter-set-backed application generation without restarting the Host or container. Copy to a temporary name and atomically rename to `integrated-recorder-adapter-*` to avoid exposing a partial copy. Existing recordings stay on their original Engine and adapter/storage provider sets. To use a curated remote registry, set `IR_PLUGIN_REGISTRY_URL=https://<registry-host>/<catalog>.json` in the Runtime Host environment. The `/adapters` page provides manual refresh, install, update, and uninstall for registry plugins; `storage.local` is bundled, mandatory, and not uninstallable or dependent on registry availability. The registry approves exact artifact size/SHA-256; downloaded binaries still pass their type-specific Protocol v1 probe and immutable catalog lifecycle. A community catalog, publisher signing, automatic plugin updates, and sandboxing are not provided. If the selected provider is unavailable, the generation fails closed; Core does not fall back to direct filesystem access. Remote application updates require a separately provisioned Ed25519 public trust key; deployments without one fail closed. The unauthenticated control API is intended for a trusted host/private network or an authenticated reverse proxy; do not expose it directly to untrusted networks.
+The container uses a named `/data` volume and publishes the Runtime Host listener on host loopback. The image includes the Runtime Host, initial Control/Engine release, the Host-declared bundled adapter `/adapters/integrated-recorder-adapter-hls`, and the standalone `storage.local` provider executable. Owncast is not bundled in the Core image. At startup the Host probes and imports `storage.local` through its normal immutable storage artifact/set lifecycle and uses the existing `/data/recordings` root, so legacy archive bytes need no move. `/data/runtime` remains reserved for Host-owned generations, catalogs, owners, secrets, IPC files, and recovery state.
+
+Local development/custom executables can be installed under `./adapter-binaries` with the `integrated-recorder-adapter-*` filename convention. To allow them in a production Runtime Host, set `IR_ALLOW_OPERATOR_PLUGINS=1`; the Host periodically probes, hashes, and imports them from the read-only `/external-adapters` mount into an immutable adapter set without restarting the Host or container. They are labeled `Local / Operator trusted` and `Not reviewed by Integrated Recorder`. Existing recordings stay on their original Engine and adapter/storage provider sets. To use a Registry, set an HTTPS `IR_PLUGIN_REGISTRY_URL`; the official catalog is `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`. The `/adapters` page provides manual refresh, install, update, and uninstall for Registry plugins; `storage.local` is bundled, mandatory, and not uninstallable or dependent on Registry availability. Approved artifact size/SHA-256 and its type-specific Protocol v1 descriptor are verified before the existing immutable import lifecycle. A custom catalog is not an official review. Publisher PKI, automatic plugin updates, and sandboxing are not provided. If the selected provider is unavailable, the generation fails closed; Core does not fall back to direct filesystem access. Remote application updates require a separately provisioned Ed25519 public trust key; deployments without one fail closed. The unauthenticated control API is intended for a trusted host/private network or an authenticated reverse proxy; do not expose it directly to untrusted networks.
 
 ## API
 
@@ -133,12 +137,12 @@ The container uses a named `/data` volume and publishes the Runtime Host listene
 | `GET` | `/api/recordings/{id}/play/tracks/{track}/playlist.m3u8` | Generated VOD media playlist |
 | `GET` | `/api/recordings/{id}/play/segments/{segmentID}` | Original stored payload |
 
-Start a recording with the first adapter:
+Start a recording with the bundled direct-HLS adapter:
 
 ```sh
 curl -X POST http://localhost:8080/api/recordings \
   -H 'Content-Type: application/json' \
-  -d '{"adapter_id":"owncast","input":{"source_url":"https://watch.owncast.online"},"title":"optional title","preview_mode":"segment"}'
+  -d '{"adapter_id":"hls","input":{"manifest_url":"https://media.example/live/index.m3u8"},"title":"optional title","preview_mode":"segment"}'
 ```
 
 `preview_mode` is optional and defaults to `disabled`. Setting it to `segment` schedules scene previews asynchronously after canonical segments are committed.
@@ -174,7 +178,9 @@ go vet ./...
 ## Roadmap
 
 - [x] Original segment acquisition + restart-safe VOD playback
-- [x] Platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
+- [x] Platform-agnostic Core + Adapter Protocol v1 + bundled HLS bridge
+- [ ] Owncast source plugin release and official Registry approval
+- [x] Three-tier plugin admission provenance, separate publisher affiliation, and trust-aware runtime projection
 - [x] Restartless immutable adapter lifecycle (Host import, adapter-set generations, and recording pinning)
 - [x] Resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] Chat timeline

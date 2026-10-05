@@ -6,7 +6,8 @@ services:
     environment:
       ADDR: ":8080"
       DATA_DIR: /data
-      ADAPTER_DIR: /adapters:/external-adapters
+      ADAPTER_DIR: /external-adapters
+      IR_ALLOW_OPERATOR_PLUGINS: ${IR_ALLOW_OPERATOR_PLUGINS:-0}
       IR_PLUGIN_REGISTRY_URL: ${IR_PLUGIN_REGISTRY_URL:-}
     volumes:
       - recording-data:/data

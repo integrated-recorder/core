@@ -21,9 +21,9 @@ RUN set -eu; \
     CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/runtime-host ./cmd/runtime-host; \
 	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/initial/control-plane ./cmd/control-plane; \
 	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/initial/recorder-engine ./cmd/recorder-engine; \
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast; \
+	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/adapters/integrated-recorder-adapter-hls ./cmd/adapters/hls; \
 	CGO_ENABLED=0 go build -trimpath -ldflags="${app_ldflags}" -o /out/plugins/storage.local ./cmd/storage-local; \
-	chmod 0555 /out/runtime-host /out/initial/control-plane /out/initial/recorder-engine /out/plugins/storage.local
+	chmod 0555 /out/runtime-host /out/initial/control-plane /out/initial/recorder-engine /out/adapters/integrated-recorder-adapter-hls /out/plugins/storage.local
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates ffmpeg && adduser -D -H -u 10001 archiver && mkdir -p /data /opt/integrated-recorder/initial /usr/local/lib/integrated-recorder/plugins && chown archiver:archiver /data
@@ -33,7 +33,7 @@ COPY --from=build /out/adapters/ /adapters/
 COPY --from=build /out/plugins/storage.local /usr/local/lib/integrated-recorder/plugins/storage.local
 RUN chmod 0555 /usr/local/bin/runtime-host /opt/integrated-recorder/initial/control-plane /opt/integrated-recorder/initial/recorder-engine /usr/local/lib/integrated-recorder/plugins/storage.local && chown -R root:root /opt/integrated-recorder /usr/local/lib/integrated-recorder /adapters
 USER 10001:10001
-ENV ADDR=:8080 DATA_DIR=/data ADAPTER_DIR=/adapters:/external-adapters
+ENV ADDR=:8080 DATA_DIR=/data ADAPTER_DIR=/external-adapters
 EXPOSE 8080
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/local/bin/runtime-host"]

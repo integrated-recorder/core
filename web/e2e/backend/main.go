@@ -16,7 +16,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,8 +41,6 @@ type sourceFixture struct {
 	mu                sync.RWMutex
 	playlist          []byte
 	segments          map[string][]byte
-	online            bool
-	endList           bool
 	streamTitle       string
 	streamDescription string
 }
@@ -72,7 +69,7 @@ func run() error {
 		name string
 		pkg  string
 	}{
-		{name: "integrated-recorder-adapter-owncast", pkg: "./cmd/adapters/owncast"},
+		{name: "integrated-recorder-adapter-hls", pkg: "./cmd/adapters/hls"},
 		{name: "integrated-recorder-adapter-workflow-fixture", pkg: "./web/e2e/fixture_adapter"},
 		{name: "integrated-recorder-adapter-metadata-fixture", pkg: "./web/e2e/metadata_fixture_adapter"},
 	} {
@@ -402,27 +399,6 @@ func playlistSegmentNames(playlist []byte) []string {
 }
 
 func (fixture *sourceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/api/status" {
-		fixture.mu.RLock()
-		online := fixture.online
-		title := fixture.streamTitle
-		fixture.mu.RUnlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"online": online, "lastConnectTime": "2026-09-28T00:00:00Z", "streamTitle": title})
-		return
-	}
-	if r.URL.Path == "/e2e/set-title" {
-		title := r.URL.Query().Get("value")
-		if len(title) > 4096 {
-			http.Error(w, "title is too long", http.StatusBadRequest)
-			return
-		}
-		fixture.mu.Lock()
-		fixture.streamTitle = title
-		fixture.mu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	if r.URL.Path == "/e2e/metadata" {
 		fixture.mu.RLock()
 		title, description := fixture.streamTitle, fixture.streamDescription
@@ -444,29 +420,10 @@ func (fixture *sourceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if r.URL.Path == "/e2e/set-online" {
-		value, parseErr := strconv.ParseBool(r.URL.Query().Get("value"))
-		if parseErr != nil {
-			http.Error(w, "value must be boolean", http.StatusBadRequest)
-			return
-		}
-		fixture.mu.Lock()
-		fixture.online = value
-		if endList := r.URL.Query().Get("endlist"); endList != "" {
-			fixture.endList = endList == "true"
-		}
-		fixture.mu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	if r.URL.Path == "/hls/stream.m3u8" {
 		fixture.mu.RLock()
 		playlist := append([]byte(nil), fixture.playlist...)
-		endList := fixture.endList
 		fixture.mu.RUnlock()
-		if endList && !bytes.Contains(playlist, []byte("#EXT-X-ENDLIST")) {
-			playlist = append(playlist, []byte("#EXT-X-ENDLIST\n")...)
-		}
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		_, _ = w.Write(playlist)
 		return

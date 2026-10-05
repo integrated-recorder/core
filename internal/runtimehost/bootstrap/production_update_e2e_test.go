@@ -171,7 +171,7 @@ func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateA
 	t.Helper()
 	moduleRoot := findRuntimeE2EModuleRoot(t)
 	root := newRuntimeE2ETempDir(t)
-	for _, name := range []string{"bin", "releases", "initial-a", "adapters"} {
+	for _, name := range []string{"bin", "releases", "initial-a", "adapters", "bundled-adapters"} {
 		if err := os.Mkdir(filepath.Join(root, name), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -205,7 +205,11 @@ func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateA
 	controlB := build(filepath.Join(bin, "control-b"), "./cmd/control-plane", "", ldflags(e2eVersionB, e2eCommitB))
 	engineFlagsB := ldflags(e2eVersionB, e2eCommitB) + " -X main.runtimeE2EFixtureOrigin=" + fixtureURL
 	engineB := build(filepath.Join(bin, "engine-b"), "./cmd/recorder-engine", "runtime_e2e", engineFlagsB)
-	adapterRuntime := build(filepath.Join(bin, "adapter-runtime"), "./cmd/adapters/owncast", "", "")
+	// adapter-runtime remains a required signed release role for compatibility;
+	// it now carries the bundled generic HLS source executable.
+	adapterRuntime := build(filepath.Join(bin, "adapter-runtime"), "./cmd/adapters/hls", "", "")
+	bundledHLS := filepath.Join(root, "bundled-adapters", "integrated-recorder-adapter-hls")
+	copyRuntimeArtifact(t, adapterRuntime, bundledHLS, 0555)
 	storageLocalBinary := build(filepath.Join(bin, "storage-local"), "./cmd/storage-local", "", "")
 	packager := build(filepath.Join(bin, "release-pack"), "./cmd/release-pack", "", "")
 	fixtureAdapter := build(filepath.Join(root, "adapters", "integrated-recorder-adapter-runtime-update-fixture"), "./web/e2e/runtime_update_adapter", "", "")
@@ -222,8 +226,12 @@ func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateA
 		_ = os.Chmod(filepath.Join(bundleA, "control-plane"), 0600)
 		_ = os.Chmod(filepath.Join(bundleA, "recorder-engine"), 0600)
 	})
-	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags(e2eVersionA, e2eCommitA)+" -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
-	hostB := build(filepath.Join(bin, "runtime-host-b"), "./cmd/runtime-host", "runtime_e2e", ldflags(e2eVersionB, e2eCommitB)+" -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
+	hostFlags := func(version, commit string) string {
+		return ldflags(version, commit) + " -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir=" + bundleA +
+			" -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundledHLSBinary=" + bundledHLS
+	}
+	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", hostFlags(e2eVersionA, e2eCommitA))
+	hostB := build(filepath.Join(bin, "runtime-host-b"), "./cmd/runtime-host", "runtime_e2e", hostFlags(e2eVersionB, e2eCommitB))
 
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -826,6 +834,7 @@ func runTargetRefreshPreflightScenario(t *testing.T, artifacts runtimeUpdateArti
 		"ADDR=" + listenAddr,
 		"AUTH_DISABLED=1",
 		"ADAPTER_DIR=" + artifacts.adapterDir,
+		"IR_ALLOW_OPERATOR_PLUGINS=1",
 		"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 		"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
 		"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
@@ -1286,6 +1295,7 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 			"ADDR=" + listenAddr,
 			"AUTH_DISABLED=1",
 			"ADAPTER_DIR=" + artifacts.adapterDir,
+			"IR_ALLOW_OPERATOR_PLUGINS=1",
 			"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 			"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
 			"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
@@ -1453,6 +1463,9 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 	if err != nil {
 		t.Fatalf("snapshot canonical archive objects at %s: %v", point, err)
 	}
+	if err := validateManifestSnapshotReferences(preCrashArchive, preCrashObjects); err != nil {
+		t.Fatalf("pre-crash canonical manifest references are inconsistent at %s: %v", point, err)
+	}
 	var metadataPreCrash []domain.MetadataRevision
 	if point == runtimehook.BeforeSourceRetirement {
 		// The stable management route intentionally fails closed while both
@@ -1497,6 +1510,9 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 	postCrashObjects, err := snapshotRecordingObjects(archiveDir)
 	if err != nil {
 		t.Fatalf("snapshot canonical archive objects after cold recovery: %v", err)
+	}
+	if err := validateManifestSnapshotReferences(postCrash, postCrashObjects); err != nil {
+		t.Fatalf("cold recovery exposed an incomplete manifest snapshot reference: %v", err)
 	}
 	var addedArchiveObjects []string
 	for object := range postCrashObjects {
@@ -1634,6 +1650,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		"ADDR=" + listenAddr,
 		"AUTH_DISABLED=1",
 		"ADAPTER_DIR=" + artifacts.adapterDir,
+		"IR_ALLOW_OPERATOR_PLUGINS=1",
 		"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 		"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
 		"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,

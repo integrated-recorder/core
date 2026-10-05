@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/runtimehook"
 )
 
@@ -144,9 +145,12 @@ func snapshotRecordingObjects(root string) (map[string]string, error) {
 }
 
 // compareArchiveSnapshotsAllowingManifestAppend proves that the durable
-// pre-crash archive remains byte-for-byte intact while allowing complete
-// append-only source manifest snapshots published by the still-authoritative
-// source Engine during cold recovery.
+// pre-crash archive remains byte-for-byte intact while allowing only
+// append-only source manifest objects published during recovery. SaveSnapshot
+// publishes the manifest payload before its sidecar; a crash between those
+// atomic object writes can leave an unreferenced manifest payload. Storage
+// recovery deliberately reports and preserves such orphan payloads without
+// attaching them to the recording.
 func compareArchiveSnapshotsAllowingManifestAppend(before, after map[string]string) error {
 	for object, digest := range before {
 		actual, ok := after[object]
@@ -169,8 +173,25 @@ func compareArchiveSnapshotsAllowingManifestAppend(before, after map[string]stri
 		if !ok {
 			return fmt.Errorf("unexpected archive object addition %q", object)
 		}
-		if _, exists := added[partner]; !exists {
-			return fmt.Errorf("new manifest snapshot %q has no matching pair %q", object, partner)
+		if strings.HasSuffix(object, ".json") {
+			if _, exists := after[partner]; !exists {
+				return fmt.Errorf("new manifest snapshot %q has no matching pair %q", object, partner)
+			}
+		}
+	}
+	return nil
+}
+
+func validateManifestSnapshotReferences(recording *domain.Recording, objects map[string]string) error {
+	if recording == nil {
+		return errors.New("recording is unavailable while validating manifest references")
+	}
+	for _, snapshot := range recording.Snapshots {
+		if _, exists := objects[snapshot.StoragePath]; !exists {
+			return fmt.Errorf("recording references missing manifest payload %q", snapshot.StoragePath)
+		}
+		if _, exists := objects[snapshot.StoragePath+".json"]; !exists {
+			return fmt.Errorf("recording references manifest payload %q without its committed sidecar", snapshot.StoragePath)
 		}
 	}
 	return nil

@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 )
 
@@ -114,6 +115,13 @@ func validRegistryV2(data []byte, artifactURL, id, version, pluginType string) R
 	if pluginType == TypeStorage {
 		document.Plugins[0].Releases[0].Artifacts[0].Filename = StorageBinaryPrefix + id
 	}
+	return document
+}
+
+func validRegistryV3(data []byte, artifactURL, id, version, pluginType, publisher string) Registry {
+	document := validRegistryV2(data, artifactURL, id, version, pluginType)
+	document.SchemaVersion = SchemaVersionV3
+	document.Plugins[0].Publisher = &PublisherInfo{Kind: publisher}
 	return document
 }
 
@@ -296,6 +304,77 @@ func TestDecodeRegistryV2TypedPlugins(t *testing.T) {
 				t.Fatalf("expected unavailable, got %v", err)
 			}
 		})
+	}
+}
+
+func TestDecodeRegistryV3PublisherAndReservedIdentities(t *testing.T) {
+	data := []byte("fixture")
+	for _, pluginType := range []string{TypeSource, TypeStorage} {
+		document := validRegistryV3(data, "https://cdn.example.test/artifact", "registry-fixture", "1.0.0", pluginType, string(plugintrust.FirstParty))
+		wire := marshalRegistry(t, document)
+		decoded, err := decodeRegistry(wire)
+		if err != nil || decoded.SchemaVersion != SchemaVersionV3 || decoded.Plugins[0].Publisher == nil || decoded.Plugins[0].Publisher.Kind != string(plugintrust.FirstParty) {
+			t.Fatalf("valid v3 %s plugin = %+v, %v", pluginType, decoded, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		plugin Plugin
+	}{
+		{name: "reserved source hls", plugin: validRegistryV3(data, "https://cdn.example.test/artifact", "hls", "1.0.0", TypeSource, string(plugintrust.FirstParty)).Plugins[0]},
+		{name: "reserved storage local", plugin: validRegistryV3(data, "https://cdn.example.test/artifact", "local", "1.0.0", TypeStorage, string(plugintrust.FirstParty)).Plugins[0]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := decodeRegistry(marshalRegistry(t, Registry{SchemaVersion: SchemaVersionV3, Plugins: []Plugin{tc.plugin}})); !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("reserved ID accepted: %v", err)
+			}
+		})
+	}
+
+	valid := marshalRegistry(t, validRegistryV3(data, "https://cdn.example.test/artifact", "registry-fixture", "1.0.0", TypeSource, string(plugintrust.ThirdParty)))
+	for name, edit := range map[string]func([]byte) []byte{
+		"missing publisher": func(wire []byte) []byte {
+			return bytes.Replace(wire, []byte(`"publisher":{"kind":"third_party"},`), nil, 1)
+		},
+		"unknown publisher kind": func(wire []byte) []byte {
+			return bytes.Replace(wire, []byte(`"kind":"third_party"`), []byte(`"kind":"publisher"`), 1)
+		},
+		"unknown publisher field": func(wire []byte) []byte {
+			return bytes.Replace(wire, []byte(`"kind":"third_party"`), []byte(`"kind":"third_party","name":"Example"`), 1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeRegistry(edit(valid)); !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("invalid publisher accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegistryV3AttestationRequiresExactOfficialEndpoint(t *testing.T) {
+	publisher := &PublisherInfo{Kind: string(plugintrust.FirstParty)}
+	if !isOfficialCatalogResponse(OfficialCatalogV3URL, OfficialCatalogV3URL) {
+		t.Fatal("exact canonical endpoint not recognized")
+	}
+	for _, final := range []string{
+		"https://integrated-recorder.github.io/plugin-registry/catalog.json",
+		"https://integrated-recorder.github.io/plugin-registry/catalog-v3.json/",
+		"https://example.test/plugin-registry/catalog-v3.json",
+		"https://integrated-recorder.github.io:443/plugin-registry/catalog-v3.json",
+	} {
+		if isOfficialCatalogResponse(OfficialCatalogV3URL, final) {
+			t.Errorf("redirect/final URL %q retained official authority", final)
+		}
+	}
+	if got := registryAttestation(SchemaVersionV3, plugintrust.Official, publisher); got != plugintrust.NewOfficialRegistry(plugintrust.FirstParty) {
+		t.Fatalf("official Registry v3 attestation = %+v", got)
+	}
+	if got := registryAttestation(SchemaVersionV3, plugintrust.Custom, publisher); got != plugintrust.NewCustomRegistry() {
+		t.Fatalf("custom Registry v3 self-claim not ignored: %+v", got)
+	}
+	if got := registryAttestation(SchemaVersionV2, plugintrust.Official, publisher); got != plugintrust.NewCustomRegistry() {
+		t.Fatalf("v2 catalog acquired publisher trust: %+v", got)
 	}
 }
 
@@ -493,6 +572,9 @@ func TestInstallUpdateRollbackUninstallAndRegistryOutage(t *testing.T) {
 	if selection.Version != "1.0.0" || selection.Digest != fixtureDigest(fixture) || filepath.Base(plan.SourceDir()) != "bin" {
 		t.Fatalf("unexpected prepared selection/directory: %+v %q", selection, plan.SourceDir())
 	}
+	if selection.Attestation == nil || *selection.Attestation != plugintrust.NewCustomRegistry() {
+		t.Fatalf("custom Registry claim was not conservatively classified: %+v", selection.Attestation)
+	}
 	path := filepath.Join(plan.SourceDir(), selection.Filename)
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0500 {
@@ -504,11 +586,15 @@ func TestInstallUpdateRollbackUninstallAndRegistryOutage(t *testing.T) {
 	plan.Close()
 	plan.Close()
 	view := manager.View()
-	if !view.Configured || !view.Available || len(view.Installed) != 1 || view.Plugins[0].Type != TypeSource || view.Plugins[0].InstalledVersion != "1.0.0" {
+	if !view.Configured || !view.Available || len(view.Installed) != 1 || view.Plugins[0].Type != TypeSource || view.Plugins[0].InstalledVersion != "1.0.0" || view.Plugins[0].Trust != plugintrust.NewCustomRegistry() {
 		t.Fatalf("installed view not updated: %+v", view)
 	}
 	if dirs, err := manager.DesiredSourceDirs(); err != nil || len(dirs) != 1 || dirs[0] != filepath.Dir(path) {
 		t.Fatalf("desired source dirs = %v, %v", dirs, err)
+	}
+	classified, err := manager.DesiredSources()
+	if err != nil || len(classified) != 1 || classified[0].Path != path || len(classified[0].AllowedIDs) != 1 || classified[0].AllowedIDs[0] != selection.ID || classified[0].Attestation != plugintrust.NewCustomRegistry() {
+		t.Fatalf("classified desired sources = %+v, %v", classified, err)
 	}
 	oldSourceSet := filepath.Dir(filepath.Dir(path))
 	oldArtifact := filepath.Join(filepath.Dir(filepath.Dir(oldSourceSet)), "artifacts", selection.Digest)

@@ -63,7 +63,8 @@ func buildRuntimeAdapterLifecycleArtifacts(t *testing.T, fixtureURL string) runt
 	bin := filepath.Join(root, "bin")
 	bundleA := filepath.Join(root, "initial-a")
 	adapterDir := filepath.Join(root, "adapters")
-	for _, directory := range []string{bin, bundleA, adapterDir} {
+	bundledAdapterDir := filepath.Join(root, "bundled-adapters")
+	for _, directory := range []string{bin, bundleA, adapterDir, bundledAdapterDir} {
 		if err := os.Mkdir(directory, 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -91,7 +92,7 @@ func buildRuntimeAdapterLifecycleArtifacts(t *testing.T, fixtureURL string) runt
 	control := build(filepath.Join(bin, "control-plane"), "./cmd/control-plane", "", ldflags)
 	engineFlags := ldflags + " -X main.runtimeE2EFixtureOrigin=" + fixtureURL
 	engine := build(filepath.Join(bin, "recorder-engine"), "./cmd/recorder-engine", "runtime_e2e", engineFlags)
-	owncast := build(filepath.Join(bin, "owncast"), "./cmd/adapters/owncast", "", "")
+	hls := build(filepath.Join(bin, "integrated-recorder-adapter-hls"), "./cmd/adapters/hls", "", ldflags)
 	storageLocal := build(filepath.Join(bin, "storage.local"), "./cmd/storage-local", "", ldflags)
 	copyRuntimeArtifact(t, control, filepath.Join(bundleA, "control-plane"), 0555)
 	copyRuntimeArtifact(t, engine, filepath.Join(bundleA, "recorder-engine"), 0555)
@@ -104,8 +105,11 @@ func buildRuntimeAdapterLifecycleArtifacts(t *testing.T, fixtureURL string) runt
 			_ = os.Chmod(filepath.Join(bundleA, name), 0600)
 		}
 	})
-	copyRuntimeArtifact(t, owncast, filepath.Join(adapterDir, "integrated-recorder-adapter-owncast"), 0555)
-	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags+" -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
+	bundledHLS := filepath.Join(bundledAdapterDir, "integrated-recorder-adapter-hls")
+	copyRuntimeArtifact(t, hls, bundledHLS, 0555)
+	hostFlags := ldflags + " -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir=" + bundleA +
+		" -X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundledHLSBinary=" + bundledHLS
+	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", hostFlags)
 	return runtimeAdapterLifecycleArtifacts{
 		root: root, fixtureURL: fixtureURL, bundleA: bundleA, hostA: hostA, adapterDir: adapterDir, storageLocalBinary: storageLocal,
 	}
@@ -160,6 +164,7 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 		"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 		"AUTH_DISABLED=1",
 		"ADAPTER_DIR=" + artifacts.adapterDir,
+		"IR_ALLOW_OPERATOR_PLUGINS=1",
 		"IR_RUNTIME_E2E_FAILPOINT=" + string(runtimehook.AfterSourceDrain),
 		"IR_RUNTIME_E2E_MARKER_DIR=" + markerDir,
 	})
@@ -434,8 +439,8 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 		t.Fatal(err)
 	}
 	status = waitForAdapterGeneration(t, ctx, client, baseURL, upgradedGeneration, runtimeE2EAdapterID, "", false)
-	if status.DefaultEngine.ID == upgradedGeneration {
-		t.Fatal("removing the final external fixture adapter did not activate an Owncast-only set")
+	if status.DefaultEngine.ID == upgradedGeneration || !adapterListHas(t, client, baseURL, "hls", e2eVersionA) {
+		t.Fatal("removing the final operator fixture adapter did not retain the bundled HLS-only set")
 	}
 	err = waitRuntimeConditionError(30*time.Second, func() bool {
 		state := readRuntimeGenerationSnapshot(t, dataDir)

@@ -22,7 +22,12 @@ func (p *StorageArtifactPlan) Selection() DesiredPlugin {
 	if p == nil {
 		return DesiredPlugin{}
 	}
-	return p.selection
+	selection := p.selection
+	if p.selection.Attestation != nil {
+		attestation := *p.selection.Attestation
+		selection.Attestation = &attestation
+	}
+	return selection
 }
 
 // BinaryPath is private Host orchestration input. Do not project it through
@@ -64,6 +69,7 @@ func (m *Manager) PrepareStorageArtifact(ctx context.Context, id string) (*Stora
 	}()
 	m.stateMu.RLock()
 	configured, available := m.registryURL != "", m.available
+	authority := m.registryAuthority
 	var document *registryDocument
 	if m.registry != nil {
 		copy := *m.registry
@@ -95,7 +101,7 @@ func (m *Manager) PrepareStorageArtifact(ctx context.Context, id string) (*Stora
 	if err := m.downloadAndVerify(ctx, plugin, release, artifact); err != nil {
 		return nil, redactFailure(err)
 	}
-	selection := DesiredPlugin{ID: plugin.ID, Name: plugin.Name, Version: release.Version, Channel: "stable", Digest: artifact.SHA256, Filename: artifact.Filename, Size: artifact.Size, SourceCommit: release.SourceCommit}
+	selection := DesiredPlugin{ID: plugin.ID, Name: plugin.Name, Version: release.Version, Channel: "stable", Digest: artifact.SHA256, Filename: artifact.Filename, Size: artifact.Size, SourceCommit: release.SourceCommit, Attestation: attestationPointer(registryAttestation(document.SchemaVersion, authority, plugin.Publisher))}
 	path := filepath.Join(m.root, "artifacts", artifact.SHA256)
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != artifact.Size || info.Mode().Perm()&0077 != 0 {

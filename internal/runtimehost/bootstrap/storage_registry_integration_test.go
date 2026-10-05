@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/generation"
 	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
 	"github.com/integrated-recorder/core/internal/runtimehost/pluginregistry"
@@ -121,6 +122,10 @@ func TestStorageRegistryInstallConfigureProbeActivate(t *testing.T) {
 	if artifact.ID != "fixture-storage" || artifact.Version != "1.0.0" || artifact.Digest != digestHex || artifact.Size != int64(len(binaryBytes)) {
 		t.Fatalf("installed artifact=%+v, want exact registry identity and bytes", artifact)
 	}
+	installedTrust, found, err := catalog.InstalledAttestation("fixture-storage")
+	if err != nil || !found || installedTrust != plugintrust.NewCustomRegistry() {
+		t.Fatalf("installed storage attestation=%+v found=%t err=%v, want custom registry", installedTrust, found, err)
+	}
 	artifactPath, err := catalog.ArtifactPath(artifact.Digest)
 	if err != nil {
 		t.Fatal(err)
@@ -142,6 +147,9 @@ func TestStorageRegistryInstallConfigureProbeActivate(t *testing.T) {
 	}
 
 	objectRoot := filepath.Join(t.TempDir(), "objects")
+	// Configuration must use the durable selection captured at install time,
+	// not current Registry availability or catalog view.
+	registryServer.Close()
 	configurationBody, err := json.Marshal(httpapi.StorageConfigRequest{
 		Values:  map[string]json.RawMessage{"root": mustStorageJSON(t, objectRoot)},
 		Secrets: map[string]string{},
@@ -163,6 +171,10 @@ func TestStorageRegistryInstallConfigureProbeActivate(t *testing.T) {
 	}
 	if got := string(configView.Values["root"]); got != mustStorageJSONString(t, objectRoot) {
 		t.Fatalf("public non-secret root value=%s", got)
+	}
+	configured, err := catalog.DesiredSet("fixture-storage")
+	if err != nil || configured.EffectiveAttestation() != plugintrust.NewCustomRegistry() {
+		t.Fatalf("configured storage set attestation=%+v err=%v, want original custom Registry authority", configured.EffectiveAttestation(), err)
 	}
 	for name, public := range map[string]string{"config": configBody, "install status": body} {
 		for _, private := range []string{registryRoot, catalogRoot, registryServer.URL + "/artifact", digestHex, "ipc_token", ".sock"} {
@@ -240,7 +252,6 @@ func TestStorageRegistryInstallConfigureProbeActivate(t *testing.T) {
 	// unavailable. A successful fresh process launch and Core-owned CRUD probe
 	// here proves that playback/recording generations do not depend on registry
 	// connectivity after activation.
-	registryServer.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	store, provider, err := storageprocess.OpenStore(ctx, fixture.root, catalogRoot, desired.ID)
@@ -541,16 +552,19 @@ func installBundledLocalProviderForTest(t *testing.T, fixture *controllerFixture
 	if err != nil {
 		t.Fatalf("import bundled storage.local fixture: %v", err)
 	}
-	if err := catalog.Install(artifact); err != nil {
+	if err := catalog.InstallWithAttestation(artifact, plugintrust.NewBundled()); err != nil {
 		t.Fatalf("install bundled storage.local fixture: %v", err)
 	}
 	rootValue, err := json.Marshal(filepath.Join(fixture.root, "recordings"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	set, err := catalog.CreateSet(artifact.Digest, storagecatalog.SetConfig{Values: map[string]json.RawMessage{"root": rootValue}})
+	set, err := catalog.CreateInstalledSet("local", storagecatalog.SetConfig{Values: map[string]json.RawMessage{"root": rootValue}})
 	if err != nil {
 		t.Fatalf("create bundled local provider set: %v", err)
+	}
+	if set.EffectiveAttestation() != plugintrust.NewBundled() {
+		t.Fatalf("bundled local storage set trust = %+v, want bundled first-party", set.EffectiveAttestation())
 	}
 	if err := catalog.SelectDesiredSet("local", set.ID); err != nil {
 		t.Fatalf("select bundled local provider set: %v", err)

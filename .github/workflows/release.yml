@@ -66,7 +66,9 @@ jobs:
             go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/runtime-host" ./cmd/runtime-host
             go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/control-plane" ./cmd/control-plane
             go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/recorder-engine" ./cmd/recorder-engine
-            go build -buildvcs=false -trimpath -o "dist/bin-${TARGET}/adapter-runtime" ./cmd/adapters/owncast
+            # The signed release schema still calls this role adapter-runtime.
+            # Its bundled source implementation is now the generic HLS bridge.
+            go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/adapter-runtime" ./cmd/adapters/hls
 
             dist/release-pack \
               -version "${VERSION}" \

@@ -17,7 +17,64 @@ import (
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 )
+
+func TestAdapterAPIUsesHostPinnedTrustProjection(t *testing.T) {
+	dir := t.TempDir()
+	writeServerTestAdapter(t, dir)
+	host, err := adapterhost.Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+
+	bundled := plugintrust.NewBundled()
+	handler := NewWithOptions(nil, host, nil, Options{AdapterTrust: map[string]plugintrust.Attestation{"schema-test": bundled}})
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "list", method: http.MethodGet, path: "/api/adapters"},
+		{name: "get", method: http.MethodGet, path: "/api/adapters/schema-test"},
+		{name: "restart", method: http.MethodPost, path: "/api/adapters/schema-test/restart"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(test.method, test.path, strings.NewReader("")))
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"provenance":"bundled"`) ||
+				!strings.Contains(response.Body.String(), `"authority":"core_release"`) || !strings.Contains(response.Body.String(), `"publisher":"first_party"`) || !strings.Contains(response.Body.String(), `"reviewed":true`) {
+				t.Fatalf("%s did not return Host-pinned trust: status=%d body=%s", test.name, response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestAdapterAPITrustProjectionIsConservativeForLegacyAndMonolithicControl(t *testing.T) {
+	dir := t.TempDir()
+	writeServerTestAdapter(t, dir)
+	host, err := adapterhost.Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+
+	legacy := NewWithOptions(nil, host, nil, Options{AdapterTrust: map[string]plugintrust.Attestation{"schema-test": plugintrust.Legacy()}})
+	response := httptest.NewRecorder()
+	legacy.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/adapters/schema-test", nil))
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), `"trust"`) {
+		t.Fatalf("legacy pinned entry should remain unclassified: status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	monolithic := New(nil, host, nil)
+	response = httptest.NewRecorder()
+	monolithic.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/adapters/schema-test", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"provenance":"operator"`) ||
+		!strings.Contains(response.Body.String(), `"authority":"local"`) || !strings.Contains(response.Body.String(), `"publisher":"unknown"`) || strings.Contains(response.Body.String(), `"reviewed":true`) {
+		t.Fatalf("monolithic adapter projection was not operator-equivalent: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
 
 func TestAdapterBrandingAPIUsesAuthenticatedIconProjection(t *testing.T) {
 	dir := t.TempDir()

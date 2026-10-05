@@ -3,9 +3,11 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"os"
 	"sort"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 	"github.com/integrated-recorder/core/internal/runtimehost/generation"
 	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
@@ -15,27 +17,44 @@ import (
 	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
-type sourceAwareAdapterCatalog interface {
-	ReconcileWithSources(context.Context, string, []string) (adaptercatalog.Snapshot, error)
+type classifiedAdapterCatalog interface {
+	ReconcileClassified(context.Context, string, []adaptercatalog.Source) (adaptercatalog.Snapshot, error)
 }
 
 func (c *updateController) reconcileCatalog(ctx context.Context, fallbackSetID string) (adaptercatalog.Snapshot, error) {
-	var sources []string
+	sources := []adaptercatalog.Source{{
+		Path: c.config.BundledHLSBinary, Attestation: plugintrust.NewBundled(), AllowedIDs: []string{"hls"},
+	}}
 	if c.pluginRegistry != nil {
-		var err error
-		sources, err = c.pluginRegistry.DesiredSourceDirs()
+		registrySources, err := c.pluginRegistry.DesiredSources()
 		if err != nil {
 			return adaptercatalog.Snapshot{}, err
 		}
+		sources = append(sources, registrySources...)
 	}
-	if len(sources) == 0 {
-		return c.adapterCatalog.Reconcile(ctx, fallbackSetID)
+	if c.config.AllowOperatorPlugins {
+		if err := validateOperatorAdapterDirs(c.config.AdapterDirs, c.config.BundledHLSBinary); err != nil {
+			return adaptercatalog.Snapshot{}, err
+		}
+		dirs, err := configuredAdapterSourceDirs(c.config.AdapterDirs)
+		if err != nil {
+			return adaptercatalog.Snapshot{}, err
+		}
+		for _, dir := range dirs {
+			sources = append(sources, adaptercatalog.Source{Path: dir, Attestation: plugintrust.NewOperator()})
+		}
 	}
-	withSources, ok := c.adapterCatalog.(sourceAwareAdapterCatalog)
-	if !ok {
-		return adaptercatalog.Snapshot{}, errors.New("adapter catalog does not support Host-owned plugin sources")
+	if classified, ok := c.adapterCatalog.(classifiedAdapterCatalog); ok {
+		return classified.ReconcileClassified(ctx, fallbackSetID, sources)
 	}
-	return withSources.ReconcileWithSources(ctx, fallbackSetID, sources)
+	// Small test doubles and legacy embedders may implement only Reconcile. Do
+	// not silently drop any real classified source when taking that fallback.
+	for _, source := range sources {
+		if _, err := os.Lstat(source.Path); err == nil || !errors.Is(err, os.ErrNotExist) {
+			return adaptercatalog.Snapshot{}, errors.New("adapter catalog does not support Host-owned plugin sources")
+		}
+	}
+	return c.adapterCatalog.Reconcile(ctx, fallbackSetID)
 }
 
 func (c *updateController) PluginStatus(ctx context.Context) (httpapi.PluginStatus, error) {
@@ -163,6 +182,9 @@ func (c *updateController) installStoragePlugin(ctx context.Context, id string, 
 	}
 	defer plan.Close()
 	selection := plan.Selection()
+	if selection.Attestation == nil || selection.Attestation.Validate() != nil {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
+	}
 	artifact, err := c.storageCatalog.Import(operationCtx, plan.BinaryPath(), storagecatalog.Expected{
 		ID: selection.ID, Version: selection.Version, ProtocolVersion: storageproto.Version,
 		SHA256: selection.Digest, Size: selection.Size,
@@ -181,16 +203,18 @@ func (c *updateController) installStoragePlugin(ctx context.Context, id string, 
 			if _, _, describeErr := c.storageCatalog.DescribeArtifact(artifact.Digest); describeErr != nil {
 				return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
 			}
-			next, setErr := c.storageCatalog.CreateSet(artifact.Digest, *previousConfig)
-			if setErr == nil {
-				migratedSet = &next
-			} else if !errors.Is(setErr, storagecatalog.ErrInvalidConfig) {
-				return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
-			}
 		}
 	}
-	if err := c.storageCatalog.Install(artifact); err != nil {
+	if err := c.storageCatalog.InstallWithAttestation(artifact, *selection.Attestation); err != nil {
 		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
+	}
+	if update && previousConfig != nil {
+		next, setErr := c.storageCatalog.CreateInstalledSet(id, *previousConfig)
+		if setErr == nil {
+			migratedSet = &next
+		} else if !errors.Is(setErr, storagecatalog.ErrInvalidConfig) {
+			return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
+		}
 	}
 	if migratedSet != nil {
 		if err := c.storageCatalog.SelectDesiredSet(id, migratedSet.ID); err != nil {
@@ -336,7 +360,7 @@ func (c *updateController) pluginStatus() httpapi.PluginStatus {
 		status.Plugins = append(status.Plugins, httpapi.PluginStatusItem{
 			ID: item.ID, Type: item.Type, Name: item.Name, AvailableVersion: item.AvailableVersion,
 			InstalledVersion: item.InstalledVersion, Installed: item.Installed,
-			UpdateAvailable: item.UpdateAvailable,
+			UpdateAvailable: item.UpdateAvailable, Trust: item.Trust,
 		})
 	}
 	if c.storageCatalog != nil {
@@ -348,6 +372,13 @@ func (c *updateController) pluginStatus() httpapi.PluginStatus {
 					// Registry-managed plugin entry.
 					continue
 				}
+				attestation, trustErr := c.storageAttestation(artifact.ID, artifact.Digest)
+				if trustErr != nil {
+					// Do not invent Registry approval for an installed executable whose
+					// admission record is unavailable. A configured set normally keeps
+					// this evidence durable across Registry outages.
+					continue
+				}
 				index, exists := byID[artifact.ID]
 				if exists {
 					item := &status.Plugins[index]
@@ -355,6 +386,7 @@ func (c *updateController) pluginStatus() httpapi.PluginStatus {
 					item.Installed = true
 					item.InstalledVersion = artifact.Version
 					item.UpdateAvailable = c.pluginRegistry != nil && c.pluginRegistry.UpdateAvailable(artifact.ID, artifact.Version)
+					item.Trust = attestation
 					continue
 				}
 				name := artifact.ID
@@ -363,13 +395,44 @@ func (c *updateController) pluginStatus() httpapi.PluginStatus {
 				}
 				status.Plugins = append(status.Plugins, httpapi.PluginStatusItem{
 					ID: artifact.ID, Type: pluginregistry.TypeStorage, Name: name,
-					InstalledVersion: artifact.Version, Installed: true,
+					InstalledVersion: artifact.Version, Installed: true, Trust: attestation,
 				})
 			}
 		}
 	}
 	sort.Slice(status.Plugins, func(i, j int) bool { return status.Plugins[i].ID < status.Plugins[j].ID })
 	return status
+}
+
+func (c *updateController) storageAttestation(id, digest string) (plugintrust.Attestation, error) {
+	if c == nil || c.storageCatalog == nil || id == "" || digest == "" {
+		return plugintrust.Attestation{}, errors.New("storage provider attestation is unavailable")
+	}
+	installed, err := c.installedStorageArtifact(id)
+	if err != nil || installed.Digest != digest {
+		return plugintrust.Attestation{}, errors.New("storage provider attestation is unavailable")
+	}
+	attestation, found, err := c.storageCatalog.InstalledAttestation(id)
+	if err != nil {
+		return plugintrust.Attestation{}, err
+	}
+	if found {
+		if attestation.Validate() == nil {
+			return attestation, nil
+		}
+		return plugintrust.Attestation{}, errors.New("storage provider attestation is invalid")
+	}
+	if set, err := c.storageCatalog.DesiredSet(id); err == nil && set.Artifact.Digest == digest {
+		attestation := set.EffectiveAttestation()
+		if attestation.Provenance == plugintrust.LegacyUnclassified {
+			return plugintrust.NewOperator(), nil
+		}
+		if attestation.Validate() == nil {
+			return attestation, nil
+		}
+		return plugintrust.Attestation{}, errors.New("storage provider attestation is invalid")
+	}
+	return plugintrust.Attestation{}, errors.New("storage provider attestation is unavailable")
 }
 
 func (c *updateController) verifyActivePlugin(selection pluginregistry.DesiredPlugin) error {

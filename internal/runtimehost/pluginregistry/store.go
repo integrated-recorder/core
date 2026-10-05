@@ -14,6 +14,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 )
 
@@ -24,14 +25,15 @@ const (
 )
 
 type DesiredPlugin struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Version      string `json:"version"`
-	Channel      string `json:"channel"`
-	Digest       string `json:"digest"`
-	Filename     string `json:"filename"`
-	Size         int64  `json:"size"`
-	SourceCommit string `json:"source_commit"`
+	ID           string                   `json:"id"`
+	Name         string                   `json:"name"`
+	Version      string                   `json:"version"`
+	Channel      string                   `json:"channel"`
+	Digest       string                   `json:"digest"`
+	Filename     string                   `json:"filename"`
+	Size         int64                    `json:"size"`
+	SourceCommit string                   `json:"source_commit"`
+	Attestation  *plugintrust.Attestation `json:"attestation,omitempty"`
 }
 
 type desiredState struct {
@@ -290,7 +292,7 @@ func validateDesiredWireShape(data []byte) error {
 		return ErrUnsafeStore
 	}
 	for _, plugin := range pluginsRaw {
-		if _, err := strictJSONObject(plugin, "id", "name", "version", "channel", "digest", "filename", "size", "source_commit"); err != nil {
+		if _, err := strictJSONObjectOptional(plugin, []string{"id", "name", "version", "channel", "digest", "filename", "size", "source_commit"}, []string{"attestation"}); err != nil {
 			return ErrUnsafeStore
 		}
 	}
@@ -319,7 +321,7 @@ func validateDesired(state desiredState) error {
 }
 
 func validDesiredPlugin(plugin DesiredPlugin) bool {
-	return validPluginID(plugin.ID) && validText(plugin.Name, maxNameBytes) && validIdentity(plugin.Version) && plugin.Channel == "stable" && shaPattern.MatchString(plugin.Digest) && plugin.Filename == adaptercatalog.BinaryPrefix+plugin.ID && len(plugin.Filename) >= minFilenameBytes && validText(plugin.Filename, maxFilenameBytes) && plugin.Size > 0 && plugin.Size <= MaxArtifactBytes && validSourceCommit(plugin.SourceCommit)
+	return validPluginID(plugin.ID) && validText(plugin.Name, maxNameBytes) && validIdentity(plugin.Version) && plugin.Channel == "stable" && shaPattern.MatchString(plugin.Digest) && plugin.Filename == adaptercatalog.BinaryPrefix+plugin.ID && len(plugin.Filename) >= minFilenameBytes && validText(plugin.Filename, maxFilenameBytes) && plugin.Size > 0 && plugin.Size <= MaxArtifactBytes && validSourceCommit(plugin.SourceCommit) && (plugin.Attestation == nil || plugin.Attestation.Validate() == nil)
 }
 
 func (m *Manager) writeDesired(state desiredState) error {
@@ -393,7 +395,41 @@ func cloneDesired(plugins []DesiredPlugin) []DesiredPlugin {
 	if out == nil {
 		out = []DesiredPlugin{}
 	}
+	for i := range out {
+		if plugins[i].Attestation != nil {
+			attestation := *plugins[i].Attestation
+			out[i].Attestation = &attestation
+		}
+	}
 	return out
+}
+
+// DesiredSources returns one explicitly classified source per immutable
+// Registry binary. Exact file paths and AllowedIDs prevent a directory's
+// unrelated executable from inheriting another plugin's Registry attestation.
+func (m *Manager) DesiredSources() ([]adaptercatalog.Source, error) {
+	if m == nil {
+		return nil, ErrInvalidConfig
+	}
+	state, err := m.loadDesired()
+	if err != nil {
+		return nil, ErrUnsafeStore
+	}
+	binDir := safeSetDirectoryPath(m.root, state.SourceSetID)
+	sources := make([]adaptercatalog.Source, 0, len(state.Plugins))
+	for _, plugin := range state.Plugins {
+		attestation := desiredAttestation(plugin)
+		if attestation.Provenance == plugintrust.LegacyUnclassified {
+			// Old desired selections did not record Registry authority. Keep
+			// them conservative when admitting a new set.
+			attestation = plugintrust.NewOperator()
+		}
+		sources = append(sources, adaptercatalog.Source{
+			Path: filepath.Join(binDir, plugin.Filename), Attestation: attestation,
+			AllowedIDs: []string{plugin.ID},
+		})
+	}
+	return sources, nil
 }
 
 func (m *Manager) ensureSourceSet(plugins []DesiredPlugin, id string) (string, error) {
@@ -535,7 +571,7 @@ func strictSourceSetManifestShape(data []byte) ([]json.RawMessage, error) {
 		return nil, ErrUnsafeStore
 	}
 	for _, plugin := range plugins {
-		if _, err := strictJSONObject(plugin, "id", "name", "version", "channel", "digest", "filename", "size", "source_commit"); err != nil {
+		if _, err := strictJSONObjectOptional(plugin, []string{"id", "name", "version", "channel", "digest", "filename", "size", "source_commit"}, []string{"attestation"}); err != nil {
 			return nil, ErrUnsafeStore
 		}
 	}
@@ -650,11 +686,42 @@ func equalDesired(a, b []DesiredPlugin) bool {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		left, right := a[i], b[i]
+		if left.ID != right.ID || left.Name != right.Name || left.Version != right.Version || left.Channel != right.Channel || left.Digest != right.Digest || left.Filename != right.Filename || left.Size != right.Size || left.SourceCommit != right.SourceCommit || !samePluginAttestation(left.Attestation, right.Attestation) {
 			return false
 		}
 	}
 	return true
+}
+
+func samePluginAttestation(a, b *plugintrust.Attestation) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func strictJSONObjectOptional(data []byte, required, optional []string) (map[string]json.RawMessage, error) {
+	fields, err := strictJSONObjectAny(data, len(required)+len(optional))
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[string]bool, len(required)+len(optional))
+	for _, key := range required {
+		allowed[key] = true
+		if _, ok := fields[key]; !ok {
+			return nil, ErrUnsafeStore
+		}
+	}
+	for _, key := range optional {
+		allowed[key] = true
+	}
+	for key := range fields {
+		if !allowed[key] {
+			return nil, ErrUnsafeStore
+		}
+	}
+	return fields, nil
 }
 
 func syncDirectory(path string) error {

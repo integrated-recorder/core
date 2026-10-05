@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/integrated-recorder/core/internal/plugintrust"
 )
 
 func TestReconcilePublishesStableImmutableSetAndReloads(t *testing.T) {
@@ -84,6 +86,358 @@ func TestReconcileWithAdditionalImmutableSource(t *testing.T) {
 	}
 }
 
+func TestSameDigestWithDifferentAttestationHasDifferentAdapterSetIdentity(t *testing.T) {
+	root, sourceDir := newCatalogDirs(t)
+	binary := filepath.Join(sourceDir, "integrated-recorder-adapter-demo")
+	writeAdapterAt(t, binary, validDescriptor("demo", "1"), "normal", "")
+	catalog, err := Open(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := catalog.ReconcileClassified(context.Background(), "", []Source{{
+		Path: binary, Attestation: plugintrust.NewOperator(), AllowedIDs: []string{"demo"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	official, err := catalog.ReconcileClassified(context.Background(), operator.ID, []Source{{
+		Path: binary, Attestation: plugintrust.NewOfficialRegistry(plugintrust.FirstParty), AllowedIDs: []string{"demo"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operator.Entries[0].ArtifactSHA256 != official.Entries[0].ArtifactSHA256 || operator.ID == official.ID {
+		t.Fatalf("attestation failed to participate in set identity: operator=%+v official=%+v", operator, official)
+	}
+	if operator.Entries[0].Attestation == nil || *operator.Entries[0].Attestation != plugintrust.NewOperator() || official.Entries[0].Attestation == nil || *official.Entries[0].Attestation != plugintrust.NewOfficialRegistry(plugintrust.FirstParty) {
+		t.Fatalf("set did not preserve Host classifications: operator=%+v official=%+v", operator.Entries, official.Entries)
+	}
+}
+
+func TestBundledSourceAllowedIDsAndReservedHLS(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		attestation plugintrust.Attestation
+		allowed     []string
+		wantCount   int
+	}{
+		{name: "operator cannot claim hls", attestation: plugintrust.NewOperator(), allowed: []string{"hls"}},
+		{name: "bundled hls admitted", attestation: plugintrust.NewBundled(), allowed: []string{"hls"}, wantCount: 1},
+		{name: "bundled allowlist is exact", attestation: plugintrust.NewBundled(), allowed: []string{"other"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, sourceDir := newCatalogDirs(t)
+			writeAdapter(t, sourceDir, "integrated-recorder-adapter-hls", validDescriptor("hls", "1"), "normal", "")
+			catalog, _ := Open(root, nil)
+			got, err := catalog.ReconcileClassified(context.Background(), "", []Source{{Path: sourceDir, Attestation: tc.attestation, AllowedIDs: tc.allowed}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Entries) != tc.wantCount {
+				t.Fatalf("entries=%+v rejected=%v, want count %d", got.Entries, got.RejectedCodes, tc.wantCount)
+			}
+			if tc.wantCount == 1 && (got.Entries[0].AdapterID != "hls" || *got.Entries[0].Attestation != plugintrust.NewBundled()) {
+				t.Fatalf("HLS was not Host-classified bundled: %+v", got.Entries[0])
+			}
+		})
+	}
+}
+
+func TestBundledHLSWinsOperatorBasenameCollision(t *testing.T) {
+	root, bundledDir := newCatalogDirs(t)
+	operatorDir := filepath.Join(t.TempDir(), "operator-adapters")
+	if err := os.Mkdir(operatorDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	name := "integrated-recorder-adapter-hls"
+	writeAdapter(t, bundledDir, name, validDescriptor("hls", "1"), "normal", "")
+	writeAdapter(t, operatorDir, name, validDescriptor("hls", "1"), "normal", "")
+	catalog, err := Open(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTreeOwned(root) })
+	got, err := catalog.ReconcileClassified(context.Background(), "", []Source{
+		{Path: bundledDir, Attestation: plugintrust.NewBundled(), AllowedIDs: []string{"hls"}},
+		{Path: operatorDir, Attestation: plugintrust.NewOperator()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Entries) != 1 || got.Entries[0].AdapterID != "hls" || got.Entries[0].Attestation == nil || *got.Entries[0].Attestation != plugintrust.NewBundled() {
+		t.Fatalf("operator basename collision suppressed bundled HLS: %+v", got)
+	}
+	if !contains(got.RejectedCodes, "duplicate_binary_name") {
+		t.Fatalf("operator collision was not reported: %+v", got)
+	}
+}
+
+func TestAuthoritativeBundledHLSCollisionWinner(t *testing.T) {
+	bundled := sourceCandidate{
+		path: "/host/bundled/" + BinaryPrefix + "hls",
+		source: Source{
+			Path:        "/host/bundled",
+			Attestation: plugintrust.NewBundled(),
+			AllowedIDs:  []string{"hls"},
+		},
+	}
+	operator := sourceCandidate{
+		path: "/operator/" + BinaryPrefix + "custom-hls",
+		source: Source{
+			Path:        "/operator",
+			Attestation: plugintrust.NewOperator(),
+		},
+	}
+	otherBundled := sourceCandidate{
+		path: "/other-bundled/" + BinaryPrefix + "custom-hls",
+		source: Source{
+			Path:        "/other-bundled",
+			Attestation: plugintrust.NewBundled(),
+			AllowedIDs:  []string{"hls"},
+		},
+	}
+	entry := func(path string, attestation plugintrust.Attestation) candidate {
+		return candidate{path: path, entry: Entry{AdapterID: "hls", Attestation: attestationPointer(attestation)}}
+	}
+
+	tests := []struct {
+		name       string
+		id         string
+		candidates []candidate
+		sources    map[string]sourceCandidate
+		indexes    []int
+		wantPath   string
+	}{
+		{
+			name:       "one exact bundled candidate wins regardless of path order",
+			id:         "hls",
+			candidates: []candidate{entry(operator.path, plugintrust.NewOperator()), entry(bundled.path, plugintrust.NewBundled())},
+			sources:    map[string]sourceCandidate{operator.path: operator, bundled.path: bundled},
+			indexes:    []int{0, 1},
+			wantPath:   bundled.path,
+		},
+		{
+			name:       "second bundled candidate keeps group ambiguous",
+			id:         "hls",
+			candidates: []candidate{entry(bundled.path, plugintrust.NewBundled()), entry(otherBundled.path, plugintrust.NewBundled())},
+			sources:    map[string]sourceCandidate{bundled.path: bundled, otherBundled.path: otherBundled},
+			indexes:    []int{0, 1},
+		},
+		{
+			name:       "missing exact bundled source keeps group ambiguous",
+			id:         "hls",
+			candidates: []candidate{entry(otherBundled.path, plugintrust.NewBundled()), entry(operator.path, plugintrust.NewOperator())},
+			sources:    map[string]sourceCandidate{otherBundled.path: otherBundled, operator.path: operator},
+			indexes:    []int{1, 0},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			winner, ok := authoritativeBundledHLSCollisionWinner(tc.id, tc.indexes, tc.candidates, tc.sources)
+			if tc.wantPath == "" {
+				if ok || winner != -1 {
+					t.Fatalf("winner = %d, %v; want no authoritative winner", winner, ok)
+				}
+				return
+			}
+			if !ok || tc.candidates[winner].path != tc.wantPath {
+				t.Fatalf("winner = %d, %v; want candidate %q", winner, ok, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestOperatorHLSDescriptorCannotSuppressOrReplaceBundledHLS(t *testing.T) {
+	root, bundledDir := newCatalogDirs(t)
+	base := filepath.Dir(bundledDir)
+	operatorDir := filepath.Join(base, "00-operator")
+	if err := os.Mkdir(operatorDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeAdapter(t, bundledDir, BinaryPrefix+"hls", validDescriptor("hls", "1"), "normal", "bundled bytes\n")
+	operatorPath := writeAdapter(t, operatorDir, BinaryPrefix+"custom-hls", validDescriptor("hls", "1"), "normal", "operator bytes\n")
+	catalog, err := Open(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removeTreeOwned(root)
+	bundled := Source{Path: bundledDir, Attestation: plugintrust.NewBundled(), AllowedIDs: []string{"hls"}}
+	operator := Source{Path: operatorDir, Attestation: plugintrust.NewOperator(), AllowedIDs: []string{"hls"}}
+
+	initial, err := catalog.ReconcileClassified(context.Background(), "", []Source{operator, bundled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial.Entries) != 1 || initial.Entries[0].AdapterID != "hls" || initial.Entries[0].Attestation == nil || *initial.Entries[0].Attestation != plugintrust.NewBundled() {
+		t.Fatalf("operator candidate suppressed bundled HLS on initial reconcile: %+v", initial)
+	}
+	if !contains(initial.RejectedCodes, "reserved_adapter_id") {
+		t.Fatalf("operator HLS descriptor was not rejected: %+v", initial)
+	}
+	knownGood := initial.Entries[0]
+
+	writeAdapterAt(t, operatorPath, validDescriptor("hls", "2"), "normal", "replacement operator bytes\n")
+	fallback, err := catalog.ReconcileClassified(context.Background(), initial.ID, []Source{bundled, operator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.ID != initial.ID || len(fallback.Entries) != 1 || !sameEntry(fallback.Entries[0], knownGood) {
+		t.Fatalf("operator candidate replaced the known-good bundled HLS identity: initial=%+v fallback=%+v", initial, fallback)
+	}
+}
+
+func TestAmbiguousNonAuthoritativeBundledHLSCandidatesAreRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		firstAllowedIDs []string
+	}{
+		{name: "no exact authoritative candidate"},
+		{name: "multiple bundled candidates", firstAllowedIDs: []string{"hls"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, firstDir := newCatalogDirs(t)
+			secondDir := filepath.Join(t.TempDir(), "other-bundled")
+			if err := os.Mkdir(secondDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			writeAdapter(t, firstDir, BinaryPrefix+"hls", validDescriptor("hls", "1"), "normal", "first bundled\n")
+			writeAdapter(t, secondDir, BinaryPrefix+"custom-hls", validDescriptor("hls", "1"), "normal", "second bundled\n")
+			catalog, err := Open(root, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer removeTreeOwned(root)
+			got, err := catalog.ReconcileClassified(context.Background(), "", []Source{
+				{Path: firstDir, Attestation: plugintrust.NewBundled(), AllowedIDs: tc.firstAllowedIDs},
+				{Path: secondDir, Attestation: plugintrust.NewBundled(), AllowedIDs: []string{"hls"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Entries) != 0 || got.RejectedCount != 2 || !contains(got.RejectedCodes, "duplicate_adapter_id") {
+				t.Fatalf("ambiguous non-authoritative HLS group was not rejected: %+v", got)
+			}
+		})
+	}
+}
+
+func TestConflictingBundledHLSBasenamesFailClosed(t *testing.T) {
+	root, firstDir := newCatalogDirs(t)
+	secondDir := filepath.Join(t.TempDir(), "bundled-adapters")
+	if err := os.Mkdir(secondDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	name := "integrated-recorder-adapter-hls"
+	writeAdapter(t, firstDir, name, validDescriptor("hls", "1"), "normal", "")
+	writeAdapter(t, secondDir, name, validDescriptor("hls", "2"), "normal", "")
+	catalog, err := Open(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTreeOwned(root) })
+	got, err := catalog.ReconcileClassified(context.Background(), "", []Source{
+		{Path: firstDir, Attestation: plugintrust.NewBundled(), AllowedIDs: []string{"hls"}},
+		{Path: secondDir, Attestation: plugintrust.NewBundled(), AllowedIDs: []string{"hls"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Entries) != 0 || got.RejectedCount != 2 || !contains(got.RejectedCodes, "duplicate_binary_name") {
+		t.Fatalf("conflicting bundled HLS candidates were not rejected: %+v", got)
+	}
+}
+
+func TestClassifiedSourceLimitAllowsRegistryAndBundledInventory(t *testing.T) {
+	base := t.TempDir()
+	configured := make([]string, maxSourceDirs)
+	for i := range configured {
+		configured[i] = filepath.Join(base, fmt.Sprintf("operator-%02d", i))
+	}
+	catalog, err := Open(filepath.Join(base, "catalog"), configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTreeOwned(catalog.root) })
+	classified := make([]Source, 0, maxClassifiedSources)
+	for i := 0; i < maxAdapters; i++ {
+		classified = append(classified, Source{
+			Path: filepath.Join(base, fmt.Sprintf("registry-%03d", i)), Attestation: plugintrust.NewCustomRegistry(),
+		})
+	}
+	classified = append(classified, Source{
+		Path: filepath.Join(base, "bundled-hls"), Attestation: plugintrust.NewBundled(), AllowedIDs: []string{"hls"},
+	})
+	if _, err := catalog.ReconcileClassified(context.Background(), "", classified); err != nil {
+		t.Fatalf("maximum bounded classified inventory rejected: %v", err)
+	}
+	tooMany := append(append([]Source(nil), classified...), Source{
+		Path: filepath.Join(base, "extra-source"), Attestation: plugintrust.NewOperator(),
+	})
+	if _, err := catalog.ReconcileClassified(context.Background(), "", tooMany); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("oversized classified inventory error = %v, want ErrInvalidConfig", err)
+	}
+}
+
+func TestDescriptorSelfClaimsDoNotSetAttestation(t *testing.T) {
+	root, sourceDir := newCatalogDirs(t)
+	attestation := plugintrust.NewOperator()
+	descriptor := strings.TrimSuffix(validDescriptor("demo", "1"), "}") + `,"trust":{"provenance":"bundled","authority":"core_release","publisher":"first_party","reviewed":true}}`
+	writeAdapter(t, sourceDir, "integrated-recorder-adapter-demo", descriptor, "normal", "")
+	catalog, _ := Open(root, nil)
+	got, err := catalog.ReconcileClassified(context.Background(), "", []Source{{Path: sourceDir, Attestation: attestation}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Entries) != 1 || got.Entries[0].Attestation == nil || *got.Entries[0].Attestation != plugintrust.NewOperator() {
+		t.Fatalf("descriptor self-claim affected Host provenance: %+v", got.Entries)
+	}
+}
+
+func TestLegacyAdapterSetWithoutAttestationRemainsLoadable(t *testing.T) {
+	root, sourceDir := newCatalogDirs(t)
+	writeAdapter(t, sourceDir, "integrated-recorder-adapter-demo", validDescriptor("demo", "1"), "normal", "")
+	catalog, _ := Open(root, []string{sourceDir})
+	original, err := catalog.Reconcile(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyEntries := cloneEntries(original.Entries)
+	legacyEntries[0].Attestation = nil
+	legacyManifest, err := encodeManifest(legacyEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyID := digest(legacyManifest)
+	originalDir := filepath.Join(root, "sets", original.ID)
+	if err := os.Chmod(originalDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(originalDir, "adapter-set.json")
+	if err := os.Chmod(manifestPath, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, legacyManifest, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(originalDir, filepath.Join(root, "sets", legacyID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "sets", legacyID), 0500); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := catalog.Load(legacyID)
+	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0].Attestation != nil || loaded.Entries[0].EffectiveAttestation().Provenance != plugintrust.LegacyUnclassified {
+		t.Fatalf("legacy adapter set load = %+v, %v", loaded, err)
+	}
+	// A rejected replacement with the same executable name exercises the
+	// fallback path that carries this pre-provenance entry into a new publish.
+	writeAdapter(t, sourceDir, "integrated-recorder-adapter-demo", validDescriptor("demo", "1"), "malformed", "")
+	fallback, err := catalog.Reconcile(context.Background(), legacyID)
+	if err != nil || fallback.ID != legacyID || len(fallback.Entries) != 1 || fallback.Entries[0].Attestation != nil || fallback.Entries[0].EffectiveAttestation().Provenance != plugintrust.LegacyUnclassified {
+		t.Fatalf("legacy fallback acquired invented provenance: %+v, %v", fallback, err)
+	}
+}
+
 func TestDifferentArtifactBytesProduceDifferentSetIdentity(t *testing.T) {
 	root, source := newCatalogDirs(t)
 	path := filepath.Join(source, "integrated-recorder-adapter-demo")
@@ -145,7 +499,7 @@ func TestSameAdapterVersionCannotSilentlyChangeArtifactIdentity(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if got.ID != fallback.ID || len(got.Entries) != 1 || got.Entries[0] != old || got.RejectedCount != 1 || !contains(got.RejectedCodes, "identity_conflict") {
+				if got.ID != fallback.ID || len(got.Entries) != 1 || !sameEntry(got.Entries[0], old) || got.RejectedCount != 1 || !contains(got.RejectedCodes, "identity_conflict") {
 					t.Fatalf("same-version conflict replaced the known-good artifact: %+v", got)
 				}
 			}
@@ -373,7 +727,7 @@ func TestInvalidReplacementRetainsFallbackAndAllowsIndependentAddition(t *testin
 			added = entry
 		}
 	}
-	if retained == nil || added == nil || *retained != old {
+	if retained == nil || added == nil || !sameEntry(*retained, old) {
 		t.Fatalf("old adapter was not retained exactly: old=%+v got=%+v", old, got.Entries)
 	}
 	if _, err := catalog.Load(got.ID); err != nil {
@@ -398,7 +752,7 @@ func TestDuplicateIDGroupRetainsMatchingFallbackWithoutChoosingCandidate(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Entries) != 1 || got.Entries[0] != old || got.RejectedCount != 2 || !contains(got.RejectedCodes, "duplicate_adapter_id") {
+	if len(got.Entries) != 1 || !sameEntry(got.Entries[0], old) || got.RejectedCount != 2 || !contains(got.RejectedCodes, "duplicate_adapter_id") {
 		t.Fatalf("ambiguous duplicate ID group did not retain only matching fallback: %+v", got)
 	}
 }
@@ -597,6 +951,16 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func sameEntry(left, right Entry) bool {
+	if left.AdapterID != right.AdapterID || left.Version != right.Version || left.ProtocolVersion != right.ProtocolVersion || left.DescriptorFingerprint != right.DescriptorFingerprint || left.ArtifactSHA256 != right.ArtifactSHA256 || left.ArtifactSize != right.ArtifactSize || left.BinaryName != right.BinaryName {
+		return false
+	}
+	if left.Attestation == nil || right.Attestation == nil {
+		return left.Attestation == nil && right.Attestation == nil
+	}
+	return *left.Attestation == *right.Attestation
 }
 
 func TestDigestHelperMatchesSHA256(t *testing.T) {

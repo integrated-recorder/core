@@ -22,6 +22,7 @@ import (
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/network"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
@@ -42,18 +43,19 @@ type Config struct {
 }
 
 type Manager struct {
-	root        string
-	registryURL string
-	goos        string
-	goarch      string
-	client      *http.Client
-	injected    bool
-	gate        chan struct{}
-	stateMu     sync.RWMutex
-	desired     desiredState
-	registry    *registryDocument
-	available   bool
-	failureCode string
+	root              string
+	registryURL       string
+	goos              string
+	goarch            string
+	client            *http.Client
+	injected          bool
+	gate              chan struct{}
+	stateMu           sync.RWMutex
+	desired           desiredState
+	registry          *registryDocument
+	registryAuthority plugintrust.Authority
+	available         bool
+	failureCode       string
 }
 
 func Open(config Config) (*Manager, error) {
@@ -80,7 +82,7 @@ func Open(config Config) (*Manager, error) {
 		root: config.Root, registryURL: config.RegistryURL,
 		goos: config.GOOS, goarch: config.GOARCH, client: client,
 		injected: injected, gate: make(chan struct{}, 1),
-		failureCode: "registry_unavailable",
+		failureCode: "registry_unavailable", registryAuthority: plugintrust.Custom,
 	}
 	if err := m.ensureLayout(); err != nil {
 		return nil, ErrUnsafeStore
@@ -194,7 +196,7 @@ func (m *Manager) Refresh(ctx context.Context) error {
 		m.setUnavailable()
 		return ErrUnavailable
 	}
-	data, err := m.getBounded(ctx, m.registryURL, MaxCatalogBytes)
+	data, finalURL, err := m.getBounded(ctx, m.registryURL, MaxCatalogBytes)
 	if err != nil {
 		m.setUnavailable()
 		return ErrUnavailable
@@ -206,6 +208,10 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	}
 	m.stateMu.Lock()
 	m.registry = &document
+	m.registryAuthority = plugintrust.Custom
+	if document.SchemaVersion == SchemaVersionV3 && isOfficialCatalogResponse(m.registryURL, finalURL) {
+		m.registryAuthority = plugintrust.Official
+	}
 	m.available = true
 	m.failureCode = ""
 	m.stateMu.Unlock()
@@ -216,6 +222,7 @@ func (m *Manager) setUnavailable() {
 	m.stateMu.Lock()
 	m.available = false
 	m.failureCode = "registry_unavailable"
+	m.registryAuthority = plugintrust.Custom
 	m.stateMu.Unlock()
 }
 
@@ -244,7 +251,11 @@ func (m *Manager) View() View {
 			if pluginType == "" {
 				pluginType = TypeSource
 			}
-			p := PluginView{ID: plugin.ID, Name: plugin.Name, Type: pluginType, Installed: isInstalled}
+			trust := registryAttestation(m.registry.SchemaVersion, m.registryAuthority, plugin.Publisher)
+			if isInstalled {
+				trust = projectedDesiredAttestation(item)
+			}
+			p := PluginView{ID: plugin.ID, Name: plugin.Name, Type: pluginType, Installed: isInstalled, Trust: trust}
 			if hasStable {
 				p.AvailableVersion = release.Version
 			}
@@ -263,7 +274,7 @@ func (m *Manager) View() View {
 		if seen[item.ID] {
 			continue
 		}
-		view.Plugins = append(view.Plugins, PluginView{ID: item.ID, Name: item.Name, Type: TypeSource, InstalledVersion: item.Version, Installed: true})
+		view.Plugins = append(view.Plugins, PluginView{ID: item.ID, Name: item.Name, Type: TypeSource, InstalledVersion: item.Version, Installed: true, Trust: projectedDesiredAttestation(item)})
 	}
 	sort.Slice(view.Plugins, func(i, j int) bool { return view.Plugins[i].ID < view.Plugins[j].ID })
 	return view
@@ -323,6 +334,7 @@ func (m *Manager) PrepareInstall(ctx context.Context, id string, update bool) (*
 	}
 	m.stateMu.RLock()
 	configured, available, document := m.registryURL != "", m.available, m.registry
+	authority := m.registryAuthority
 	var registryCopy *registryDocument
 	if document != nil {
 		copyDocument := *document
@@ -361,7 +373,7 @@ func (m *Manager) PrepareInstall(ctx context.Context, id string, update bool) (*
 	if update && currentIndex >= 0 && state.Plugins[currentIndex].Version == release.Version {
 		return nil, ErrNoUpdateAvailable
 	}
-	selected := DesiredPlugin{ID: plugin.ID, Name: plugin.Name, Version: release.Version, Channel: "stable", Digest: artifact.SHA256, Filename: artifact.Filename, Size: artifact.Size, SourceCommit: release.SourceCommit}
+	selected := DesiredPlugin{ID: plugin.ID, Name: plugin.Name, Version: release.Version, Channel: "stable", Digest: artifact.SHA256, Filename: artifact.Filename, Size: artifact.Size, SourceCommit: release.SourceCommit, Attestation: attestationPointer(registryAttestation(registryCopy.SchemaVersion, authority, plugin.Publisher))}
 	if err := m.downloadAndVerify(ctx, plugin, release, artifact); err != nil {
 		return nil, redactFailure(err)
 	}
@@ -445,32 +457,42 @@ func findPlugin(plugins []registryPlugin, id string) (registryPlugin, bool) {
 	return registryPlugin{}, false
 }
 
-func (m *Manager) getBounded(ctx context.Context, rawURL string, max int64) ([]byte, error) {
+func (m *Manager) getBounded(ctx context.Context, rawURL string, max int64) ([]byte, string, error) {
 	if !validHTTPSURL(rawURL, true) {
-		return nil, ErrUnavailable
+		return nil, "", ErrUnavailable
 	}
 	if err := validateNetworkURL(ctx, rawURL, m.injected); err != nil {
-		return nil, ErrUnavailable
+		return nil, "", ErrUnavailable
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, ErrUnavailable
+		return nil, "", ErrUnavailable
 	}
 	response, err := m.client.Do(request)
 	if err != nil {
-		return nil, ErrUnavailable
+		return nil, "", ErrUnavailable
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || (response.Request != nil && (response.Request.URL.Scheme != "https" || response.Request.URL.User != nil)) || response.ContentLength > max {
-		return nil, ErrUnavailable
+	finalURL := request.URL
+	if response.Request != nil && response.Request.URL != nil {
+		finalURL = response.Request.URL
+	}
+	if response.StatusCode != http.StatusOK || finalURL.Scheme != "https" || finalURL.User != nil || finalURL.Fragment != "" || response.ContentLength > max {
+		return nil, "", ErrUnavailable
+	}
+	// A canonical official endpoint remains official only if the final response
+	// URL is exactly the configured canonical HTTPS endpoint. Same-origin
+	// redirects to another path are transport redirects, not official authority.
+	if rawURL == OfficialCatalogV3URL && finalURL.String() != OfficialCatalogV3URL {
+		return nil, "", ErrUnavailable
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, max+1))
 	if err != nil || int64(len(data)) > max {
-		return nil, ErrUnavailable
+		return nil, "", ErrUnavailable
 	}
-	return data, nil
+	return data, finalURL.String(), nil
 }
 
 func (m *Manager) downloadAndVerify(ctx context.Context, plugin registryPlugin, release registryRelease, artifact registryArtifact) error {

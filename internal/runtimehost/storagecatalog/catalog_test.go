@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/storageproto"
 )
 
@@ -156,6 +157,193 @@ func TestImportCreateSetReloadInstallAndStart(t *testing.T) {
 	}
 	if _, err := reopened.ArtifactPath(artifact.Digest); !errors.Is(err, ErrArtifactMissing) {
 		t.Fatalf("unreferenced artifact still exists: %v", err)
+	}
+}
+
+func TestStorageSetAttestationAffectsIdentityButNotArtifact(t *testing.T) {
+	binary := buildFixtureProvider(t)
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	expected := Expected{ID: "fixture-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	catalog, err := Open(filepath.Join(t.TempDir(), "catalog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTreeOwned(catalog.root) })
+	artifact, err := catalog.Import(context.Background(), binary, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := SetConfig{Values: map[string]json.RawMessage{"root": json.RawMessage(`"/tmp/objects"`)}}
+	bundled, err := catalog.CreateSetWithAttestation(artifact.Digest, config, plugintrust.NewBundled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := catalog.CreateSetWithAttestation(artifact.Digest, config, plugintrust.NewOperator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundled.Artifact.Digest != operator.Artifact.Digest || bundled.ID == operator.ID {
+		t.Fatalf("attestation did not distinguish provider sets: bundled=%+v operator=%+v", bundled, operator)
+	}
+	if bundled.Attestation == nil || *bundled.Attestation != plugintrust.NewBundled() || operator.Attestation == nil || *operator.Attestation != plugintrust.NewOperator() {
+		t.Fatalf("set attestations were lost: bundled=%+v operator=%+v", bundled, operator)
+	}
+}
+
+func TestInstalledStorageArtifactAttestationSurvivesRegistryOutage(t *testing.T) {
+	binary := buildFixtureProvider(t)
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	expected := Expected{ID: "fixture-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	root := filepath.Join(t.TempDir(), "catalog")
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTreeOwned(root) })
+	artifact, err := catalog.Import(context.Background(), binary, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registryAttestation := plugintrust.NewOfficialRegistry(plugintrust.ThirdParty)
+	if err := catalog.InstallWithAttestation(artifact, registryAttestation); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopening models a later configure/probe after the Registry is no longer
+	// available. The selected admission evidence is local durable state.
+	reopened, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, found, err := reopened.InstalledAttestation(artifact.ID)
+	if err != nil || !found || selected != registryAttestation {
+		t.Fatalf("InstalledAttestation() = %+v, %t, %v", selected, found, err)
+	}
+	attestations, err := reopened.AttestationsForArtifact(artifact.Digest)
+	if err != nil || len(attestations) != 1 || attestations[0] != registryAttestation {
+		t.Fatalf("AttestationsForArtifact() = %+v, %v", attestations, err)
+	}
+	config := SetConfig{Values: map[string]json.RawMessage{"root": json.RawMessage(`"` + filepath.Join(t.TempDir(), "objects") + `"`)}}
+	set, err := reopened.CreateInstalledSet(artifact.ID, config)
+	if err != nil || set.Attestation == nil || *set.Attestation != registryAttestation {
+		t.Fatalf("CreateInstalledSet() = %+v, %v", set, err)
+	}
+
+	// The same bytes can later be deliberately selected from a different
+	// admission path. Both pieces of evidence remain separate, and each
+	// immutable set retains the explicitly selected provenance.
+	operatorAttestation := plugintrust.NewOperator()
+	if err := reopened.InstallWithAttestation(artifact, operatorAttestation); err != nil {
+		t.Fatal(err)
+	}
+	attestations, err = reopened.AttestationsForArtifact(artifact.Digest)
+	if err != nil || len(attestations) != 2 {
+		t.Fatalf("same-digest admission evidence collapsed: %+v, %v", attestations, err)
+	}
+	selected, found, err = reopened.InstalledAttestation(artifact.ID)
+	if err != nil || !found || selected != operatorAttestation {
+		t.Fatalf("explicit operator selection was not retained: %+v, %t, %v", selected, found, err)
+	}
+	operatorSet, err := reopened.CreateInstalledSet(artifact.ID, config)
+	if err != nil || operatorSet.ID == set.ID || operatorSet.Attestation == nil || *operatorSet.Attestation != operatorAttestation {
+		t.Fatalf("operator set did not preserve selected provenance: %+v, %v", operatorSet, err)
+	}
+}
+
+func TestUnclassifiedInstallDoesNotManufactureTrust(t *testing.T) {
+	binary := buildFixtureProvider(t)
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	expected := Expected{ID: "fixture-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	catalog, err := Open(filepath.Join(t.TempDir(), "catalog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTreeOwned(catalog.root) })
+	artifact, err := catalog.Import(context.Background(), binary, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.Install(artifact); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := catalog.InstalledAttestation(artifact.ID); err != nil || found {
+		t.Fatalf("unclassified Install manufactured admission trust: found=%t err=%v", found, err)
+	}
+	if _, err := catalog.CreateInstalledSet(artifact.ID, SetConfig{Values: map[string]json.RawMessage{"root": json.RawMessage(`"/tmp/objects"`)}}); !errors.Is(err, ErrAttestationMissing) {
+		t.Fatalf("CreateInstalledSet without provenance = %v, want ErrAttestationMissing", err)
+	}
+}
+
+func TestLegacyStorageSetWithoutAttestationRemainsLoadable(t *testing.T) {
+	binary := buildFixtureProvider(t)
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	expected := Expected{ID: "fixture-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	catalog, err := Open(filepath.Join(t.TempDir(), "catalog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTreeOwned(catalog.root) })
+	artifact, err := catalog.Import(context.Background(), binary, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := catalog.CreateSetWithAttestation(artifact.Digest, SetConfig{Values: map[string]json.RawMessage{"root": json.RawMessage(`"/tmp/objects"`)}}, plugintrust.NewBundled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(catalog.root, "sets", set.ID, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest setManifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Attestation = nil
+	legacyBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyID := digestBytes(legacyBytes)
+	setDir := filepath.Dir(manifestPath)
+	if err := os.Chmod(setDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(manifestPath, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, legacyBytes, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(manifestPath, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(setDir, filepath.Join(catalog.root, "sets", legacyID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(catalog.root, "sets", legacyID), 0700); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := catalog.LoadSet(legacyID)
+	if err != nil || loaded.Attestation != nil || loaded.EffectiveAttestation().Provenance != plugintrust.LegacyUnclassified {
+		t.Fatalf("legacy storage set load = %+v, %v", loaded, err)
 	}
 }
 

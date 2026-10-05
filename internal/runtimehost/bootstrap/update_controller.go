@@ -1816,6 +1816,14 @@ func (c *updateController) publishControl(ctx context.Context, id, directory str
 	if err != nil {
 		return err
 	}
+	adapterSet, err := c.adapterCatalog.Load(gen.AdapterSetID)
+	if err != nil || adapterSet.ID != gen.AdapterSetID {
+		return errors.New("generation adapter set identity is unavailable")
+	}
+	trustJSON, err := marshalAdapterTrust(adapterSet)
+	if err != nil {
+		return errors.New("generation adapter trust projection is unavailable")
+	}
 	env := append([]string(nil), commonChildEnv(c.config, adapterDir)...)
 	env = append(env,
 		"CONTROL_ADDR="+controlAddr,
@@ -1828,6 +1836,7 @@ func (c *updateController) publishControl(ctx context.Context, id, directory str
 		"RUNTIME_RESOURCE_SOCKET_PATH="+c.resourceSocket,
 		"RUNTIME_RESOURCE_TOKEN_FILE="+c.resourceTokenPath,
 		"RUNTIME_RESOURCE_OWNER="+resourceOwner,
+		"CONTROL_ADAPTER_TRUST_JSON="+trustJSON,
 	)
 	env = append(env, storageProviderChildEnv(c.config.DataDir, gen.StorageProviderSetID)...)
 	if c.config.AuthDisabled {

@@ -24,20 +24,22 @@ import (
 
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/plugintrust"
 )
 
 const (
-	SchemaVersion       = 1
-	BinaryPrefix        = "integrated-recorder-adapter-"
-	MaxArtifactBytes    = 512 << 20
-	maxManifestBytes    = 1 << 20
-	maxAdapters         = 256
-	maxSourceDirs       = 32
-	maxSourceDirEntries = 4096
-	maxRejectedCodes    = 16
-	quarantineCapacity  = 1024
-	probeTimeout        = 6 * time.Second
-	copyBufferSize      = 256 << 10
+	SchemaVersion        = 1
+	BinaryPrefix         = "integrated-recorder-adapter-"
+	MaxArtifactBytes     = 512 << 20
+	maxManifestBytes     = 1 << 20
+	maxAdapters          = 256
+	maxSourceDirs        = 32
+	maxClassifiedSources = maxAdapters + 1 // 256 Registry artifacts plus one bundled reference source.
+	maxSourceDirEntries  = 4096
+	maxRejectedCodes     = 16
+	quarantineCapacity   = 1024
+	probeTimeout         = 6 * time.Second
+	copyBufferSize       = 256 << 10
 )
 
 var (
@@ -61,13 +63,23 @@ type Snapshot struct {
 // Entry identifies both the adapter's validated protocol identity and the
 // immutable executable bytes used by this set.
 type Entry struct {
-	AdapterID             string `json:"adapter_id"`
-	Version               string `json:"version"`
-	ProtocolVersion       int    `json:"protocol_version"`
-	DescriptorFingerprint string `json:"descriptor_fingerprint"`
-	ArtifactSHA256        string `json:"artifact_sha256"`
-	ArtifactSize          int64  `json:"artifact_size"`
-	BinaryName            string `json:"binary_name"`
+	AdapterID             string                   `json:"adapter_id"`
+	Version               string                   `json:"version"`
+	ProtocolVersion       int                      `json:"protocol_version"`
+	DescriptorFingerprint string                   `json:"descriptor_fingerprint"`
+	ArtifactSHA256        string                   `json:"artifact_sha256"`
+	ArtifactSize          int64                    `json:"artifact_size"`
+	BinaryName            string                   `json:"binary_name"`
+	Attestation           *plugintrust.Attestation `json:"attestation,omitempty"`
+}
+
+// EffectiveAttestation returns the persisted Host attestation, or the
+// conservative legacy marker for a pre-provenance manifest.
+func (e Entry) EffectiveAttestation() plugintrust.Attestation {
+	if e.Attestation == nil {
+		return plugintrust.Legacy()
+	}
+	return *e.Attestation
 }
 
 type manifest struct {
@@ -78,6 +90,20 @@ type manifest struct {
 type candidate struct {
 	path  string
 	entry Entry
+}
+
+// Source assigns Host-owned admission evidence to one mutable import source.
+// AllowedIDs, when non-empty, is an exact descriptor-ID allowlist for that
+// source. The descriptor itself cannot supply or alter Attestation.
+type Source struct {
+	Path        string
+	Attestation plugintrust.Attestation
+	AllowedIDs  []string
+}
+
+type sourceCandidate struct {
+	path   string
+	source Source
 }
 
 type rejection struct {
@@ -162,21 +188,71 @@ func (c *Catalog) Reconcile(ctx context.Context, fallbackSetID string) (Snapshot
 // registry artifacts without mutating the catalog's configured source list.
 // Callers must serialize source selection with application update operations.
 func (c *Catalog) ReconcileWithSources(ctx context.Context, fallbackSetID string, additionalSources []string) (Snapshot, error) {
+	classified := make([]Source, 0, len(additionalSources))
+	for _, source := range additionalSources {
+		classified = append(classified, Source{Path: source, Attestation: plugintrust.NewOperator()})
+	}
+	return c.ReconcileClassified(ctx, fallbackSetID, classified)
+}
+
+// ReconcileClassified imports the Catalog's configured paths as operator
+// supplied sources and the supplied sources with their explicit Host-owned
+// admission attestations. Source classification is attached to each imported
+// entry and participates in immutable adapter-set identity.
+func (c *Catalog) ReconcileClassified(ctx context.Context, fallbackSetID string, additionalSources []Source) (Snapshot, error) {
 	if c == nil || ctx == nil {
 		return Snapshot{}, ErrInvalidConfig
 	}
-	if len(additionalSources) > maxSourceDirs || len(c.sources)+len(additionalSources) > maxSourceDirs {
+	if len(additionalSources) > maxClassifiedSources || len(c.sources)+len(additionalSources) > maxSourceDirs+maxClassifiedSources {
 		return Snapshot{}, ErrInvalidConfig
 	}
-	sources := append([]string(nil), c.sources...)
-	for _, source := range additionalSources {
-		if !validAbsoluteClean(source) || filepath.Clean(source) == string(filepath.Separator) {
+	sources := make([]Source, 0, len(c.sources)+len(additionalSources))
+	for _, source := range c.sources {
+		sources = append(sources, Source{Path: source, Attestation: plugintrust.NewOperator()})
+	}
+	sources = append(sources, additionalSources...)
+	for i := range sources {
+		source := &sources[i]
+		if !validAbsoluteClean(source.Path) || filepath.Clean(source.Path) == string(filepath.Separator) || source.Attestation.Validate() != nil {
 			return Snapshot{}, ErrInvalidConfig
 		}
-		sources = append(sources, source)
+		allowed := make(map[string]bool, len(source.AllowedIDs))
+		for _, id := range source.AllowedIDs {
+			if !adapterproto.IsValidIdentifier(id) || allowed[id] {
+				return Snapshot{}, ErrInvalidConfig
+			}
+			allowed[id] = true
+		}
+		source.AllowedIDs = append([]string(nil), source.AllowedIDs...)
+		sort.Strings(source.AllowedIDs)
 	}
-	sort.Strings(sources)
-	sources = compactStrings(sources)
+	sort.Slice(sources, func(i, j int) bool {
+		if sources[i].Path != sources[j].Path {
+			return sources[i].Path < sources[j].Path
+		}
+		if sources[i].Attestation.Provenance != sources[j].Attestation.Provenance {
+			return sources[i].Attestation.Provenance < sources[j].Attestation.Provenance
+		}
+		if sources[i].Attestation.Authority != sources[j].Attestation.Authority {
+			return sources[i].Attestation.Authority < sources[j].Attestation.Authority
+		}
+		if sources[i].Attestation.Publisher != sources[j].Attestation.Publisher {
+			return sources[i].Attestation.Publisher < sources[j].Attestation.Publisher
+		}
+		if sources[i].Attestation.Reviewed != sources[j].Attestation.Reviewed {
+			return !sources[i].Attestation.Reviewed
+		}
+		return strings.Join(sources[i].AllowedIDs, "\x00") < strings.Join(sources[j].AllowedIDs, "\x00")
+	})
+	for i := 1; i < len(sources); i++ {
+		if sources[i-1].Path == sources[i].Path {
+			if !sameSource(sources[i-1], sources[i]) {
+				return Snapshot{}, ErrInvalidConfig
+			}
+			sources = append(sources[:i], sources[i+1:]...)
+			i--
+		}
+	}
 	if err := c.acquire(ctx); err != nil {
 		return Snapshot{}, err
 	}
@@ -203,16 +279,21 @@ func (c *Catalog) ReconcileWithSources(ctx context.Context, fallbackSetID string
 	if overflow {
 		return c.fallbackOrError(fallback, fallbackSetID, "inventory_limit_exceeded", ErrUnsafeStore)
 	}
+	sourcesByPath := make(map[string]sourceCandidate, len(paths))
+	for _, source := range paths {
+		sourcesByPath[source.path] = source
+	}
 	rejectedByPath := make(map[string]string)
 	failedNames := make(map[string]bool)
 	failedIDs := make(map[string]bool)
 
 	// Duplicate source basenames across directories are ambiguous even if one
-	// copy happens to validate. Reject the whole group before launching either
-	// executable so source-directory ordering never selects a winner.
-	pathsByName := make(map[string][]string)
-	for _, path := range paths {
-		pathsByName[filepath.Base(path)] = append(pathsByName[filepath.Base(path)], path)
+	// copy happens to validate. The one reserved exception is the exact
+	// Host-declared bundled HLS executable: an operator collision must not be
+	// able to suppress that bundled identity merely by path ordering.
+	pathsByName := make(map[string][]sourceCandidate)
+	for _, item := range paths {
+		pathsByName[filepath.Base(item.path)] = append(pathsByName[filepath.Base(item.path)], item)
 	}
 	duplicateNames := make([]string, 0)
 	for name, group := range pathsByName {
@@ -222,21 +303,42 @@ func (c *Catalog) ReconcileWithSources(ctx context.Context, fallbackSetID string
 	}
 	sort.Strings(duplicateNames)
 	for _, name := range duplicateNames {
+		group := pathsByName[name]
+		var bundledHLS *sourceCandidate
+		bundledCount := 0
+		for i := range group {
+			if group[i].source.Attestation.Provenance == plugintrust.Bundled {
+				bundledCount++
+			}
+			if exactBundledHLSCandidate(group[i]) {
+				candidate := group[i]
+				bundledHLS = &candidate
+			}
+		}
+		if bundledHLS != nil && bundledCount == 1 {
+			for _, item := range group {
+				if item.path != bundledHLS.path {
+					rejectedByPath[item.path] = "duplicate_binary_name"
+				}
+			}
+			continue
+		}
 		failedNames[name] = true
-		for _, path := range pathsByName[name] {
-			rejectedByPath[path] = "duplicate_binary_name"
+		for _, item := range group {
+			rejectedByPath[item.path] = "duplicate_binary_name"
 		}
 	}
 
 	valid := make([]candidate, 0, len(paths))
-	for _, path := range paths {
+	for _, source := range paths {
 		if err := ctx.Err(); err != nil {
 			return Snapshot{}, err
 		}
+		path := source.path
 		if rejectedByPath[path] != "" {
 			continue
 		}
-		item, code := c.importCandidate(ctx, path, fallback.Entries)
+		item, code := c.importCandidate(ctx, path, source.source, fallback.Entries)
 		if code != "" {
 			if code == "catalog_unavailable" || code == "artifact_publish_failed" {
 				return c.fallbackOrError(fallback, fallbackSetID, code, ErrUnsafeStore)
@@ -267,6 +369,21 @@ func (c *Catalog) ReconcileWithSources(ctx context.Context, fallbackSetID string
 	sort.Strings(duplicateIDs)
 	remove := make(map[int]bool)
 	for _, id := range duplicateIDs {
+		if winner, authoritative := authoritativeBundledHLSCollisionWinner(id, byID[id], valid, sourcesByPath); authoritative {
+			// Treat the rejected collision as an identity failure so a known-good
+			// HLS entry remains eligible for fallback preservation.
+			failedIDs[id] = true
+			for _, index := range byID[id] {
+				if index == winner {
+					continue
+				}
+				remove[index] = true
+				item := valid[index]
+				rejectedByPath[item.path] = "duplicate_adapter_id"
+				failedNames[item.entry.BinaryName] = true
+			}
+			continue
+		}
 		failedIDs[id] = true
 		for _, index := range byID[id] {
 			remove[index] = true
@@ -552,15 +669,74 @@ func (c *Catalog) Collect(keepIDs []string) error {
 	return nil
 }
 
-func (c *Catalog) sourceCandidates(sourceDirs []string) ([]string, bool, error) {
-	paths := []string{}
+func sameSource(left, right Source) bool {
+	if left.Path != right.Path || left.Attestation != right.Attestation || len(left.AllowedIDs) != len(right.AllowedIDs) {
+		return false
+	}
+	for i := range left.AllowedIDs {
+		if left.AllowedIDs[i] != right.AllowedIDs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func exactBundledHLSCandidate(candidate sourceCandidate) bool {
+	if filepath.Base(candidate.path) != BinaryPrefix+"hls" || candidate.source.Attestation != plugintrust.NewBundled() {
+		return false
+	}
+	return len(candidate.source.AllowedIDs) == 1 && candidate.source.AllowedIDs[0] == "hls"
+}
+
+// authoritativeBundledHLSCollisionWinner identifies the one source candidate
+// which may survive an HLS descriptor-ID collision. The Host's source
+// allowlist/path predicate is necessary but not sufficient: the imported
+// descriptor must also identify itself as HLS, and no second bundled entry may
+// participate in the collision.
+func authoritativeBundledHLSCollisionWinner(id string, indexes []int, candidates []candidate, sourcesByPath map[string]sourceCandidate) (int, bool) {
+	if id != "hls" {
+		return -1, false
+	}
+	winner := -1
+	bundledCount := 0
+	for _, index := range indexes {
+		item := candidates[index]
+		if item.entry.Attestation != nil && item.entry.Attestation.Provenance == plugintrust.Bundled {
+			bundledCount++
+		}
+		source, ok := sourcesByPath[item.path]
+		if item.entry.AdapterID == "hls" && ok && exactBundledHLSCandidate(source) {
+			winner = index
+		}
+	}
+	if winner < 0 || bundledCount != 1 {
+		return -1, false
+	}
+	return winner, true
+}
+
+func (c *Catalog) sourceCandidates(sources []Source) ([]sourceCandidate, bool, error) {
+	paths := []sourceCandidate{}
 	overflow := false
-	for _, dir := range sourceDirs {
+	for _, source := range sources {
+		dir := source.Path
 		info, err := os.Lstat(dir)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return nil, false, ErrUnsafeStore
+		}
+		if info.Mode().IsRegular() {
+			if strings.HasPrefix(filepath.Base(dir), BinaryPrefix) {
+				paths = append(paths, sourceCandidate{path: dir, source: source})
+				if len(paths) > maxAdapters {
+					return paths[:maxAdapters], true, nil
+				}
+			}
+			continue
+		}
+		if !info.IsDir() {
 			return nil, false, ErrUnsafeStore
 		}
 		file, err := openSourceNoFollow(dir)
@@ -607,7 +783,7 @@ func (c *Catalog) sourceCandidates(sourceDirs []string) ([]string, bool, error) 
 			if !strings.HasPrefix(name, BinaryPrefix) {
 				continue
 			}
-			paths = append(paths, filepath.Join(dir, name))
+			paths = append(paths, sourceCandidate{path: filepath.Join(dir, name), source: source})
 			if len(paths) > maxAdapters {
 				overflow = true
 				paths = paths[:maxAdapters]
@@ -618,11 +794,11 @@ func (c *Catalog) sourceCandidates(sourceDirs []string) ([]string, bool, error) 
 			break
 		}
 	}
-	sort.Strings(paths)
+	sort.Slice(paths, func(i, j int) bool { return paths[i].path < paths[j].path })
 	return paths, overflow, nil
 }
 
-func (c *Catalog) importCandidate(ctx context.Context, source string, fallback []Entry) (candidate, string) {
+func (c *Catalog) importCandidate(ctx context.Context, source string, inputSource Source, fallback []Entry) (candidate, string) {
 	name := filepath.Base(source)
 	parent, parentErr := os.Lstat(filepath.Dir(source))
 	if !safeBinaryName(name) || parentErr != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 {
@@ -752,10 +928,22 @@ func (c *Catalog) importCandidate(ctx context.Context, source string, fallback [
 		ArtifactSHA256:        digestHex,
 		ArtifactSize:          written,
 		BinaryName:            name,
+		Attestation:           attestationPointer(inputSource.Attestation),
 	}
 	if !validEntry(entry) {
 		c.rememberRejected(digestHex, "descriptor_rejected")
 		return candidate{}, "descriptor_rejected"
+	}
+	if len(inputSource.AllowedIDs) > 0 && !containsID(inputSource.AllowedIDs, entry.AdapterID) {
+		c.rememberRejectedIdentity(digestHex, "descriptor_rejected", entry.AdapterID)
+		return candidate{path: source, entry: entry}, "descriptor_rejected"
+	}
+	// HLS is the bundled reference source identity and is reserved by the
+	// Host. No Registry/operator source can shadow it, regardless of path
+	// ordering or descriptor claims.
+	if entry.AdapterID == "hls" && inputSource.Attestation.Provenance != plugintrust.Bundled {
+		c.rememberRejectedIdentity(digestHex, "reserved_adapter_id", entry.AdapterID)
+		return candidate{path: source, entry: entry}, "reserved_adapter_id"
 	}
 	for _, previous := range fallback {
 		if previous.AdapterID != entry.AdapterID || previous.Version != entry.Version {
@@ -773,6 +961,16 @@ func (c *Catalog) importCandidate(ctx context.Context, source string, fallback [
 		return candidate{}, "artifact_publish_failed"
 	}
 	return candidate{path: source, entry: entry}, ""
+}
+
+func containsID(ids []string, id string) bool {
+	index := sort.SearchStrings(ids, id)
+	return index < len(ids) && ids[index] == id
+}
+
+func attestationPointer(value plugintrust.Attestation) *plugintrust.Attestation {
+	copy := value
+	return &copy
 }
 
 func copyContext(ctx context.Context, dst io.Writer, src io.Reader, buffer []byte, limit int64) (int64, error) {
@@ -841,6 +1039,10 @@ func (c *Catalog) publishSet(entries []Entry) (Snapshot, error) {
 		return Snapshot{}, ErrInvalidSet
 	}
 	entries = cloneEntries(entries)
+	// A fallback entry without attestation remains legacy-unclassified. Do not
+	// manufacture operator evidence merely because its original source is no
+	// longer present; newly imported entries always receive explicit source
+	// classification in importCandidate.
 	sortEntries(entries)
 	if !entriesCanonical(entries) {
 		return Snapshot{}, ErrInvalidSet
@@ -960,7 +1162,7 @@ func entriesCanonical(entries []Entry) bool {
 }
 
 func validEntry(entry Entry) bool {
-	return adapterproto.IsValidIdentifier(entry.AdapterID) && entry.Version != "" && len(entry.Version) <= 128 && entry.ProtocolVersion == adapterproto.Version && validDigest(entry.DescriptorFingerprint) && validDigest(entry.ArtifactSHA256) && entry.ArtifactSize > 0 && entry.ArtifactSize <= MaxArtifactBytes && safeBinaryName(entry.BinaryName)
+	return adapterproto.IsValidIdentifier(entry.AdapterID) && entry.Version != "" && len(entry.Version) <= 128 && entry.ProtocolVersion == adapterproto.Version && validDigest(entry.DescriptorFingerprint) && validDigest(entry.ArtifactSHA256) && entry.ArtifactSize > 0 && entry.ArtifactSize <= MaxArtifactBytes && safeBinaryName(entry.BinaryName) && (entry.Attestation == nil || entry.Attestation.Validate() == nil)
 }
 
 func safeBinaryName(name string) bool {
@@ -980,6 +1182,12 @@ func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeT
 func cloneEntries(in []Entry) []Entry {
 	out := make([]Entry, len(in))
 	copy(out, in)
+	for i := range out {
+		if in[i].Attestation != nil {
+			attestation := *in[i].Attestation
+			out[i].Attestation = &attestation
+		}
+	}
 	return out
 }
 

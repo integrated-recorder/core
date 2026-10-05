@@ -34,7 +34,12 @@ func (p *Plan) Selection() DesiredPlugin {
 	if p == nil {
 		return DesiredPlugin{}
 	}
-	return p.selection
+	selection := p.selection
+	if p.selection.Attestation != nil {
+		attestation := *p.selection.Attestation
+		selection.Attestation = &attestation
+	}
+	return selection
 }
 
 // Commit atomically makes the proposed plugin selection the durable desired

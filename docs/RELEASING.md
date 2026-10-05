@@ -5,8 +5,10 @@ Official application releases are built for `linux/amd64` and `linux/arm64` from
 and Go test suite before building the Runtime Host, Control Plane, Recorder
 Engine, and bundled generic HLS source adapter. The Docker image separately
 bundles the `storage.local` Storage Provider Protocol v1 executable. Owncast
-is first-party software but is not bundled. Its Registry distribution is
-pending public release artifacts and independent Registry approval.
+is first-party software but is not bundled. It is distributed from the official
+Registry as v0.2.0 after its pull request passed required CI and artifact
+validation and was merged. Current solo-maintainer policy does not require an
+independent approving review.
 
 Each target has its own signed manifest and artifact set:
 

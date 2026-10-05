@@ -30,12 +30,12 @@ export function PluginTrustBadges({ trust, compact = false, warning = false }: P
     ? trust.authority === 'official' ? 'Official Registry' : trust.authority === 'custom' ? 'Custom Registry' : 'Local operator'
     : provenanceLabels[trust.provenance]
   const isUnreviewedOrigin = trust.provenance === 'operator' || (trust.provenance === 'registry' && trust.authority === 'custom')
-  const showRegistryReviewed = trust.provenance === 'registry' && trust.authority === 'official' && trust.reviewed
+  const showRegistryApproved = trust.provenance === 'registry' && trust.authority === 'official' && trust.reviewed
 
   return <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
     <Badge tone={trust.provenance === 'bundled' ? 'blue' : 'neutral'}>{authorityLabel}</Badge>
     <Badge>{publisherLabels[trust.publisher]}</Badge>
-    {showRegistryReviewed && <Badge tone="green">Registry reviewed</Badge>}
+    {showRegistryApproved && <Badge tone="green">Registry approved</Badge>}
     {warning && isUnreviewedOrigin && <span className={`inline-flex items-center gap-1 text-[10px] leading-4 text-amber-800 dark:text-amber-200 ${compact ? 'max-w-full' : ''}`}>
       <CircleAlert aria-hidden="true" className="h-3 w-3 shrink-0" />
       <span>Integrated Recorder에서 검토되지 않았으며 샌드박스 없이 실행됩니다.</span>

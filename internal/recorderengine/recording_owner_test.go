@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -153,6 +154,55 @@ func TestManagedEngineClaimsBeforeCanonicalCreateAndUsesHostID(t *testing.T) {
 	}
 }
 
+func TestManagedStopRetainsOwnerUntilAutomaticHistoricalRepairFinishes(t *testing.T) {
+	transport := &blockingTerminalRecoveryTransport{historyStarted: make(chan struct{}), resumeHistory: make(chan struct{})}
+	engine, manager, ownerClient, _ := newManagedEngineFixture(t, transport)
+	media := adapterproto.MediaSource{
+		Type: "hls", ManifestURL: "https://fixture.example/live.m3u8",
+		HistoricalAvailability: &adapterproto.HistoricalAvailability{
+			Mode:                  adapterproto.HistoricalModeSequenceRanges,
+			SequenceRanges:        []adapterproto.HistoricalSequenceRange{{Start: 2, End: 2}},
+			HistoricalManifestURL: "https://fixture.example/history.m3u8",
+		},
+	}
+	if _, err := engine.Handle(context.Background(), recorderengine.OperationStartResolved, managedStartPayload(t, generatedRecordingID, media)); err != nil {
+		t.Fatalf("managed start: %v", err)
+	}
+	select {
+	case <-transport.historyStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("automatic historical recovery did not start")
+	}
+	stopped, err := engine.Handle(context.Background(), recorderengine.OperationStop, mustJSON(t, recorderengine.RecordingIDRequest{RecordingID: generatedRecordingID}))
+	if err != nil || stopped.(*domain.Recording).State == domain.StateRecording {
+		t.Fatalf("managed stop result=%#v err=%v", stopped, err)
+	}
+	_, claims, releases, _ := ownerClient.snapshot()
+	if len(claims) != 1 || len(releases) != 0 {
+		t.Fatalf("Stop released generation owner before historical recovery finished: claims=%+v releases=%+v", claims, releases)
+	}
+	current, err := ownerClient.store.Current(generatedRecordingID)
+	if err != nil || current != claims[0] {
+		t.Fatalf("terminal repair lost its generation owner lease: owner=%+v err=%v", current, err)
+	}
+
+	close(transport.resumeHistory)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		current, getErr := manager.Get(generatedRecordingID)
+		_, _, releases, _ = ownerClient.snapshot()
+		if getErr == nil && hasRecordingSequence(current, 2) && len(releases) == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_, _, releases, _ = ownerClient.snapshot()
+	recording, getErr := manager.Get(generatedRecordingID)
+	if len(releases) != 1 || releases[0] != claims[0] || getErr != nil || !hasRecordingSequence(recording, 2) {
+		t.Fatalf("terminal recovery did not commit history and reach idle: releases=%+v history_requests=%d recording=%#v get_error=%v", releases, transport.historyRequests.Load(), recording, getErr)
+	}
+}
+
 func TestManagedEngineHonorsExplicitIDAndReleasesFailedStart(t *testing.T) {
 	engine, _, ownerClient, archive := newManagedEngineFixture(t, fixtureTransport{})
 	const explicitID = "dddddddddddddddddddddddddddddddd"
@@ -246,6 +296,49 @@ func (endListFixtureTransport) RoundTrip(request *http.Request) (*http.Response,
 		return nil, io.EOF
 	}
 	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: request}, nil
+}
+
+type blockingTerminalRecoveryTransport struct {
+	historyStarted  chan struct{}
+	resumeHistory   chan struct{}
+	historyRequests atomic.Int32
+	once            sync.Once
+}
+
+func (t *blockingTerminalRecoveryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	var body string
+	switch request.URL.Path {
+	case "/live.m3u8":
+		body = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,fixture\nsegment.ts\n"
+	case "/history.m3u8":
+		t.historyRequests.Add(1)
+		t.once.Do(func() { close(t.historyStarted) })
+		select {
+		case <-t.resumeHistory:
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		}
+		body = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:1,fixture\nhistory-segment.ts\n#EXT-X-ENDLIST\n"
+	case "/segment.ts":
+		body = "fixture media bytes"
+	case "/history-segment.ts":
+		body = "historical bytes committed after capture stopped"
+	default:
+		return nil, io.EOF
+	}
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: request}, nil
+}
+
+func hasRecordingSequence(recording *domain.Recording, sequence uint64) bool {
+	if recording == nil || recording.Tracks["main"] == nil {
+		return false
+	}
+	for _, segment := range recording.Tracks["main"].Segments {
+		if segment.Sequence == sequence {
+			return true
+		}
+	}
+	return false
 }
 
 func mustJSON(t *testing.T, value any) []byte {

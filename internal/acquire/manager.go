@@ -75,23 +75,29 @@ type SourceValidator func(context.Context, string) error
 type entry struct {
 	// persistMu serializes durable root-document writes and archive deletion.
 	// Callers always acquire it before mu, and never hold mu across storage I/O.
-	persistMu       sync.Mutex
-	mu              sync.Mutex
-	recording       *domain.Recording
-	deleted         bool
-	cancel          context.CancelFunc
-	done            chan struct{}
-	media           adapterproto.MediaSource
-	mediaGeneration uint64
-	refreshGate     chan struct{}
-	scheduler       *segmentScheduler
-	adapterID       string
-	resource        *adapterproto.ResourceRef
-	ownership       *OwnershipToken
-	terminalErr     error
-	handoverGate    chan struct{}
-	handoverWake    chan struct{}
-	handover        *handoverOperation
+	persistMu               sync.Mutex
+	mu                      sync.Mutex
+	recording               *domain.Recording
+	deleted                 bool
+	cancel                  context.CancelFunc
+	done                    chan struct{}
+	media                   adapterproto.MediaSource
+	mediaGeneration         uint64
+	refreshGate             chan struct{}
+	scheduler               *segmentScheduler
+	adapterID               string
+	resource                *adapterproto.ResourceRef
+	ownership               *OwnershipToken
+	terminalErr             error
+	recoveryAttempts        int
+	recoveryNoProgress      int
+	recoveryManifestStarted bool
+	handoverGate            chan struct{}
+	handoverWake            chan struct{}
+	// recoveryGate serializes historical commits with source handover. The
+	// source worker holds it after live work drains until resume or retirement.
+	recoveryGate chan struct{}
+	handover     *handoverOperation
 	// handoverCandidate owns bounded, non-canonical payload reservations until
 	// the first scheduler adopts them or the worker is torn down.
 	handoverCandidate *handoverContinuationCandidate
@@ -123,6 +129,7 @@ type Manager struct {
 	canonicalFence       CanonicalCommitFence
 	startAttempted       bool
 	terminalOwnerRelease func(OwnershipToken) error
+	autoRecovery         *automaticRecoveryScheduler
 
 	// fetchBoundaryHook is a deterministic test seam for scheduler-owned
 	// generation checks. It is configured before recording goroutines start.
@@ -319,6 +326,32 @@ func (m *Manager) ConfigureTerminalOwnerRelease(release func(OwnershipToken) err
 	return nil
 }
 
+// ConfigureAutomaticArchiveRecovery starts the bounded Core-owned recovery
+// coordinator. Host ownership still comes only from the authenticated Engine
+// callback. Configuration must happen before the first managed recording.
+func (m *Manager) ConfigureAutomaticArchiveRecovery(claim func(context.Context, string) (OwnershipToken, error)) error {
+	if m == nil || claim == nil {
+		return ErrCanonicalFenceRequired
+	}
+	m.mu.Lock()
+	if m.startAttempted || m.closed || m.autoRecovery != nil {
+		m.mu.Unlock()
+		return ErrFenceConfigurationClosed
+	}
+	recoverExisting := !m.freshGeneration
+	scheduler := newAutomaticRecoveryScheduler(m, claim)
+	m.autoRecovery = scheduler
+	m.mu.Unlock()
+	scheduler.start()
+	if recoverExisting {
+		scheduler.mu.Lock()
+		scheduler.rescan = true
+		scheduler.mu.Unlock()
+		scheduler.signal()
+	}
+	return nil
+}
+
 // HandoverSnapshot is the bounded, serializable continuation context needed to
 // prepare another Engine. It deliberately contains no worker, scheduler,
 // network connection, adapter process, or buffered media state.
@@ -349,18 +382,19 @@ const (
 )
 
 type handoverOperation struct {
-	ctx          context.Context
-	expected     OwnershipToken
-	state        handoverOperationState
-	snapshot     HandoverSnapshot
-	paused       chan struct{}
-	resumed      chan struct{}
-	resume       chan struct{}
-	complete     chan struct{}
-	pausedOnce   sync.Once
-	resumedOnce  sync.Once
-	resumeOnce   sync.Once
-	completeOnce sync.Once
+	ctx              context.Context
+	expected         OwnershipToken
+	state            handoverOperationState
+	snapshot         HandoverSnapshot
+	paused           chan struct{}
+	resumed          chan struct{}
+	resume           chan struct{}
+	complete         chan struct{}
+	pausedOnce       sync.Once
+	resumedOnce      sync.Once
+	resumeOnce       sync.Once
+	completeOnce     sync.Once
+	recoveryGateHeld bool
 }
 
 type preparedHandover struct {
@@ -476,6 +510,7 @@ func (m *Manager) abortOrResumeTimedOutPause(e *entry, op *handoverOperation) {
 		resumed := op.resumed
 		e.mu.Unlock()
 		<-resumed
+		m.releaseHandoverRecoveryGate(e, op)
 		return
 	}
 	// The worker's drain is using op.ctx and will unwind as soon as the
@@ -523,6 +558,7 @@ func (m *Manager) ResumeHandover(id string, newOwner OwnershipToken, snapshot Ha
 	op.resumeOnce.Do(func() { close(op.resume) })
 	e.mu.Unlock()
 	<-op.resumed
+	m.releaseHandoverRecoveryGate(e, op)
 	return nil
 }
 
@@ -567,6 +603,7 @@ func (m *Manager) CompleteHandover(id string, expectedOld OwnershipToken) error 
 	op.completeOnce.Do(func() { close(op.complete) })
 	e.mu.Unlock()
 	<-e.done
+	m.releaseHandoverRecoveryGate(e, op)
 	return nil
 }
 
@@ -1092,6 +1129,7 @@ func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) error {
 		media: cloneMediaSource(prepared.media), refreshGate: make(chan struct{}, 1),
 		adapterID: prepared.snapshot.AdapterID, resource: cloneResourceRef(prepared.snapshot.Resource), ownership: &ownerCopy,
 		handoverGate: make(chan struct{}, 1), handoverWake: make(chan struct{}, 1),
+		recoveryGate:      newArchiveRecoveryGate(),
 		handoverCandidate: prepared.continuation, handoverFirstCommitPending: true,
 	}
 	e.handoverGate <- struct{}{}
@@ -1199,6 +1237,60 @@ func acquireHandoverGate(ctx context.Context, e *entry) error {
 
 func releaseHandoverGate(e *entry) {
 	e.handoverGate <- struct{}{}
+}
+
+func newArchiveRecoveryGate() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}
+
+func ensureArchiveRecoveryGate(e *entry) chan struct{} {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	if e.recoveryGate == nil {
+		e.recoveryGate = newArchiveRecoveryGate()
+	}
+	gate := e.recoveryGate
+	e.mu.Unlock()
+	return gate
+}
+
+func acquireArchiveRecoveryGate(ctx context.Context, e *entry) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	gate := ensureArchiveRecoveryGate(e)
+	if gate == nil {
+		return ErrHandoverUnavailable
+	}
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseArchiveRecoveryGate(e *entry) {
+	if gate := ensureArchiveRecoveryGate(e); gate != nil {
+		gate <- struct{}{}
+	}
+}
+
+func (m *Manager) releaseHandoverRecoveryGate(e *entry, op *handoverOperation) {
+	e.mu.Lock()
+	held := op != nil && op.recoveryGateHeld
+	if held {
+		op.recoveryGateHeld = false
+	}
+	e.mu.Unlock()
+	if held {
+		releaseArchiveRecoveryGate(e)
+		m.signalAutomaticArchiveRecovery(recordingID(e))
+	}
 }
 
 func signalHandover(e *entry) {
@@ -1404,7 +1496,7 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 		copy := *owner
 		ownershipCopy = &copy
 	}
-	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), media: cloneMediaSource(media), refreshGate: make(chan struct{}, 1), adapterID: adapterID, resource: cloneResourceRef(resource), ownership: ownershipCopy}
+	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), media: cloneMediaSource(media), refreshGate: make(chan struct{}, 1), adapterID: adapterID, resource: cloneResourceRef(resource), ownership: ownershipCopy, recoveryGate: newArchiveRecoveryGate()}
 	if ownershipCopy != nil {
 		e.handoverGate = make(chan struct{}, 1)
 		e.handoverGate <- struct{}{}
@@ -1613,7 +1705,11 @@ func (m *Manager) delete(id string, allowUnownedTerminal bool) error {
 func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	m.closed = true
+	recovery := m.autoRecovery
 	m.mu.Unlock()
+	if recovery != nil {
+		recovery.stop()
+	}
 
 	m.startsWait.Do(func() {
 		go func() {
@@ -1661,6 +1757,11 @@ func (m *Manager) Close(ctx context.Context) error {
 		}
 		waits = append(waits, workerWait{e: e, done: done})
 	}
+	if recovery != nil {
+		if err := recovery.wait(ctx); err != nil {
+			return err
+		}
+	}
 	// Start closing ingest admission immediately after cancelling acquisitions.
 	// IngestService.Close starts its bounded drain coordinator before honoring
 	// this caller's deadline; that coordinator also wakes Submit calls which
@@ -1673,6 +1774,19 @@ func (m *Manager) Close(ctx context.Context) error {
 		case <-worker.done:
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+	}
+	for _, worker := range waits {
+		worker.e.mu.Lock()
+		terminal := worker.e.recording != nil && worker.e.recording.State != domain.StateRecording
+		var owner *OwnershipToken
+		if terminal && worker.e.ownership != nil {
+			copy := *worker.e.ownership
+			owner = &copy
+		}
+		worker.e.mu.Unlock()
+		if owner != nil {
+			_ = m.releaseAutomaticRecoveryOwner(worker.e, *owner)
 		}
 	}
 	var terminalErrors []error
@@ -1906,7 +2020,19 @@ func (m *Manager) updateWithinAuthorizedCommit(e *entry, fn func(*domain.Recordi
 }
 
 func (m *Manager) run(ctx context.Context, e *entry, media adapterproto.MediaSource) {
-	defer close(e.done)
+	defer func() {
+		close(e.done)
+		e.mu.Lock()
+		terminal := !e.deleted && e.recording != nil && e.recording.State != domain.StateRecording
+		id := ""
+		if terminal {
+			id = e.recording.ID
+		}
+		e.mu.Unlock()
+		if terminal {
+			m.signalAutomaticArchiveRecovery(id)
+		}
+	}()
 	m.runWorker(ctx, e, media)
 	e.mu.Lock()
 	staged := e.handoverCandidate
@@ -1924,9 +2050,35 @@ func (m *Manager) run(ctx context.Context, e *entry, media adapterproto.MediaSou
 	m.mu.RLock()
 	release := m.terminalOwnerRelease
 	m.mu.RUnlock()
-	if owner != nil && terminal && release != nil {
-		_ = release(*owner)
+	if owner != nil && terminal && release != nil && !m.retainTerminalRecoveryOwner(e, *owner) {
+		_ = m.releaseAutomaticRecoveryOwner(e, *owner)
 	}
+}
+
+func (m *Manager) retainTerminalRecoveryOwner(e *entry, owner OwnershipToken) bool {
+	m.mu.RLock()
+	enabled, closed := m.autoRecovery != nil, m.closed
+	m.mu.RUnlock()
+	if !enabled || closed {
+		return false
+	}
+	e.mu.Lock()
+	eligible := !e.deleted && e.recording != nil && e.recording.State != domain.StateRecording &&
+		!e.recording.ArchiveSealed && sameOwner(e.ownership, owner)
+	media := cloneMediaSource(e.media)
+	id := ""
+	if e.recording != nil {
+		id = e.recording.ID
+	}
+	e.mu.Unlock()
+	if !eligible {
+		return false
+	}
+	if validHistoricalAvailability(media) {
+		return true
+	}
+	loaded, err := m.loadAcquisitionContext(id)
+	return err == nil && validHistoricalAvailability(loaded)
 }
 
 func (m *Manager) fail(e *entry, err error) {

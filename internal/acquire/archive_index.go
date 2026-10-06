@@ -829,6 +829,12 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 	if commitErr != nil {
 		return storage.PayloadResult{}, nil, commitErr
 	}
+	if source == archiveindex.ClaimLiveOrigin {
+		// A live claim can change the historical coverage plan even when the
+		// source manifest itself did not introduce a new gap. Coalescing keeps
+		// this commit-boundary trigger bounded while the recovery worker runs.
+		m.signalAutomaticArchiveRecovery(recordingID(e))
+	}
 	return result, plannedMarker, nil
 }
 

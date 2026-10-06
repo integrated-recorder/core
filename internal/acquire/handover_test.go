@@ -199,6 +199,126 @@ func newHandoverManagerWithResolver(t *testing.T, store *storage.Store, ownerSto
 	return manager
 }
 
+type blockingHistoricalHandoverTransport struct {
+	base     *handoverFixture
+	manifest []byte
+	seen     chan struct{}
+	resume   chan struct{}
+}
+
+func (t *blockingHistoricalHandoverTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Path == "/history.m3u8" {
+		select {
+		case <-t.seen:
+		default:
+			close(t.seen)
+		}
+		select {
+		case <-t.resume:
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(bytes.NewReader(t.manifest)), ContentLength: int64(len(t.manifest)), Request: request,
+		}, nil
+	}
+	return t.base.RoundTrip(request)
+}
+
+func TestHandoverPauseDrainsAutomaticHistoricalRecovery(t *testing.T) {
+	store, owners, _ := newHandoverStores(t)
+	fixture := &handoverFixture{max: 1, metadata: "title"}
+	transport := &blockingHistoricalHandoverTransport{
+		base:     fixture,
+		manifest: []byte("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nsegment-000000.ts\n#EXT-X-ENDLIST\n"),
+		seen:     make(chan struct{}), resume: make(chan struct{}),
+	}
+	manager, err := NewManagerWithMode(store, &http.Client{Transport: transport}, &handoverMetadataResolver{fixture: fixture}, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureCanonicalCommitFence(owners); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureTerminalOwnerRelease(owners.Release); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureAutomaticArchiveRecovery(func(_ context.Context, id string) (OwnershipToken, error) {
+		return owners.Claim(id, handoverGenA, handoverWorkerA)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := manager.Close(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("close recovery handover manager: %v", err)
+		}
+	})
+
+	owner := claimHandoverOwner(t, owners, handoverGenA, handoverWorkerA)
+	media := adapterproto.MediaSource{
+		Type: "hls", ManifestURL: "https://fixture.invalid/live.m3u8",
+		HistoricalAvailability: &adapterproto.HistoricalAvailability{
+			Mode:                  adapterproto.HistoricalModeSequenceRanges,
+			SequenceRanges:        []adapterproto.HistoricalSequenceRange{{Start: 0, End: 0}},
+			HistoricalManifestURL: "https://fixture.invalid/history.m3u8",
+		},
+	}
+	recording, err := manager.StartResolvedWithIDOwned(context.Background(), owner, handoverRecordingID, "fixture", media, nil, "handover recovery fixture", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.seen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("automatic historical recovery did not start")
+	}
+
+	type pauseResult struct {
+		snapshot HandoverSnapshot
+		err      error
+	}
+	paused := make(chan pauseResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		snapshot, pauseErr := manager.PauseForHandover(ctx, recording.ID, owner)
+		paused <- pauseResult{snapshot: snapshot, err: pauseErr}
+	}()
+	select {
+	case result := <-paused:
+		t.Fatalf("handover returned before historical request drained: err=%v", result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(transport.resume)
+	var result pauseResult
+	select {
+	case result = <-paused:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handover did not finish after historical recovery drained")
+	}
+	if result.err != nil {
+		t.Fatalf("PauseForHandover: %v", result.err)
+	}
+	current, err := manager.Get(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.SegmentCount() != 2 || segmentAtSequence(t, current.Tracks["main"].Segments, 0).TimelineOrdinal != 1 || segmentAtSequence(t, current.Tracks["main"].Segments, 1).TimelineOrdinal != 2 {
+		t.Fatalf("recovery was not drained before snapshot: %#v", current.Tracks["main"].Segments)
+	}
+	rootAtPause := recordingRootBytes(t, store, recording.ID)
+	time.Sleep(80 * time.Millisecond)
+	if afterPause := recordingRootBytes(t, store, recording.ID); !bytes.Equal(rootAtPause, afterPause) {
+		t.Fatal("canonical archive changed after handover snapshot")
+	}
+	if err := manager.ResumeHandover(recording.ID, owner, result.snapshot); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newHandoverStores(t *testing.T) (*storage.Store, *recordingowner.Store, string) {
 	t.Helper()
 	dataDir := t.TempDir()

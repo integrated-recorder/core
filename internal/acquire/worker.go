@@ -931,6 +931,7 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 		// cleared operation first so a caller can safely issue Stop or another
 		// handover as soon as resume completes.
 		op.resumedOnce.Do(func() { close(op.resumed) })
+		m.releaseHandoverRecoveryGate(e, op)
 		media, _ = currentMediaVersion(e)
 	}
 }
@@ -1217,6 +1218,24 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			m.fail(e, err)
 			return
 		}
+		recoveryTrigger := false
+		e.mu.Lock()
+		if !e.recoveryManifestStarted {
+			e.recoveryManifestStarted = true
+			recoveryTrigger = true
+		}
+		e.mu.Unlock()
+		if !recoveryTrigger {
+			for _, segment := range playlist.Segments {
+				if segment.Gap {
+					recoveryTrigger = true
+					break
+				}
+			}
+		}
+		if recoveryTrigger {
+			m.signalAutomaticArchiveRecovery(recordingID(e))
+		}
 		if done {
 			return
 		}
@@ -1323,27 +1342,49 @@ func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler
 	if err := scheduler.close(); err != nil {
 		return false, err
 	}
+	if err := acquireArchiveRecoveryGate(op.ctx, e); err != nil {
+		startMetadata()
+		e.mu.Lock()
+		if e.handover == op {
+			op.state = handoverAborted
+			e.handover = nil
+		}
+		e.mu.Unlock()
+		op.resumedOnce.Do(func() { close(op.resumed) })
+		if ctx.Err() == nil && op.ctx.Err() == nil {
+			return false, err
+		}
+		return false, nil
+	}
 	e.mu.Lock()
 	if e.handover != op || e.recording == nil || e.recording.State != domain.StateRecording || !sameOwner(e.ownership, op.expected) {
 		e.mu.Unlock()
+		releaseArchiveRecoveryGate(e)
 		return false, ErrHandoverOwnerMismatch
 	}
+	op.recoveryGateHeld = true
 	snapshot, err := makeHandoverSnapshot(e.recording.ID, *e.ownership, e.adapterID, e.media, e.resource)
 	if err != nil {
 		e.mu.Unlock()
+		m.releaseHandoverRecoveryGate(e, op)
 		return false, err
 	}
 	op.snapshot = snapshot
 	op.state = handoverPaused
 	op.pausedOnce.Do(func() { close(op.paused) })
+	timedOut := false
 	if op.ctx.Err() != nil {
 		// The caller timed out at the close boundary. Park only long enough for
 		// the outer worker loop to rebuild its scheduler under the old owner.
 		op.state = handoverResuming
 		e.handover = nil
 		op.resumeOnce.Do(func() { close(op.resume) })
+		timedOut = true
 	}
 	e.mu.Unlock()
+	if timedOut {
+		m.releaseHandoverRecoveryGate(e, op)
+	}
 	return true, nil
 }
 
@@ -1427,6 +1468,7 @@ func (m *Manager) refreshMediaAtGeneration(ctx context.Context, e *entry, curren
 	if scheduler != nil {
 		scheduler.noteMediaGeneration(generation)
 	}
+	m.signalAutomaticArchiveRecovery(recordingID(e))
 	return cloneMediaSource(copy), generation, nil
 }
 
@@ -1717,7 +1759,7 @@ func (m *Manager) hasSequenceCoordinate(e *entry, epoch, discontinuitySequence, 
 	return false
 }
 func (m *Manager) markPending(e *entry, epoch, discontinuitySequence, seq uint64, err error) error {
-	return m.update(e, func(r *domain.Recording) error {
+	updateErr := m.update(e, func(r *domain.Recording) error {
 		t := r.Tracks["main"]
 		if t == nil {
 			return errors.New("main track is missing")
@@ -1741,10 +1783,16 @@ func (m *Manager) markPending(e *entry, epoch, discontinuitySequence, seq uint64
 		r.LastError = safeFailureDescription(err)
 		return nil
 	})
+	if updateErr == nil {
+		// A live acquisition failure can make an already-declared historical
+		// coordinate newly actionable. The scheduler coalesces this signal.
+		m.signalAutomaticArchiveRecovery(recordingID(e))
+	}
+	return updateErr
 }
 
 func (m *Manager) markGap(e *entry, epoch, discontinuitySequence, sequence uint64, reason string) error {
-	return m.update(e, func(r *domain.Recording) error {
+	updateErr := m.update(e, func(r *domain.Recording) error {
 		t := r.Tracks["main"]
 		if t == nil {
 			return errors.New("main track is missing")
@@ -1757,6 +1805,10 @@ func (m *Manager) markGap(e *entry, epoch, discontinuitySequence, sequence uint6
 		}
 		return nil
 	})
+	if updateErr == nil {
+		m.signalAutomaticArchiveRecovery(recordingID(e))
+	}
+	return updateErr
 }
 
 // markRemainingPending preserves the manifest's known media inventory when a

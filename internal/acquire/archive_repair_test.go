@@ -13,6 +13,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +48,18 @@ func (f *repairOwnerFence) WithUnownedCommit(_ string, commit func() error) erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return commit()
+}
+
+func (f *repairOwnerFence) WithFencedRecovery(recover func() error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.current != nil {
+		if f.current.Epoch > f.last {
+			f.last = f.current.Epoch
+		}
+		f.current = nil
+	}
+	return recover()
 }
 
 func (f *repairOwnerFence) Release(owner OwnershipToken) error {
@@ -319,6 +332,421 @@ func newRepairTestManager(t *testing.T, store *storage.Store, fixture *repairFix
 
 func ownerForRepair(id string, epoch uint64) OwnershipToken {
 	return OwnershipToken{RecordingID: id, EngineGeneration: "host-generation", WorkerInstance: "repair-worker", Epoch: epoch}
+}
+
+func TestAutomaticArchiveRecoveryRepairsLatePrefixWithoutManualPass(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := repairMediaContextForTest()
+	fixture := &repairFixtureTransport{manifest: repairManifestFixture(), objects: map[string][]byte{
+		"/archive/prefix.m4v": []byte("automatic-prefix-exact-bytes"),
+		"/archive/init.m4v":   []byte("automatic-prefix-init"),
+	}}
+	root := newRepairTestRoot(t, store, domain.StateCompleted, media)
+	root.Tracks["main"].SourceEpoch = 1
+	root.Tracks["main"].Segments[0].SourceEpoch = 1
+	root.Tracks["main"].Segments[0].Discontinuity = true
+	for i := range root.Gaps {
+		root.Gaps[i].SourceEpoch = 1
+	}
+	if err := store.SaveRecording(root); err != nil {
+		t.Fatal(err)
+	}
+	fence := &repairOwnerFence{}
+	manager, e, closeManager := newRepairTestManager(t, store, fixture, root, fence, nil)
+	e.mu.Lock()
+	e.media = media
+	e.mu.Unlock()
+	manager.freshGeneration = false // Model a fenced managed startup, not a candidate generation.
+	owner := ownerForRepair(root.ID, 1)
+	var claims atomic.Int32
+	if err := manager.ConfigureAutomaticArchiveRecovery(func(context.Context, string) (OwnershipToken, error) {
+		claims.Add(1)
+		return owner, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForRepairCondition(t, "automatic prefix commit", func() bool {
+		current, getErr := manager.Get(root.ID)
+		if getErr != nil {
+			return false
+		}
+		for _, segment := range current.Tracks["main"].Segments {
+			if segment.Sequence == 10 {
+				return true
+			}
+		}
+		return false
+	})
+	current, err := manager.Get(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := segmentAtSequence(t, current.Tracks["main"].Segments, 10)
+	tail := segmentAtSequence(t, current.Tracks["main"].Segments, 12)
+	if prefix.TimelineOrdinal != 1 || prefix.ArchiveOrdinal != 8 || tail.TimelineOrdinal != 2 || tail.ArchiveOrdinal != 7 {
+		t.Fatalf("automatic prefix changed append-only identity or failed projection: prefix=%#v tail=%#v", prefix, tail)
+	}
+	if current.TimelineRevision <= 1 || current.Duration() != 8 {
+		t.Fatalf("automatic prefix timeline revision/duration = %d/%v", current.TimelineRevision, current.Duration())
+	}
+	assertStoredPayload(t, store, root.ID, prefix.StoragePath, []byte("automatic-prefix-exact-bytes"))
+	if claims.Load() != 1 {
+		t.Fatalf("terminal recovery owner claims = %d, want one Host claim", claims.Load())
+	}
+	if err := closeManager(); err != nil {
+		t.Fatal(err)
+	}
+	fence.mu.Lock()
+	stillOwned := fence.current != nil
+	fence.mu.Unlock()
+	if stillOwned {
+		t.Fatal("Manager.Close retained terminal owner after recovery scheduler stopped")
+	}
+}
+
+func TestAutomaticArchiveRecoveryRetriesMiddleGapAfterBackoff(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := repairMediaContextForTest()
+	manifest := bytes.Replace(repairManifestFixture(), []byte("#EXT-X-GAP\nmissing.ts"), []byte("middle.ts"), 1)
+	fixture := &repairFixtureTransport{manifest: manifest, objects: map[string][]byte{
+		"/archive/prefix.m4v": []byte("retry-prefix"),
+		"/archive/middle.m4v": []byte("retry-middle-exact-bytes"),
+		"/archive/init.m4v":   []byte("retry-init"),
+	}}
+	fixture.fail("/archive/middle.m4v", 1)
+	root := newRepairTestRoot(t, store, domain.StateCompleted, media)
+	fence := &repairOwnerFence{}
+	manager, e, closeManager := newRepairTestManager(t, store, fixture, root, fence, nil)
+	e.mu.Lock()
+	e.media = media
+	e.mu.Unlock()
+	manager.freshGeneration = false
+	owner := ownerForRepair(root.ID, 1)
+	var claims atomic.Int32
+	if err := manager.ConfigureAutomaticArchiveRecovery(func(context.Context, string) (OwnershipToken, error) {
+		claims.Add(1)
+		return owner, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForRepairCondition(t, "middle acquisition failure coverage", func() bool {
+		inventory, inventoryErr := manager.ArchiveInventory(root.ID)
+		if inventoryErr != nil {
+			return false
+		}
+		coordinate := archiveindex.Coordinate{SessionID: inventory.Session.ID, TrackID: "main", SourceEpoch: 0, DiscontinuitySequence: 7, Sequence: 11, Kind: archiveindex.ObjectMedia}
+		return archiveindex.CoverageAt(inventory, coordinate) == archiveindex.CoverageAcquisitionFailed
+	})
+	firstMiddleRequests := 0
+	for _, requested := range fixture.requestedURLs() {
+		if strings.Contains(requested, "/archive/middle.m4v") {
+			firstMiddleRequests++
+		}
+	}
+	if firstMiddleRequests != 1 {
+		t.Fatalf("middle requests before scheduler backoff = %d, want one failed request", firstMiddleRequests)
+	}
+	waitForRepairCondition(t, "automatic retry after capped backoff", func() bool {
+		count := 0
+		for _, requested := range fixture.requestedURLs() {
+			if strings.Contains(requested, "/archive/middle.m4v") {
+				count++
+			}
+		}
+		return count >= 2
+	})
+	waitForRepairCondition(t, "repaired middle gap projection", func() bool {
+		current, getErr := manager.Get(root.ID)
+		if getErr != nil || len(current.Tracks["main"].Segments) != 3 {
+			return false
+		}
+		middle, ok := findSegmentBySequence(current.Tracks["main"].Segments, 11)
+		return ok && middle.TimelineOrdinal == 2 && current.TimelineRevision > 1
+	})
+	current, err := manager.Get(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Duration() != 12 || segmentAtSequence(t, current.Tracks["main"].Segments, 12).TimelineOrdinal != 3 {
+		t.Fatalf("VOD projection after automatic gap repair: duration=%v segments=%#v", current.Duration(), current.Tracks["main"].Segments)
+	}
+	if claims.Load() != 1 {
+		t.Fatalf("recovery retry claimed a new owner instead of retaining generation lease: claims=%d", claims.Load())
+	}
+	assertStoredPayload(t, store, root.ID, segmentAtSequence(t, current.Tracks["main"].Segments, 11).StoragePath, []byte("retry-middle-exact-bytes"))
+	if err := closeManager(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLiveCommitAndFailurePublicationWakeAutomaticRecovery(t *testing.T) {
+	for _, trigger := range []string{"live-claim", "acquisition-failure"} {
+		t.Run(trigger, func(t *testing.T) {
+			store, err := storage.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			media := repairMediaContextForTest()
+			fixture := &repairFixtureTransport{manifest: repairManifestFixture(), objects: map[string][]byte{}}
+			root := newRepairTestRoot(t, store, domain.StateCompleted, media)
+			fence := &repairOwnerFence{}
+			manager, e, closeManager := newRepairTestManager(t, store, fixture, root, fence, nil)
+			e.mu.Lock()
+			e.media = media
+			e.mu.Unlock()
+			owner := ownerForRepair(root.ID, 1)
+			if err := manager.ConfigureAutomaticArchiveRecovery(func(context.Context, string) (OwnershipToken, error) {
+				return owner, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			switch trigger {
+			case "live-claim":
+				segment := domain.Segment{
+					TrackID: "main", SourceEpoch: 0, DiscontinuitySequence: 7, Sequence: 13,
+					ArchiveOrdinal: 8, TimelineOrdinal: 2, Duration: 4,
+					SourceURI: "https://media.example/archive/live-13.ts",
+				}
+				if _, _, err := manager.commitArchiveSegmentOwned(e, &owner, segment, archiveindex.ClaimLiveOrigin, []byte("live-claim-bytes"), true); err != nil {
+					t.Fatalf("publish live claim: %v", err)
+				}
+			case "acquisition-failure":
+				e.mu.Lock()
+				e.ownership = &owner
+				e.mu.Unlock()
+				if err := manager.markPending(e, 0, 7, 11, newFetchError("segment", http.StatusServiceUnavailable, true, true)); err != nil {
+					t.Fatalf("publish acquisition failure: %v", err)
+				}
+			}
+
+			waitForRepairCondition(t, "automatic recovery after "+trigger, func() bool {
+				for _, requested := range fixture.requestedURLs() {
+					if strings.Contains(requested, "/archive/index.m3u8") {
+						return true
+					}
+				}
+				return false
+			})
+			if err := closeManager(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAutomaticArchiveRecoveryResumesAfterRestartWithoutRefetchingPresentClaims(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := repairMediaContextForTest()
+	manifest := bytes.Replace(repairManifestFixture(), []byte("#EXT-X-GAP\nmissing.ts"), []byte("middle.ts"), 1)
+	fixture := &repairFixtureTransport{manifest: manifest, objects: map[string][]byte{
+		"/archive/prefix.m4v": []byte("restart-prefix-bytes"),
+		"/archive/middle.m4v": []byte("restart-middle-bytes"),
+		"/archive/init.m4v":   []byte("restart-init-bytes"),
+	}}
+	fixture.fail("/archive/middle.m4v", 1)
+	root := newRepairTestRoot(t, store, domain.StateCompleted, media)
+	fenceBeforeRestart := &repairOwnerFence{}
+	manager, e, closeManager := newRepairTestManager(t, store, fixture, root, fenceBeforeRestart, nil)
+	e.mu.Lock()
+	e.media = media
+	e.mu.Unlock()
+	firstOwner := ownerForRepair(root.ID, 1)
+	if err := manager.RepairDeclaredHistory(context.Background(), firstOwner, root.ID); err != nil {
+		t.Fatalf("initial partial historical pass: %v", err)
+	}
+	beforeRestart, err := manager.Get(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefixBefore := segmentAtSequence(t, beforeRestart.Tracks["main"].Segments, 10)
+	if _, ok := findSegmentBySequence(beforeRestart.Tracks["main"].Segments, 11); ok {
+		t.Fatal("fixture did not leave a partial repair for restart")
+	}
+	countRequested := func(fragment string) int {
+		count := 0
+		for _, requested := range fixture.requestedURLs() {
+			if strings.Contains(requested, fragment) {
+				count++
+			}
+		}
+		return count
+	}
+	if prefixRequests := countRequested("/archive/prefix.m4v"); prefixRequests != 1 {
+		t.Fatalf("initial prefix fetch count=%d, want 1", prefixRequests)
+	}
+	if err := closeManager(); err != nil {
+		t.Fatal(err)
+	}
+
+	restartedStore, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenceAfterRestart := &repairOwnerFence{}
+	validate := SourceValidator(func(_ context.Context, raw string) error {
+		parsed, parseErr := url.Parse(raw)
+		if parseErr != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return errors.New("invalid fixture URL")
+		}
+		return nil
+	})
+	restarted, err := NewManagerWithFencedRecovery(restartedStore, &http.Client{Transport: fixture}, nil, validate, fenceAfterRestart, fenceAfterRestart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ConfigureTerminalOwnerRelease(fenceAfterRestart.Release); err != nil {
+		t.Fatal(err)
+	}
+	requestsBeforeOwnerConfig := len(fixture.requestedURLs())
+	time.Sleep(25 * time.Millisecond)
+	if requestsAfterLoad := len(fixture.requestedURLs()); requestsAfterLoad != requestsBeforeOwnerConfig {
+		t.Fatalf("recovered archive started network work before Host owner callback configuration: before=%d after=%d", requestsBeforeOwnerConfig, requestsAfterLoad)
+	}
+	var claims atomic.Int32
+	secondOwner := ownerForRepair(root.ID, 2)
+	if err := restarted.ConfigureAutomaticArchiveRecovery(func(context.Context, string) (OwnershipToken, error) {
+		claims.Add(1)
+		return secondOwner, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := restarted.Close(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("close restarted automatic recovery manager: %v", err)
+		}
+	})
+	waitForRepairCondition(t, "automatic repair after cold restart", func() bool {
+		current, getErr := restarted.Get(root.ID)
+		if getErr != nil {
+			return false
+		}
+		_, present := findSegmentBySequence(current.Tracks["main"].Segments, 11)
+		return present
+	})
+	afterRestart, err := restarted.Get(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefixAfter := segmentAtSequence(t, afterRestart.Tracks["main"].Segments, 10)
+	if prefixAfter.StoragePath != prefixBefore.StoragePath || prefixAfter.ArchiveOrdinal != prefixBefore.ArchiveOrdinal || prefixAfter.SHA256 != prefixBefore.SHA256 {
+		t.Fatalf("restart changed existing immutable claim identity: before=%#v after=%#v", prefixBefore, prefixAfter)
+	}
+	assertStoredPayload(t, restartedStore, root.ID, prefixAfter.StoragePath, []byte("restart-prefix-bytes"))
+	if prefixRequests := countRequested("/archive/prefix.m4v"); prefixRequests != 1 {
+		t.Fatalf("restart refetched already-present prefix %d times", prefixRequests-1)
+	}
+	if middleRequests := countRequested("/archive/middle.m4v"); middleRequests != 2 {
+		t.Fatalf("restart middle requests=%d, want one failed pre-crash request and one recovery request", middleRequests)
+	}
+	if claims.Load() != 1 {
+		t.Fatalf("restart recovery owner claims=%d, want one authenticated Host claim", claims.Load())
+	}
+}
+
+func TestSlowHistoricalRequestDoesNotBlockLiveCanonicalCommit(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := repairMediaContextForTest()
+	fixture := &repairFixtureTransport{manifest: repairManifestFixture(), objects: map[string][]byte{
+		"/archive/prefix.m4v": []byte("concurrent-prefix"),
+		"/archive/middle.m4v": []byte("concurrent-middle"),
+		"/archive/init.m4v":   []byte("concurrent-init"),
+	}}
+	historicalSeen, resumeHistorical := make(chan struct{}), make(chan struct{})
+	fixture.setBlockManifest(historicalSeen, resumeHistorical)
+	root := newRepairTestRoot(t, store, domain.StateRecording, media)
+	fence := &repairOwnerFence{}
+	manager, e, closeManager := newRepairTestManager(t, store, fixture, root, fence, nil)
+	owner := ownerForRepair(root.ID, 1)
+	_, cancelLive := context.WithCancel(context.Background())
+	e.mu.Lock()
+	e.media = media
+	e.ownership = &owner
+	e.cancel = cancelLive
+	e.done = make(chan struct{})
+	e.mu.Unlock()
+	var claims atomic.Int32
+	if err := manager.ConfigureAutomaticArchiveRecovery(func(context.Context, string) (OwnershipToken, error) {
+		claims.Add(1)
+		return owner, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager.signalAutomaticArchiveRecovery(root.ID)
+	select {
+	case <-historicalSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("automatic historical request did not start")
+	}
+
+	liveSegment := domain.Segment{
+		TrackID: "main", SourceEpoch: 0, DiscontinuitySequence: 7, Sequence: 13,
+		ArchiveOrdinal: 8, TimelineOrdinal: 2, Duration: 4,
+		SourceURI: "https://media.example/archive/live-13.ts",
+	}
+	committed := make(chan error, 1)
+	go func() {
+		_, _, commitErr := manager.commitArchiveSegment(e, &owner, liveSegment, archiveindex.ClaimLiveOrigin, []byte("live-during-history"))
+		committed <- commitErr
+	}()
+	select {
+	case commitErr := <-committed:
+		if commitErr != nil {
+			t.Fatalf("live commit while historical fetch blocked: %v", commitErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("historical network request blocked the live canonical commit")
+	}
+	current, err := manager.Get(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := findSegmentBySequence(current.Tracks["main"].Segments, 13); !present {
+		t.Fatal("live commit did not publish while historical request remained blocked")
+	}
+	cancelLive()
+	if err := closeManager(); err != nil {
+		t.Fatal(err)
+	}
+	if claims.Load() != 0 {
+		t.Fatalf("live historical recovery claimed a replacement owner %d times", claims.Load())
+	}
+}
+
+func findSegmentBySequence(segments []domain.Segment, sequence uint64) (domain.Segment, bool) {
+	for _, segment := range segments {
+		if segment.Sequence == sequence {
+			return segment, true
+		}
+	}
+	return domain.Segment{}, false
+}
+
+func waitForRepairCondition(t *testing.T, description string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
 }
 
 func TestRepairDeclaredHistoryLegacyRootTransformRetryRestartAndSeal(t *testing.T) {

@@ -208,17 +208,52 @@ func (e *Engine) ConfigureRecordingOwnerClient(client recordingOwnerClient) erro
 	e.admissionMu.Lock()
 	defer e.admissionMu.Unlock()
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.startSeen || e.ownerClient != nil || e.closed {
+		e.mu.Unlock()
 		return errors.New("recording owner client must be configured before Engine starts")
 	}
+	e.ownerClient = client
+	e.mu.Unlock()
 	if err := e.manager.ConfigureTerminalOwnerRelease(func(owner acquire.OwnershipToken) error {
 		return e.releaseOwner(context.Background(), owner)
 	}); err != nil {
+		e.mu.Lock()
+		e.ownerClient = nil
+		e.mu.Unlock()
 		return err
 	}
-	e.ownerClient = client
+	if err := e.manager.ConfigureAutomaticArchiveRecovery(e.claimAutomaticRecoveryOwner); err != nil {
+		e.mu.Lock()
+		e.ownerClient = nil
+		e.mu.Unlock()
+		return err
+	}
 	return nil
+}
+
+func (e *Engine) claimAutomaticRecoveryOwner(ctx context.Context, recordingID string) (recordingowner.Owner, error) {
+	e.admissionMu.RLock()
+	draining := e.draining
+	e.admissionMu.RUnlock()
+	e.mu.RLock()
+	client, unavailable := e.ownerClient, e.closed || draining
+	e.mu.RUnlock()
+	if client == nil || unavailable {
+		return recordingowner.Owner{}, errors.New("engine cannot claim recovery ownership")
+	}
+	owner, err := client.ClaimRecording(ctx, recordingID)
+	if err != nil {
+		return recordingowner.Owner{}, err
+	}
+	e.ownerMu.Lock()
+	if current, exists := e.owners[recordingID]; exists && current != owner {
+		e.ownerMu.Unlock()
+		_ = client.ReleaseRecording(context.Background(), owner)
+		return recordingowner.Owner{}, recordingowner.ErrStaleOwner
+	}
+	e.owners[recordingID] = owner
+	e.ownerMu.Unlock()
+	return owner, nil
 }
 
 // RuntimeInstanceID is returned in the transport envelope so a Control Plane
@@ -360,13 +395,6 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 			return nil, publicError("invalid_request", "recording identity is invalid")
 		}
 		result, err := e.manager.StopContext(ctx, request.RecordingID)
-		if result != nil && result.State != domain.StateRecording {
-			if owner, ok := e.currentOwner(request.RecordingID); ok {
-				if releaseErr := e.releaseOwner(ctx, owner); releaseErr != nil {
-					return nil, publicError("stop_failed", "recording ownership could not be released")
-				}
-			}
-		}
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil, publicError("not_owned", "recording is not owned by this engine")

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/hls"
 	"github.com/integrated-recorder/core/internal/network"
@@ -101,15 +102,16 @@ type entry struct {
 }
 
 type Manager struct {
-	store      *storage.Store
-	ingest     *storage.IngestService
-	client     *http.Client
-	resolver   Resolver
-	validate   SourceValidator
-	mu         sync.RWMutex
-	entries    map[string]*entry
-	prepared   map[string]preparedHandover
-	handoverMu sync.Mutex
+	store           *storage.Store
+	ingest          *storage.IngestService
+	client          *http.Client
+	resolver        Resolver
+	validate        SourceValidator
+	mu              sync.RWMutex
+	startCreationMu sync.Mutex
+	entries         map[string]*entry
+	prepared        map[string]preparedHandover
+	handoverMu      sync.Mutex
 	// freshGeneration leaves existing archive documents read-only and does
 	// not take ownership of them. It is used for a candidate Engine generation
 	// that must not recover/interrupt work owned by an older Engine.
@@ -813,7 +815,7 @@ func (m *Manager) fetchHandoverPlaylist(ctx context.Context, recordingID string,
 	if err := m.validate(ctx, manifestURL); err != nil {
 		return hls.MediaPlaylist{}, newFetchError("manifest", 0, false, false)
 	}
-	payload, err := fetchManifestBuffered(ctx, m.client, m.ingest, recordingID, manifestURL, media.Headers, manifestURL, media.RequestPolicy)
+	payload, requestedManifestURL, err := m.fetchManifestForMedia(ctx, recordingID, media, media.ManifestURL, manifestURL, adapterproto.RequestScopeManifest)
 	if err != nil {
 		if payload != nil {
 			payload.Release()
@@ -823,19 +825,18 @@ func (m *Manager) fetchHandoverPlaylist(ctx context.Context, recordingID string,
 	if payload == nil {
 		return hls.MediaPlaylist{}, ErrHandoverUnavailable
 	}
-	selectedURL := manifestURL
+	selectedURL := requestedManifestURL
 	if hls.IsMasterPlaylist(payload.Bytes()) {
-		master, parseErr := hlsParseMaster(payload.Bytes(), manifestURL)
+		master, parseErr := hlsParseMaster(payload.Bytes(), requestedManifestURL)
 		payload.Release()
 		if parseErr != nil {
 			return hls.MediaPlaylist{}, ErrHandoverUnavailable
 		}
 		variant, selectErr := selectVariant(master)
-		if selectErr != nil || m.validate(ctx, variant.URI) != nil {
+		if selectErr != nil {
 			return hls.MediaPlaylist{}, ErrHandoverUnavailable
 		}
-		selectedURL = variant.URI
-		payload, err = fetchManifestBuffered(ctx, m.client, m.ingest, recordingID, selectedURL, media.Headers, manifestURL, media.RequestPolicy)
+		payload, selectedURL, err = m.fetchManifestForMedia(ctx, recordingID, media, requestedManifestURL, variant.URI, adapterproto.RequestScopeVariant)
 		if err != nil {
 			if payload != nil {
 				payload.Release()
@@ -986,13 +987,13 @@ func findHandoverCandidate(recording *domain.Recording, playlist hls.MediaPlayli
 		epoch++
 	}
 	for _, incoming := range playlist.Segments {
-		if incoming.Gap || gapCoversEpoch(recording, "main", epoch, incoming.Sequence) {
+		if incoming.Gap || gapCoversCoordinate(recording, "main", epoch, incoming.DiscontinuitySequence, incoming.Sequence) {
 			continue
 		}
 		captured := false
 		for i := range track.Segments {
 			segment := &track.Segments[i]
-			if segment.SourceEpoch == epoch && segment.Sequence == incoming.Sequence {
+			if segment.SourceEpoch == epoch && segment.DiscontinuitySequence == incoming.DiscontinuitySequence && segment.Sequence == incoming.Sequence {
 				captured = true
 				break
 			}
@@ -1349,6 +1350,8 @@ func (m *Manager) beginStart(owner *OwnershipToken) error {
 }
 
 func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media adapterproto.MediaSource, resource *adapterproto.ResourceRef, title string, provenance *adapterproto.AdapterProvenance, owner *OwnershipToken) (*domain.Recording, error) {
+	m.startCreationMu.Lock()
+	defer m.startCreationMu.Unlock()
 	if owner != nil && (!validOwnershipToken(*owner) || owner.RecordingID != id) {
 		return nil, ErrInvalidOwnershipToken
 	}
@@ -1368,12 +1371,31 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 	if err = m.validate(ctx, media.ManifestURL); err != nil {
 		return nil, fmt.Errorf("invalid resolved media URL")
 	}
+	acquisitionContext, err := mediaContext(media)
+	if err != nil {
+		return nil, err
+	}
+	contextDoc, err := acquisitionContextDocument(acquisitionContext)
+	if err != nil {
+		return nil, errors.New("recording acquisition context could not be initialized")
+	}
+	sessionIdentity, err := archiveindex.NewSessionIdentity(id, adapterID, archiveResource(resource), media.SessionRef)
+	if err != nil {
+		return nil, errors.New("recording source identity is invalid")
+	}
 	now := time.Now().UTC()
 	classification := media.SourceURIClassification()
-	recording := &domain.Recording{FormatVersion: 1, ID: id, Title: title, AdapterID: adapterID, Adapter: archiveProvenance(provenance), Resource: archiveResource(resource), SourceURIClassification: classification, State: domain.StateRecording, CreatedAt: now, StartedAt: now, Tracks: map[string]*domain.Track{
+	recording := &domain.Recording{FormatVersion: 1, ID: id, SourceSessionID: sessionIdentity.ID, Title: title, AdapterID: adapterID, Adapter: archiveProvenance(provenance), Resource: archiveResource(resource), SourceURIClassification: classification, State: domain.StateRecording, CreatedAt: now, StartedAt: now, Tracks: map[string]*domain.Track{
 		"main": {ID: "main", SourcePlaylistURL: media.ManifestURL, NextArchiveOrdinal: 1, Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
 	}}
-	if err = m.withOwnershipCommit(owner, func() error { return m.store.CreateRecording(recording) }); err != nil {
+	if err = m.withOwnershipCommit(owner, func() error {
+		if _, loadErr := m.store.LoadRecordingReadOnly(id); loadErr == nil {
+			return errors.New("recording already exists")
+		} else if !errors.Is(loadErr, storage.ErrNotFound) {
+			return errors.New("recording storage is unavailable")
+		}
+		return m.store.CreateRecordingWithSidecar(recording, acquisitionContextPath, contextDoc)
+	}); err != nil {
 		return nil, errors.New("recording storage could not be initialized")
 	}
 	workerCtx, cancel := context.WithCancel(context.Background())

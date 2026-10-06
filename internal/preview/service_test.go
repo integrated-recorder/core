@@ -339,6 +339,87 @@ func TestPreviewTimelineCacheIsBoundedAndKeepsExactStarts(t *testing.T) {
 	}
 }
 
+func TestPreviewTimelineRevisionRepositionsStableArchiveFrames(t *testing.T) {
+	fixture := newPreviewFixture(t, 0, false, "normal")
+	service := fixture.open(t)
+	defer service.Close(context.Background())
+	id := fixture.recording.ID
+	initial := orderedSegments([]domain.Segment{
+		{ID: "first", ArchiveOrdinal: 1, TimelineOrdinal: 1, Duration: 2},
+		{ID: "tail", ArchiveOrdinal: 2, TimelineOrdinal: 2, Duration: 4},
+	})
+	service.mu.Lock()
+	initialStarts, changed := service.timelineStartsAndRevisionLocked(id, initial)
+	if changed || len(initialStarts) != 2 || initialStarts[0] != 0 || initialStarts[1] != 2 {
+		service.mu.Unlock()
+		t.Fatalf("initial starts=%v revised=%t", initialStarts, changed)
+	}
+	generated := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	service.indexes[id] = &Index{Version: ProfileVersion, Profile: defaultProfile(), Items: []Frame{
+		{ArchiveOrdinal: 1, FrameTimeSeconds: 0, SegmentStartSeconds: 0, SegmentDurationSeconds: 2, SegmentSHA256: "first-hash", ImageSHA256: "first-image", GeneratedAt: generated},
+		{ArchiveOrdinal: 2, FrameTimeSeconds: 2, SegmentStartSeconds: 2, SegmentDurationSeconds: 4, SegmentSHA256: "tail-hash", ImageSHA256: "tail-image", GeneratedAt: generated},
+		{ArchiveOrdinal: 4, FrameTimeSeconds: 99, SegmentStartSeconds: 99, SegmentDurationSeconds: 3, SegmentSHA256: "repair-hash", ImageSHA256: "repair-image", GeneratedAt: generated},
+	}}
+	service.mu.Unlock()
+
+	// A newly discovered prefix and a repaired middle segment both change the
+	// playback projection, while the original payload/frame identities stay put.
+	current := orderedSegments([]domain.Segment{
+		{ID: "tail", ArchiveOrdinal: 2, TimelineOrdinal: 4, Duration: 4, SHA256: "tail-hash"},
+		{ID: "first", ArchiveOrdinal: 1, TimelineOrdinal: 2, Duration: 2, SHA256: "first-hash"},
+		{ID: "prefix", ArchiveOrdinal: 3, TimelineOrdinal: 1, Duration: 1, SHA256: "prefix-hash"},
+		{ID: "repair", ArchiveOrdinal: 4, TimelineOrdinal: 3, Duration: 3, SHA256: "repair-hash"},
+	})
+	service.mu.Lock()
+	starts, revised := service.timelineStartsAndRevisionLocked(id, current)
+	if !revised || len(starts) != 4 || starts[0] != 0 || starts[1] != 1 || starts[2] != 3 || starts[3] != 6 {
+		service.mu.Unlock()
+		t.Fatalf("revised starts=%v revised=%t, want [0 1 3 6] and a revision", starts, revised)
+	}
+	if !service.refreshFrameTimingsLocked(id, current, starts) {
+		service.mu.Unlock()
+		t.Fatal("cached frame timeline metadata was not refreshed")
+	}
+	idx := service.indexes[id]
+	framesByOrdinal := make(map[uint64]Frame, len(idx.Items))
+	for _, frame := range idx.Items {
+		framesByOrdinal[frame.ArchiveOrdinal] = frame
+	}
+	service.mu.Unlock()
+	for ordinal, wantStart := range map[uint64]float64{1: 1, 2: 6, 4: 3} {
+		frame := framesByOrdinal[ordinal]
+		if frame.SegmentStartSeconds != wantStart || frame.FrameTimeSeconds != wantStart {
+			t.Errorf("archive frame %d projected at start=%v time=%v, want %v", ordinal, frame.SegmentStartSeconds, frame.FrameTimeSeconds, wantStart)
+		}
+		if frame.GeneratedAt != generated || frame.ImageSHA256 == "" {
+			t.Errorf("timeline-only revision changed the generated frame asset metadata for archive ordinal %d: %+v", ordinal, frame)
+		}
+	}
+
+	recording := &domain.Recording{ID: id, Tracks: map[string]*domain.Track{"main": {ID: "main", Segments: current}}}
+	response, err := service.Items(recording, SamplingNearest, 1, 3.2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Items) != 1 || response.Items[0].ArchiveOrdinal != 4 || response.Items[0].FrameTimeSeconds != 3 {
+		t.Fatalf("nearest seek after timeline revision = %+v, want repaired archive ordinal 4 at 3s", response.Items)
+	}
+}
+
+func TestPreviewLegacyTimelineFallsBackToArchiveOrder(t *testing.T) {
+	segments := orderedSegments([]domain.Segment{
+		{ID: "later", ArchiveOrdinal: 2, Sequence: 1, Duration: 3},
+		{ID: "earlier", ArchiveOrdinal: 1, Sequence: 99, Duration: 2},
+	})
+	if len(segments) != 2 || segments[0].ID != "earlier" || segments[1].ID != "later" {
+		t.Fatalf("legacy segments without TimelineOrdinal order = %+v", segments)
+	}
+	starts := segmentStarts(segments)
+	if starts[1] != 0 || starts[2] != 2 {
+		t.Fatalf("legacy archive timeline starts = %v, want archive 1 at 0 and archive 2 at 2", starts)
+	}
+}
+
 func TestSegmentPreviewSamplingDoesNotDecodeAgainAndRestartReusesIndex(t *testing.T) {
 	fixture := newPreviewFixture(t, 12, false, "normal")
 	service := fixture.open(t)

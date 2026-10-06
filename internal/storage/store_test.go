@@ -51,6 +51,79 @@ func TestLoadAllMarksStaleRecordingInterrupted(t *testing.T) {
 	}
 }
 
+func TestLocalCreateRecordingWithSidecarPublishesRootAndSidecarTogether(t *testing.T) {
+	root := t.TempDir()
+	store, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "0a23456789abcdef0123456789abcdef"
+	type privateContext struct {
+		SchemaVersion int    `json:"schema_version"`
+		ManifestURL   string `json:"manifest_url"`
+	}
+	context := privateContext{SchemaVersion: 1, ManifestURL: "https://media.example/live.m3u8"}
+	if err := store.CreateRecordingWithSidecar(stoppedRecording(id), "archive-index/acquisition-context", context); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "recordings", id, "recording.json")); err != nil {
+		t.Fatalf("recording root was not published: %v", err)
+	}
+	var got privateContext
+	if err := store.LoadSidecar(id, "archive-index/acquisition-context", 64<<10, &got); err != nil {
+		t.Fatalf("private sidecar was not published with root: %v", err)
+	}
+	if got != context {
+		t.Fatalf("sidecar=%#v, want %#v", got, context)
+	}
+
+	// A failed duplicate initialization must leave the existing root and
+	// sidecar untouched rather than replacing either document.
+	if err := store.CreateRecordingWithSidecar(stoppedRecording(id), "archive-index/acquisition-context", privateContext{SchemaVersion: 2}); err == nil {
+		t.Fatal("duplicate recording initialization succeeded")
+	}
+	var after privateContext
+	if err := store.LoadSidecar(id, "archive-index/acquisition-context", 64<<10, &after); err != nil || after != context {
+		t.Fatalf("existing sidecar changed after failed initialization: %#v, %v", after, err)
+	}
+}
+
+func TestLocalCreateRecordingStagingResidueIsNotPublished(t *testing.T) {
+	root := t.TempDir()
+	store, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "0c23456789abcdef0123456789abcdef"
+	stage := filepath.Join(root, "recordings", ".incomplete-"+id+"-crash")
+	if err := os.MkdirAll(filepath.Join(stage, "archive-index"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "archive-index", "acquisition-context.json"), []byte(`{"schema_version":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 0 {
+		t.Fatalf("staging residue became a visible recording: %#v", loaded)
+	}
+	if _, err := os.Stat(filepath.Join(root, "recordings", id, "recording.json")); !os.IsNotExist(err) {
+		t.Fatalf("staging residue published canonical root: %v", err)
+	}
+	found := false
+	for _, issue := range store.RecoveryIssues() {
+		if issue.ID == id && issue.Code == "incomplete_creation" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("crash residue was not reported: %#v", store.RecoveryIssues())
+	}
+}
+
 func TestSavePayloadExactDoesNotPublishWrongLength(t *testing.T) {
 	store, err := New(t.TempDir())
 	if err != nil {

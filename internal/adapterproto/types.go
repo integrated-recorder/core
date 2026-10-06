@@ -303,15 +303,16 @@ type AdapterProvenance struct {
 }
 
 type MediaSource struct {
-	Type          string            `json:"type"`
-	ManifestURL   string            `json:"manifest_url"`
-	Headers       map[string]string `json:"headers,omitempty"`
-	RequestPolicy *RequestPolicy    `json:"request_policy,omitempty"`
-	SessionRef    string            `json:"session_ref,omitempty"`
-	Refresh       json.RawMessage   `json:"refresh,omitempty"`
-	Metadata      json.RawMessage   `json:"metadata,omitempty"`
-	ArchivePolicy *ArchivePolicy    `json:"archive_policy,omitempty"`
-	RefreshPolicy *RefreshPolicy    `json:"refresh_policy,omitempty"`
+	Type                   string                  `json:"type"`
+	ManifestURL            string                  `json:"manifest_url"`
+	Headers                map[string]string       `json:"headers,omitempty"`
+	RequestPolicy          *RequestPolicy          `json:"request_policy,omitempty"`
+	SessionRef             string                  `json:"session_ref,omitempty"`
+	Refresh                json.RawMessage         `json:"refresh,omitempty"`
+	Metadata               json.RawMessage         `json:"metadata,omitempty"`
+	ArchivePolicy          *ArchivePolicy          `json:"archive_policy,omitempty"`
+	RefreshPolicy          *RefreshPolicy          `json:"refresh_policy,omitempty"`
+	HistoricalAvailability *HistoricalAvailability `json:"historical_availability,omitempty"`
 }
 
 // RefreshPolicy declares adapter-owned refresh triggers. Core does not infer
@@ -388,11 +389,12 @@ func (m MediaSource) SourceURIClassification() string {
 	return m.ArchivePolicy.SourceURI
 }
 
-// RequestPolicy limits where Core may forward adapter-supplied media headers.
-// It authorizes header forwarding only; network and SSRF policy remains owned
-// by Core. An omitted policy or header_forwarding block is restrictive.
+// RequestPolicy declares bounded request behavior for media acquisition.
+// Header forwarding and URL transforms do not replace Core's network and SSRF
+// policy. Omitted blocks are restrictive.
 type RequestPolicy struct {
 	HeaderForwarding *HeaderForwardingPolicy `json:"header_forwarding,omitempty"`
+	URLTransform     *URLTransformPolicy     `json:"url_transform,omitempty"`
 }
 
 // HeaderForwardingPolicy currently applies one origin set to all adapter-
@@ -1455,6 +1457,9 @@ func ValidateMediaSource(media MediaSource, supported []string) error {
 	if err := validateRequestPolicy(media.RequestPolicy); err != nil {
 		return fmt.Errorf("invalid request policy: %w", err)
 	}
+	if err := media.HistoricalAvailability.Validate(); err != nil {
+		return fmt.Errorf("invalid historical availability: %w", err)
+	}
 	if classification := media.SourceURIClassification(); classification != "sensitive" && classification != "public" {
 		return fmt.Errorf("invalid source URI archive classification")
 	}
@@ -1533,36 +1538,40 @@ func ValidateWorkflowResult(result ResolveWorkflowResult, expectedWorkflowID str
 }
 
 func validateRequestPolicy(policy *RequestPolicy) error {
-	if policy == nil || policy.HeaderForwarding == nil {
+	if policy == nil {
 		return nil
 	}
-	forwarding := policy.HeaderForwarding
-	mode := forwarding.Mode
-	if mode == "" {
-		mode = HeaderForwardingSameOrigin
+	if forwarding := policy.HeaderForwarding; forwarding != nil {
+		mode := forwarding.Mode
+		if mode == "" {
+			mode = HeaderForwardingSameOrigin
+		}
+		switch mode {
+		case HeaderForwardingSameOrigin:
+			if len(forwarding.Origins) != 0 {
+				return fmt.Errorf("same_origin mode cannot declare extra origins")
+			}
+		case HeaderForwardingAllowlist:
+			if len(forwarding.Origins) == 0 {
+				return fmt.Errorf("allowlist mode requires at least one origin")
+			}
+			seen := map[mediaOrigin]bool{}
+			for _, raw := range forwarding.Origins {
+				origin, err := parseAllowedOrigin(raw)
+				if err != nil {
+					return fmt.Errorf("invalid allowed origin %q", raw)
+				}
+				if seen[origin] {
+					return fmt.Errorf("allowed origins must be unique")
+				}
+				seen[origin] = true
+			}
+		default:
+			return fmt.Errorf("unsupported header forwarding mode %q", forwarding.Mode)
+		}
 	}
-	switch mode {
-	case HeaderForwardingSameOrigin:
-		if len(forwarding.Origins) != 0 {
-			return fmt.Errorf("same_origin mode cannot declare extra origins")
-		}
-	case HeaderForwardingAllowlist:
-		if len(forwarding.Origins) == 0 {
-			return fmt.Errorf("allowlist mode requires at least one origin")
-		}
-		seen := map[mediaOrigin]bool{}
-		for _, raw := range forwarding.Origins {
-			origin, err := parseAllowedOrigin(raw)
-			if err != nil {
-				return fmt.Errorf("invalid allowed origin %q", raw)
-			}
-			if seen[origin] {
-				return fmt.Errorf("allowed origins must be unique")
-			}
-			seen[origin] = true
-		}
-	default:
-		return fmt.Errorf("unsupported header forwarding mode %q", forwarding.Mode)
+	if err := policy.URLTransform.Validate(); err != nil {
+		return err
 	}
 	return nil
 }

@@ -46,9 +46,10 @@ type FetchError struct {
 }
 
 type segmentRefreshTrigger struct {
-	epoch    uint64
-	sequence uint64
-	fetchErr *FetchError
+	epoch                 uint64
+	discontinuitySequence uint64
+	sequence              uint64
+	fetchErr              *FetchError
 }
 
 func (e *segmentRefreshTrigger) Error() string {
@@ -316,7 +317,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		return true, nil
 	}
 	scheduler := activeScheduler(e)
-	var protectedByEpoch map[uint64]map[uint64]bool
+	var protectedByEpoch map[uint64]map[segmentTaskKey]bool
 	if scheduler != nil {
 		protectedByEpoch = scheduler.protectedByEpoch()
 	}
@@ -394,27 +395,33 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			t.HasLastObservedSequence = false
 		}
 		epoch := t.SourceEpoch
-		captured := capturedSequenceSet(t, epoch)
-		for sequence := range protectedByEpoch[epoch] {
-			captured[sequence] = true
-		}
 		for _, seg := range playlist.Segments {
 			if seg.Gap {
-				addMissingRanges(r, t, epoch, seg.Sequence, seg.Sequence, "source manifest marked segment as a gap", captured)
+				addMissingRangesDS(r, t, epoch, seg.DiscontinuitySequence, seg.Sequence, seg.Sequence, "source manifest marked segment as a gap", capturedSequenceSetDS(t, epoch, seg.DiscontinuitySequence))
 			}
 		}
 		if t.HasLastObservedSequence && t.LastObservedSequence < ^uint64(0) && minSeq > t.LastObservedSequence && minSeq-t.LastObservedSequence > 1 {
-			addMissingRanges(r, t, epoch, t.LastObservedSequence+1, minSeq-1, "sequence advanced past uncaptured media", captured)
-		}
-		for i := 1; i < len(playlist.Segments); i++ {
-			prev, next := playlist.Segments[i-1].Sequence, playlist.Segments[i].Sequence
-			if prev < ^uint64(0) && next > prev && next-prev > 1 {
-				addMissingRanges(r, t, epoch, prev+1, next-1, "sequence skipped in manifest", captured)
+			lastDS, known := lastObservedDiscontinuitySequence(t, epoch, t.LastObservedSequence)
+			if known && len(playlist.Segments) > 0 && playlist.Segments[0].DiscontinuitySequence == lastDS {
+				addMissingRangesDS(r, t, epoch, lastDS, t.LastObservedSequence+1, minSeq-1, "sequence advanced past uncaptured media", capturedSequenceSetDS(t, epoch, lastDS))
 			}
 		}
-		present := map[uint64]bool{}
+		for i := 1; i < len(playlist.Segments); i++ {
+			previous, next := playlist.Segments[i-1], playlist.Segments[i]
+			prevSeq := previous.Sequence
+			if previous.DiscontinuitySequence == next.DiscontinuitySequence && prevSeq < ^uint64(0) && next.Sequence > prevSeq && next.Sequence-prevSeq > 1 {
+				addMissingRangesDS(r, t, epoch, next.DiscontinuitySequence, prevSeq+1, next.Sequence-1, "sequence skipped in manifest", capturedSequenceSetDS(t, epoch, next.DiscontinuitySequence))
+			}
+		}
+		present := map[segmentTaskKey]bool{}
 		for _, seg := range playlist.Segments {
-			present[seg.Sequence] = true
+			present[segmentTaskKey{epoch: epoch, discontinuitySequence: seg.DiscontinuitySequence, sequence: seg.Sequence}] = true
+		}
+		maxByDS := map[uint64]uint64{}
+		for _, seg := range playlist.Segments {
+			if prior, ok := maxByDS[seg.DiscontinuitySequence]; !ok || seg.Sequence > prior {
+				maxByDS[seg.DiscontinuitySequence] = seg.Sequence
+			}
 		}
 		pending := t.PendingSegments[:0]
 		for _, item := range t.PendingSegments {
@@ -422,14 +429,16 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 				pending = append(pending, item)
 				continue
 			}
+			key := segmentTaskKey{epoch: item.SourceEpoch, discontinuitySequence: item.DiscontinuitySequence, sequence: item.Sequence}
+			captured := capturedSequenceSetDS(t, epoch, item.DiscontinuitySequence)
 			if captured[item.Sequence] {
-				if protectedByEpoch[epoch][item.Sequence] {
+				if protectedByEpoch[epoch][key] {
 					pending = append(pending, item)
 				}
 				continue
 			}
-			if !present[item.Sequence] && maxSeq > item.Sequence {
-				addMissingRanges(r, t, epoch, item.Sequence, item.Sequence, "media left the live window after retries", captured)
+			if !present[key] && maxByDS[item.DiscontinuitySequence] > item.Sequence {
+				addMissingRangesDS(r, t, epoch, item.DiscontinuitySequence, item.Sequence, item.Sequence, "media left the live window after retries", captured)
 				continue
 			}
 			pending = append(pending, item)
@@ -438,14 +447,16 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		if epoch == 0 {
 			legacyPending := t.PendingSequences[:0]
 			for _, seq := range t.PendingSequences {
+				captured := capturedSequenceSetDS(t, epoch, 0)
+				key := segmentTaskKey{epoch: epoch, sequence: seq}
 				if captured[seq] {
-					if protectedByEpoch[epoch][seq] {
+					if protectedByEpoch[epoch][key] {
 						legacyPending = append(legacyPending, seq)
 					}
 					continue
 				}
-				if !present[seq] && maxSeq > seq {
-					addMissingRanges(r, t, epoch, seq, seq, "media left the live window after retries", captured)
+				if !present[key] && maxByDS[0] > seq {
+					addMissingRangesDS(r, t, epoch, 0, seq, seq, "media left the live window after retries", captured)
 					continue
 				}
 				legacyPending = append(legacyPending, seq)
@@ -646,7 +657,7 @@ func (m *Manager) acquireMediaOnce(ctx context.Context, e *entry, source hls.Med
 // the completed payload to the independent storage writer.
 func (m *Manager) acquireMediaBuffered(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, media adapterproto.MediaSource, expectedGeneration uint64) (domain.Segment, *storage.IngestPayload, error) {
 	recordingID := recordingID(e)
-	payload, err := m.downloadObjectBufferedOnceAtGeneration(ctx, source.URI, source.ByteRange, recordingID, media, e, expectedGeneration)
+	payload, err := m.downloadObjectBufferedOnceAtGenerationScope(ctx, source.URI, source.ByteRange, recordingID, media, e, expectedGeneration, adapterproto.RequestScopeMedia)
 	if err != nil {
 		return domain.Segment{}, nil, err
 	}
@@ -666,11 +677,19 @@ func makeArchiveSegment(source hls.MediaSegment, epoch, ordinal uint64, initID s
 }
 
 func (m *Manager) downloadObjectBufferedOnceAtGeneration(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID string, media adapterproto.MediaSource, e *entry, expectedGeneration uint64) (*storage.IngestPayload, error) {
+	return m.downloadObjectBufferedOnceAtGenerationScope(ctx, uri, byteRange, recordingID, media, e, expectedGeneration, adapterproto.RequestScopeMedia)
+}
+
+func (m *Manager) downloadObjectBufferedOnceAtGenerationScope(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID string, media adapterproto.MediaSource, e *entry, expectedGeneration uint64, scope adapterproto.ResourceRequestScope) (*storage.IngestPayload, error) {
 	maxPayloadBytes := m.ingest.Options().MaxPayloadBytes
 	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
 		return nil, newFetchError("segment", 0, false, false)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
+	requestURL, err := m.transformedRequestURL(ctx, media, media.ManifestURL, uri, scope)
+	if err != nil {
+		return nil, newFetchError("segment", 0, false, false)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return nil, newFetchError("segment", 0, false, false)
 	}
@@ -974,6 +993,13 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 	defer stopMetadata()
 
 	selectedURL := media.ManifestURL
+	selectedBaseURL := media.ManifestURL
+	selectedScope := adapterproto.RequestScopeManifest
+	resetPlaylistRequest := func(source adapterproto.MediaSource) {
+		selectedURL = source.ManifestURL
+		selectedBaseURL = source.ManifestURL
+		selectedScope = adapterproto.RequestScopeManifest
+	}
 	firstPlaylist := true
 	_, manifestGeneration := currentMediaVersion(e)
 	refreshCycles := 0
@@ -987,7 +1013,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		}
 		media, generation := currentMediaVersion(e)
 		if generation != manifestGeneration {
-			selectedURL = media.ManifestURL
+			resetPlaylistRequest(media)
 			firstPlaylist = true
 			manifestGeneration = generation
 		}
@@ -1003,7 +1029,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			}
 			proactiveRefreshes++
 			media = refreshed
-			selectedURL = media.ManifestURL
+			resetPlaylistRequest(media)
 			firstPlaylist = true
 			_, generation = currentMediaVersion(e)
 			manifestGeneration = generation
@@ -1019,7 +1045,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		}
 
 		fetchGeneration := generation
-		manifestPayload, err := fetchManifestBuffered(ctx, m.client, m.ingest, recordingID(e), selectedURL, media.Headers, media.ManifestURL, media.RequestPolicy)
+		manifestPayload, requestedManifestURL, err := m.fetchManifestForMedia(ctx, recordingID(e), media, selectedBaseURL, selectedURL, selectedScope)
 		var body []byte
 		if manifestPayload != nil {
 			body = manifestPayload.Bytes()
@@ -1033,7 +1059,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			// request was in flight. Neither a stale successful body nor its
 			// stale fetch error may affect snapshots, discovery, or refresh policy.
 			media = latestMedia
-			selectedURL = media.ManifestURL
+			resetPlaylistRequest(media)
 			firstPlaylist = true
 			manifestGeneration = currentGeneration
 			select {
@@ -1060,7 +1086,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 						proactiveRefreshes = 0
 					}
 					media = refreshed
-					selectedURL = media.ManifestURL
+					resetPlaylistRequest(media)
 					firstPlaylist = true
 					_, manifestGeneration = currentMediaVersion(e)
 					continue
@@ -1072,9 +1098,9 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			return
 		}
 		if firstPlaylist && hls.IsMasterPlaylist(body) {
-			master, parseErr := hlsParseMaster(body, selectedURL)
+			master, parseErr := hlsParseMaster(body, requestedManifestURL)
 			if parseErr != nil {
-				if err = scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, nil); err != nil {
+				if err = scheduler.queueSnapshot(fetchGeneration, "main", requestedManifestURL, manifestPayload, nil); err != nil {
 					if ctx.Err() != nil {
 						return
 					}
@@ -1087,7 +1113,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			}
 			variant, selectErr := selectVariant(master)
 			if selectErr != nil {
-				if err = scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, nil); err != nil {
+				if err = scheduler.queueSnapshot(fetchGeneration, "main", requestedManifestURL, manifestPayload, nil); err != nil {
 					if ctx.Err() != nil {
 						return
 					}
@@ -1098,13 +1124,11 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 				m.fail(e, selectErr)
 				return
 			}
-			variantURL := variant.URI
-			if err = scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, func(r *domain.Recording) error {
+			if err = scheduler.queueSnapshot(fetchGeneration, "main", requestedManifestURL, manifestPayload, func(r *domain.Recording) error {
 				t := r.Tracks["main"]
 				if t == nil {
 					return errors.New("main track is missing")
 				}
-				t.SourcePlaylistURL = variantURL
 				t.Bandwidth = variant.Bandwidth
 				return nil
 			}); err != nil {
@@ -1115,13 +1139,15 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 				return
 			}
 			body = nil
-			selectedURL = variantURL
+			selectedBaseURL = requestedManifestURL
+			selectedURL = variant.URI
+			selectedScope = adapterproto.RequestScopeVariant
 			continue
 		}
 		firstPlaylist = false
-		playlist, err := hlsParseMedia(body, selectedURL)
+		playlist, err := hlsParseMedia(body, requestedManifestURL)
 		if err != nil {
-			if queueErr := scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, nil); queueErr != nil {
+			if queueErr := scheduler.queueSnapshot(fetchGeneration, "main", requestedManifestURL, manifestPayload, nil); queueErr != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -1132,13 +1158,22 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			m.fail(e, err)
 			return
 		}
-		if err = scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, nil); err != nil {
+		if err = scheduler.queueSnapshot(fetchGeneration, "main", requestedManifestURL, manifestPayload, func(r *domain.Recording) error {
+			t := r.Tracks["main"]
+			if t == nil {
+				return errors.New("main track is missing")
+			}
+			t.SourcePlaylistURL = requestedManifestURL
+			return nil
+		}); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			m.fail(e, err)
 			return
 		}
+		// The request helper applied the declared scope transform exactly once,
+		// so the persisted source URL is the actual parser base used above.
 		body = nil
 		done, err := m.processWithSchedulerGeneration(e, ctx, playlist, false, fetchGeneration)
 		if err != nil {
@@ -1148,7 +1183,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			var trigger *segmentRefreshTrigger
 			if errors.As(err, &trigger) {
 				if refreshCycles >= maxRefreshCycles {
-					if pendingErr := m.markPending(e, trigger.epoch, trigger.sequence, trigger); pendingErr != nil {
+					if pendingErr := m.markPending(e, trigger.epoch, trigger.discontinuitySequence, trigger.sequence, trigger); pendingErr != nil {
 						m.fail(e, pendingErr)
 						return
 					}
@@ -1163,16 +1198,16 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 					} else {
 						proactiveRefreshes = 0
 					}
-					if pendingErr := m.markPending(e, trigger.epoch, trigger.sequence, trigger); pendingErr != nil {
+					if pendingErr := m.markPending(e, trigger.epoch, trigger.discontinuitySequence, trigger.sequence, trigger); pendingErr != nil {
 						m.fail(e, pendingErr)
 						return
 					}
 					media = refreshed
-					selectedURL = media.ManifestURL
+					resetPlaylistRequest(media)
 					firstPlaylist = true
 					continue
 				}
-				if pendingErr := m.markPending(e, trigger.epoch, trigger.sequence, trigger); pendingErr != nil {
+				if pendingErr := m.markPending(e, trigger.epoch, trigger.discontinuitySequence, trigger.sequence, trigger); pendingErr != nil {
 					m.fail(e, pendingErr)
 					return
 				}
@@ -1408,12 +1443,12 @@ func (m *Manager) shouldRefresh(media adapterproto.MediaSource, err error) bool 
 	return false
 }
 
-func makeSegmentRefreshTrigger(epoch, sequence uint64, err error) *segmentRefreshTrigger {
+func makeSegmentRefreshTrigger(epoch, discontinuitySequence, sequence uint64, err error) *segmentRefreshTrigger {
 	var fetchErr *FetchError
 	if errors.As(err, &fetchErr) {
-		return &segmentRefreshTrigger{epoch: epoch, sequence: sequence, fetchErr: fetchErr}
+		return &segmentRefreshTrigger{epoch: epoch, discontinuitySequence: discontinuitySequence, sequence: sequence, fetchErr: fetchErr}
 	}
-	return &segmentRefreshTrigger{epoch: epoch, sequence: sequence, fetchErr: newFetchError("segment", 0, false, false)}
+	return &segmentRefreshTrigger{epoch: epoch, discontinuitySequence: discontinuitySequence, sequence: sequence, fetchErr: newFetchError("segment", 0, false, false)}
 }
 
 func expiryKey(media adapterproto.MediaSource) string {
@@ -1480,10 +1515,10 @@ func hasCapturedEpoch(e *entry, epoch uint64) bool {
 	return false
 }
 
-func removePending(values []domain.PendingSequence, epoch, sequence uint64) []domain.PendingSequence {
+func removePending(values []domain.PendingSequence, epoch, discontinuitySequence, sequence uint64) []domain.PendingSequence {
 	out := values[:0]
 	for _, value := range values {
-		if value.SourceEpoch != epoch || value.Sequence != sequence {
+		if value.SourceEpoch != epoch || value.DiscontinuitySequence != discontinuitySequence || value.Sequence != sequence {
 			out = append(out, value)
 		}
 	}
@@ -1664,6 +1699,10 @@ func decimalUint(value string) bool {
 }
 
 func (m *Manager) hasSequence(e *entry, epoch, sequence uint64) bool {
+	return m.hasSequenceCoordinate(e, epoch, 0, sequence)
+}
+
+func (m *Manager) hasSequenceCoordinate(e *entry, epoch, discontinuitySequence, sequence uint64) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	track := e.recording.Tracks["main"]
@@ -1671,28 +1710,31 @@ func (m *Manager) hasSequence(e *entry, epoch, sequence uint64) bool {
 		return false
 	}
 	for _, s := range track.Segments {
-		if s.SourceEpoch == epoch && s.Sequence == sequence {
+		if s.SourceEpoch == epoch && s.DiscontinuitySequence == discontinuitySequence && s.Sequence == sequence {
 			return true
 		}
 	}
 	return false
 }
-func (m *Manager) markPending(e *entry, epoch, seq uint64, err error) error {
+func (m *Manager) markPending(e *entry, epoch, discontinuitySequence, seq uint64, err error) error {
 	return m.update(e, func(r *domain.Recording) error {
 		t := r.Tracks["main"]
 		if t == nil {
 			return errors.New("main track is missing")
 		}
 		for _, pending := range t.PendingSegments {
-			if pending.SourceEpoch == epoch && pending.Sequence == seq {
+			if pending.SourceEpoch == epoch && pending.DiscontinuitySequence == discontinuitySequence && pending.Sequence == seq {
 				r.LastError = safeFailureDescription(err)
 				return nil
 			}
 		}
-		t.PendingSegments = append(t.PendingSegments, domain.PendingSequence{SourceEpoch: epoch, Sequence: seq})
+		t.PendingSegments = append(t.PendingSegments, domain.PendingSequence{SourceEpoch: epoch, DiscontinuitySequence: discontinuitySequence, Sequence: seq})
 		sort.Slice(t.PendingSegments, func(i, j int) bool {
 			if t.PendingSegments[i].SourceEpoch != t.PendingSegments[j].SourceEpoch {
 				return t.PendingSegments[i].SourceEpoch < t.PendingSegments[j].SourceEpoch
+			}
+			if t.PendingSegments[i].DiscontinuitySequence != t.PendingSegments[j].DiscontinuitySequence {
+				return t.PendingSegments[i].DiscontinuitySequence < t.PendingSegments[j].DiscontinuitySequence
 			}
 			return t.PendingSegments[i].Sequence < t.PendingSegments[j].Sequence
 		})
@@ -1701,15 +1743,15 @@ func (m *Manager) markPending(e *entry, epoch, seq uint64, err error) error {
 	})
 }
 
-func (m *Manager) markGap(e *entry, epoch, sequence uint64, reason string) error {
+func (m *Manager) markGap(e *entry, epoch, discontinuitySequence, sequence uint64, reason string) error {
 	return m.update(e, func(r *domain.Recording) error {
 		t := r.Tracks["main"]
 		if t == nil {
 			return errors.New("main track is missing")
 		}
-		captured := capturedSequenceSet(t, epoch)
-		addMissingRanges(r, t, epoch, sequence, sequence, reason, captured)
-		t.PendingSegments = removePending(t.PendingSegments, epoch, sequence)
+		captured := capturedSequenceSetDS(t, epoch, discontinuitySequence)
+		addMissingRangesDS(r, t, epoch, discontinuitySequence, sequence, sequence, reason, captured)
+		t.PendingSegments = removePending(t.PendingSegments, epoch, discontinuitySequence, sequence)
 		if epoch == 0 {
 			t.PendingSequences = removeSequence(t.PendingSequences, sequence)
 		}
@@ -1729,23 +1771,26 @@ func (m *Manager) markRemainingPending(e *entry, epoch uint64, segments []hls.Me
 		if t == nil {
 			return errors.New("main track is missing")
 		}
-		captured := capturedSequenceSet(t, epoch)
-		pending := make(map[uint64]bool, len(t.PendingSegments))
+		pending := make(map[segmentTaskKey]bool, len(t.PendingSegments))
 		for _, item := range t.PendingSegments {
 			if item.SourceEpoch == epoch {
-				pending[item.Sequence] = true
+				pending[segmentTaskKey{epoch: epoch, discontinuitySequence: item.DiscontinuitySequence, sequence: item.Sequence}] = true
 			}
 		}
 		for _, source := range segments {
-			if source.Gap || captured[source.Sequence] || pending[source.Sequence] {
+			key := segmentTaskKey{epoch: epoch, discontinuitySequence: source.DiscontinuitySequence, sequence: source.Sequence}
+			if source.Gap || capturedSequenceSetDS(t, epoch, source.DiscontinuitySequence)[source.Sequence] || pending[key] {
 				continue
 			}
-			t.PendingSegments = append(t.PendingSegments, domain.PendingSequence{SourceEpoch: epoch, Sequence: source.Sequence})
-			pending[source.Sequence] = true
+			t.PendingSegments = append(t.PendingSegments, domain.PendingSequence{SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence, Sequence: source.Sequence})
+			pending[key] = true
 		}
 		sort.Slice(t.PendingSegments, func(i, j int) bool {
 			if t.PendingSegments[i].SourceEpoch != t.PendingSegments[j].SourceEpoch {
 				return t.PendingSegments[i].SourceEpoch < t.PendingSegments[j].SourceEpoch
+			}
+			if t.PendingSegments[i].DiscontinuitySequence != t.PendingSegments[j].DiscontinuitySequence {
+				return t.PendingSegments[i].DiscontinuitySequence < t.PendingSegments[j].DiscontinuitySequence
 			}
 			return t.PendingSegments[i].Sequence < t.PendingSegments[j].Sequence
 		})
@@ -1778,29 +1823,29 @@ func (m *Manager) finalizePendingEpoch(r *domain.Recording, t *domain.Track, epo
 	m.finalizePendingEpochExcept(r, t, epoch, reason, nil)
 }
 
-func (m *Manager) finalizePendingEpochExcept(r *domain.Recording, t *domain.Track, epoch uint64, reason string, protected map[uint64]bool) {
-	captured := capturedSequenceSet(t, epoch)
+func (m *Manager) finalizePendingEpochExcept(r *domain.Recording, t *domain.Track, epoch uint64, reason string, protected map[segmentTaskKey]bool) {
 	remaining := t.PendingSegments[:0]
 	for _, item := range t.PendingSegments {
 		if item.SourceEpoch != epoch {
 			remaining = append(remaining, item)
 			continue
 		}
-		if protected[item.Sequence] {
+		key := segmentTaskKey{epoch: item.SourceEpoch, discontinuitySequence: item.DiscontinuitySequence, sequence: item.Sequence}
+		if protected[key] {
 			remaining = append(remaining, item)
 			continue
 		}
-		addMissingRanges(r, t, epoch, item.Sequence, item.Sequence, reason, captured)
+		addMissingRangesDS(r, t, epoch, item.DiscontinuitySequence, item.Sequence, item.Sequence, reason, capturedSequenceSetDS(t, epoch, item.DiscontinuitySequence))
 	}
 	t.PendingSegments = remaining
 	if epoch == 0 {
 		legacy := t.PendingSequences[:0]
 		for _, seq := range t.PendingSequences {
-			if protected[seq] {
+			if protected[segmentTaskKey{epoch: epoch, sequence: seq}] {
 				legacy = append(legacy, seq)
 				continue
 			}
-			addMissingRanges(r, t, epoch, seq, seq, reason, captured)
+			addMissingRangesDS(r, t, epoch, 0, seq, seq, reason, capturedSequenceSetDS(t, epoch, 0))
 		}
 		t.PendingSequences = legacy
 	}
@@ -1816,7 +1861,57 @@ func capturedSequenceSet(t *domain.Track, epoch uint64) map[uint64]bool {
 	return captured
 }
 
+func capturedSequenceSetDS(t *domain.Track, epoch, discontinuitySequence uint64) map[uint64]bool {
+	captured := make(map[uint64]bool)
+	for _, segment := range t.Segments {
+		if segment.SourceEpoch == epoch && segment.DiscontinuitySequence == discontinuitySequence {
+			captured[segment.Sequence] = true
+		}
+	}
+	return captured
+}
+
+func lastObservedDiscontinuitySequence(track *domain.Track, epoch, sequence uint64) (uint64, bool) {
+	if track == nil {
+		return 0, false
+	}
+	var selected uint64
+	var latestOrdinal uint64
+	found := false
+	for _, segment := range track.Segments {
+		if segment.SourceEpoch != epoch || segment.Sequence != sequence {
+			continue
+		}
+		if !found || segment.ArchiveOrdinal >= latestOrdinal {
+			selected, latestOrdinal, found = segment.DiscontinuitySequence, segment.ArchiveOrdinal, true
+		}
+	}
+	if found {
+		return selected, true
+	}
+	for _, pending := range track.PendingSegments {
+		if pending.SourceEpoch != epoch || pending.Sequence != sequence {
+			continue
+		}
+		if found && selected != pending.DiscontinuitySequence {
+			return 0, false
+		}
+		selected, found = pending.DiscontinuitySequence, true
+	}
+	if found {
+		return selected, true
+	}
+	if epoch == 0 {
+		return 0, true // legacy recordings imply discontinuity sequence zero
+	}
+	return 0, false
+}
+
 func addMissingRanges(r *domain.Recording, t *domain.Track, epoch, from, to uint64, reason string, captured map[uint64]bool) {
+	addMissingRangesDS(r, t, epoch, 0, from, to, reason, captured)
+}
+
+func addMissingRangesDS(r *domain.Recording, t *domain.Track, epoch, discontinuitySequence, from, to uint64, reason string, captured map[uint64]bool) {
 	if to < from {
 		return
 	}
@@ -1828,7 +1923,7 @@ func addMissingRanges(r *domain.Recording, t *domain.Track, epoch, from, to uint
 		}
 	}
 	for _, gap := range r.Gaps {
-		if gap.TrackID != t.ID || gap.SourceEpoch != epoch || gap.ToSequence < from || gap.FromSequence > to {
+		if gap.TrackID != t.ID || gap.SourceEpoch != epoch || gap.DiscontinuitySequence != discontinuitySequence || gap.ToSequence < from || gap.FromSequence > to {
 			continue
 		}
 		start, end := gap.FromSequence, gap.ToSequence
@@ -1847,7 +1942,7 @@ func addMissingRanges(r *domain.Recording, t *domain.Track, epoch, from, to uint
 			continue
 		}
 		if item.start > cursor {
-			r.Gaps = append(r.Gaps, domain.Gap{TrackID: t.ID, SourceEpoch: epoch, FromSequence: cursor, ToSequence: item.start - 1, DetectedAt: time.Now().UTC(), Reason: reason})
+			r.Gaps = append(r.Gaps, domain.Gap{TrackID: t.ID, SourceEpoch: epoch, DiscontinuitySequence: discontinuitySequence, FromSequence: cursor, ToSequence: item.start - 1, DetectedAt: time.Now().UTC(), Reason: reason})
 		}
 		if item.end == ^uint64(0) {
 			return
@@ -1860,7 +1955,7 @@ func addMissingRanges(r *domain.Recording, t *domain.Track, epoch, from, to uint
 		}
 	}
 	if cursor <= to {
-		r.Gaps = append(r.Gaps, domain.Gap{TrackID: t.ID, SourceEpoch: epoch, FromSequence: cursor, ToSequence: to, DetectedAt: time.Now().UTC(), Reason: reason})
+		r.Gaps = append(r.Gaps, domain.Gap{TrackID: t.ID, SourceEpoch: epoch, DiscontinuitySequence: discontinuitySequence, FromSequence: cursor, ToSequence: to, DetectedAt: time.Now().UTC(), Reason: reason})
 	}
 }
 func gapCovers(r *domain.Recording, track string, seq uint64) bool {
@@ -1870,6 +1965,15 @@ func gapCovers(r *domain.Recording, track string, seq uint64) bool {
 func gapCoversEpoch(r *domain.Recording, track string, epoch, seq uint64) bool {
 	for _, g := range r.Gaps {
 		if g.TrackID == track && g.SourceEpoch == epoch && seq >= g.FromSequence && seq <= g.ToSequence {
+			return true
+		}
+	}
+	return false
+}
+
+func gapCoversCoordinate(r *domain.Recording, track string, epoch, discontinuitySequence, seq uint64) bool {
+	for _, gap := range r.Gaps {
+		if gap.TrackID == track && gap.SourceEpoch == epoch && gap.DiscontinuitySequence == discontinuitySequence && seq >= gap.FromSequence && seq <= gap.ToSequence {
 			return true
 		}
 	}

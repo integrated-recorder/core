@@ -58,11 +58,20 @@ type activeTask struct {
 }
 
 type timelineCache struct {
-	count       int
-	lastOrdinal uint64
-	lastSHA     string
-	total       float64
-	starts      []float64
+	segments []timelineFingerprint
+	total    float64
+	starts   []float64
+}
+
+type timelineFingerprint struct {
+	id                    string
+	sha256                string
+	timelineOrdinal       uint64
+	archiveOrdinal        uint64
+	sourceEpoch           uint64
+	discontinuitySequence uint64
+	sequence              uint64
+	durationBits          uint64
 }
 
 // Service turns committed canonical media into disposable, reusable frame
@@ -339,7 +348,7 @@ func (s *Service) summaryLocked(id string, recording *domain.Recording) Summary 
 	items := idx.Items
 	var latest *uint64
 	if len(items) != 0 {
-		value := items[len(items)-1].ArchiveOrdinal
+		value := latestFrame(items).ArchiveOrdinal
 		latest = &value
 	}
 	result = Summary{Mode: policy.Mode, State: StateDisabled, FrameCount: len(items), LatestArchiveOrdinal: latest}
@@ -399,7 +408,7 @@ func (s *Service) summaryLocked(id string, recording *domain.Recording) Summary 
 		}
 	}
 	if len(items) > 0 {
-		selection := items[len(items)-1]
+		selection := latestFrame(items)
 		if recording != nil && recording.State != domain.StateRecording {
 			selection = posterFrame(items, playbackDuration(recording)*0.25)
 		}
@@ -613,9 +622,10 @@ func (s *Service) Reconcile() error {
 			s.mu.Unlock()
 			continue
 		}
-		// Storage keeps committed media segments in canonical archive order.
-		// Avoid copying/sorting the full history on every poll.
-		segments := track.Segments
+		// ArchiveOrdinal remains the append/storage identity. Playback work uses
+		// the current revisionable timeline projection, which can insert a late
+		// prefix or repair a middle gap.
+		segments := orderedSegments(track.Segments)
 		idx := s.indexLocked(id)
 		if idx == nil {
 			// A dirty LRU entry could not be durably flushed. Keep the hard
@@ -624,7 +634,21 @@ func (s *Service) Reconcile() error {
 			s.mu.Unlock()
 			continue
 		}
+		starts, timelineChanged := s.timelineStartsAndRevisionLocked(id, segments)
+		if timelineChanged {
+			// A previous cursor refers to the former order. Rescan from the
+			// beginning after a revision so repaired/prefixed segments are not
+			// starved behind that stale cursor.
+			s.scanCursor[id] = 0
+		}
+		indexChanged := false
 		if !s.indexChecked[id] && s.recoverReadyFramesLocked(id, recording, track, segments) {
+			indexChanged = true
+		}
+		if s.refreshFrameTimingsLocked(id, segments, starts) {
+			indexChanged = true
+		}
+		if indexChanged {
 			if err := s.persistIndexLocked(id, idx); err != nil {
 				// Keep the old durable index; next pass retries reconciliation.
 			}
@@ -632,7 +656,6 @@ func (s *Service) Reconcile() error {
 		if recording.State != domain.StateRecording && !s.recordingHasTasksLocked(id) && s.dirtyIndexes[id] > 0 {
 			_ = s.flushIndexLocked(id)
 		}
-		starts := s.timelineStartsLocked(id, segments)
 		queuedForRecording := 0
 		// Live freshness takes priority, but every recording only gets a small
 		// queue budget. The cursor then advances through history over later
@@ -850,11 +873,19 @@ func (s *Service) recordingHasTasksLocked(id string) bool {
 	return s.recordingActiveLocked(id)
 }
 
-// timelineStartsLocked maintains a per-recording prefix cache. Canonical media
-// segments are append-only and stored in archive-ordinal order, so steady-state
-// polls process only the newly committed tail instead of summing the complete
-// archive on every pass.
+// timelineStartsLocked maintains a per-recording cache for the current ordered
+// playback projection. Archive identities remain append-only, but a projection
+// can be revised when late media is discovered or a gap is repaired.
 func (s *Service) timelineStartsLocked(id string, segments []domain.Segment) []float64 {
+	starts, _ := s.timelineStartsAndRevisionLocked(id, segments)
+	return starts
+}
+
+// timelineStartsAndRevisionLocked incrementally extends the cached timeline
+// only while the entire prior ordered projection is unchanged. A late prefix,
+// a middle repair, a changed duration, or a changed playback ordinal invalidates
+// the affected suffix (and insertion/reordering naturally invalidates it all).
+func (s *Service) timelineStartsAndRevisionLocked(id string, segments []domain.Segment) ([]float64, bool) {
 	cache, exists := s.timelines[id]
 	if exists {
 		s.touchTimelineLocked(id)
@@ -864,27 +895,94 @@ func (s *Service) timelineStartsLocked(id string, segments []domain.Segment) []f
 		}
 		s.touchTimelineLocked(id)
 	}
-	validPrefix := exists && cache.count <= len(segments)
-	if validPrefix && cache.count > 0 {
-		last := segments[cache.count-1]
-		validPrefix = last.ArchiveOrdinal == cache.lastOrdinal && last.SHA256 == cache.lastSHA
+	fingerprints := make([]timelineFingerprint, len(segments))
+	for i, segment := range segments {
+		fingerprints[i] = fingerprintTimelineSegment(segment)
 	}
+	validPrefix := exists && len(cache.segments) <= len(fingerprints)
+	if validPrefix {
+		for i := range cache.segments {
+			if cache.segments[i] != fingerprints[i] {
+				validPrefix = false
+				break
+			}
+		}
+	}
+	revised := exists && !validPrefix
 	if !validPrefix {
 		cache = timelineCache{starts: make([]float64, 0, len(segments))}
-		cache.count = 0
+		cache.segments = make([]timelineFingerprint, 0, len(segments))
 	}
-	for i := cache.count; i < len(segments); i++ {
+	for i := len(cache.segments); i < len(segments); i++ {
 		segment := segments[i]
 		cache.starts = append(cache.starts, cache.total)
+		cache.segments = append(cache.segments, fingerprints[i])
 		if validDuration(segment.Duration) && cache.total <= math.MaxFloat64-segment.Duration {
 			cache.total += segment.Duration
 		}
-		cache.count = i + 1
-		cache.lastOrdinal = segment.ArchiveOrdinal
-		cache.lastSHA = segment.SHA256
 	}
 	s.timelines[id] = cache
-	return cache.starts
+	return cache.starts, revised
+}
+
+func fingerprintTimelineSegment(segment domain.Segment) timelineFingerprint {
+	return timelineFingerprint{
+		id:                    segment.ID,
+		sha256:                segment.SHA256,
+		timelineOrdinal:       segment.TimelineOrdinal,
+		archiveOrdinal:        segment.ArchiveOrdinal,
+		sourceEpoch:           segment.SourceEpoch,
+		discontinuitySequence: segment.DiscontinuitySequence,
+		sequence:              segment.Sequence,
+		durationBits:          math.Float64bits(segment.Duration),
+	}
+}
+
+// refreshFrameTimingsLocked updates only disposable timeline metadata. Frame
+// JPEGs remain keyed by ArchiveOrdinal and are not regenerated merely because
+// an earlier segment was discovered or repaired.
+func (s *Service) refreshFrameTimingsLocked(id string, segments []domain.Segment, starts []float64) bool {
+	idx := s.indexLocked(id)
+	if idx == nil {
+		return false
+	}
+	segmentByOrdinal := make(map[uint64]domain.Segment, len(segments))
+	startByOrdinal := make(map[uint64]float64, len(segments))
+	for index, segment := range segments {
+		if segment.ArchiveOrdinal != 0 {
+			segmentByOrdinal[segment.ArchiveOrdinal] = segment
+			if index < len(starts) {
+				startByOrdinal[segment.ArchiveOrdinal] = starts[index]
+			}
+		}
+	}
+	changed := false
+	for i := range idx.Items {
+		frame := &idx.Items[i]
+		segment, ok := segmentByOrdinal[frame.ArchiveOrdinal]
+		if !ok || segment.SHA256 != frame.SegmentSHA256 {
+			continue
+		}
+		start := startByOrdinal[frame.ArchiveOrdinal]
+		offset := frame.FrameTimeSeconds - frame.SegmentStartSeconds
+		if offset < 0 || math.IsNaN(offset) || math.IsInf(offset, 0) {
+			offset = 0
+		}
+		frameTime := start + offset
+		if frame.SegmentStartSeconds != start || frame.FrameTimeSeconds != frameTime || frame.SegmentDurationSeconds != segment.Duration || frame.SourceEpoch != segment.SourceEpoch || frame.Sequence != segment.Sequence {
+			frame.SegmentStartSeconds = start
+			frame.FrameTimeSeconds = frameTime
+			frame.SegmentDurationSeconds = segment.Duration
+			frame.SourceEpoch = segment.SourceEpoch
+			frame.Sequence = segment.Sequence
+			changed = true
+		}
+	}
+	if changed {
+		idx.UpdatedAt = time.Now().UTC()
+		_ = s.markIndexDirtyLocked(id, false)
+	}
+	return changed
 }
 
 func (s *Service) touchTimelineLocked(id string) {

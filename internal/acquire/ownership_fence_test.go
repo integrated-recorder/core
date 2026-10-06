@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/storage"
 )
@@ -193,6 +194,10 @@ func TestOwnedStartFenceDenialDoesNotCreateRecording(t *testing.T) {
 	if _, err := store.LoadRecordingReadOnly(id); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("denied start published recording: err=%v", err)
 	}
+	var context acquisitionContextSidecar
+	if err := store.LoadSidecar(id, acquisitionContextPath, maxAcquisitionContext, &context); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("denied start published acquisition context: err=%v", err)
+	}
 }
 
 func TestCanonicalRootMutationDeniedWithoutArchiveWrite(t *testing.T) {
@@ -298,13 +303,18 @@ func TestSegmentPayloadSidecarAndRootUseOneFence(t *testing.T) {
 	if calls != 1 || callbacks != 1 || nested != 0 {
 		t.Fatalf("segment transaction fence calls=%d callbacks=%d nested=%d, want 1/1/0", calls, callbacks, nested)
 	}
-	info, err := store.StatPayload(id, segment.StoragePath)
-	if err != nil || info.Size != int64(len(payload)) {
-		t.Fatalf("segment payload info=%#v err=%v", info, err)
-	}
 	loaded, err := store.LoadRecordingReadOnly(id)
 	if err != nil || loaded.SegmentCount() != 1 || loaded.Tracks["main"].Segments[0].SHA256 == "" {
 		t.Fatalf("segment root was not published: recording=%#v err=%v", loaded, err)
+	}
+	persisted := loaded.Tracks["main"].Segments[0]
+	info, err := store.StatPayload(id, persisted.StoragePath)
+	if err != nil || info.Size != int64(len(payload)) {
+		t.Fatalf("immutable segment payload info=%#v path=%q err=%v", info, persisted.StoragePath, err)
+	}
+	var sidecar domain.Segment
+	if err := store.LoadSidecar(id, persisted.StoragePath, 1<<20, &sidecar); err != nil || sidecar.StoragePath != persisted.StoragePath || sidecar.SHA256 != persisted.SHA256 {
+		t.Fatalf("segment sidecar does not match selected root: sidecar=%#v err=%v", sidecar, err)
 	}
 }
 
@@ -320,10 +330,20 @@ func TestDeniedSegmentFenceSuppressesPayloadSidecarAndRoot(t *testing.T) {
 	e := &entry{recording: root, ownership: &owner}
 	scheduler := &segmentScheduler{manager: manager, e: e, epochMarkers: make(map[uint64]epochMarker)}
 	segment := domain.Segment{ID: "segment-1", TrackID: "main", Sequence: 1, ArchiveOrdinal: 1, SourceURI: "https://media.example/1.ts", StoragePath: "tracks/main/00000000000000000001.ts"}
-	if _, err := scheduler.persistSegment(segment, nil, []byte("must-not-commit")); !errors.Is(err, errOwnershipTestDenied) {
+	payload := []byte("must-not-commit")
+	if _, err := scheduler.persistSegment(segment, nil, payload); !errors.Is(err, errOwnershipTestDenied) {
 		t.Fatalf("denied segment commit error = %v", err)
 	}
-	if _, err := store.StatPayload(id, segment.StoragePath); !errors.Is(err, os.ErrNotExist) {
+	identity, err := archiveSessionIdentity(root, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logicalID, err := archiveindex.SegmentIdentity(coordinateForSegment(identity.ID, segment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	immutablePath := immutableObjectPath(logicalID, sha256Hex(payload), segment.SourceURI)
+	if _, err := store.StatPayload(id, immutablePath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("denied segment payload stat error = %v, want not-exist", err)
 	}
 	if loaded, loadErr := store.LoadRecordingReadOnly(id); loadErr != nil || loaded.SegmentCount() != 0 {

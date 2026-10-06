@@ -42,6 +42,15 @@ func orderedSegments(input []domain.Segment) []domain.Segment {
 	segments := append([]domain.Segment(nil), input...)
 	sort.SliceStable(segments, func(i, j int) bool {
 		a, b := segments[i], segments[j]
+		if a.TimelineOrdinal != 0 || b.TimelineOrdinal != 0 {
+			aPosition := playbackPosition(a)
+			bPosition := playbackPosition(b)
+			if aPosition != bPosition {
+				return aPosition < bPosition
+			}
+		}
+		// ArchiveOrdinal is stable append/storage identity, and remains the
+		// ordering fallback for legacy archives without a timeline projection.
 		if a.ArchiveOrdinal != 0 || b.ArchiveOrdinal != 0 {
 			if a.ArchiveOrdinal == 0 {
 				return false
@@ -49,17 +58,23 @@ func orderedSegments(input []domain.Segment) []domain.Segment {
 			if b.ArchiveOrdinal == 0 {
 				return true
 			}
-			return a.ArchiveOrdinal < b.ArchiveOrdinal
+			if a.ArchiveOrdinal != b.ArchiveOrdinal {
+				return a.ArchiveOrdinal < b.ArchiveOrdinal
+			}
 		}
 		if a.SourceEpoch != b.SourceEpoch {
 			return a.SourceEpoch < b.SourceEpoch
 		}
-		return a.Sequence < b.Sequence
+		if a.Sequence != b.Sequence {
+			return a.Sequence < b.Sequence
+		}
+		return a.ID < b.ID
 	})
 	return segments
 }
 
 func segmentStarts(segments []domain.Segment) map[uint64]float64 {
+	segments = orderedSegments(segments)
 	starts := make(map[uint64]float64, len(segments))
 	var elapsed float64
 	for _, segment := range segments {
@@ -103,10 +118,10 @@ func buildContext(recording *domain.Recording, track *domain.Track, segments []d
 	return buildContextAtStart(recording, track, segments, ordinal, start)
 }
 
-// buildContextAtStart assumes storage's canonical ArchiveOrdinal ordering and
-// uses a binary search so each extraction only inspects its target and the
-// bounded decoder context, not the full history.
+// buildContextAtStart accepts a stable ArchiveOrdinal identity even when the
+// current playback projection places that segment elsewhere in the timeline.
 func buildContextAtStart(recording *domain.Recording, track *domain.Track, segments []domain.Segment, ordinal uint64, start float64) ([]domain.Segment, float64, float64, error) {
+	segments = orderedSegments(segments)
 	attempts, err := buildContextAttemptsAtStart(recording, track, segments, ordinal, start)
 	if err != nil {
 		return nil, 0, 0, err
@@ -123,10 +138,8 @@ func buildContextAttemptsAtStart(recording *domain.Recording, track *domain.Trac
 	if recording == nil || track == nil || len(segments) == 0 || ordinal == 0 || math.IsNaN(start) || math.IsInf(start, 0) || start < 0 {
 		return nil, ErrInvalid
 	}
-	targetIndex := sort.Search(len(segments), func(i int) bool {
-		return segments[i].ArchiveOrdinal >= ordinal
-	})
-	if targetIndex >= len(segments) || segments[targetIndex].ArchiveOrdinal != ordinal {
+	targetIndex := segmentIndexByArchiveOrdinal(segments, ordinal)
+	if targetIndex < 0 {
 		return nil, ErrNotFound
 	}
 	target := segments[targetIndex]
@@ -172,6 +185,42 @@ func buildContextAttemptsAtStart(recording *domain.Recording, track *domain.Trac
 		}
 	}
 	return attempts, nil
+}
+
+// segmentIndexByArchiveOrdinal keeps the fast path for legacy append-ordered
+// slices, but falls back to an identity scan when a revisionable timeline has
+// moved archive identities into a different playback order.
+func segmentIndexByArchiveOrdinal(segments []domain.Segment, ordinal uint64) int {
+	archiveOrdered := true
+	for i := 1; i < len(segments); i++ {
+		if segments[i-1].ArchiveOrdinal > segments[i].ArchiveOrdinal {
+			archiveOrdered = false
+			break
+		}
+	}
+	if archiveOrdered {
+		index := sort.Search(len(segments), func(i int) bool { return segments[i].ArchiveOrdinal >= ordinal })
+		if index < len(segments) && segments[index].ArchiveOrdinal == ordinal {
+			return index
+		}
+		return -1
+	}
+	for index := range segments {
+		if segments[index].ArchiveOrdinal == ordinal {
+			return index
+		}
+	}
+	return -1
+}
+
+func playbackPosition(segment domain.Segment) uint64 {
+	if segment.TimelineOrdinal != 0 {
+		return segment.TimelineOrdinal
+	}
+	if segment.ArchiveOrdinal != 0 {
+		return segment.ArchiveOrdinal
+	}
+	return segment.Sequence
 }
 
 func validDuration(duration float64) bool {
@@ -419,6 +468,19 @@ func posterFrame(items []Frame, seconds float64) Frame {
 		return Frame{}
 	}
 	return nearest(items, seconds)
+}
+
+func latestFrame(items []Frame) Frame {
+	if len(items) == 0 {
+		return Frame{}
+	}
+	latest := items[0]
+	for _, frame := range items[1:] {
+		if frame.FrameTimeSeconds > latest.FrameTimeSeconds || frame.FrameTimeSeconds == latest.FrameTimeSeconds && frame.ArchiveOrdinal > latest.ArchiveOrdinal {
+			latest = frame
+		}
+	}
+	return latest
 }
 
 func findFrame(items []Frame, ordinal uint64) (Frame, bool) {

@@ -340,6 +340,43 @@ func TestNewWithObjectStoreArchiveContractAndCommitOrdering(t *testing.T) {
 	}
 }
 
+func TestObjectStoreCreateRecordingWithSidecarPublishesContextBeforeRoot(t *testing.T) {
+	objects := newMemoryPhysicalObjects()
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "0b23456789abcdef0123456789abcdef"
+	rootKey := recordingObjectKey(id, "recording.json")
+	sidecarKey := recordingObjectKey(id, "archive-index/acquisition-context") + ".json"
+	type privateContext struct {
+		SchemaVersion int    `json:"schema_version"`
+		ManifestURL   string `json:"manifest_url"`
+	}
+	context := privateContext{SchemaVersion: 1, ManifestURL: "https://media.example/live.m3u8"}
+
+	objects.failPutBefore = true
+	if err := store.CreateRecordingWithSidecar(stoppedRecording(id), "archive-index/acquisition-context", context); err == nil {
+		t.Fatal("injected sidecar PUT failure was ignored")
+	}
+	if len(objects.get(rootKey)) != 0 {
+		t.Fatal("root was published after sidecar failure")
+	}
+
+	if err := store.CreateRecordingWithSidecar(stoppedRecording(id), "archive-index/acquisition-context", context); err != nil {
+		t.Fatal(err)
+	}
+	if len(objects.get(rootKey)) == 0 || len(objects.get(sidecarKey)) == 0 {
+		t.Fatal("successful initialization did not publish root and sidecar")
+	}
+	objects.mu.Lock()
+	puts := append([]string(nil), objects.putKeys...)
+	objects.mu.Unlock()
+	if len(puts) < 2 || puts[len(puts)-2] != sidecarKey || puts[len(puts)-1] != rootKey {
+		t.Fatalf("initial object publication order=%v, want sidecar before root", puts)
+	}
+}
+
 func TestObjectStorePoolMetricsUsePinnedProviderIdentity(t *testing.T) {
 	for _, test := range []struct {
 		id, name, wantID, wantKind string

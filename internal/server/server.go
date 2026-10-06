@@ -920,10 +920,7 @@ func (s *Server) trackPlaylist(w http.ResponseWriter, r *http.Request) {
 		target = 1
 	}
 	var builder strings.Builder
-	mediaSequence := segments[0].Sequence
-	if segments[0].ArchiveOrdinal > 0 {
-		mediaSequence = segments[0].ArchiveOrdinal - 1
-	}
+	mediaSequence := playbackMediaSequence(segments[0])
 	fmt.Fprintf(&builder, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%d\n", target, mediaSequence)
 	previous := segments[0]
 	previousInit := ""
@@ -1047,10 +1044,7 @@ func (s *Server) liveTrackPlaylist(w http.ResponseWriter, r *http.Request) {
 			discontinuitySequence++
 		}
 	}
-	mediaSequence := segments[0].Sequence
-	if segments[0].ArchiveOrdinal > 0 {
-		mediaSequence = segments[0].ArchiveOrdinal - 1
-	}
+	mediaSequence := playbackMediaSequence(segments[0])
 
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%d\n", target, mediaSequence)
@@ -1329,6 +1323,41 @@ func hasGapBetweenEpoch(gaps []domain.Gap, trackID string, epoch, previous, next
 }
 
 func segmentBefore(a, b domain.Segment) bool {
+	// A timeline ordinal is a revisionable playback position. It takes
+	// precedence over append-only archive placement whenever both segments have
+	// one. Legacy segments (and mixed legacy/new projections) retain a stable
+	// fallback through archive placement and source coordinates.
+	if a.TimelineOrdinal != 0 || b.TimelineOrdinal != 0 {
+		aPosition := playbackPosition(a)
+		bPosition := playbackPosition(b)
+		if aPosition != bPosition {
+			return aPosition < bPosition
+		}
+	}
+	return legacySegmentBefore(a, b)
+}
+
+func playbackPosition(segment domain.Segment) uint64 {
+	if segment.TimelineOrdinal != 0 {
+		return segment.TimelineOrdinal
+	}
+	if segment.ArchiveOrdinal != 0 {
+		return segment.ArchiveOrdinal
+	}
+	return segment.Sequence
+}
+
+func playbackMediaSequence(segment domain.Segment) uint64 {
+	if segment.TimelineOrdinal != 0 {
+		return segment.TimelineOrdinal - 1
+	}
+	if segment.ArchiveOrdinal != 0 {
+		return segment.ArchiveOrdinal - 1
+	}
+	return segment.Sequence
+}
+
+func legacySegmentBefore(a, b domain.Segment) bool {
 	if a.ArchiveOrdinal > 0 || b.ArchiveOrdinal > 0 {
 		if a.SourceEpoch != b.SourceEpoch {
 			return a.SourceEpoch < b.SourceEpoch

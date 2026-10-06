@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/hls"
 	"github.com/integrated-recorder/core/internal/storage"
@@ -103,7 +104,13 @@ func TestBlockedStorageWriterDoesNotBlockSegmentFetchWorkers(t *testing.T) {
 	if got := current.SegmentCount(); got != 0 {
 		t.Fatalf("buffered payloads became canonical before storage commit: segment count=%d", got)
 	}
-	if _, err = store.StatPayload(recording.ID, "tracks/main/00000000000000000001.ts"); !errors.Is(err, os.ErrNotExist) {
+	first := domain.Segment{TrackID: "main", Sequence: 1, SourceURI: server.URL + "/1.ts"}
+	logicalID, identityErr := archiveindex.SegmentIdentity(coordinateForSegment(current.SourceSessionID, first))
+	if identityErr != nil {
+		t.Fatal(identityErr)
+	}
+	firstPath := immutableObjectPath(logicalID, sha256Hex([]byte("canonical-source-1")), first.SourceURI)
+	if _, err = store.StatPayload(recording.ID, firstPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("canonical payload was visible or stat failed unexpectedly before commit: %v", err)
 	}
 	releaseOnce.Do(func() { close(release) })
@@ -191,6 +198,26 @@ func (b *transientSegmentRootBackend) SaveRecording(recording *domain.Recording)
 	return b.StorageBackend.SaveRecording(recording)
 }
 
+func (b *transientSegmentRootBackend) LoadSidecar(id, relativePath string, maxBytes int64, output any) error {
+	reader, ok := b.StorageBackend.(interface {
+		LoadSidecar(string, string, int64, any) error
+	})
+	if !ok {
+		return storage.ErrSidecarReadUnsupported
+	}
+	return reader.LoadSidecar(id, relativePath, maxBytes, output)
+}
+
+func (b *transientSegmentRootBackend) CreateRecordingWithSidecar(recording *domain.Recording, relativePath string, value any) error {
+	creator, ok := b.StorageBackend.(interface {
+		CreateRecordingWithSidecar(*domain.Recording, string, any) error
+	})
+	if !ok {
+		return storage.ErrAtomicRecordingCreationUnsupported
+	}
+	return creator.CreateRecordingWithSidecar(recording, relativePath, value)
+}
+
 func TestTransientRootMetadataFailureDoesNotPoisonSuccessfulStorageRetry(t *testing.T) {
 	var requests atomic.Int32
 	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -225,11 +252,16 @@ func TestTransientRootMetadataFailureDoesNotPoisonSuccessfulStorageRetry(t *test
 	if backend.failures.Load() != 1 || requests.Load() != 1 {
 		t.Fatalf("root write failures=%d network requests=%d, want one each", backend.failures.Load(), requests.Load())
 	}
-	if _, err = manager.Stop(recording.ID); err != nil {
+	stopped, err := manager.Stop(recording.ID)
+	if err != nil {
 		t.Fatalf("successful storage retry left a terminal error: %v", err)
 	}
-	if got, statErr := localStore.StatPayload(recording.ID, "tracks/main/00000000000000000001.ts"); statErr != nil || !got.Regular || got.Size == 0 {
-		t.Fatalf("canonical segment after retry = %#v, %v", got, statErr)
+	if len(stopped.Tracks["main"].Segments) != 1 {
+		t.Fatalf("successful retry selected segments=%#v", stopped.Tracks["main"].Segments)
+	}
+	path := stopped.Tracks["main"].Segments[0].StoragePath
+	if got, statErr := localStore.StatPayload(recording.ID, path); statErr != nil || !got.Regular || got.Size == 0 {
+		t.Fatalf("canonical segment after retry at %q = %#v, %v", path, got, statErr)
 	}
 }
 

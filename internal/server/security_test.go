@@ -308,7 +308,7 @@ func TestSegmentMetadataDoesNotExposeSourceURI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "must-not-appear") || strings.Contains(string(data), "media.example") {
+	if strings.Contains(string(data), "must-not-appear") || strings.Contains(string(data), "media.example") || strings.Contains(string(data), "acquisition_context") {
 		t.Fatalf("detail leaked a sensitive source URI: %s", data)
 	}
 }

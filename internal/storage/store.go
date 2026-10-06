@@ -26,6 +26,8 @@ import (
 
 var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
+const maxSidecarReadBytes int64 = 16 << 20
+
 // ErrPayloadSizeMismatch marks a complete source response whose byte count
 // did not match an exact range request. Callers may retry the source fetch;
 // ordinary local I/O errors remain distinguishable and are not retried.
@@ -34,6 +36,14 @@ var ErrPayloadSizeMismatch = errors.New("payload size mismatch")
 // ErrReadOnlyListLimit marks a read-only archive snapshot that exceeds its
 // caller's count bound.
 var ErrReadOnlyListLimit = errors.New("read-only recording list exceeds limit")
+
+// ErrSidecarReadUnsupported marks a backend that does not expose the optional
+// read-only sidecar capability. It is intentionally safe to return to callers.
+var ErrSidecarReadUnsupported = errors.New("storage backend does not support sidecar reads")
+
+// ErrAtomicRecordingCreationUnsupported marks a backend that cannot publish an
+// initial private sidecar and recording root as one visible recording.
+var ErrAtomicRecordingCreationUnsupported = errors.New("storage backend does not support atomic recording creation with sidecar")
 
 // StorageBackend is the set of canonical archive operations currently needed
 // by the application. Store is the stable archive facade. New preserves the
@@ -82,6 +92,76 @@ type Store struct {
 	runtimeIngest    RuntimeIngestCoordinator
 	telemetryMu      sync.RWMutex
 	runtimeTelemetry RuntimeStorageTelemetry
+}
+
+// LoadSidecar reads one bounded JSON sidecar when the backend supports the
+// optional read capability. It deliberately does not expand StorageBackend,
+// so existing third-party and test backends remain source-compatible.
+func (s *Store) LoadSidecar(id, relativePath string, maxBytes int64, output any) error {
+	if err := validateSidecarRead(id, relativePath, maxBytes, output); err != nil {
+		return err
+	}
+	reader, ok := s.StorageBackend.(interface {
+		LoadSidecar(string, string, int64, any) error
+	})
+	if !ok {
+		return ErrSidecarReadUnsupported
+	}
+	return reader.LoadSidecar(id, relativePath, maxBytes, output)
+}
+
+// CreateRecordingWithSidecar atomically initializes one recording with a
+// bounded private sidecar. The root becomes visible only after backend has
+// durably published both documents.
+func (s *Store) CreateRecordingWithSidecar(recording *domain.Recording, relativePath string, value any) error {
+	if recording == nil || !recordingIDPattern.MatchString(recording.ID) || !validInitialSidecarPath(relativePath) || value == nil {
+		return errors.New("invalid recording sidecar initialization")
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil || int64(len(data)+1) > maxSidecarReadBytes {
+		return errors.New("recording sidecar initialization exceeds size limit")
+	}
+	creator, ok := s.StorageBackend.(interface {
+		CreateRecordingWithSidecar(*domain.Recording, string, any) error
+	})
+	if !ok {
+		return ErrAtomicRecordingCreationUnsupported
+	}
+	return creator.CreateRecordingWithSidecar(recording, relativePath, value)
+}
+
+func validateSidecarRead(id, relativePath string, maxBytes int64, output any) error {
+	if !recordingIDPattern.MatchString(id) || !canonicalRelativePath(relativePath) {
+		return errors.New("invalid sidecar reference")
+	}
+	if maxBytes <= 0 || maxBytes > maxSidecarReadBytes {
+		return errors.New("sidecar read limit is invalid")
+	}
+	if output == nil {
+		return errors.New("sidecar output is required")
+	}
+	return nil
+}
+
+func validInitialSidecarPath(relativePath string) bool {
+	if len(relativePath) > 1024 || !canonicalRelativePath(relativePath) {
+		return false
+	}
+	path := relativePath + ".json"
+	return path != "recording.json" && !strings.HasPrefix(path, "recording.json/")
+}
+
+func decodeStrictSidecar(data []byte, output any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		return errors.New("sidecar JSON is invalid")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("sidecar JSON contains trailing data")
+	}
+	return nil
 }
 
 // LocalFilesystemBackend is retained for the legacy monolithic development
@@ -435,6 +515,24 @@ func (s *LocalFilesystemBackend) NewRecordingDir(id string) error {
 // rename leaves an identifiable hidden staging directory for LoadAll to
 // report; it never exposes a half-created final recording directory.
 func (s *LocalFilesystemBackend) CreateRecording(recording *domain.Recording) (err error) {
+	return s.createRecording(recording, "", nil)
+}
+
+// CreateRecordingWithSidecar stages both documents below a private directory
+// and publishes their parent with one directory rename. A visible recording
+// therefore always has its private initial sidecar.
+func (s *LocalFilesystemBackend) CreateRecordingWithSidecar(recording *domain.Recording, relativePath string, value any) error {
+	if !validInitialSidecarPath(relativePath) || value == nil {
+		return errors.New("invalid recording sidecar initialization")
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil || int64(len(data)+1) > maxSidecarReadBytes {
+		return errors.New("recording sidecar initialization exceeds size limit")
+	}
+	return s.createRecording(recording, relativePath, data)
+}
+
+func (s *LocalFilesystemBackend) createRecording(recording *domain.Recording, sidecarRelative string, sidecarData []byte) (err error) {
 	started := time.Now()
 	var written uint64
 	defer func() {
@@ -481,13 +579,30 @@ func (s *LocalFilesystemBackend) CreateRecording(recording *domain.Recording) (e
 		return err
 	}
 	written = uint64(len(data) + 1)
+	if sidecarRelative != "" {
+		stageSidecar, pathErr := s.safePathForRoot(stage, sidecarRelative+".json")
+		if pathErr != nil || !within(stage, stageSidecar) {
+			return errors.New("invalid recording sidecar path")
+		}
+		if err = atomicWrite(stageSidecar, append(sidecarData, '\n'), 0600); err != nil {
+			return err
+		}
+		written += uint64(len(sidecarData) + 1)
+	}
 	rootPath := filepath.Join(stage, "recording.json")
 	if err = atomicWrite(rootPath, append(data, '\n'), 0600); err != nil {
 		return err
 	}
 	// Persist all directory entries below the staging root before publishing
 	// the root directory's name in the parent.
-	for _, dir := range []string{filepath.Join(stage, "tracks", "main"), filepath.Join(stage, "tracks"), filepath.Join(stage, "manifests"), stage} {
+	dirs := []string{filepath.Join(stage, "tracks", "main"), filepath.Join(stage, "tracks"), filepath.Join(stage, "manifests")}
+	if sidecarRelative != "" {
+		for dir := filepath.Dir(filepath.Join(stage, filepath.FromSlash(sidecarRelative+".json"))); within(stage, dir) && dir != stage; dir = filepath.Dir(dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	dirs = append(dirs, stage)
+	for _, dir := range dirs {
 		if err = syncDirectory(dir); err != nil {
 			return err
 		}
@@ -496,6 +611,19 @@ func (s *LocalFilesystemBackend) CreateRecording(recording *domain.Recording) (e
 		return err
 	}
 	return syncDirectory(base)
+}
+
+// safePathForRoot validates a recording-relative path against an arbitrary
+// staging root without deriving authority from a not-yet-published recording.
+func (s *LocalFilesystemBackend) safePathForRoot(root, relative string) (string, error) {
+	if root == "" || !canonicalRelativePath(relative) {
+		return "", errors.New("invalid relative storage path")
+	}
+	full := filepath.Join(root, filepath.FromSlash(relative))
+	if !within(root, full) {
+		return "", errors.New("storage path escapes recording directory")
+	}
+	return full, nil
 }
 
 func (s *LocalFilesystemBackend) SaveRecording(recording *domain.Recording) error {
@@ -1157,6 +1285,40 @@ func (s *LocalFilesystemBackend) SaveSidecar(id, relativePath string, v any) err
 		s.telemetry.recordWrite(uint64(len(data)), time.Since(started))
 	}
 	return err
+}
+
+// LoadSidecar is an optional, read-only JSON sidecar capability. The read is
+// bounded and uses the same path containment checks as canonical payload reads.
+func (s *LocalFilesystemBackend) LoadSidecar(id, relativePath string, maxBytes int64, output any) error {
+	if err := validateSidecarRead(id, relativePath, maxBytes, output); err != nil {
+		return err
+	}
+	started := time.Now()
+	file, info, err := s.openPayload(id, relativePath+".json")
+	if err != nil {
+		s.telemetry.recordError()
+		return err
+	}
+	defer file.Close()
+	if !info.Mode().IsRegular() || info.Size() > maxBytes {
+		s.telemetry.recordError()
+		return errors.New("sidecar exceeds size limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		s.telemetry.recordError()
+		return errors.New("sidecar is unavailable")
+	}
+	if int64(len(data)) > maxBytes {
+		s.telemetry.recordError()
+		return errors.New("sidecar exceeds size limit")
+	}
+	if err = decodeStrictSidecar(data, output); err != nil {
+		s.telemetry.recordError()
+		return err
+	}
+	s.telemetry.recordRead(uint64(len(data)), 1, time.Since(started))
+	return nil
 }
 
 func (s *LocalFilesystemBackend) SaveSnapshot(id, trackID, sourceURI string, data []byte, at time.Time) (domain.ManifestSnapshot, error) {

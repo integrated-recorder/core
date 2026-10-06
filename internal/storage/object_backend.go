@@ -112,6 +112,32 @@ func (b *ObjectStoreArchiveBackend) CreateRecording(recording *domain.Recording)
 	return nil
 }
 
+// CreateRecordingWithSidecar publishes a private initial sidecar before the
+// complete root object. The root is the visibility marker, so a crash after
+// sidecar PUT but before root PUT leaves only an ignored orphan.
+func (b *ObjectStoreArchiveBackend) CreateRecordingWithSidecar(recording *domain.Recording, relativePath string, value any) error {
+	if err := validateArchiveRecording(recording); err != nil || !validInitialSidecarPath(relativePath) || value == nil {
+		return errors.New("invalid recording sidecar initialization")
+	}
+	sidecarData, err := json.MarshalIndent(value, "", "  ")
+	if err != nil || int64(len(sidecarData)+1) > maxSidecarReadBytes || int64(len(sidecarData)+1) > maxObjectJSONBytes {
+		return errors.New("recording sidecar initialization exceeds size limit")
+	}
+	rootKey := recordingObjectKey(recording.ID, "recording.json")
+	if _, err := b.stat(context.Background(), rootKey); err == nil {
+		return errors.New("recording already exists")
+	} else if !isObjectNotFound(err) {
+		return errors.New("recording metadata is unavailable")
+	}
+	if recording.Tracks == nil {
+		recording.Tracks = map[string]*domain.Track{}
+	}
+	if err := b.SaveSidecar(recording.ID, relativePath, value); err != nil {
+		return err
+	}
+	return b.CreateRecording(recording)
+}
+
 func (b *ObjectStoreArchiveBackend) SaveRecording(recording *domain.Recording) error {
 	started := time.Now()
 	if err := validateArchiveRecording(recording); err != nil {
@@ -705,6 +731,34 @@ func (b *ObjectStoreArchiveBackend) SaveSidecar(id, relativePath string, value a
 		return err
 	}
 	b.telemetry.recordWrite(uint64(len(data)), time.Since(started))
+	return nil
+}
+
+// LoadSidecar is an optional, read-only JSON sidecar capability. The physical
+// provider returns bounded bytes; Core alone decodes the archive document.
+func (b *ObjectStoreArchiveBackend) LoadSidecar(id, relativePath string, maxBytes int64, output any) error {
+	if err := validateSidecarRead(id, relativePath, maxBytes, output); err != nil {
+		return err
+	}
+	key, err := b.recordingKey(id, relativePath)
+	if err != nil {
+		return err
+	}
+	key += ".json"
+	if err := ValidateObjectKey(key); err != nil {
+		return errors.New("invalid sidecar reference")
+	}
+	started := time.Now()
+	data, _, err := b.readObject(context.Background(), key, maxBytes)
+	if err != nil {
+		b.telemetry.recordError()
+		return err
+	}
+	if err := decodeStrictSidecar(data, output); err != nil {
+		b.telemetry.recordError()
+		return err
+	}
+	b.telemetry.recordRead(uint64(len(data)), 1, time.Since(started))
 	return nil
 }
 

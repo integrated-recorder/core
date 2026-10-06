@@ -494,8 +494,18 @@ func TestExternalAdapterSubprocessAcquireReloadAndVOD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(recordingJSON), headerValue) {
-		t.Fatal("media headers or input were persisted in recording metadata")
+	if strings.Contains(string(recordingJSON), headerValue) || strings.Contains(string(recordingJSON), "acquisition_context") {
+		t.Fatal("media headers or private acquisition context were persisted in recording metadata")
+	}
+	var privateContext struct {
+		SchemaVersion int                      `json:"schema_version"`
+		Media         adapterproto.MediaSource `json:"media"`
+	}
+	if err := store.LoadSidecar(recording.ID, "archive-index/acquisition-context", 64<<10, &privateContext); err != nil {
+		t.Fatalf("private acquisition context was not persisted: %v", err)
+	}
+	if privateContext.SchemaVersion != 1 || privateContext.Media.Headers[headerName] != headerValue || privateContext.Media.SessionRef != "" {
+		t.Fatalf("private acquisition context mismatch: %#v", privateContext)
 	}
 	reloaded, err := acquire.NewManager(store, source.Client(), host, validate)
 	if err != nil {

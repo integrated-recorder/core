@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,6 +95,106 @@ func TestProcessRecordsExplicitManifestGapWithoutFetchingIt(t *testing.T) {
 	}
 	if len(e.recording.Tracks["main"].Segments) != 0 || len(e.recording.Gaps) != 1 || e.recording.Gaps[0].FromSequence != 7 || e.recording.Gaps[0].ToSequence != 7 {
 		t.Fatalf("manifest gap was not recorded without capture: %#v", e.recording)
+	}
+}
+
+func TestWorkerTransformsManifestVariantAndRelativeMediaAgainstFetchedURLs(t *testing.T) {
+	var mu sync.Mutex
+	var requests []string
+	segmentBytes := []byte("transform-fixture-exact-segment")
+	transport := testRoundTripper(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		requests = append(requests, request.URL.String())
+		mu.Unlock()
+		var body []byte
+		switch request.URL.Path {
+		case "/archive/live.m3u8":
+			body = []byte("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\nvariant.ts\n")
+		case "/archive/variant.m3u8":
+			body = []byte("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:41\n#EXTINF:1,\nsegment.ts\n#EXT-X-ENDLIST\n")
+		case "/archive/segment.m4v":
+			body = segmentBytes
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(nil)), Request: request}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body)), ContentLength: int64(len(body)), Request: request}, nil
+	})
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, &http.Client{Transport: transport}, emptyResolver{}, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(func() {
+		cancel()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer closeCancel()
+		_ = manager.Close(closeCtx)
+	})
+	policy := &adapterproto.URLTransformPolicy{Rules: []adapterproto.URLTransformRule{
+		{Scopes: []adapterproto.ResourceRequestScope{adapterproto.RequestScopeManifest}, PathSuffix: &adapterproto.PathSuffixRewrite{From: ".ts", To: ".m3u8"}, QueryParameters: []adapterproto.QueryParameterPropagation{{From: "hdnts", To: "__bgda__"}}},
+		{Scopes: []adapterproto.ResourceRequestScope{adapterproto.RequestScopeVariant}, PathSuffix: &adapterproto.PathSuffixRewrite{From: ".ts", To: ".m3u8"}, QueryParameters: []adapterproto.QueryParameterPropagation{{From: "hdnts", To: "__bgda__"}}},
+		{Scopes: []adapterproto.ResourceRequestScope{adapterproto.RequestScopeMedia}, PathSuffix: &adapterproto.PathSuffixRewrite{From: ".ts", To: ".m4v"}, QueryParameters: []adapterproto.QueryParameterPropagation{{From: "hdnts", To: "__bgda__"}}},
+	}}
+	started, err := manager.StartResolved(ctx, "fixture", adapterproto.MediaSource{
+		Type: "hls", ManifestURL: "https://media.example/archive/live.ts?hdnts=signed-value",
+		RequestPolicy: &adapterproto.RequestPolicy{URLTransform: policy},
+	}, nil, "transformed HLS", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRecordingState(t, manager, started.ID, domain.StateCompleted)
+	recording, err := manager.Get(started.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recording.SegmentCount() != 1 {
+		t.Fatalf("captured segment count=%d, want 1", recording.SegmentCount())
+	}
+	const wantPlaylistURL = "https://media.example/archive/variant.m3u8?__bgda__=signed-value"
+	if got := recording.Tracks["main"].SourcePlaylistURL; got != wantPlaylistURL {
+		t.Fatalf("source playlist URL=%q, want actual transformed absolute URL %q", got, wantPlaylistURL)
+	}
+	segment := recording.Tracks["main"].Segments[0]
+	if segment.SourceURI != "https://media.example/archive/segment.ts" {
+		t.Fatalf("relative media URI resolved against wrong base: %q", segment.SourceURI)
+	}
+	assertStoredPayload(t, store, recording.ID, segment.StoragePath, segmentBytes)
+	if digest := sha256.Sum256(segmentBytes); segment.SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("stored segment digest=%s, want exact source bytes", segment.SHA256)
+	}
+
+	mu.Lock()
+	gotRequests := append([]string(nil), requests...)
+	mu.Unlock()
+	wantPaths := map[string]string{
+		"/archive/live.m3u8":    "signed-value",
+		"/archive/variant.m3u8": "signed-value",
+		"/archive/segment.m4v":  "signed-value",
+	}
+	seen := make(map[string]bool, len(wantPaths))
+	for _, raw := range gotRequests {
+		parsed, parseErr := url.Parse(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		wantQuery, ok := wantPaths[parsed.Path]
+		if !ok {
+			t.Errorf("unexpected transformed request URL %q", raw)
+			continue
+		}
+		if parsed.Query().Get("__bgda__") != wantQuery {
+			t.Errorf("request %q lacks propagated query value", raw)
+		}
+		seen[parsed.Path] = true
+	}
+	for path := range wantPaths {
+		if !seen[path] {
+			t.Errorf("transformed request path %q was not fetched; requests=%v", path, gotRequests)
+		}
 	}
 }
 
@@ -1301,12 +1402,31 @@ func TestCatchUpSequenceResetCreatesStableEpochAndReloadsInArchiveOrder(t *testi
 	const id = "cccccccccccccccccccccccccccccccc"
 	old := &domain.Recording{FormatVersion: 1, ID: id, State: domain.StateRecording, Tracks: map[string]*domain.Track{"main": {
 		ID: "main", SourceEpoch: 0, NextArchiveOrdinal: 3, HasLastObservedSequence: true, LastObservedSequence: 1,
-		Segments: []domain.Segment{
-			{ID: "old-0", TrackID: "main", Sequence: 0, SourceEpoch: 0, DiscontinuitySequence: 0, ArchiveOrdinal: 1, SourceURI: source.URL + "/old-0.ts"},
-			{ID: "old-1", TrackID: "main", Sequence: 1, SourceEpoch: 0, DiscontinuitySequence: 0, ArchiveOrdinal: 2, SourceURI: source.URL + "/old-1.ts"},
-		},
+		Segments: []domain.Segment{},
 	}}}
 	if err = store.CreateRecording(old); err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		id, path, uri string
+		sequence      uint64
+		ordinal       uint64
+	}{
+		{id: "old-0", path: "tracks/main/legacy-0.ts", uri: source.URL + "/old-0.ts", sequence: 0, ordinal: 1},
+		{id: "old-1", path: "tracks/main/legacy-1.ts", uri: source.URL + "/old-1.ts", sequence: 1, ordinal: 2},
+	} {
+		payload := []byte("legacy-source-" + fixture.id)
+		result, saveErr := store.SavePayloadExact(id, fixture.path, bytes.NewReader(payload), 1<<20, int64(len(payload)))
+		if saveErr != nil {
+			t.Fatal(saveErr)
+		}
+		old.Tracks["main"].Segments = append(old.Tracks["main"].Segments, domain.Segment{
+			ID: fixture.id, TrackID: "main", Sequence: fixture.sequence, SourceEpoch: 0,
+			DiscontinuitySequence: 0, ArchiveOrdinal: fixture.ordinal, SourceURI: fixture.uri,
+			Duration: 1, StoragePath: fixture.path, PayloadSize: result.Size, SHA256: result.SHA256,
+		})
+	}
+	if err = store.SaveRecording(old); err != nil {
 		t.Fatal(err)
 	}
 	manager, err := NewManager(store, &http.Client{}, emptyResolver{}, func(context.Context, string) error { return nil })

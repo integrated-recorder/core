@@ -122,7 +122,21 @@ Adapter는 input을 generic media source로 resolve합니다. Playlist parsing, 
 
 현재 HLS subset은 하나의 자체 완결 rendition, MPEG-TS 또는 fMP4 media object, init map, 명시적이고 overflow-safe한 byte range, discontinuity, program date/time, 완료된 `EXTINF` segment를 지원합니다. 동일 playlist에 완료 segment가 있으면 LL-HLS partial tag는 무시할 수 있습니다. 암호화 HLS, external audio/video/subtitle rendition, I-frame-only, URI 변수 대체(`EXT-X-DEFINE`), delta(`EXT-X-SKIP`), partial-only LL-HLS는 명시적으로 거부합니다. DASH, 별도 subtitle rendition, DRM/key acquisition은 구현하지 않았습니다. 거부 동작은 결정적이며 source media byte는 수정하지 않습니다.
 
-Media sequence는 source identifier일 뿐 archive identity가 아닙니다. Core는 source epoch와 증가하는 archive ordinal을 함께 기록하여 sequence reset 이후 재사용된 번호가 새 segment 수집을 막지 않도록 합니다. VOD는 archive ordinal 순서로 만들고 epoch 경계 또는 감지한 gap에 discontinuity를 삽입합니다.
+Media sequence는 source coordinate이지 archive identity가 아닙니다. `ArchiveOrdinal`은 archive/preview 참조를 위한 append-only identity로 유지하고, 별도의 `TimelineOrdinal`은 수정 가능한 playback 위치로 사용합니다. Source epoch와 discontinuity sequence도 coordinate에 포함하므로 sequence reset이나 재사용된 media sequence가 기존 object와 충돌하지 않습니다. VOD는 발견 순서를 playback 순서로 간주하지 않고 현재 timeline projection을 사용합니다.
+
+## Repairable archive inventory
+
+`internal/archiveindex`는 canonical recording 위에 놓이는 bounded·transport-independent inventory를 정의하며, 엄격한 serialized-size 제한을 둔 versioned `archive-index` sidecar로 저장합니다. Recording ID는 Core가 한 번 수행한 capture 실행을 식별하고, 별도의 불투명한 source-session identity는 adapter가 충분한 근거를 제공했을 때 방송/resource session을 나타냅니다. Core는 resource와 선택적 adapter `session_ref`를 hash하며 raw identity 입력을 inventory identity로 노출하지 않습니다. 명시적인 session reference가 없으면 resource/channel 하나가 방송 하나를 뜻한다고 가정하지 않고 recording 범위 안에서만 identity를 만듭니다.
+
+Logical media identity는 언제 발견했는지 또는 어떤 archive ordinal을 받았는지가 아니라 session, track, source epoch, discontinuity sequence, media sequence, object kind로 구성된 source coordinate에서 파생됩니다. 각 coordinate는 live origin, historical acquisition, peer, import 등 제한된 수의 claim을 가질 수 있습니다. Claim은 각각 provenance, payload path, 정확한 size, SHA-256, verification 결과와 evidence를 보존합니다. 같은 bytes를 다시 관측하면 멱등적인 duplicate claim이 됩니다. 이미 claim이 있는 coordinate에서 다른 bytes가 들어오면 conflict로 기록하며, 이전에 선택된 verified payload를 유지하고 덮어쓰지 않습니다. Coverage는 `unknown`, `known_missing`, `acquisition_failed`, `present`, `conflict`를 구분합니다. Bytes가 존재하거나 conflict라는 관측은 오래된 missing/failure 구간보다 우선합니다.
+
+Inventory의 playback timeline은 revision이 있는 projection입니다. Core는 `ArchiveOrdinal`을 바꾸거나 저장된 media를 다시 쓰지 않고 앞쪽 prefix를 늦게 삽입하거나 중간 gap을 채울 수 있습니다. 선택된 media object에 deterministic coordinate 순서로 조밀한 `TimelineOrdinal`을 다시 부여하고, 현재 projection에서 VOD playlist/index를 재구성합니다. 따라서 duration과 seek 위치는 새로 확보된 segment duration을 반영하고, 길이를 모르는 gap에 시간을 임의로 보태지 않습니다. 기존 preview frame asset은 append-only archive ordinal로 식별하면서 playback상 위치만 다시 계산합니다.
+
+Capture lifecycle과 archive lifecycle은 분리됩니다. Capture를 중지하거나 중단하면 live admission은 닫히지만 archive는 repair 가능한 상태로 남습니다. 명시적으로 seal한 경우에만 repair가 종료됩니다. Live와 historical discovery/acquisition은 제한된 scheduling 아래 독립적으로 진행할 수 있지만, canonical commit은 기존 recording별 owner/epoch fence를 거쳐 직렬화됩니다. Fence를 잃은 stale Engine은 claim이나 playback projection을 publish할 수 없습니다. Inventory read-modify-write와 root/timeline 갱신도 같은 fenced canonical mutation 경로를 사용합니다.
+
+Adapter는 historical availability를 rolling window, sequence range 또는 time range로 선언할 수 있으며, 선택적으로 historical manifest URL을 제공할 수 있습니다. Manifest, variant, media, init, key 요청에는 resource scope가 지정된 bounded request transform을 선언할 수 있습니다. 지원되는 변환은 literal path-suffix 교체와 선택한 query parameter 전달이며, 필요하면 HTTP(S) origin allowlist를 지정합니다. Transform은 대상 authority를 바꿀 수 없고, Core는 변환 후에도 자체 URL·redirect·SSRF 검사를 수행합니다. 예를 들어 source는 media 경로 suffix 변경과 서명 query 한 값을 선언할 수 있지만 Core에 플랫폼별 분기를 넣지 않습니다. Plugin에 media bytes를 임의로 proxy/rewrite하는 callback을 제공하지 않습니다. 요청과 payload 취득은 Core가 수행하며 저장 bytes를 보존합니다.
+
+Inventory와 claim reconciliation primitive는 transport와 분리되어 있고 peer/import claim source도 표현하므로, 향후 archive 전송은 recording 의미를 바꾸지 않고 coordinate와 verified content를 비교할 수 있습니다. Peer discovery, 인증, P2P transport는 아직 구현하지 않았습니다. 기존 `recording.json`은 payload object나 legacy archive path를 다시 쓰지 않고 coordinate 기반 claim과 coverage로 채택할 수 있습니다. Source-session 근거가 없는 legacy archive는 보수적으로 해당 recording 범위에 묶습니다. Inventory가 잘못됐거나 크기 제한을 넘었다고 해서 canonical archive를 변경해도 된다는 뜻은 아닙니다.
 
 ## Storage, privacy, recovery
 
@@ -138,7 +152,7 @@ Storage facade는 logical archive key와 physical placement를 분리합니다. 
 
 Storage 관측은 Integrated Recorder storage facade를 통과한 I/O만 측정하며 OS 장치나 cloud account 전체의 traffic은 아닙니다. Remote provider capacity는 unknown으로 보고하며 무한 capacity를 표시하지 않습니다. 기본값은 5초 간격 측정과 24시간 memory retention이며 두 값은 검증된 범위에서 설정됩니다. 보존 기간은 `max(ceil(5분 / 측정 간격) × 측정 간격, 20 × 측정 간격)` 이상이어야 하며, 5분 관측 구간의 정수 sample과 방향별 최소 20개 sample을 보관합니다. 관측 상한은 실제 비유휴 sample 시간을 합산한 5분 이상과 방향별 최소 20개 sample이 있어야 계산합니다. read/write p95는 독립 추정치입니다. 인증된 `/api/storage/pools`, `/api/storage/pools/{pool_id}/metrics` endpoint는 absolute local path를 반환하지 않습니다. Installation마다 primary 하나를 사용합니다. 자동 placement, tiering, migration, replication, eviction, restore는 구현하지 않았습니다.
 
-`internal/domain` archive type은 protocol wire type과 분리되어 있습니다. 기존 JSON field 이름을 유지하고 epoch, ordinal, provenance, URI classification은 optional이므로 구 recording도 읽을 수 있습니다. Adapter ID/version/protocol version/fingerprint는 provenance이며 credential, header, adapter state는 recording metadata에 복사하지 않습니다. Source URL과 raw manifest snapshot은 credential이 포함된 경우에도 원본 canonical data로 보존합니다. 따라서 recording directory 권한을 제한하고 public list/detail 응답에서는 URL을 제거합니다.
+`internal/domain` archive type은 protocol wire type과 분리되어 있습니다. 기존 JSON field 이름을 유지하고 epoch, ordinal, provenance, URI classification은 optional이므로 구 recording도 읽을 수 있습니다. Adapter ID/version/protocol version/fingerprint는 provenance이며 adapter state는 recording metadata에 복사하지 않습니다. Core의 historical request에 필요한 bounded private acquisition context를 보존할 수 있으며 여기에는 signed URL이나 request header가 포함될 수 있습니다. 이는 source URL과 raw manifest snapshot처럼 민감한 값이므로 public Recording list/detail 응답에 노출하지 않습니다. Raw session reference를 public session identity로 사용하지도 않습니다. Recording directory 권한을 제한하고 public projection에서는 민감한 source context를 제외합니다.
 
 ## Preview Frame Index
 

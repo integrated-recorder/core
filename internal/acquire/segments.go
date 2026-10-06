@@ -1,7 +1,6 @@
 package acquire
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/hls"
 	"github.com/integrated-recorder/core/internal/runtimehook"
@@ -25,8 +25,9 @@ const (
 )
 
 type segmentTaskKey struct {
-	epoch    uint64
-	sequence uint64
+	epoch                 uint64
+	discontinuitySequence uint64
+	sequence              uint64
 }
 
 type segmentTaskState uint8
@@ -75,8 +76,10 @@ var (
 )
 
 type epochMarker struct {
-	ordinal             uint64
-	sourceDiscontinuity bool
+	ordinal               uint64
+	discontinuitySequence uint64
+	sequence              uint64
+	sourceDiscontinuity   bool
 }
 
 // segmentScheduler belongs to one recording worker. Discovery is serialized by
@@ -138,7 +141,7 @@ func newSegmentScheduler(parent context.Context, manager *Manager, e *entry) (*s
 			cancel()
 			return nil, ErrHandoverUnavailable
 		}
-		key := segmentTaskKey{epoch: candidate.epoch, sequence: candidate.source.Sequence}
+		key := segmentTaskKey{epoch: candidate.epoch, discontinuitySequence: candidate.source.DiscontinuitySequence, sequence: candidate.source.Sequence}
 		if _, exists := s.tasks[key]; exists {
 			e.mu.Unlock()
 			cancel()
@@ -197,10 +200,10 @@ func (s *segmentScheduler) discoverAtGeneration(ctx context.Context, epoch uint6
 		if !s.manifestGenerationCurrent(generation) {
 			return false, nil
 		}
-		if source.Gap || s.manager.hasSequence(s.e, epoch, source.Sequence) || gapCoversEpoch(s.recordingSnapshot(), "main", epoch, source.Sequence) {
+		if source.Gap || s.manager.hasSequenceCoordinate(s.e, epoch, source.DiscontinuitySequence, source.Sequence) || gapCoversCoordinate(s.recordingSnapshot(), "main", epoch, source.DiscontinuitySequence, source.Sequence) {
 			continue
 		}
-		key := segmentTaskKey{epoch: epoch, sequence: source.Sequence}
+		key := segmentTaskKey{epoch: epoch, discontinuitySequence: source.DiscontinuitySequence, sequence: source.Sequence}
 		for {
 			s.mu.Lock()
 			if s.closed {
@@ -240,7 +243,7 @@ func (s *segmentScheduler) discoverAtGeneration(ctx context.Context, epoch uint6
 			// prevent a poll that passed the optimistic check from re-enqueueing
 			// an already captured segment. A gap is similarly protected by the
 			// gap-committing state until its metadata write succeeds.
-			if s.manager.hasSequence(s.e, epoch, source.Sequence) || gapCoversEpoch(s.recordingSnapshot(), "main", epoch, source.Sequence) {
+			if s.manager.hasSequenceCoordinate(s.e, epoch, source.DiscontinuitySequence, source.Sequence) || gapCoversCoordinate(s.recordingSnapshot(), "main", epoch, source.DiscontinuitySequence, source.Sequence) {
 				s.mu.Unlock()
 				break
 			}
@@ -577,15 +580,15 @@ func (s *segmentScheduler) protectedSequences(epoch uint64) map[uint64]bool {
 	return protected
 }
 
-func (s *segmentScheduler) protectedByEpoch() map[uint64]map[uint64]bool {
+func (s *segmentScheduler) protectedByEpoch() map[uint64]map[segmentTaskKey]bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	protected := make(map[uint64]map[uint64]bool)
+	protected := make(map[uint64]map[segmentTaskKey]bool)
 	for key := range s.tasks {
 		if protected[key.epoch] == nil {
-			protected[key.epoch] = make(map[uint64]bool)
+			protected[key.epoch] = make(map[segmentTaskKey]bool)
 		}
-		protected[key.epoch][key.sequence] = true
+		protected[key.epoch][key] = true
 	}
 	return protected
 }
@@ -743,7 +746,7 @@ func (s *segmentScheduler) worker(burst bool) {
 			}
 			continue
 		}
-		if persistErr := s.manager.markPending(s.e, task.key.epoch, task.key.sequence, err); persistErr != nil {
+		if persistErr := s.manager.markPending(s.e, task.key.epoch, task.key.discontinuitySequence, task.key.sequence, err); persistErr != nil {
 			s.mu.Unlock()
 			s.failFatal(persistErr)
 			return
@@ -824,7 +827,7 @@ func (s *segmentScheduler) awaitManifest(task *segmentTask) {
 }
 
 func (s *segmentScheduler) persistGap(task *segmentTask, reason string) error {
-	if err := s.manager.markGap(s.e, task.key.epoch, task.key.sequence, reason); err != nil {
+	if err := s.manager.markGap(s.e, task.key.epoch, task.key.discontinuitySequence, task.key.sequence, reason); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -1014,6 +1017,10 @@ func (s *segmentScheduler) removeTask(task *segmentTask) {
 }
 
 func (s *segmentScheduler) persistSegment(segment domain.Segment, initDependency *initFlight, data []byte) (storage.PayloadResult, error) {
+	return s.persistSegmentFrom(segment, initDependency, data, archiveindex.ClaimLiveOrigin)
+}
+
+func (s *segmentScheduler) persistSegmentFrom(segment domain.Segment, initDependency *initFlight, data []byte, source archiveindex.ClaimSource) (storage.PayloadResult, error) {
 	// Init jobs are submitted before the referencing media task to the same
 	// FIFO service. Wait for the durable init sidecar/root metadata before
 	// publishing a media segment that refers to it.
@@ -1045,101 +1052,14 @@ func (s *segmentScheduler) persistSegment(segment domain.Segment, initDependency
 	}
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
-	var result storage.PayloadResult
-	var plannedMarker *epochMarker
-	err := s.manager.withCanonicalMutation(s.e, func() error {
-		var err error
-		result, err = s.manager.store.SavePayload(recordingID(s.e), segment.StoragePath, bytes.NewReader(data), s.manager.ingest.Options().MaxPayloadBytes)
-		if err != nil {
-			return err
-		}
-		segment.PayloadSize, segment.SHA256 = result.Size, result.SHA256
-		sourceDiscontinuity := segment.Discontinuity
-		root := s.recordingSnapshot()
-		var previousUpdate *domain.Segment
-		if segment.SourceEpoch > 0 {
-			marker, exists := s.epochMarkers[segment.SourceEpoch]
-			if !exists {
-				track := root.Tracks["main"]
-				if track != nil {
-					for i := range track.Segments {
-						candidate := track.Segments[i]
-						if candidate.SourceEpoch == segment.SourceEpoch && (marker.ordinal == 0 || candidate.ArchiveOrdinal < marker.ordinal) {
-							marker = epochMarker{ordinal: candidate.ArchiveOrdinal, sourceDiscontinuity: candidate.Discontinuity}
-							exists = true
-						}
-					}
-				}
-			}
-			if !exists || segment.ArchiveOrdinal < marker.ordinal {
-				if exists {
-					track := root.Tracks["main"]
-					for i := range track.Segments {
-						candidate := track.Segments[i]
-						if candidate.SourceEpoch == segment.SourceEpoch && candidate.ArchiveOrdinal == marker.ordinal {
-							candidate.Discontinuity = marker.sourceDiscontinuity
-							previousUpdate = &candidate
-							break
-						}
-					}
-				}
-				segment.Discontinuity = true
-				planned := epochMarker{ordinal: segment.ArchiveOrdinal, sourceDiscontinuity: sourceDiscontinuity}
-				plannedMarker = &planned
-			} else if plannedMarker == nil {
-				planned := marker
-				plannedMarker = &planned
-			}
-		}
-		// Sidecars, including a moved synthetic epoch marker, are durable before
-		// the root metadata references their final projection.
-		if err = s.manager.store.SaveSidecar(recordingID(s.e), segment.StoragePath, segment); err != nil {
-			return err
-		}
-		if previousUpdate != nil {
-			if err = s.manager.store.SaveSidecar(recordingID(s.e), previousUpdate.StoragePath, *previousUpdate); err != nil {
-				return err
-			}
-		}
-		return s.manager.updateWithinAuthorizedCommit(s.e, func(r *domain.Recording) error {
-			t := r.Tracks["main"]
-			for _, existing := range t.Segments {
-				if existing.SourceEpoch == segment.SourceEpoch && existing.Sequence == segment.Sequence {
-					return nil
-				}
-			}
-			if previousUpdate != nil {
-				for i := range t.Segments {
-					if t.Segments[i].ID == previousUpdate.ID {
-						t.Segments[i].Discontinuity = previousUpdate.Discontinuity
-						break
-					}
-				}
-			}
-			t.Segments = append(t.Segments, segment)
-			sort.Slice(t.Segments, func(i, j int) bool {
-				if t.Segments[i].ArchiveOrdinal != t.Segments[j].ArchiveOrdinal {
-					return t.Segments[i].ArchiveOrdinal < t.Segments[j].ArchiveOrdinal
-				}
-				if t.Segments[i].SourceEpoch != t.Segments[j].SourceEpoch {
-					return t.Segments[i].SourceEpoch < t.Segments[j].SourceEpoch
-				}
-				return t.Segments[i].Sequence < t.Segments[j].Sequence
-			})
-			if segment.ArchiveOrdinal >= t.NextArchiveOrdinal {
-				if segment.ArchiveOrdinal == ^uint64(0) {
-					return errors.New("archive ordinal overflow")
-				}
-				t.NextArchiveOrdinal = segment.ArchiveOrdinal + 1
-			}
-			t.PendingSegments = removePending(t.PendingSegments, segment.SourceEpoch, segment.Sequence)
-			if segment.SourceEpoch == 0 {
-				t.PendingSequences = removeSequence(t.PendingSequences, segment.Sequence)
-			}
-			r.LastError = ""
-			return nil
-		})
-	})
+	s.e.mu.Lock()
+	var expectedOwner *OwnershipToken
+	if s.e.ownership != nil {
+		copy := *s.e.ownership
+		expectedOwner = &copy
+	}
+	s.e.mu.Unlock()
+	result, plannedMarker, err := s.manager.commitArchiveSegment(s.e, expectedOwner, segment, source, data)
 	if err != nil {
 		if firstHandoverCommit {
 			s.e.mu.Lock()
@@ -1197,14 +1117,14 @@ func (s *segmentScheduler) handleFetchFailure(task *segmentTask, media adapterpr
 		return err
 	}
 	if refreshCycles >= maxRefreshCycles {
-		return makeSegmentRefreshTrigger(task.key.epoch, task.key.sequence, err)
+		return makeSegmentRefreshTrigger(task.key.epoch, task.key.discontinuitySequence, task.key.sequence, err)
 	}
 	if !s.markRefreshing(task) {
 		return errAwaitManifest
 	}
 	_, nextGeneration, refreshErr := s.manager.refreshMediaAtGeneration(s.ctx, s.e, media, generation)
 	if refreshErr != nil {
-		return makeSegmentRefreshTrigger(task.key.epoch, task.key.sequence, err)
+		return makeSegmentRefreshTrigger(task.key.epoch, task.key.discontinuitySequence, task.key.sequence, err)
 	}
 	s.mu.Lock()
 	if s.tasks[task.key] == task {
@@ -1244,9 +1164,17 @@ func (s *segmentScheduler) acquireInitWithPayload(segment hls.MediaSegment, epoc
 
 func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource, generation uint64, stagedPayload *storage.IngestPayload) (string, *initFlight, error) {
 	source := *segment.Init
-	id := initSegmentID(source, epoch, segment.DiscontinuitySequence)
 	key := initIdentity(source, epoch, segment.DiscontinuitySequence)
-	if initExists(s.recordingSnapshot(), id) {
+	var err error
+	recording := s.recordingSnapshot()
+	asset := domain.Segment{
+		TrackID: "main", Sequence: segment.Sequence, SourceEpoch: epoch,
+		DiscontinuitySequence: segment.DiscontinuitySequence,
+		SourceURI:             source.URI, ByteRange: cloneRange(source.ByteRange), IsInit: true,
+	}
+	id := initSegmentID(source, epoch, segment.DiscontinuitySequence)
+	asset.ID = id
+	if initExists(recording, id) {
 		if stagedPayload != nil {
 			stagedPayload.Release()
 		}
@@ -1272,17 +1200,15 @@ func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epo
 	s.init[key] = flight
 	s.mu.Unlock()
 
-	recording := s.recordingSnapshot()
 	payload := stagedPayload
-	var err error
 	if payload == nil {
-		payload, err = s.manager.downloadObjectBufferedOnceAtGeneration(s.ctx, source.URI, source.ByteRange, recording.ID, media, s.e, generation)
+		payload, err = s.manager.downloadObjectBufferedOnceAtGenerationScope(s.ctx, source.URI, source.ByteRange, recording.ID, media, s.e, generation, adapterproto.RequestScopeInit)
 		if err != nil {
 			s.resolveInitQueueError(key, flight, err)
 			return "", nil, err
 		}
 	}
-	asset := domain.Segment{ID: id, TrackID: "main", SourceEpoch: epoch, DiscontinuitySequence: segment.DiscontinuitySequence, SourceURI: source.URI, ByteRange: cloneRange(source.ByteRange), StoragePath: "tracks/main/" + id + extensionFor(source.URI), PayloadSize: payload.Result().Size, SHA256: payload.Result().SHA256, IsInit: true}
+	asset.PayloadSize, asset.SHA256 = payload.Result().Size, payload.Result().SHA256
 	s.wg.Add(1)
 	err = s.manager.ingest.Submit(s.ctx, payload, func(data []byte) (storage.PayloadResult, error) {
 		if s.manager.storageWriteHook != nil {
@@ -1293,34 +1219,7 @@ func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epo
 				return storage.PayloadResult{}, hookErr
 			}
 		}
-		s.commitMu.Lock()
-		defer s.commitMu.Unlock()
-		var result storage.PayloadResult
-		persistErr := s.manager.withCanonicalMutation(s.e, func() error {
-			var err error
-			result, err = s.manager.store.SavePayload(recording.ID, asset.StoragePath, bytes.NewReader(data), s.manager.ingest.Options().MaxPayloadBytes)
-			if err != nil {
-				return err
-			}
-			asset.PayloadSize, asset.SHA256 = result.Size, result.SHA256
-			if err = s.manager.store.SaveSidecar(recording.ID, asset.StoragePath, asset); err != nil {
-				return err
-			}
-			return s.manager.updateWithinAuthorizedCommit(s.e, func(r *domain.Recording) error {
-				track := r.Tracks["main"]
-				for _, previous := range track.InitSegments {
-					if previous.ID == id {
-						return nil
-					}
-				}
-				track.InitSegments = append(track.InitSegments, asset)
-				return nil
-			})
-		})
-		if persistErr != nil {
-			return storage.PayloadResult{}, persistErr
-		}
-		return result, nil
+		return s.persistSegmentFrom(asset, nil, data, archiveindex.ClaimLiveOrigin)
 	}, func(_ storage.PayloadResult, persistErr error) {
 		defer s.wg.Done()
 		s.mu.Lock()
@@ -1520,10 +1419,10 @@ func (s *segmentScheduler) close() error {
 		payload.Release()
 	}
 	for _, key := range pending {
-		if s.manager.hasSequence(s.e, key.epoch, key.sequence) {
+		if s.manager.hasSequenceCoordinate(s.e, key.epoch, key.discontinuitySequence, key.sequence) {
 			continue
 		}
-		if err := s.manager.markPending(s.e, key.epoch, key.sequence, context.Canceled); err != nil {
+		if err := s.manager.markPending(s.e, key.epoch, key.discontinuitySequence, key.sequence, context.Canceled); err != nil {
 			s.failFatal(err)
 			return err
 		}

@@ -493,7 +493,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	e.mu.Unlock()
 	if err := m.withCanonicalCommit(e, func() error {
 		if err := m.store.SaveRecording(r); err != nil {
-			return err
+			return newStorageStageError("recording root commit", err)
 		}
 		e.mu.Lock()
 		defer e.mu.Unlock()
@@ -506,7 +506,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		if errors.Is(err, errStaleMediaGeneration) {
 			return false, nil
 		}
-		return false, errors.New("recording metadata persistence failed")
+		return false, fmt.Errorf("recording metadata persistence failed: %w", err)
 	}
 	return true, nil
 }
@@ -546,7 +546,7 @@ func (m *Manager) updateAtMediaGenerationWithinAuthorizedCommit(e *entry, genera
 		return false, err
 	}
 	if err := m.store.SaveRecording(next); err != nil {
-		return false, errors.New("recording metadata persistence failed")
+		return false, newStorageStageError("recording root commit", err)
 	}
 	e.mu.Lock()
 	if e.deleted || e.mediaGeneration != generation {
@@ -962,7 +962,8 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			}
 			return nil
 		}); err != nil {
-			m.setTerminalError(e, err)
+			m.recordStorageFailureDiagnostic(e, err)
+			m.setTerminalError(e, sanitizedPersistenceError(err))
 		}
 	}()
 	var metadataCancel context.CancelFunc

@@ -611,8 +611,14 @@ func TestIngestPermanentStorageFailureReleasesVolatileBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	completed := make(chan error, 1)
+	firstCause := errors.New("synthetic first backend failure")
+	finalCause := errors.New("synthetic final backend failure")
+	var calls atomic.Int32
 	err = service.Submit(context.Background(), payload, func([]byte) (PayloadResult, error) {
-		return PayloadResult{}, errors.New("storage unavailable")
+		if calls.Add(1) == 1 {
+			return PayloadResult{}, firstCause
+		}
+		return PayloadResult{}, finalCause
 	}, func(_ PayloadResult, persistErr error) { completed <- persistErr })
 	if err != nil {
 		t.Fatal(err)
@@ -622,12 +628,113 @@ func TestIngestPermanentStorageFailureReleasesVolatileBytes(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("failed persistence callback did not complete")
 	}
-	if err == nil || err.Error() != "canonical storage commit failed after bounded retries" {
-		t.Fatalf("public persistence error = %v", err)
+	if !errors.Is(err, ErrCanonicalCommitFailed) {
+		t.Fatalf("persistence classification = %v, want ErrCanonicalCommitFailed", err)
+	}
+	if !errors.Is(err, finalCause) || errors.Is(err, firstCause) {
+		t.Fatalf("persistence error chain = %v, want only final cause", err)
+	}
+	var attemptErr attemptCountedError
+	if !errors.As(err, &attemptErr) || attemptErr.Attempts() != 2 {
+		t.Fatalf("persistence attempts = %v, want 2", err)
+	}
+	if calls.Load() != 2 || !strings.Contains(err.Error(), "after bounded retries (2 attempts)") || !strings.Contains(err.Error(), finalCause.Error()) || strings.Contains(err.Error(), firstCause.Error()) {
+		t.Fatalf("persistence diagnostic = %q, calls=%d", err, calls.Load())
 	}
 	if got := service.Snapshot(); got.BufferUsedBytes != 0 || got.ReservedBytes != 0 || got.StorageErrorsTotal != 1 {
 		t.Fatalf("failed persistence accounting = %#v", got)
 	}
+}
+
+type failingIngestCoordinator struct {
+	queueErr      error
+	writerErr     error
+	queueRelease  atomic.Int32
+	writerRelease atomic.Int32
+}
+
+func (c *failingIngestCoordinator) SetReservation(context.Context, string, string, int64) error {
+	return nil
+}
+func (c *failingIngestCoordinator) ReleaseReservation(context.Context, string, string) error {
+	return nil
+}
+func (c *failingIngestCoordinator) AcquireQueue(context.Context, string) error { return c.queueErr }
+func (c *failingIngestCoordinator) ReleaseQueue(context.Context, string) error {
+	c.queueRelease.Add(1)
+	return nil
+}
+func (c *failingIngestCoordinator) AcquireWriter(context.Context, string) error { return c.writerErr }
+func (c *failingIngestCoordinator) ReleaseWriter(context.Context, string) error {
+	c.writerRelease.Add(1)
+	return nil
+}
+
+func newSmallIngestWithCoordinator(t *testing.T, coordinator RuntimeIngestCoordinator) *IngestService {
+	t.Helper()
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultIngestOptions()
+	options.QueueObjects = 2
+	options.GlobalBytes = 16
+	options.PerRecordingBytes = 8
+	options.MaxPayloadBytes = 8
+	options.RetryBase = 10 * time.Millisecond
+	service, err := newIngestService(store, options, coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := service.Close(ctx); err != nil {
+			t.Errorf("close ingest service: %v", err)
+		}
+	})
+	return service
+}
+
+func TestIngestGlobalLeaseAcquisitionErrorsRetainCause(t *testing.T) {
+	t.Run("queue", func(t *testing.T) {
+		cause := errors.New("synthetic queue acquisition failure")
+		coordinator := &failingIngestCoordinator{queueErr: cause}
+		service := newSmallIngestWithCoordinator(t, coordinator)
+		err := service.SubmitCommit(context.Background(), "queue-failure", func() error { return nil }, func(error) {})
+		if !errors.Is(err, cause) || !strings.Contains(err.Error(), "global storage queue is unavailable") {
+			t.Fatalf("queue acquisition error = %v, want wrapped cause and classification", err)
+		}
+		if coordinator.queueRelease.Load() != 1 || service.Snapshot().QueueObjects != 0 {
+			t.Fatalf("queue lease cleanup = releases:%d snapshot:%#v", coordinator.queueRelease.Load(), service.Snapshot())
+		}
+	})
+
+	t.Run("writer", func(t *testing.T) {
+		cause := errors.New("synthetic writer acquisition failure")
+		coordinator := &failingIngestCoordinator{writerErr: cause}
+		service := newSmallIngestWithCoordinator(t, coordinator)
+		completed := make(chan error, 1)
+		if err := service.SubmitCommit(context.Background(), "writer-failure", func() error { return nil }, func(err error) { completed <- err }); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-completed:
+			if !errors.Is(err, cause) || !strings.Contains(err.Error(), "global storage writer is unavailable") {
+				t.Fatalf("writer acquisition error = %v, want wrapped cause and classification", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("writer acquisition failure did not complete job")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := service.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if coordinator.queueRelease.Load() != 1 || coordinator.writerRelease.Load() != 1 {
+			t.Fatalf("writer lease cleanup = queue:%d writer:%d", coordinator.queueRelease.Load(), coordinator.writerRelease.Load())
+		}
+	})
 }
 
 func TestIngestCloseDeadlineCanBeRepeatedAfterWriterUnblocks(t *testing.T) {

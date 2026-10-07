@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"reflect"
 	"sort"
@@ -75,23 +76,26 @@ type SourceValidator func(context.Context, string) error
 type entry struct {
 	// persistMu serializes durable root-document writes and archive deletion.
 	// Callers always acquire it before mu, and never hold mu across storage I/O.
-	persistMu               sync.Mutex
-	mu                      sync.Mutex
-	recording               *domain.Recording
-	deleted                 bool
-	cancel                  context.CancelFunc
-	done                    chan struct{}
-	media                   adapterproto.MediaSource
-	mediaGeneration         uint64
-	refreshGate             chan struct{}
-	scheduler               *segmentScheduler
-	adapterID               string
-	resource                *adapterproto.ResourceRef
-	ownership               *OwnershipToken
-	terminalErr             error
-	recoveryAttempts        int
-	recoveryNoProgress      int
-	recoveryManifestStarted bool
+	persistMu       sync.Mutex
+	mu              sync.Mutex
+	recording       *domain.Recording
+	deleted         bool
+	cancel          context.CancelFunc
+	done            chan struct{}
+	media           adapterproto.MediaSource
+	mediaGeneration uint64
+	refreshGate     chan struct{}
+	scheduler       *segmentScheduler
+	adapterID       string
+	resource        *adapterproto.ResourceRef
+	ownership       *OwnershipToken
+	terminalErr     error
+	// storageFailureDiagnostic retains the first internal storage error chain.
+	// Public state and Stop errors continue to use sanitized terminalErr.
+	storageFailureDiagnostic error
+	recoveryAttempts         int
+	recoveryNoProgress       int
+	recoveryManifestStarted  bool
 	// pendingRecoveryRelease retains an exact terminal owner token when Host
 	// release fails. Scheduler queue capacity never owns this obligation.
 	pendingRecoveryRelease  *OwnershipToken
@@ -2026,7 +2030,7 @@ func (m *Manager) updateWithinAuthorizedCommit(e *entry, fn func(*domain.Recordi
 		return err
 	}
 	if err := m.store.SaveRecording(next); err != nil {
-		return errors.New("recording metadata persistence failed")
+		return newStorageStageError("recording root commit", err)
 	}
 	e.mu.Lock()
 	e.recording = next
@@ -2109,6 +2113,7 @@ func (m *Manager) retainTerminalRecoveryOwner(e *entry, owner OwnershipToken) bo
 }
 
 func (m *Manager) fail(e *entry, err error) {
+	m.recordStorageFailureDiagnostic(e, err)
 	safe := safeFailureDescription(err)
 	if updateErr := m.update(e, func(r *domain.Recording) error {
 		if errors.Is(err, errStorageCommit) {
@@ -2137,6 +2142,40 @@ func (m *Manager) fail(e *entry, err error) {
 	m.setTerminalError(e, errors.New(safe))
 }
 
+func (m *Manager) recordStorageFailureDiagnostic(e *entry, err error) {
+	var stagedError interface{ Stage() string }
+	if errors.Is(err, errStorageCommit) || (errors.As(err, &stagedError) && stagedError.Stage() != "") {
+		e.mu.Lock()
+		firstStorageFailure := e.storageFailureDiagnostic == nil
+		if firstStorageFailure {
+			e.storageFailureDiagnostic = err
+		}
+		e.mu.Unlock()
+		if firstStorageFailure {
+			logStorageCommitFailure(err)
+		}
+	}
+}
+
+func logStorageCommitFailure(err error) {
+	var stages []string
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		if staged, ok := current.(interface{ Stage() string }); ok && staged.Stage() != "" {
+			stages = append(stages, staged.Stage())
+		}
+	}
+	var attempts int
+	var retryFailure interface{ Attempts() int }
+	if errors.As(err, &retryFailure) {
+		attempts = retryFailure.Attempts()
+	}
+	var types []string
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		types = append(types, fmt.Sprintf("%T", current))
+	}
+	log.Printf("recording storage commit diagnostic: stages=%q attempts=%d error_types=%q error=%v", stages, attempts, types, err)
+}
+
 func (m *Manager) setTerminalError(e *entry, err error) {
 	if err == nil {
 		return
@@ -2160,6 +2199,17 @@ func safeFailureDescription(err error) string {
 		return "recording stopped"
 	}
 	return "recording acquisition failed"
+}
+
+func sanitizedPersistenceError(err error) error {
+	if errors.Is(err, errStorageCommit) {
+		return errors.New("recording storage commit failed")
+	}
+	var staged interface{ Stage() string }
+	if errors.As(err, &staged) && staged.Stage() != "" {
+		return errors.New("recording metadata persistence failed")
+	}
+	return err
 }
 
 // clone ensures API callers cannot mutate state protected by the manager.

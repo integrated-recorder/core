@@ -36,11 +36,37 @@ const (
 )
 
 var (
-	ErrIngestClosed       = errors.New("storage ingest service is closed")
-	ErrIngestTooLarge     = errors.New("ingest payload exceeds size limit")
-	ErrIngestReservation  = errors.New("ingest payload exceeded its reserved byte budget")
-	ErrIngestSizeMismatch = ErrPayloadSizeMismatch
+	ErrIngestClosed          = errors.New("storage ingest service is closed")
+	ErrIngestTooLarge        = errors.New("ingest payload exceeds size limit")
+	ErrIngestReservation     = errors.New("ingest payload exceeded its reserved byte budget")
+	ErrIngestSizeMismatch    = ErrPayloadSizeMismatch
+	ErrCanonicalCommitFailed = errors.New("canonical storage commit failed")
 )
+
+type canonicalCommitFailure struct {
+	attempts int
+	cause    error
+}
+
+type attemptCountedError interface {
+	error
+	Attempts() int
+}
+
+func (e *canonicalCommitFailure) Error() string {
+	if e.cause == nil {
+		return fmt.Sprintf("canonical storage commit failed after bounded retries (%d attempts): persistence callback returned no error", e.attempts)
+	}
+	return fmt.Sprintf("canonical storage commit failed after bounded retries (%d attempts): %v", e.attempts, e.cause)
+}
+
+func (e *canonicalCommitFailure) Is(target error) bool {
+	return target == ErrCanonicalCommitFailed
+}
+
+func (e *canonicalCommitFailure) Unwrap() error { return e.cause }
+
+func (e *canonicalCommitFailure) Attempts() int { return e.attempts }
 
 // RuntimeIngestCoordinator is the transport-neutral process-wide accounting
 // contract used when multiple recorder-engine generations share one Runtime
@@ -726,7 +752,7 @@ slotAcquired:
 		if err := s.global.AcquireQueue(context.Background(), job.queueLease); err != nil {
 			_ = s.releaseGlobalQueue(job)
 			<-s.slots
-			return errors.New("global storage queue is unavailable")
+			return fmt.Errorf("global storage queue is unavailable: %w", err)
 		}
 	}
 	s.mu.Lock()
@@ -764,7 +790,7 @@ func (s *IngestService) writer() {
 			_ = s.releaseGlobalQueue(job)
 		} else if s.global != nil {
 			if acquireErr := s.global.AcquireWriter(context.Background(), job.writerLease); acquireErr != nil {
-				err = errors.New("global storage writer is unavailable")
+				err = fmt.Errorf("global storage writer is unavailable: %w", acquireErr)
 				_ = s.releaseGlobalWriter(job)
 				_ = s.releaseGlobalQueue(job)
 			} else {
@@ -828,26 +854,28 @@ func (s *IngestService) releaseGlobalWriter(job *ingestJob) error {
 
 func (s *IngestService) persistWithRetry(job *ingestJob) (PayloadResult, error) {
 	var result PayloadResult
-	var err error
+	var lastErr error
 	var data []byte
 	if job.payload != nil {
 		data = job.payload.data
 	}
-	for attempt := 0; attempt < s.options.PersistAttempts; attempt++ {
-		result, err = job.persist(data)
-		if err == nil {
+	attempts := 0
+	for attempts < s.options.PersistAttempts {
+		attempts++
+		result, lastErr = job.persist(data)
+		if lastErr == nil {
 			return result, nil
 		}
 		// Store payload callbacks already measure successful writes. Callback
 		// failures are counted here; avoid logging error contents or paths.
-		if attempt+1 == s.options.PersistAttempts {
+		if attempts == s.options.PersistAttempts {
 			break
 		}
-		delay := retryBackoff(s.options.RetryBase, s.options.RetryMaxBackoff, attempt)
+		delay := retryBackoff(s.options.RetryBase, s.options.RetryMaxBackoff, attempts-1)
 		timer := time.NewTimer(delay)
 		<-timer.C
 	}
-	return PayloadResult{}, errors.New("canonical storage commit failed after bounded retries")
+	return PayloadResult{}, &canonicalCommitFailure{attempts: attempts, cause: lastErr}
 }
 
 func retryBackoff(initial, maximum time.Duration, retryIndex int) time.Duration {

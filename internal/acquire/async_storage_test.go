@@ -191,6 +191,40 @@ type transientSegmentRootBackend struct {
 	failures atomic.Int32
 }
 
+type permanentSegmentRootBackend struct {
+	storage.StorageBackend
+	segments int
+	cause    error
+	failed   atomic.Bool
+}
+
+func (b *permanentSegmentRootBackend) SaveRecording(recording *domain.Recording) error {
+	if track := recording.Tracks["main"]; track != nil && len(track.Segments) == b.segments && b.failed.CompareAndSwap(false, true) {
+		return b.cause
+	}
+	return b.StorageBackend.SaveRecording(recording)
+}
+
+func (b *permanentSegmentRootBackend) LoadSidecar(id, relativePath string, maxBytes int64, output any) error {
+	reader, ok := b.StorageBackend.(interface {
+		LoadSidecar(string, string, int64, any) error
+	})
+	if !ok {
+		return storage.ErrSidecarReadUnsupported
+	}
+	return reader.LoadSidecar(id, relativePath, maxBytes, output)
+}
+
+func (b *permanentSegmentRootBackend) CreateRecordingWithSidecar(recording *domain.Recording, relativePath string, value any) error {
+	creator, ok := b.StorageBackend.(interface {
+		CreateRecordingWithSidecar(*domain.Recording, string, any) error
+	})
+	if !ok {
+		return storage.ErrAtomicRecordingCreationUnsupported
+	}
+	return creator.CreateRecordingWithSidecar(recording, relativePath, value)
+}
+
 func (b *transientSegmentRootBackend) SaveRecording(recording *domain.Recording) error {
 	if track := recording.Tracks["main"]; track != nil && len(track.Segments) > 0 && b.failures.CompareAndSwap(0, 1) {
 		return errors.New("temporary root metadata write failure")
@@ -262,6 +296,139 @@ func TestTransientRootMetadataFailureDoesNotPoisonSuccessfulStorageRetry(t *test
 	path := stopped.Tracks["main"].Segments[0].StoragePath
 	if got, statErr := localStore.StatPayload(recording.ID, path); statErr != nil || !got.Regular || got.Size == 0 {
 		t.Fatalf("canonical segment after retry at %q = %#v, %v", path, got, statErr)
+	}
+}
+
+func TestPermanentRootCommitFailureRetainsInternalCauseAndSanitizesPublicError(t *testing.T) {
+	const segmentCount = 5
+	var requests atomic.Int32
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/live.m3u8" {
+			_, _ = fmt.Fprintln(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:21")
+			for sequence := 21; sequence < 21+segmentCount; sequence++ {
+				_, _ = fmt.Fprintf(w, "#EXTINF:1,\n%d.ts\n", sequence)
+			}
+			return
+		}
+		requests.Add(1)
+		_, _ = fmt.Fprintf(w, "canonical-source-%s", strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/"), ".ts"))
+	}))
+	defer server.Close()
+
+	localStore, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := storage.DefaultIngestOptions()
+	options.PersistAttempts = 1
+	options.Writers = 1
+	backendFailure := errors.New("synthetic root backend failure")
+	backend := &permanentSegmentRootBackend{
+		StorageBackend: localStore.StorageBackend,
+		segments:       segmentCount,
+		cause:          backendFailure,
+	}
+	store := &storage.Store{StorageBackend: backend}
+	if err := store.ConfigureIngestOptions(options); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, server.Client(), emptyResolver{}, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = manager.Close(ctx)
+	})
+	recording, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/live.m3u8"}, nil, "root failure", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		current, getErr := manager.Get(recording.ID)
+		if backend.failed.Load() || getErr == nil && current.State == domain.StateInterrupted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !backend.failed.Load() {
+		current, getErr := manager.Get(recording.ID)
+		if getErr != nil {
+			t.Fatalf("backend root failure was not reached; recording read failed: %v", getErr)
+		}
+		t.Fatalf("backend root failure was not reached; state=%s segment_count=%d requests=%d", current.State, current.SegmentCount(), requests.Load())
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		current, getErr := manager.Get(recording.ID)
+		return getErr == nil && current.State == domain.StateInterrupted
+	}, "permanent root commit failure terminal state")
+
+	current, err := manager.Get(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.LastError != "recording storage commit failed" {
+		t.Fatalf("public LastError=%q, want sanitized storage error", current.LastError)
+	}
+	if got := current.SegmentCount(); got != segmentCount-1 {
+		t.Fatalf("canonical segment count=%d, want=%d", got, segmentCount-1)
+	}
+	if len(current.Gaps) != 0 {
+		t.Fatalf("storage failure created source gaps: %#v", current.Gaps)
+	}
+	track := current.Tracks["main"]
+	if len(track.PendingSegments) != 0 || len(track.PendingSequences) != 0 {
+		t.Fatalf("storage failure left pending source observations: %#v", track)
+	}
+
+	e, ok := manager.entry(recording.ID)
+	if !ok {
+		t.Fatal("recording entry disappeared")
+	}
+	e.mu.Lock()
+	diagnostic := e.storageFailureDiagnostic
+	e.mu.Unlock()
+	if diagnostic == nil {
+		t.Fatal("internal storage failure diagnostic is missing")
+	}
+	if !errors.Is(diagnostic, errStorageCommit) || !errors.Is(diagnostic, backendFailure) {
+		t.Fatalf("diagnostic lost classification or backend cause: %v", diagnostic)
+	}
+	if !strings.Contains(diagnostic.Error(), "media payload commit") || !strings.Contains(diagnostic.Error(), "recording root commit") {
+		t.Fatalf("diagnostic lost commit stage: %v", diagnostic)
+	}
+	var retryFailure interface{ Attempts() int }
+	if !errors.As(diagnostic, &retryFailure) || retryFailure.Attempts() != 1 {
+		t.Fatalf("diagnostic retry attempts missing or incorrect: %v", diagnostic)
+	}
+	if got := safeFailureDescription(diagnostic); got != "recording storage commit failed" {
+		t.Fatalf("public sanitizer exposed internal diagnostic: %q", got)
+	}
+	if !backend.failed.Load() || requests.Load() == 0 {
+		t.Fatalf("root failure or source fetch did not occur: failed=%t requests=%d", backend.failed.Load(), requests.Load())
+	}
+	if _, err := manager.Stop(recording.ID); err == nil || err.Error() != "recording storage commit failed" {
+		t.Fatalf("Stop error=%v, want sanitized storage error", err)
+	}
+}
+
+func TestSchedulerStorageFailureRetainsStageAndCause(t *testing.T) {
+	cause := errors.New("synthetic scheduler commit cause")
+	scheduler := &segmentScheduler{e: &entry{}, changed: make(chan struct{}), cancel: func() {}}
+	scheduler.failStorage("manifest snapshot commit", cause)
+
+	failure := scheduler.failure()
+	if !errors.Is(failure, errStorageCommit) || !errors.Is(failure, cause) {
+		t.Fatalf("scheduler failure lost classification or cause: %v", failure)
+	}
+	var staged interface{ Stage() string }
+	if !errors.As(failure, &staged) || staged.Stage() != "manifest snapshot commit" {
+		t.Fatalf("scheduler failure stage=%v, want manifest snapshot commit", failure)
+	}
+	if got := safeFailureDescription(failure); got != "recording storage commit failed" {
+		t.Fatalf("public sanitizer exposed scheduler cause: %q", got)
 	}
 }
 

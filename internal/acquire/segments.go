@@ -75,6 +75,86 @@ var (
 	errStorageCommit = errors.New("canonical storage commit failed")
 )
 
+// storageCommitFailure keeps storage classification and the internal failure
+// stage while preserving the underlying commit error for diagnostics.
+type storageCommitFailure struct {
+	stage string
+	cause error
+}
+
+// storageStageError adds internal operation context without changing existing
+// failure classification for callers that handle canonical commits.
+type storageStageError struct {
+	stage string
+	cause error
+}
+
+func newStorageStageError(stage string, cause error) error {
+	if cause == nil {
+		cause = errors.New("storage commit cause unavailable")
+	}
+	return &storageStageError{stage: stage, cause: cause}
+}
+
+func newStorageCommitFailure(stage string, cause error) error {
+	if cause == nil {
+		cause = errors.New("storage commit cause unavailable")
+	}
+	return &storageCommitFailure{stage: stage, cause: cause}
+}
+
+func (e *storageCommitFailure) Error() string {
+	if e == nil {
+		return errStorageCommit.Error()
+	}
+	if e.cause == nil {
+		return fmt.Sprintf("%s: %s", errStorageCommit, e.stage)
+	}
+	return fmt.Sprintf("%s: %s: %v", errStorageCommit, e.stage, e.cause)
+}
+
+func (e *storageCommitFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *storageCommitFailure) Is(target error) bool {
+	return target == errStorageCommit
+}
+
+func (e *storageCommitFailure) Stage() string {
+	if e == nil {
+		return ""
+	}
+	return e.stage
+}
+
+func (e *storageStageError) Error() string {
+	if e == nil {
+		return "storage commit stage unavailable"
+	}
+	if e.cause == nil {
+		return e.stage
+	}
+	return fmt.Sprintf("%s: %v", e.stage, e.cause)
+}
+
+func (e *storageStageError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *storageStageError) Stage() string {
+	if e == nil {
+		return ""
+	}
+	return e.stage
+}
+
 type epochMarker struct {
 	ordinal               uint64
 	discontinuitySequence uint64
@@ -356,7 +436,7 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 		s.signalLocked()
 		s.mu.Unlock()
 		if persistErr != nil {
-			s.failStorage()
+			s.failStorage("manifest snapshot commit", persistErr)
 		}
 	})
 	if err != nil {
@@ -372,7 +452,7 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 			}
 			return err
 		}
-		return fmt.Errorf("%w: manifest snapshot persistence queue unavailable", errStorageCommit)
+		return newStorageCommitFailure("manifest snapshot queue submission", err)
 	}
 	return nil
 }
@@ -407,7 +487,7 @@ func (s *segmentScheduler) queueRecordingCommit() error {
 				return errors.New("recording state could not be copied")
 			}
 			if err := s.manager.store.SaveRecording(current); err != nil {
-				return errors.New("recording metadata persistence failed")
+				return newStorageStageError("recording root commit", err)
 			}
 			return nil
 		})
@@ -418,7 +498,7 @@ func (s *segmentScheduler) queueRecordingCommit() error {
 		s.signalLocked()
 		s.mu.Unlock()
 		if commitErr != nil {
-			s.failStorage()
+			s.failStorage("recording metadata commit", commitErr)
 		}
 	})
 	if err == nil {
@@ -435,7 +515,7 @@ func (s *segmentScheduler) queueRecordingCommit() error {
 		}
 		return err
 	}
-	return fmt.Errorf("%w: recording metadata queue unavailable", errStorageCommit)
+	return newStorageCommitFailure("recording metadata queue submission", err)
 }
 
 func (s *segmentScheduler) recordingSnapshot() *domain.Recording {
@@ -704,7 +784,7 @@ func (s *segmentScheduler) worker(burst bool) {
 		}
 		if errors.Is(err, errStorageCommit) {
 			s.mu.Unlock()
-			s.failStorage()
+			s.failStorage("segment acquisition commit", err)
 			continue
 		}
 		if err == nil {
@@ -966,7 +1046,7 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 	}, func(_ storage.PayloadResult, persistErr error) {
 		defer s.wg.Done()
 		if persistErr != nil {
-			s.failStorage()
+			s.failStorage("media payload commit", persistErr)
 			return
 		}
 		s.mu.Lock()
@@ -989,7 +1069,7 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 		if s.ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			return err
 		}
-		return fmt.Errorf("%w: persistence queue unavailable", errStorageCommit)
+		return newStorageCommitFailure("media payload queue submission", err)
 	}
 	// IngestService now owns payload and will release its reservation after the
 	// canonical commit callback. Prevent the local deferred cleanup from racing
@@ -1027,7 +1107,7 @@ func (s *segmentScheduler) persistSegmentFrom(segment domain.Segment, initDepend
 	if initDependency != nil {
 		<-initDependency.done
 		if initDependency.err != nil {
-			return storage.PayloadResult{}, errStorageCommit
+			return storage.PayloadResult{}, newStorageCommitFailure("init payload dependency", initDependency.err)
 		}
 	}
 	if s.manager.storageWriteHook != nil {
@@ -1231,7 +1311,7 @@ func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epo
 		s.signalLocked()
 		s.mu.Unlock()
 		if persistErr != nil {
-			s.failStorage()
+			s.failStorage("init payload commit", persistErr)
 		}
 	})
 	if err != nil {
@@ -1309,8 +1389,8 @@ func (s *segmentScheduler) failFatal(err error) {
 	s.cancel()
 }
 
-func (s *segmentScheduler) failStorage() {
-	s.failFatal(errStorageCommit)
+func (s *segmentScheduler) failStorage(stage string, cause error) {
+	s.failFatal(newStorageCommitFailure(stage, cause))
 }
 
 func (s *segmentScheduler) drain(ctx context.Context) error {

@@ -241,7 +241,7 @@ func TestHandoverPauseDrainsAutomaticHistoricalRecovery(t *testing.T) {
 	if err := manager.ConfigureCanonicalCommitFence(owners); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.ConfigureTerminalOwnerRelease(owners.Release); err != nil {
+	if err := manager.ConfigureTerminalOwnerRelease(func(_ context.Context, owner OwnershipToken) error { return owners.Release(owner) }); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.ConfigureAutomaticArchiveRecovery(func(_ context.Context, id string) (OwnershipToken, error) {

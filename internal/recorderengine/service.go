@@ -214,8 +214,8 @@ func (e *Engine) ConfigureRecordingOwnerClient(client recordingOwnerClient) erro
 	}
 	e.ownerClient = client
 	e.mu.Unlock()
-	if err := e.manager.ConfigureTerminalOwnerRelease(func(owner acquire.OwnershipToken) error {
-		return e.releaseOwner(context.Background(), owner)
+	if err := e.manager.ConfigureTerminalOwnerRelease(func(ctx context.Context, owner acquire.OwnershipToken) error {
+		return e.releaseOwner(ctx, owner)
 	}); err != nil {
 		e.mu.Lock()
 		e.ownerClient = nil
@@ -689,6 +689,13 @@ func (e *Engine) releaseOwner(ctx context.Context, owner recordingowner.Owner) e
 	releaseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := e.ownerClient.ReleaseRecording(releaseCtx, owner); err != nil {
+		if errors.Is(err, recordingowner.ErrStaleOwner) || errors.Is(err, recordingowner.ErrNotFound) {
+			// Host already advanced or removed this exact owner. Drop only its
+			// local map entry so it cannot block a later generation claim.
+			if current, ok := e.owners[owner.RecordingID]; ok && current == owner {
+				delete(e.owners, owner.RecordingID)
+			}
+		}
 		return err
 	}
 	delete(e.owners, owner.RecordingID)

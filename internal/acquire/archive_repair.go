@@ -12,7 +12,7 @@ import (
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
-const maxHistoricalRepairSegments = 128
+const maxHistoricalRecoveryWorkPerPass = 128
 
 type historicalRepairProgress struct {
 	failed       int
@@ -82,7 +82,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 			return nil
 		}); err != nil {
 			if ownerAdopted {
-				_ = m.releaseRepairOwner(e, owner)
+				if releaseErr := m.releaseRepairOwner(ctx, e, owner); releaseErr != nil {
+					return errors.Join(err, releaseErr)
+				}
 			}
 			return err
 		}
@@ -91,7 +93,7 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				if !ownerAdopted {
 					return
 				}
-				if releaseErr := m.releaseRepairOwner(e, owner); returnErr == nil && releaseErr != nil {
+				if releaseErr := m.releaseRepairOwner(ctx, e, owner); returnErr == nil && releaseErr != nil {
 					returnErr = releaseErr
 				}
 			}()
@@ -201,11 +203,16 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 		return errors.New("main track is missing")
 	}
 	candidateCapacity := len(playlist.Segments)
-	if candidateCapacity > maxHistoricalRepairSegments {
-		candidateCapacity = maxHistoricalRepairSegments
+	if candidateCapacity > maxHistoricalRecoveryWorkPerPass {
+		candidateCapacity = maxHistoricalRecoveryWorkPerPass
 	}
-	candidates := make([]hls.MediaSegment, 0, candidateCapacity)
+	type recoveryCandidate struct {
+		source hls.MediaSegment
+	}
+	candidates := make([]recoveryCandidate, 0, candidateCapacity)
 	selected := historicalAvailabilitySelection(media.HistoricalAvailability, playlist.Segments, time.Now())
+	work := 0
+	plannedInit := make(map[string]struct{})
 	for index, source := range playlist.Segments {
 		if !selected[index] {
 			continue
@@ -225,22 +232,50 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				progress.knownMissing++
 				progress.needsRecheck = true
 			}
-			if state != archiveindex.CoverageKnownMissing {
-				if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), coordinate, archiveindex.CoverageKnownMissing, "source manifest declared media missing"); err != nil {
-					return err
-				}
+			if state == archiveindex.CoverageKnownMissing {
+				continue
 			}
+			if work == maxHistoricalRecoveryWorkPerPass {
+				if progress != nil {
+					progress.more = true
+				}
+				break
+			}
+			if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), coordinate, archiveindex.CoverageKnownMissing, "source manifest declared media missing"); err != nil {
+				return err
+			}
+			work++
 			continue
 		}
-		candidates = append(candidates, source)
-		if len(candidates) == maxHistoricalRepairSegments {
+		candidateCost := 1 // one media coordinate, including failure publication
+		initID := ""
+		if source.Init != nil && historicalInitIdentity(rootTrack, source, epoch) == "" {
+			initID = initSegmentID(*source.Init, epoch, source.DiscontinuitySequence)
+			asset := domain.Segment{
+				TrackID: trackID, Sequence: source.Sequence, SourceEpoch: epoch,
+				DiscontinuitySequence: source.DiscontinuitySequence,
+				SourceURI:             source.Init.URI, ByteRange: cloneRange(source.Init.ByteRange), IsInit: true,
+			}
+			if _, exists := findRootSegment(root, coordinateForSegment(identity.ID, asset)); !exists {
+				if _, alreadyPlanned := plannedInit[initID]; !alreadyPlanned {
+					candidateCost++
+				}
+			}
+		}
+		if work+candidateCost > maxHistoricalRecoveryWorkPerPass {
 			if progress != nil {
-				progress.more = hasLaterSelectedHistoricalCandidate(playlist.Segments, selected, index+1)
+				progress.more = true
 			}
 			break
 		}
+		work += candidateCost
+		if initID != "" {
+			plannedInit[initID] = struct{}{}
+		}
+		candidates = append(candidates, recoveryCandidate{source: source})
 	}
-	for _, source := range candidates {
+	for _, candidate := range candidates {
+		source := candidate.source
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -429,6 +464,12 @@ func (m *Manager) refreshMediaAtGenerationOwned(ctx context.Context, e *entry, c
 	if updatedScheduler != nil {
 		updatedScheduler.noteMediaGeneration(nextGeneration)
 	}
+	if nextGeneration != expectedGeneration {
+		// A refreshed historical manifest/context can expose work that the
+		// current pass could not see. Promote any delayed retry after publishing
+		// the new media generation.
+		m.signalAutomaticArchiveRecovery(recordingID(e))
+	}
 	return copy, nextGeneration, nil
 }
 
@@ -453,7 +494,7 @@ func (m *Manager) SealArchive(owner OwnershipToken, id string) (returnErr error)
 		if !ownerAdopted {
 			return
 		}
-		if releaseErr := m.releaseRepairOwner(e, owner); returnErr == nil && releaseErr != nil {
+		if releaseErr := m.releaseRepairOwner(context.Background(), e, owner); returnErr == nil && releaseErr != nil {
 			returnErr = releaseErr
 		}
 	}()
@@ -771,7 +812,7 @@ func (m *Manager) recordHistoricalCoverage(e *entry, owner *OwnershipToken, term
 	})
 }
 
-func (m *Manager) releaseRepairOwner(e *entry, owner OwnershipToken) error {
+func (m *Manager) releaseRepairOwner(ctx context.Context, e *entry, owner OwnershipToken) error {
 	e.mu.Lock()
 	terminal := e.recording != nil && e.recording.State != domain.StateRecording && sameOwner(e.ownership, owner)
 	e.mu.Unlock()
@@ -784,7 +825,7 @@ func (m *Manager) releaseRepairOwner(e *entry, owner OwnershipToken) error {
 	if release == nil {
 		return ErrCanonicalFenceRequired
 	}
-	if err := release(owner); err != nil {
+	if err := release(ctx, owner); err != nil {
 		return err
 	}
 	e.mu.Lock()

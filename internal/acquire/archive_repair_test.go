@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -76,6 +77,7 @@ func (f *repairOwnerFence) Release(owner OwnershipToken) error {
 type repairFixtureTransport struct {
 	mu            sync.Mutex
 	manifest      []byte
+	manifests     map[string][]byte
 	objects       map[string][]byte
 	failPath      string
 	failRemaining int
@@ -142,7 +144,9 @@ func (t *repairFixtureTransport) RoundTrip(request *http.Request) (*http.Respons
 	}
 	status := http.StatusOK
 	var body []byte
-	if request.URL.Path == "/archive/index.m3u8" {
+	if manifest, ok := t.manifests[request.URL.Path]; ok {
+		body = append([]byte(nil), manifest...)
+	} else if request.URL.Path == "/archive/index.m3u8" {
 		body = append([]byte(nil), t.manifest...)
 	} else {
 		if request.URL.Path == t.failPath && t.failRemaining > 0 {
@@ -272,6 +276,92 @@ func newRepairTestRoot(t *testing.T, store *storage.Store, state domain.Recordin
 	return root
 }
 
+func newRecoveryFairnessRoot(t *testing.T, store *storage.Store, id string, media adapterproto.MediaSource) *domain.Recording {
+	t.Helper()
+	contextBytes, err := mediaContext(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	root := &domain.Recording{
+		FormatVersion: 1, ID: id, Title: "recovery fairness fixture", AdapterID: "fixture",
+		SourceURIClassification: "public", State: domain.StateCompleted, CreatedAt: now, StartedAt: now,
+		StoppedAt: &now, TimelineRevision: 1,
+		Tracks: map[string]*domain.Track{
+			"main": {ID: "main", SourceEpoch: 0, SourcePlaylistURL: media.ManifestURL, NextArchiveOrdinal: 1,
+				Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
+		},
+	}
+	if err := store.CreateRecording(root); err != nil {
+		t.Fatal(err)
+	}
+	contextDoc, err := newAcquisitionContextSidecar(contextBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSidecar(root.ID, acquisitionContextPath, contextDoc); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+type repairMultiOwnerFence struct {
+	mu      sync.Mutex
+	current map[string]OwnershipToken
+	last    map[string]uint64
+}
+
+func newRepairMultiOwnerFence() *repairMultiOwnerFence {
+	return &repairMultiOwnerFence{current: make(map[string]OwnershipToken), last: make(map[string]uint64)}
+}
+
+func (f *repairMultiOwnerFence) WithCommit(owner OwnershipToken, commit func() error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	current, exists := f.current[owner.RecordingID]
+	if !exists {
+		if owner.Epoch <= f.last[owner.RecordingID] {
+			return ErrInvalidOwnershipToken
+		}
+	} else if current != owner {
+		return ErrInvalidOwnershipToken
+	}
+	if err := commit(); err != nil {
+		return err
+	}
+	f.current[owner.RecordingID] = owner
+	return nil
+}
+
+func (f *repairMultiOwnerFence) WithUnownedCommit(_ string, commit func() error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return commit()
+}
+
+func (f *repairMultiOwnerFence) WithFencedRecovery(recover func() error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, owner := range f.current {
+		if owner.Epoch > f.last[id] {
+			f.last[id] = owner.Epoch
+		}
+	}
+	f.current = make(map[string]OwnershipToken)
+	return recover()
+}
+
+func (f *repairMultiOwnerFence) Release(owner OwnershipToken) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if current, exists := f.current[owner.RecordingID]; !exists || current != owner {
+		return ErrInvalidOwnershipToken
+	}
+	f.last[owner.RecordingID] = owner.Epoch
+	delete(f.current, owner.RecordingID)
+	return nil
+}
+
 func newRepairTestManager(t *testing.T, store *storage.Store, fixture *repairFixtureTransport, root *domain.Recording, fence *repairOwnerFence, validate SourceValidator) (*Manager, *entry, func() error) {
 	t.Helper()
 	if validate == nil {
@@ -290,7 +380,7 @@ func newRepairTestManager(t *testing.T, store *storage.Store, fixture *repairFix
 	if err := manager.ConfigureCanonicalCommitFence(fence); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.ConfigureTerminalOwnerRelease(fence.Release); err != nil {
+	if err := manager.ConfigureTerminalOwnerRelease(func(_ context.Context, owner OwnershipToken) error { return fence.Release(owner) }); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := store.LoadRecordingReadOnly(root.ID)
@@ -405,6 +495,200 @@ func TestAutomaticArchiveRecoveryRepairsLatePrefixWithoutManualPass(t *testing.T
 	if stillOwned {
 		t.Fatal("Manager.Close retained terminal owner after recovery scheduler stopped")
 	}
+}
+
+func TestHistoricalGapOnlyPassUsesBoundedRecoveryWorkAndContinues(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const gapCount = 129
+	var manifest strings.Builder
+	fmt.Fprintf(&manifest, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n")
+	for sequence := 1; sequence <= gapCount; sequence++ {
+		fmt.Fprintf(&manifest, "#EXTINF:2,\n#EXT-X-GAP\nsegment-%d.m4s\n", sequence)
+	}
+	media := repairMediaContextForTest()
+	media.HistoricalAvailability.SequenceRanges = []adapterproto.HistoricalSequenceRange{{Start: 1, End: gapCount}}
+	fixture := &repairFixtureTransport{manifest: []byte(manifest.String()), objects: map[string][]byte{}}
+	root := newRepairTestRoot(t, store, domain.StateCompleted, media)
+	root.Gaps = nil
+	if err := store.SaveRecording(root); err != nil {
+		t.Fatal(err)
+	}
+	fence := &repairOwnerFence{}
+	manager, e, closeManager := newRepairTestManager(t, store, fixture, root, fence, nil)
+	e.mu.Lock()
+	e.media = media
+	e.recording.Gaps = nil
+	e.mu.Unlock()
+	owner := ownerForRepair(root.ID, 1)
+	first, err := manager.repairDeclaredHistoryPass(context.Background(), owner, root.ID)
+	if err != nil {
+		t.Fatalf("first bounded GAP pass: %v", err)
+	}
+	if !first.more {
+		t.Fatal("GAP-only manifest did not request continuation after work budget")
+	}
+	inventory, err := manager.ArchiveInventory(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countMissing := func() int {
+		missing := 0
+		for sequence := uint64(1); sequence <= gapCount; sequence++ {
+			coordinate := archiveindex.Coordinate{SessionID: inventory.Session.ID, TrackID: "main", DiscontinuitySequence: 0, Sequence: sequence, Kind: archiveindex.ObjectMedia}
+			if archiveindex.CoverageAt(inventory, coordinate) == archiveindex.CoverageKnownMissing {
+				missing++
+			}
+		}
+		return missing
+	}
+	if count := countMissing(); count > maxHistoricalRecoveryWorkPerPass {
+		t.Fatalf("first pass published %d coordinate states, budget=%d", count, maxHistoricalRecoveryWorkPerPass)
+	}
+	for passes := 1; first.more && passes < 8; passes++ {
+		first, err = manager.repairDeclaredHistoryPass(context.Background(), owner, root.ID)
+		if err != nil {
+			t.Fatalf("GAP continuation pass %d: %v", passes+1, err)
+		}
+	}
+	if first.more {
+		t.Fatal("GAP-only manifest did not converge after bounded continuations")
+	}
+	inventory, err = manager.ArchiveInventory(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := countMissing(); count != gapCount {
+		t.Fatalf("GAP continuation did not make forward progress: coverage=%d want=%d", count, gapCount)
+	}
+	if err := closeManager(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAutomaticRecoveryGapOnlyPassYieldsToNextRecording(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		aID       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		bID       = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		gapCount  = 512
+		bManifest = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:2,\nb.ts\n#EXT-X-ENDLIST\n"
+	)
+	mediaA := repairMediaContextForTest()
+	mediaA.ManifestURL = "https://media.example/a/index.m3u8?hdnts=signed-value"
+	mediaA.HistoricalAvailability.SequenceRanges = []adapterproto.HistoricalSequenceRange{{Start: 1, End: gapCount}}
+	mediaB := repairMediaContextForTest()
+	mediaB.ManifestURL = "https://media.example/b/index.m3u8?hdnts=signed-value"
+	mediaB.HistoricalAvailability.SequenceRanges = []adapterproto.HistoricalSequenceRange{{Start: 1, End: 1}}
+	var gapManifest strings.Builder
+	gapManifest.WriteString("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n")
+	for sequence := 1; sequence <= gapCount; sequence++ {
+		fmt.Fprintf(&gapManifest, "#EXTINF:2,\n#EXT-X-GAP\nsegment-%d.ts\n", sequence)
+	}
+	fixture := &repairFixtureTransport{
+		manifests: map[string][]byte{
+			"/a/index.m3u8": []byte(gapManifest.String()),
+			"/b/index.m3u8": []byte(bManifest),
+		},
+		objects: map[string][]byte{"/b/b.m4v": []byte("recording-b-media")},
+	}
+	aRoot := newRecoveryFairnessRoot(t, store, aID, mediaA)
+	bRoot := newRecoveryFairnessRoot(t, store, bID, mediaB)
+	fence := newRepairMultiOwnerFence()
+	manager, err := NewManagerWithMode(store, &http.Client{Transport: fixture}, nil, func(_ context.Context, raw string) error {
+		parsed, parseErr := url.Parse(raw)
+		if parseErr != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || parsed.User != nil {
+			return errors.New("invalid fixture URL")
+		}
+		return nil
+	}, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureCanonicalCommitFence(fence); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureTerminalOwnerRelease(func(_ context.Context, owner OwnershipToken) error { return fence.Release(owner) }); err != nil {
+		t.Fatal(err)
+	}
+	manager.freshGeneration = false
+	for _, setup := range []struct {
+		root  *domain.Recording
+		media adapterproto.MediaSource
+	}{{aRoot, mediaA}, {bRoot, mediaB}} {
+		loaded, loadErr := store.LoadRecordingReadOnly(setup.root.ID)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		manager.entries[setup.root.ID] = &entry{recording: loaded, done: closedChannel(), adapterID: loaded.AdapterID, media: setup.media}
+	}
+	claim := func(_ context.Context, id string) (OwnershipToken, error) {
+		switch id {
+		case aID:
+			return ownerForRepair(id, 1), nil
+		case bID:
+			return ownerForRepair(id, 1), nil
+		default:
+			return OwnershipToken{}, errors.New("unexpected recording claim")
+		}
+	}
+	scheduler := newAutomaticRecoveryScheduler(manager, claim)
+	t.Cleanup(func() {
+		scheduler.cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if closeErr := manager.Close(ctx); closeErr != nil {
+			t.Errorf("close fairness manager: %v", closeErr)
+		}
+	})
+	fixedNow := time.Now()
+	scheduler.now = func() time.Time { return fixedNow }
+	scheduler.enqueue(aID, time.Time{})
+	scheduler.enqueue(bID, time.Time{})
+	firstID, firstItem, _, ok := scheduler.next()
+	if !ok || firstID != aID {
+		t.Fatalf("large history did not start first: id=%q ok=%v", firstID, ok)
+	}
+	aOutcome := scheduler.process(firstID, firstItem)
+	if !aOutcome.more {
+		t.Fatal("large GAP-only history did not yield a continuation")
+	}
+	aInventory, err := manager.ArchiveInventory(aID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aPublished := 0
+	for sequence := uint64(1); sequence <= gapCount; sequence++ {
+		coordinate := archiveindex.Coordinate{SessionID: aInventory.Session.ID, TrackID: "main", Sequence: sequence, Kind: archiveindex.ObjectMedia}
+		if archiveindex.CoverageAt(aInventory, coordinate) == archiveindex.CoverageKnownMissing {
+			aPublished++
+		}
+	}
+	if aPublished == 0 || aPublished > maxHistoricalRecoveryWorkPerPass {
+		t.Fatalf("A first pass mutations=%d, want 1..%d", aPublished, maxHistoricalRecoveryWorkPerPass)
+	}
+	scheduler.complete(firstID, firstItem, aOutcome)
+	secondID, secondItem, _, ok := scheduler.next()
+	if !ok || secondID != bID {
+		t.Fatalf("B did not run after A's bounded pass: id=%q ok=%v queue=%v", secondID, ok, scheduler.queue)
+	}
+	bOutcome := scheduler.process(secondID, secondItem)
+	if bOutcome.retry || bOutcome.more {
+		t.Fatalf("B's single fetchable coordinate did not finish: %+v", bOutcome)
+	}
+	currentB, err := manager.Get(bID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(currentB.Tracks["main"].Segments); got != 1 {
+		t.Fatalf("B persisted segments=%d, want 1 before A history drained", got)
+	}
+	scheduler.complete(secondID, secondItem, bOutcome)
 }
 
 func TestAutomaticArchiveRecoveryRetriesMiddleGapAfterBackoff(t *testing.T) {
@@ -605,7 +889,7 @@ func TestAutomaticArchiveRecoveryResumesAfterRestartWithoutRefetchingPresentClai
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restarted.ConfigureTerminalOwnerRelease(fenceAfterRestart.Release); err != nil {
+	if err := restarted.ConfigureTerminalOwnerRelease(func(_ context.Context, owner OwnershipToken) error { return fenceAfterRestart.Release(owner) }); err != nil {
 		t.Fatal(err)
 	}
 	requestsBeforeOwnerConfig := len(fixture.requestedURLs())
@@ -937,7 +1221,7 @@ func TestRepairDeclaredHistoryLegacyRootTransformRetryRestartAndSeal(t *testing.
 	if !conflictClaimFound {
 		t.Fatal("conflicting bytes were not retained at a distinct immutable path")
 	}
-	if err := manager.releaseRepairOwner(e, thirdOwner); err != nil {
+	if err := manager.releaseRepairOwner(context.Background(), e, thirdOwner); err != nil {
 		t.Fatal(err)
 	}
 
@@ -962,7 +1246,7 @@ func TestRepairDeclaredHistoryLegacyRootTransformRetryRestartAndSeal(t *testing.
 	if err := manager2.ConfigureCanonicalCommitFence(fence2); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager2.ConfigureTerminalOwnerRelease(fence2.Release); err != nil {
+	if err := manager2.ConfigureTerminalOwnerRelease(func(_ context.Context, owner OwnershipToken) error { return fence2.Release(owner) }); err != nil {
 		t.Fatal(err)
 	}
 	manager2.entries[root.ID] = &entry{recording: loadedRoot, done: closedChannel(), adapterID: loadedRoot.AdapterID}
@@ -1189,7 +1473,7 @@ func TestSelectedClaimShardRetryPreservesHistoricalProvenance(t *testing.T) {
 			t.Fatalf("uncommitted orphan became visible after shard failure: %#v", item)
 		}
 	}
-	if err := manager.releaseRepairOwner(e, firstOwner); err != nil {
+	if err := manager.releaseRepairOwner(context.Background(), e, firstOwner); err != nil {
 		t.Fatal(err)
 	}
 	if err := closeManager(); err != nil {
@@ -1217,7 +1501,7 @@ func TestSelectedClaimShardRetryPreservesHistoricalProvenance(t *testing.T) {
 	if _, _, err := manager2.commitArchiveSegmentOwned(e2, &secondOwner, segment, archiveindex.ClaimHistorical, data, true); err == nil {
 		t.Fatal("expected injected root save failure after claim shard publication")
 	}
-	if err := manager2.releaseRepairOwner(e2, secondOwner); err != nil {
+	if err := manager2.releaseRepairOwner(context.Background(), e2, secondOwner); err != nil {
 		t.Fatal(err)
 	}
 	inventoryBeforeRetry, err := manager2.ArchiveInventory(root.ID)
@@ -1251,7 +1535,7 @@ func TestSelectedClaimShardRetryPreservesHistoricalProvenance(t *testing.T) {
 		t.Fatalf("retry changed selected immutable object: %#v", selected)
 	}
 	assertStoredPayload(t, store, root.ID, selected.StoragePath, data)
-	if err := manager3.releaseRepairOwner(e3, thirdOwner); err != nil {
+	if err := manager3.releaseRepairOwner(context.Background(), e3, thirdOwner); err != nil {
 		t.Fatal(err)
 	}
 	inventory, err := manager3.ArchiveInventory(root.ID)

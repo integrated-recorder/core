@@ -92,6 +92,12 @@ type entry struct {
 	recoveryAttempts        int
 	recoveryNoProgress      int
 	recoveryManifestStarted bool
+	// pendingRecoveryRelease retains an exact terminal owner token when Host
+	// release fails. Scheduler queue capacity never owns this obligation.
+	pendingRecoveryRelease  *OwnershipToken
+	recoveryReleaseDue      time.Time
+	recoveryReleaseAttempts int
+	recoveryAfterRelease    bool
 	handoverGate            chan struct{}
 	handoverWake            chan struct{}
 	// recoveryGate serializes historical commits with source handover. The
@@ -128,7 +134,7 @@ type Manager struct {
 	startsDone           chan struct{}
 	canonicalFence       CanonicalCommitFence
 	startAttempted       bool
-	terminalOwnerRelease func(OwnershipToken) error
+	terminalOwnerRelease func(context.Context, OwnershipToken) error
 	autoRecovery         *automaticRecoveryScheduler
 
 	// fetchBoundaryHook is a deterministic test seam for scheduler-owned
@@ -313,7 +319,7 @@ func (m *Manager) ConfigureCanonicalCommitFence(fence CanonicalCommitFence) erro
 // ConfigureTerminalOwnerRelease installs the Host callback used after a
 // worker has durably published its terminal state. It must be configured
 // before the manager admits any Recording starts.
-func (m *Manager) ConfigureTerminalOwnerRelease(release func(OwnershipToken) error) error {
+func (m *Manager) ConfigureTerminalOwnerRelease(release func(context.Context, OwnershipToken) error) error {
 	if m == nil || release == nil {
 		return ErrCanonicalFenceRequired
 	}
@@ -1776,17 +1782,26 @@ func (m *Manager) Close(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	var releaseErrors []error
+	m.mu.RLock()
+	hasOwnerRelease := m.terminalOwnerRelease != nil
+	m.mu.RUnlock()
 	for _, worker := range waits {
 		worker.e.mu.Lock()
 		terminal := worker.e.recording != nil && worker.e.recording.State != domain.StateRecording
-		var owner *OwnershipToken
-		if terminal && worker.e.ownership != nil {
-			copy := *worker.e.ownership
-			owner = &copy
+		owners := make([]OwnershipToken, 0, 2)
+		if hasOwnerRelease && terminal && worker.e.pendingRecoveryRelease != nil {
+			owners = append(owners, *worker.e.pendingRecoveryRelease)
+		}
+		if hasOwnerRelease && terminal && worker.e.ownership != nil && (len(owners) == 0 || owners[0] != *worker.e.ownership) {
+			owners = append(owners, *worker.e.ownership)
 		}
 		worker.e.mu.Unlock()
-		if owner != nil {
-			_ = m.releaseAutomaticRecoveryOwner(worker.e, *owner)
+		for _, owner := range owners {
+			if err := m.releaseAutomaticRecoveryOwner(ctx, worker.e, owner); err != nil {
+				m.retainAutomaticRecoveryRelease(worker.e, owner, time.Time{}, false)
+				releaseErrors = append(releaseErrors, err)
+			}
 		}
 	}
 	var terminalErrors []error
@@ -1797,7 +1812,7 @@ func (m *Manager) Close(ctx context.Context) error {
 		}
 		worker.e.mu.Unlock()
 	}
-	return errors.Join(terminalErrors...)
+	return errors.Join(append(terminalErrors, releaseErrors...)...)
 }
 
 func (m *Manager) Get(id string) (*domain.Recording, error) {
@@ -2051,7 +2066,19 @@ func (m *Manager) run(ctx context.Context, e *entry, media adapterproto.MediaSou
 	release := m.terminalOwnerRelease
 	m.mu.RUnlock()
 	if owner != nil && terminal && release != nil && !m.retainTerminalRecoveryOwner(e, *owner) {
-		_ = m.releaseAutomaticRecoveryOwner(e, *owner)
+		m.mu.RLock()
+		closed := m.closed
+		scheduler := m.autoRecovery
+		m.mu.RUnlock()
+		if closed {
+			return
+		}
+		if err := m.releaseAutomaticRecoveryOwner(context.Background(), e, *owner); err != nil {
+			m.retainAutomaticRecoveryRelease(e, *owner, time.Time{}, false)
+			if scheduler != nil {
+				scheduler.retainAutomaticRecoveryReleaseForRetry(recordingID(e), *owner, false)
+			}
+		}
 	}
 }
 

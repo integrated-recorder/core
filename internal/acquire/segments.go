@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	minSegmentWorkers = 1
-	maxSegmentWorkers = 4
-	maxSegmentTasks   = 128
+	minSegmentWorkers         = 1
+	maxSegmentWorkers         = 4
+	maxSegmentTasks           = 128
+	maxCoordinatorTaskRetries = 8
 )
 
 type segmentTaskKey struct {
@@ -44,22 +45,24 @@ const (
 )
 
 type segmentTask struct {
-	key                segmentTaskKey
-	source             hls.MediaSegment
-	ordinal            uint64
-	available          bool
-	observed           bool
-	observedGeneration uint64
-	requiredGeneration uint64
-	awaitingManifest   bool
-	attempt            int
-	refreshCycles      int
-	state              segmentTaskState
-	timerToken         uint64
-	retryCancel        context.CancelFunc
-	preloaded          bool
-	stagedInitPayload  *storage.IngestPayload
-	stagedMediaPayload *storage.IngestPayload
+	key                     segmentTaskKey
+	source                  hls.MediaSegment
+	ordinal                 uint64
+	available               bool
+	observed                bool
+	observedGeneration      uint64
+	requiredGeneration      uint64
+	awaitingManifest        bool
+	attempt                 int
+	coordinatorRetries      int
+	coordinatorRetryPending bool
+	refreshCycles           int
+	state                   segmentTaskState
+	timerToken              uint64
+	retryCancel             context.CancelFunc
+	preloaded               bool
+	stagedInitPayload       *storage.IngestPayload
+	stagedMediaPayload      *storage.IngestPayload
 }
 
 type initFlight struct {
@@ -436,6 +439,11 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 		s.signalLocked()
 		s.mu.Unlock()
 		if persistErr != nil {
+			if errors.Is(persistErr, storage.ErrIngestCoordinatorUnavailable) {
+				// Snapshot observations are refreshed by the next manifest poll. A
+				// coordinator outage is not a canonical payload failure.
+				return
+			}
 			s.failStorage("manifest snapshot commit", persistErr)
 		}
 	})
@@ -446,6 +454,11 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 		s.signalLocked()
 		s.mu.Unlock()
 		payload.Release()
+		if errors.Is(err, storage.ErrIngestCoordinatorUnavailable) {
+			// The snapshot is an observation, not media evidence. The next
+			// manifest poll can publish a fresh snapshot after admission recovers.
+			return nil
+		}
 		if s.ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			if ctxErr := s.ctx.Err(); ctxErr != nil {
 				return ctxErr
@@ -497,6 +510,11 @@ func (s *segmentScheduler) queueRecordingCommit() error {
 		s.pendingMetadata--
 		s.signalLocked()
 		s.mu.Unlock()
+		if errors.Is(commitErr, storage.ErrIngestCoordinatorUnavailable) {
+			// A later manifest/segment commit will persist the current in-memory
+			// root. Do not report this pre-mutation lease outage as corruption.
+			return
+		}
 		if commitErr != nil {
 			s.failStorage("recording metadata commit", commitErr)
 		}
@@ -514,6 +532,11 @@ func (s *segmentScheduler) queueRecordingCommit() error {
 			return ctxErr
 		}
 		return err
+	}
+	if errors.Is(err, storage.ErrIngestCoordinatorUnavailable) {
+		// The root projection remains in memory. A later manifest or segment
+		// commit persists it after coordinator admission recovers.
+		return nil
 	}
 	return newStorageCommitFailure("recording metadata queue submission", err)
 }
@@ -609,6 +632,12 @@ func (s *segmentScheduler) observeAtGeneration(epoch uint64, playlist hls.MediaP
 		available := key.epoch == epoch && present[key.sequence] && !gaps[key.sequence]
 		if !available && (key.epoch < epoch || max > key.sequence || (key.epoch == epoch && gaps[key.sequence])) {
 			task.available = false
+			// A coordinator retry follows a completed fetch/admission attempt,
+			// not a source failure. Keep the task through its bounded retry even
+			// if the live playlist slides past it while the coordinator is down.
+			if (task.state == segmentTaskRetryWait || task.state == segmentTaskQueued) && task.coordinatorRetryPending {
+				continue
+			}
 			if task.state == segmentTaskRetryWait || task.state == segmentTaskQueued || task.state == segmentTaskAwaitManifest {
 				task.timerToken++
 				task.state = segmentTaskGapCommitting
@@ -763,6 +792,7 @@ func (s *segmentScheduler) worker(burst bool) {
 			continue
 		}
 		task.state = segmentTaskInFlight
+		task.coordinatorRetryPending = false
 		s.busy++
 		s.growIfSaturatedLocked()
 		s.signalLocked()
@@ -780,6 +810,14 @@ func (s *segmentScheduler) worker(burst bool) {
 		if errors.Is(err, errPersistQueued) {
 			s.signalLocked()
 			s.mu.Unlock()
+			continue
+		}
+		// Coordinator failures happen before canonical mutation. Keep the
+		// logical task and retry it after bounded backoff; do not report a
+		// storage corruption or turn the failure into a source fetch error.
+		if errors.Is(err, storage.ErrIngestCoordinatorUnavailable) {
+			s.mu.Unlock()
+			s.retryCoordinatorTask(task)
 			continue
 		}
 		if errors.Is(err, errStorageCommit) {
@@ -951,6 +989,59 @@ func (s *segmentScheduler) retryTimer(ctx context.Context, cancel context.Cancel
 	s.signalLocked()
 }
 
+func (s *segmentScheduler) retryCoordinatorTask(task *segmentTask) {
+	if task == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed || s.ctx.Err() != nil || s.tasks[task.key] != task {
+		s.mu.Unlock()
+		return
+	}
+	if task.coordinatorRetries >= maxCoordinatorTaskRetries {
+		s.mu.Unlock()
+		s.failCoordinator("segment persistence", storage.ErrIngestCoordinatorUnavailable)
+		return
+	}
+	task.coordinatorRetries++
+	task.state = segmentTaskRetryWait
+	task.coordinatorRetryPending = true
+	task.timerToken++
+	token := task.timerToken
+	delay := retryDelay(task.coordinatorRetries - 1)
+	timerCtx, timerCancel := context.WithCancel(s.ctx)
+	if task.retryCancel != nil {
+		task.retryCancel()
+	}
+	task.retryCancel = timerCancel
+	s.wg.Add(1)
+	s.signalLocked()
+	s.mu.Unlock()
+	go s.retryCoordinatorTimer(timerCtx, timerCancel, task, token, delay)
+}
+
+func (s *segmentScheduler) retryCoordinatorTimer(ctx context.Context, cancel context.CancelFunc, task *segmentTask, token uint64, delay time.Duration) {
+	defer s.wg.Done()
+	defer cancel()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.ctx.Err() != nil || s.tasks[task.key] != task || task.timerToken != token {
+		return
+	}
+	task.retryCancel = nil
+	task.state = segmentTaskQueued
+	s.ready = append(s.ready, task)
+	s.growIfSaturatedLocked()
+	s.signalLocked()
+}
+
 func (s *segmentScheduler) acquire(task *segmentTask) error {
 	s.mu.Lock()
 	s.e.mu.Lock()
@@ -1046,6 +1137,10 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 	}, func(_ storage.PayloadResult, persistErr error) {
 		defer s.wg.Done()
 		if persistErr != nil {
+			if errors.Is(persistErr, storage.ErrIngestCoordinatorUnavailable) {
+				s.retryCoordinatorTask(task)
+				return
+			}
 			s.failStorage("media payload commit", persistErr)
 			return
 		}
@@ -1067,6 +1162,9 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 			return nil
 		}
 		if s.ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return err
+		}
+		if errors.Is(err, storage.ErrIngestCoordinatorUnavailable) {
 			return err
 		}
 		return newStorageCommitFailure("media payload queue submission", err)
@@ -1107,6 +1205,9 @@ func (s *segmentScheduler) persistSegmentFrom(segment domain.Segment, initDepend
 	if initDependency != nil {
 		<-initDependency.done
 		if initDependency.err != nil {
+			if errors.Is(initDependency.err, storage.ErrIngestCoordinatorUnavailable) {
+				return storage.PayloadResult{}, initDependency.err
+			}
 			return storage.PayloadResult{}, newStorageCommitFailure("init payload dependency", initDependency.err)
 		}
 	}
@@ -1310,7 +1411,7 @@ func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epo
 		close(flight.done)
 		s.signalLocked()
 		s.mu.Unlock()
-		if persistErr != nil {
+		if persistErr != nil && !errors.Is(persistErr, storage.ErrIngestCoordinatorUnavailable) {
 			s.failStorage("init payload commit", persistErr)
 		}
 	})
@@ -1390,7 +1491,18 @@ func (s *segmentScheduler) failFatal(err error) {
 }
 
 func (s *segmentScheduler) failStorage(stage string, cause error) {
+	if errors.Is(cause, storage.ErrIngestCoordinatorUnavailable) {
+		s.failCoordinator(stage, cause)
+		return
+	}
 	s.failFatal(newStorageCommitFailure(stage, cause))
+}
+
+func (s *segmentScheduler) failCoordinator(stage string, cause error) {
+	if cause == nil {
+		cause = storage.ErrIngestCoordinatorUnavailable
+	}
+	s.failFatal(fmt.Errorf("storage coordinator unavailable during %s: %w", stage, cause))
 }
 
 func (s *segmentScheduler) drain(ctx context.Context) error {

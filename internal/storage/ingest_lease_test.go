@@ -179,18 +179,39 @@ func TestCoordinatorAcquireRetriesSameIDAndDoesNotPoisonRecording(t *testing.T) 
 
 	t.Run("explicit queue rejection does not leak local slot", func(t *testing.T) {
 		coordinator := newLeaseFaultCoordinator()
-		coordinator.fail("acquire_queue", leaseExplicitReject, leaseExplicitReject, leaseExplicitReject)
+		coordinator.fail("acquire_queue", repeatedFault(leaseExplicitReject, runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)...)
 		service := newSmallIngestWithCoordinator(t, coordinator)
 		if err := service.SubmitCommit(context.Background(), "queue-reject", func() error { return nil }, func(error) {}); !errors.Is(err, ErrIngestCoordinatorUnavailable) {
 			t.Fatalf("queue rejection = %v", err)
 		}
-		assertSameLeaseID(t, coordinator.callIDs("acquire_queue"), runtimeResourceOperationAttempts)
+		assertSameLeaseID(t, coordinator.callIDs("acquire_queue"), runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)
 		assertSameLeaseID(t, coordinator.callIDs("release_queue"), 1)
+		if coordinator.activeCount("acquire_queue") != 0 {
+			t.Fatal("queue lease remained after exhausted acquisition")
+		}
 		if got := service.Snapshot(); got.QueueObjects != 0 || got.QueueBytes != 0 || got.ActiveWriters != 0 {
 			t.Fatalf("local queue accounting drifted: %#v", got)
 		}
 		if err := waitCommit(t, service, coordinator, "queue-recover", func() error { return nil }); err != nil {
 			t.Fatalf("next queue acquisition did not progress: %v", err)
+		}
+	})
+
+	t.Run("queue retries after one transport batch", func(t *testing.T) {
+		coordinator := newLeaseFaultCoordinator()
+		coordinator.fail("acquire_queue", repeatedFault(leaseExplicitReject, runtimeResourceOperationAttempts)...)
+		service := newSmallIngestWithCoordinator(t, coordinator)
+		var commitCalls int
+		if err := waitCommit(t, service, coordinator, "queue-retry-batch", func() error {
+			commitCalls++
+			return nil
+		}); err != nil {
+			t.Fatalf("queue acquisition did not recover: %v", err)
+		}
+		assertSameLeaseID(t, coordinator.callIDs("acquire_queue"), runtimeResourceOperationAttempts+1)
+		assertSameLeaseID(t, coordinator.callIDs("release_queue"), 1)
+		if commitCalls != 1 || coordinator.activeCount("acquire_queue") != 0 {
+			t.Fatalf("queue retry commit calls=%d active=%d", commitCalls, coordinator.activeCount("acquire_queue"))
 		}
 	})
 
@@ -223,7 +244,7 @@ func TestCoordinatorAcquireRetriesSameIDAndDoesNotPoisonRecording(t *testing.T) 
 
 	t.Run("explicit writer rejection is transient and does not poison", func(t *testing.T) {
 		coordinator := newLeaseFaultCoordinator()
-		coordinator.fail("acquire_writer", leaseExplicitReject, leaseExplicitReject, leaseExplicitReject)
+		coordinator.fail("acquire_writer", repeatedFault(leaseExplicitReject, runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)...)
 		service := newSmallIngestWithCoordinator(t, coordinator)
 		var firstPersistCalls int
 		firstErr := waitCommit(t, service, coordinator, "writer-recover", func() error {
@@ -233,6 +254,7 @@ func TestCoordinatorAcquireRetriesSameIDAndDoesNotPoisonRecording(t *testing.T) 
 		if !errors.Is(firstErr, ErrIngestCoordinatorUnavailable) || errors.Is(firstErr, ErrCanonicalCommitFailed) || firstPersistCalls != 0 {
 			t.Fatalf("writer acquire failure = %v, callback calls=%d", firstErr, firstPersistCalls)
 		}
+		assertSameLeaseID(t, coordinator.callIDs("acquire_writer"), runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)
 		if err := waitCommit(t, service, coordinator, "writer-recover", func() error { return nil }); err != nil {
 			t.Fatalf("same recording stayed poisoned after transient acquire failure: %v", err)
 		}
@@ -240,6 +262,149 @@ func TestCoordinatorAcquireRetriesSameIDAndDoesNotPoisonRecording(t *testing.T) 
 			t.Fatalf("writer failure poisoned or drifted accounting: %#v", got)
 		}
 	})
+}
+
+func TestAcceptedPayloadRetriesTransientWriterAcquire(t *testing.T) {
+	coordinator := newLeaseFaultCoordinator()
+	// One complete callCoordinator cycle fails, followed by another transport
+	// failure. The accepted payload must remain queued until the same lease ID
+	// succeeds, without invoking persistence early or twice.
+	coordinator.fail("acquire_writer", repeatedFault(leaseExplicitReject, runtimeResourceOperationAttempts+1)...)
+	service := newSmallIngestWithCoordinator(t, coordinator)
+	payload, err := service.ReadPayload(context.Background(), "writer-payload-retry", bytes.NewReader([]byte("payload")), 8, -1, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := make(chan error, 1)
+	var persistCalls int
+	if err := service.SubmitWithKind(context.Background(), payload, IngestJobKindMediaPayload, func(data []byte) (PayloadResult, error) {
+		persistCalls++
+		if !bytes.Equal(data, []byte("payload")) {
+			return PayloadResult{}, errors.New("accepted payload changed during retry")
+		}
+		return PayloadResult{Size: int64(len(data))}, nil
+	}, func(_ PayloadResult, err error) { completed <- err }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-completed:
+		if err != nil {
+			t.Fatalf("accepted payload completion = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("accepted payload did not survive coordinator recovery")
+	}
+	assertSameLeaseID(t, coordinator.callIDs("acquire_writer"), runtimeResourceOperationAttempts+2)
+	if persistCalls != 1 {
+		t.Fatalf("persistence callback calls=%d, want one", persistCalls)
+	}
+	service.mu.Lock()
+	_, poisoned := service.failedRecordings["writer-payload-retry"]
+	service.mu.Unlock()
+	if poisoned {
+		t.Fatal("transient writer acquisition poisoned recording")
+	}
+	if got := service.Snapshot(); got.StorageErrorsTotal != 0 || got.QueueObjects != 0 || got.ActiveWriters != 0 {
+		t.Fatalf("transient writer acquisition changed canonical accounting: %#v", got)
+	}
+}
+
+func TestPermanentWriterAcquireFailureIsBoundedAndDoesNotPoison(t *testing.T) {
+	coordinator := newLeaseFaultCoordinator()
+	coordinator.fail("acquire_writer", repeatedFault(leaseExplicitReject, runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)...)
+	service := newSmallIngestWithCoordinator(t, coordinator)
+	var persistCalls int
+	err := waitCommit(t, service, coordinator, "writer-permanent-outage", func() error {
+		persistCalls++
+		return nil
+	})
+	if !errors.Is(err, ErrIngestCoordinatorUnavailable) || errors.Is(err, ErrCanonicalCommitFailed) || persistCalls != 0 {
+		t.Fatalf("permanent acquire failure=%v persist calls=%d", err, persistCalls)
+	}
+	assertSameLeaseID(t, coordinator.callIDs("acquire_writer"), runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)
+	assertSameLeaseID(t, coordinator.callIDs("release_writer"), 1)
+	if coordinator.activeCount("acquire_writer") != 0 {
+		t.Fatal("writer lease remained after exhausted acquisition")
+	}
+	service.mu.Lock()
+	_, poisoned := service.failedRecordings["writer-permanent-outage"]
+	service.mu.Unlock()
+	if poisoned {
+		t.Fatal("coordinator outage poisoned canonical recording state")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := service.Close(ctx); err != nil {
+		t.Fatalf("bounded acquisition left shutdown blocked: %v", err)
+	}
+}
+
+func TestCoordinatorDependencyFailureDoesNotBecomeCanonicalFailure(t *testing.T) {
+	coordinator := newLeaseFaultCoordinator()
+	coordinator.fail("acquire_writer", repeatedFault(leaseExplicitReject, runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)...)
+	service := newSmallIngestWithCoordinator(t, coordinator)
+	var initPersistCalls int
+	initErr := waitCommit(t, service, coordinator, "init-dependency", func() error {
+		initPersistCalls++
+		return nil
+	})
+	if !errors.Is(initErr, ErrIngestCoordinatorUnavailable) || errors.Is(initErr, ErrCanonicalCommitFailed) || initPersistCalls != 0 {
+		t.Fatalf("init acquire failure=%v persist calls=%d", initErr, initPersistCalls)
+	}
+
+	var mediaPersistCalls int
+	mediaErr := waitCommit(t, service, coordinator, "init-dependency", func() error {
+		mediaPersistCalls++
+		return fmt.Errorf("canonical storage commit failed: init payload dependency: %w", initErr)
+	})
+	if !errors.Is(mediaErr, ErrIngestCoordinatorUnavailable) || errors.Is(mediaErr, ErrCanonicalCommitFailed) || !errors.Is(mediaErr, initErr) {
+		t.Fatalf("dependent media error=%v, want original coordinator failure without canonical classification", mediaErr)
+	}
+	var attempts attemptCountedError
+	if !errors.As(mediaErr, &attempts) || attempts.Attempts() != 0 {
+		t.Fatalf("dependent media attempts=%#v, want zero canonical persistence attempts", attempts)
+	}
+	if mediaPersistCalls != 1 {
+		t.Fatalf("dependent media callback calls=%d, want one", mediaPersistCalls)
+	}
+	service.mu.Lock()
+	_, poisoned := service.failedRecordings["init-dependency"]
+	service.mu.Unlock()
+	if poisoned || service.Snapshot().StorageErrorsTotal != 0 {
+		t.Fatalf("coordinator dependency failure poisoned canonical state: %#v", service.Snapshot())
+	}
+	if err := waitCommit(t, service, coordinator, "init-dependency", func() error { return nil }); err != nil {
+		t.Fatalf("later canonical commit did not progress: %v", err)
+	}
+}
+
+func TestQueueAcquireExhaustionLeavesPayloadWithCaller(t *testing.T) {
+	coordinator := newLeaseFaultCoordinator()
+	coordinator.fail("acquire_queue", repeatedFault(leaseExplicitReject, runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)...)
+	service := newSmallIngestWithCoordinator(t, coordinator)
+	payload, err := service.ReadPayload(context.Background(), "queue-payload-retry", bytes.NewReader([]byte("caller")), 8, -1, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = service.SubmitWithKind(context.Background(), payload, IngestJobKindMediaPayload, func([]byte) (PayloadResult, error) {
+		t.Fatal("pre-admission queue failure ran canonical callback")
+		return PayloadResult{}, nil
+	}, func(PayloadResult, error) { t.Fatal("pre-admission queue failure completed accepted job") })
+	if !errors.Is(err, ErrIngestCoordinatorUnavailable) || errors.Is(err, ErrCanonicalCommitFailed) {
+		t.Fatalf("queue acquire error = %v", err)
+	}
+	assertSameLeaseID(t, coordinator.callIDs("acquire_queue"), runtimeResourceLeaseAcquireCycles*runtimeResourceOperationAttempts)
+	assertSameLeaseID(t, coordinator.callIDs("release_queue"), 1)
+	if !bytes.Equal(payload.Bytes(), []byte("caller")) {
+		t.Fatal("failed pre-admission submit transferred or cleared payload ownership")
+	}
+	if got := service.Snapshot(); got.QueueObjects != 0 || got.QueueBytes != 0 || got.ActiveWriters != 0 {
+		t.Fatalf("queue accounting after exhausted acquisition = %#v", got)
+	}
+	payload.Release()
+	if got := service.Snapshot(); got.BufferUsedBytes != 0 || got.ReservedBytes != 0 {
+		t.Fatalf("caller payload release left local accounting: %#v", got)
+	}
 }
 
 func TestCanonicalFailureRemainsRecordingScoped(t *testing.T) {

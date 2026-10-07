@@ -35,6 +35,9 @@ const (
 	runtimeResourceOperationTimeout            = 3 * time.Second
 	runtimeResourceReleaseAttemptTimeout       = time.Second
 	runtimeResourceOperationAttempts           = 3
+	// Queue and writer acquisition get bounded callCoordinator cycles. Each
+	// cycle retries one idempotent lease ID at the transport layer.
+	runtimeResourceLeaseAcquireCycles          = 3
 	runtimeResourceRetryBackoff                = 20 * time.Millisecond
 	runtimeResourceOperationRetryBackoff       = 50 * time.Millisecond
 	runtimeResourceReleaseRetryBase            = 100 * time.Millisecond
@@ -267,6 +270,13 @@ func waitCoordinatorRetry(ctx context.Context, attempt int) bool {
 func waitCoordinatorOperationRetry(ctx context.Context, attempt int) bool {
 	delay := runtimeResourceOperationRetryBackoff * time.Duration(attempt+1)
 	return waitCoordinatorDelay(ctx, delay)
+}
+
+func waitCoordinatorLeaseAcquireRetry(attempt int) {
+	delay := runtimeResourceOperationRetryBackoff * time.Duration(attempt+1)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	<-timer.C
 }
 
 func waitCoordinatorDelay(ctx context.Context, delay time.Duration) bool {
@@ -1099,13 +1109,12 @@ func (s *IngestService) submit(_ context.Context, job *ingestJob) error {
 
 slotAcquired:
 	if s.global != nil {
-		if err := callCoordinator(context.Background(), "acquire queue", func(ctx context.Context) error {
+		if err := s.acquireGlobalLease("acquire queue", func(ctx context.Context) error {
 			return s.global.AcquireQueue(ctx, job.queueLease)
 		}); err != nil {
-			s.recordCoordinatorFailure(err)
 			_ = s.releaseGlobalQueue(job)
 			<-s.slots
-			return &ingestCoordinatorFailure{operation: "acquire queue", cause: err}
+			return err
 		}
 	}
 	s.mu.Lock()
@@ -1142,11 +1151,8 @@ func (s *IngestService) writer() {
 			err = &poisonedIngestFailure{currentKind: job.kind, first: firstFailure}
 			_ = s.releaseGlobalQueue(job)
 		} else if s.global != nil {
-			if acquireErr := callCoordinator(context.Background(), "acquire writer", func(ctx context.Context) error {
-				return s.global.AcquireWriter(ctx, job.writerLease)
-			}); acquireErr != nil {
-				s.recordCoordinatorFailure(acquireErr)
-				err = &ingestWriterAcquireFailure{kind: job.kind, cause: acquireErr}
+			if acquireErr := s.acquireGlobalWriter(job); acquireErr != nil {
+				err = acquireErr
 				_ = s.releaseGlobalWriter(job)
 				_ = s.releaseGlobalQueue(job)
 			} else {
@@ -1188,6 +1194,35 @@ func (s *IngestService) writer() {
 		s.signalLocked()
 		s.mu.Unlock()
 	}
+}
+
+// acquireGlobalWriter retains an accepted job and its payload across transient
+// Runtime Host failures. Every retry uses the same idempotent writer lease ID.
+// The bounded transport cycle and this bounded outer retry keep outage
+// handling finite; Close can still return when its caller deadline expires.
+func (s *IngestService) acquireGlobalWriter(job *ingestJob) error {
+	err := s.acquireGlobalLease("acquire writer", func(ctx context.Context) error {
+		return s.global.AcquireWriter(ctx, job.writerLease)
+	})
+	if err != nil {
+		return &ingestWriterAcquireFailure{kind: job.kind, cause: err}
+	}
+	return nil
+}
+
+func (s *IngestService) acquireGlobalLease(operation string, call func(context.Context) error) error {
+	var lastErr error
+	for cycle := 0; cycle < runtimeResourceLeaseAcquireCycles; cycle++ {
+		lastErr = callCoordinator(context.Background(), operation, call)
+		if lastErr == nil {
+			return nil
+		}
+		s.recordCoordinatorFailure(lastErr)
+		if cycle+1 < runtimeResourceLeaseAcquireCycles {
+			waitCoordinatorLeaseAcquireRetry(cycle)
+		}
+	}
+	return lastErr
 }
 
 func (s *IngestService) releaseGlobalQueue(job *ingestJob) error {
@@ -1333,6 +1368,14 @@ func (s *IngestService) persistWithRetry(job *ingestJob) (PayloadResult, error) 
 		result, lastErr = job.persist(data)
 		if lastErr == nil {
 			return result, nil
+		}
+		// A dependent job can reach this callback after another accepted job
+		// failed to acquire a Runtime Host lease. That is infrastructure
+		// unavailability, not a canonical write failure. Preserve its error chain
+		// and zero persistence-attempt diagnostics; retrying the callback cannot
+		// repair the dependency and poisoning would misclassify the recording.
+		if errors.Is(lastErr, ErrIngestCoordinatorUnavailable) {
+			return PayloadResult{}, lastErr
 		}
 		// Store payload callbacks already measure successful writes. Callback
 		// failures are counted here; avoid logging error contents or paths.

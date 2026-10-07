@@ -316,6 +316,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 					if errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded) {
 						return result.err
 					}
+					if errors.Is(result.err, storage.ErrIngestCoordinatorUnavailable) {
+						return retryableHistorical(result.err)
+					}
 					if errors.Is(result.err, errHistoricalScratch) {
 						return retryableHistorical(errHistoricalScratch)
 					}
@@ -335,6 +338,12 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				}
 				initID, initErr := m.acquireHistoricalInit(ctx, e, owner, terminalRepairMutationAllowed(e, !active), historicalMedia, generation, identity.ID, rootTrack, source, epoch)
 				if initErr != nil {
+					if errors.Is(initErr, storage.ErrIngestCoordinatorUnavailable) {
+						return retryableHistorical(initErr)
+					}
+					if errors.Is(initErr, storage.ErrCanonicalCommitFailed) {
+						return initErr
+					}
 					if m.shouldRefresh(historicalMedia, initErr) {
 						if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, historicalMedia, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
 							return retryableHistorical(errors.New("historical source refresh failed"))
@@ -359,6 +368,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				if err != nil {
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 						return err
+					}
+					if errors.Is(err, storage.ErrIngestCoordinatorUnavailable) {
+						return retryableHistorical(err)
 					}
 					return retryableHistorical(errHistoricalScratch)
 				}

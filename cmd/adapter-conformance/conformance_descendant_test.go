@@ -31,7 +31,9 @@ func TestConformanceRunnerTimeoutTerminatesProcessGroupDescendants(t *testing.T)
 func TestConformanceRunnerClosesOutputWhenEscapedDescendantHoldsStdout(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "descendant-pid")
 	start := time.Now()
-	report := runTestAdapterAtMarker(t, "hang-with-escaped-descendant", marker, 250*time.Millisecond)
+	// Allow the helper process to start and publish its descendant PID before
+	// the blocked describe request reaches its timeout.
+	report := runTestAdapterAtMarker(t, "hang-with-escaped-descendant", marker, 2*time.Second)
 	if report.Passed {
 		t.Fatal("hanging adapter unexpectedly passed")
 	}

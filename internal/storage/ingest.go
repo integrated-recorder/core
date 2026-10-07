@@ -45,6 +45,7 @@ var (
 
 type canonicalCommitFailure struct {
 	attempts int
+	jobKind  IngestJobKind
 	cause    error
 }
 
@@ -67,6 +68,102 @@ func (e *canonicalCommitFailure) Is(target error) bool {
 func (e *canonicalCommitFailure) Unwrap() error { return e.cause }
 
 func (e *canonicalCommitFailure) Attempts() int { return e.attempts }
+
+func (e *canonicalCommitFailure) CurrentJobKind() IngestJobKind { return e.jobKind }
+
+func (e *canonicalCommitFailure) FirstFailureJobKind() IngestJobKind { return e.jobKind }
+
+func (e *canonicalCommitFailure) CurrentAttempts() int { return e.attempts }
+
+func (e *canonicalCommitFailure) FirstFailureAttempts() int { return e.attempts }
+
+// IngestJobKind identifies bounded canonical work classes for diagnostics.
+// Values describe Core-owned archive operations, not source platforms.
+type IngestJobKind string
+
+const (
+	IngestJobKindCanonicalPayload  IngestJobKind = "canonical_payload"
+	IngestJobKindMediaPayload      IngestJobKind = "media_payload"
+	IngestJobKindInitPayload       IngestJobKind = "init_payload"
+	IngestJobKindHistoricalMedia   IngestJobKind = "historical_media"
+	IngestJobKindHistoricalInit    IngestJobKind = "historical_init"
+	IngestJobKindManifestSnapshot  IngestJobKind = "manifest_snapshot"
+	IngestJobKindRecordingMetadata IngestJobKind = "recording_metadata"
+)
+
+func (kind IngestJobKind) valid() bool {
+	switch kind {
+	case IngestJobKindCanonicalPayload, IngestJobKindMediaPayload,
+		IngestJobKindInitPayload, IngestJobKindHistoricalMedia,
+		IngestJobKindHistoricalInit, IngestJobKindManifestSnapshot,
+		IngestJobKindRecordingMetadata:
+		return true
+	default:
+		return false
+	}
+}
+
+// IngestFailureDetails exposes bounded job identity and retry counts without
+// exposing persistence error text or backend details.
+type IngestFailureDetails interface {
+	CurrentJobKind() IngestJobKind
+	FirstFailureJobKind() IngestJobKind
+	CurrentAttempts() int
+	FirstFailureAttempts() int
+}
+
+type ingestFailureRecord struct {
+	kind     IngestJobKind
+	err      error
+	attempts int
+}
+
+type poisonedIngestFailure struct {
+	currentKind IngestJobKind
+	first       ingestFailureRecord
+}
+
+func (e *poisonedIngestFailure) Error() string { return ErrCanonicalCommitFailed.Error() }
+
+func (e *poisonedIngestFailure) Is(target error) bool {
+	return target == ErrCanonicalCommitFailed
+}
+
+func (e *poisonedIngestFailure) Unwrap() error { return e.first.err }
+
+// Attempts reports attempts for this queued job. Poisoned jobs never persist.
+func (e *poisonedIngestFailure) Attempts() int { return 0 }
+
+func (e *poisonedIngestFailure) CurrentJobKind() IngestJobKind { return e.currentKind }
+
+func (e *poisonedIngestFailure) FirstFailureJobKind() IngestJobKind { return e.first.kind }
+
+func (e *poisonedIngestFailure) CurrentAttempts() int { return 0 }
+
+func (e *poisonedIngestFailure) FirstFailureAttempts() int { return e.first.attempts }
+
+type ingestWriterAcquireFailure struct {
+	kind  IngestJobKind
+	cause error
+}
+
+func (e *ingestWriterAcquireFailure) Error() string { return "global storage writer is unavailable" }
+
+func (e *ingestWriterAcquireFailure) Is(target error) bool {
+	return target == ErrCanonicalCommitFailed
+}
+
+func (e *ingestWriterAcquireFailure) Unwrap() error { return e.cause }
+
+func (e *ingestWriterAcquireFailure) Attempts() int { return 0 }
+
+func (e *ingestWriterAcquireFailure) CurrentJobKind() IngestJobKind { return e.kind }
+
+func (e *ingestWriterAcquireFailure) FirstFailureJobKind() IngestJobKind { return e.kind }
+
+func (e *ingestWriterAcquireFailure) CurrentAttempts() int { return 0 }
+
+func (e *ingestWriterAcquireFailure) FirstFailureAttempts() int { return 0 }
 
 // RuntimeIngestCoordinator is the transport-neutral process-wide accounting
 // contract used when multiple recorder-engine generations share one Runtime
@@ -234,7 +331,7 @@ type IngestService struct {
 	activeWriters       int
 	activeSubmits       int
 	storageErrors       uint64
-	failedRecordings    map[string]bool
+	failedRecordings    map[string]ingestFailureRecord
 	// reallocationHook is a deterministic test seam for observing transient
 	// old+new backing-array reservations. Production leaves it nil.
 	reallocationHook func(oldCapacity, newCapacity int64)
@@ -250,6 +347,7 @@ type storageErrorRecorder interface{ recordStorageError() }
 
 type ingestJob struct {
 	recordingID string
+	kind        IngestJobKind
 	queueLease  string
 	writerLease string
 	payload     *IngestPayload
@@ -339,7 +437,7 @@ func newIngestService(store *Store, options IngestOptions, global RuntimeIngestC
 	if backend, ok := store.StorageBackend.(*LocalFilesystemBackend); ok {
 		backend.telemetry.configure(options.SampleInterval, options.MetricsRetention)
 	}
-	s := &IngestService{store: store, options: options, global: global, jobs: make(chan *ingestJob, options.QueueObjects), slots: make(chan struct{}, options.QueueObjects), changed: make(chan struct{}), reservedByRecording: map[string]int64{}, queueTimes: map[*ingestJob]time.Time{}, failedRecordings: map[string]bool{}, closeDone: make(chan struct{}), samplerStop: make(chan struct{}), samplerDone: make(chan struct{})}
+	s := &IngestService{store: store, options: options, global: global, jobs: make(chan *ingestJob, options.QueueObjects), slots: make(chan struct{}, options.QueueObjects), changed: make(chan struct{}), reservedByRecording: map[string]int64{}, queueTimes: map[*ingestJob]time.Time{}, failedRecordings: map[string]ingestFailureRecord{}, closeDone: make(chan struct{}), samplerStop: make(chan struct{}), samplerDone: make(chan struct{})}
 	for i := 0; i < options.Writers; i++ {
 		s.workers.Add(1)
 		go s.writer()
@@ -682,10 +780,19 @@ func (s *IngestService) releasePayload(payload *IngestPayload) {
 // queue. Persistence failures are retried over the same byte slice. A failed
 // submission leaves ownership with the caller.
 func (s *IngestService) Submit(ctx context.Context, payload *IngestPayload, persist func([]byte) (PayloadResult, error), complete func(PayloadResult, error)) error {
+	return s.SubmitWithKind(ctx, payload, IngestJobKindCanonicalPayload, persist, complete)
+}
+
+// SubmitWithKind transfers payload ownership after placing it in the bounded
+// object queue. Kind is bounded to Core-owned canonical work classes.
+func (s *IngestService) SubmitWithKind(ctx context.Context, payload *IngestPayload, kind IngestJobKind, persist func([]byte) (PayloadResult, error), complete func(PayloadResult, error)) error {
 	if payload == nil || payload.service != s || persist == nil || complete == nil {
 		return errors.New("invalid ingest job")
 	}
-	return s.submit(ctx, &ingestJob{recordingID: payload.recordingID, payload: payload, persist: persist, complete: complete})
+	if !kind.valid() {
+		return errors.New("invalid ingest job kind")
+	}
+	return s.submit(ctx, &ingestJob{recordingID: payload.recordingID, kind: kind, payload: payload, persist: persist, complete: complete})
 }
 
 // SubmitCommit queues a bounded, byte-free metadata operation behind durable
@@ -693,11 +800,21 @@ func (s *IngestService) Submit(ctx context.Context, payload *IngestPayload, pers
 // writes do not hold the HLS poller; the callback must persist the latest
 // recording projection when it runs instead of a stale captured snapshot.
 func (s *IngestService) SubmitCommit(ctx context.Context, recordingID string, commit func() error, complete func(error)) error {
+	return s.SubmitCommitWithKind(ctx, recordingID, IngestJobKindCanonicalPayload, commit, complete)
+}
+
+// SubmitCommitWithKind queues a bounded, byte-free metadata operation behind
+// durable payload jobs. Kind identifies the Core-owned operation for failure
+// diagnostics.
+func (s *IngestService) SubmitCommitWithKind(ctx context.Context, recordingID string, kind IngestJobKind, commit func() error, complete func(error)) error {
 	if recordingID == "" || commit == nil || complete == nil {
 		return errors.New("invalid ingest commit")
 	}
+	if !kind.valid() {
+		return errors.New("invalid ingest job kind")
+	}
 	return s.submit(ctx, &ingestJob{
-		recordingID: recordingID,
+		recordingID: recordingID, kind: kind,
 		persist: func([]byte) (PayloadResult, error) {
 			return PayloadResult{}, commit()
 		},
@@ -780,17 +897,17 @@ func (s *IngestService) writer() {
 		s.mu.Unlock()
 		<-s.slots
 		s.mu.Lock()
-		failed := s.failedRecordings[job.recordingID]
+		firstFailure, failed := s.failedRecordings[job.recordingID]
 		s.mu.Unlock()
 		var result PayloadResult
 		var err error
 		writerAcquired := false
 		if failed {
-			err = errors.New("canonical storage commit failed")
+			err = &poisonedIngestFailure{currentKind: job.kind, first: firstFailure}
 			_ = s.releaseGlobalQueue(job)
 		} else if s.global != nil {
 			if acquireErr := s.global.AcquireWriter(context.Background(), job.writerLease); acquireErr != nil {
-				err = fmt.Errorf("global storage writer is unavailable: %w", acquireErr)
+				err = &ingestWriterAcquireFailure{kind: job.kind, cause: acquireErr}
 				_ = s.releaseGlobalWriter(job)
 				_ = s.releaseGlobalQueue(job)
 			} else {
@@ -809,7 +926,11 @@ func (s *IngestService) writer() {
 		if err != nil {
 			s.mu.Lock()
 			s.storageErrors++
-			s.failedRecordings[job.recordingID] = true
+			if _, exists := s.failedRecordings[job.recordingID]; !exists {
+				s.failedRecordings[job.recordingID] = ingestFailureRecord{
+					kind: job.kind, err: err, attempts: ingestFailureAttempts(err),
+				}
+			}
 			s.mu.Unlock()
 			if recorder, ok := s.store.StorageBackend.(storageErrorRecorder); ok {
 				recorder.recordStorageError()
@@ -875,7 +996,15 @@ func (s *IngestService) persistWithRetry(job *ingestJob) (PayloadResult, error) 
 		timer := time.NewTimer(delay)
 		<-timer.C
 	}
-	return PayloadResult{}, &canonicalCommitFailure{attempts: attempts, cause: lastErr}
+	return PayloadResult{}, &canonicalCommitFailure{attempts: attempts, jobKind: job.kind, cause: lastErr}
+}
+
+func ingestFailureAttempts(err error) int {
+	var counted attemptCountedError
+	if errors.As(err, &counted) {
+		return counted.Attempts()
+	}
+	return 0
 }
 
 func retryBackoff(initial, maximum time.Duration, retryIndex int) time.Duration {

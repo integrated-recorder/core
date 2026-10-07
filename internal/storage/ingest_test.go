@@ -720,8 +720,13 @@ func TestIngestGlobalLeaseAcquisitionErrorsRetainCause(t *testing.T) {
 		}
 		select {
 		case err := <-completed:
-			if !errors.Is(err, cause) || !strings.Contains(err.Error(), "global storage writer is unavailable") {
+			if !errors.Is(err, cause) || !errors.Is(err, ErrCanonicalCommitFailed) || !strings.Contains(err.Error(), "global storage writer is unavailable") {
 				t.Fatalf("writer acquisition error = %v, want wrapped cause and classification", err)
+			}
+			var details IngestFailureDetails
+			if !errors.As(err, &details) || details.CurrentJobKind() != IngestJobKindCanonicalPayload ||
+				details.FirstFailureJobKind() != IngestJobKindCanonicalPayload || details.CurrentAttempts() != 0 || details.FirstFailureAttempts() != 0 {
+				t.Fatalf("writer acquisition details = %#v, want canonical job with zero persistence attempts", details)
 			}
 		case <-time.After(time.Second):
 			t.Fatal("writer acquisition failure did not complete job")

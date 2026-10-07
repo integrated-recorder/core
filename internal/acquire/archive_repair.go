@@ -775,10 +775,21 @@ func (m *Manager) acquireHistoricalInit(ctx context.Context, e *entry, owner Own
 
 func (m *Manager) commitHistoricalPayload(ctx context.Context, e *entry, owner OwnershipToken, terminal bool, segment domain.Segment, payload *storage.IngestPayload) error {
 	done := make(chan error, 1)
-	err := m.ingest.Submit(ctx, payload, func(data []byte) (storage.PayloadResult, error) {
+	kind := storage.IngestJobKindHistoricalMedia
+	stage := "historical media payload commit"
+	if segment.IsInit {
+		kind = storage.IngestJobKindHistoricalInit
+		stage = "historical init payload commit"
+	}
+	err := m.ingest.SubmitWithKind(ctx, payload, kind, func(data []byte) (storage.PayloadResult, error) {
 		result, _, commitErr := m.commitArchiveSegmentOwned(e, &owner, segment, archiveindex.ClaimHistorical, data, terminal)
 		return result, commitErr
-	}, func(_ storage.PayloadResult, commitErr error) { done <- commitErr })
+	}, func(_ storage.PayloadResult, commitErr error) {
+		if errors.Is(commitErr, storage.ErrCanonicalCommitFailed) {
+			m.recordStorageFailureDiagnostic(e, newStorageCommitFailure(stage, commitErr))
+		}
+		done <- commitErr
+	})
 	if err != nil {
 		payload.Release()
 		return err

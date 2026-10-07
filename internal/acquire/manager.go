@@ -2169,11 +2169,43 @@ func logStorageCommitFailure(err error) {
 	if errors.As(err, &retryFailure) {
 		attempts = retryFailure.Attempts()
 	}
+	var currentJobKind, firstFailureJobKind storage.IngestJobKind
+	var currentAttempts, firstFailureAttempts int
+	var ingestFailure storage.IngestFailureDetails
+	if errors.As(err, &ingestFailure) {
+		currentJobKind = ingestFailure.CurrentJobKind()
+		firstFailureJobKind = ingestFailure.FirstFailureJobKind()
+		currentAttempts = ingestFailure.CurrentAttempts()
+		firstFailureAttempts = ingestFailure.FirstFailureAttempts()
+	}
+	currentJobStage := ingestJobStage(currentJobKind)
+	firstFailureJobStage := ingestJobStage(firstFailureJobKind)
 	var types []string
 	for current := err; current != nil; current = errors.Unwrap(current) {
 		types = append(types, fmt.Sprintf("%T", current))
 	}
-	log.Printf("recording storage commit diagnostic: stages=%q attempts=%d error_types=%q error=%v", stages, attempts, types, err)
+	log.Printf("recording storage commit diagnostic: stages=%q attempts=%d current_job_kind=%q current_job_stage=%q first_failure_job_kind=%q first_failure_job_stage=%q current_attempts=%d first_failure_attempts=%d error_types=%q", stages, attempts, currentJobKind, currentJobStage, firstFailureJobKind, firstFailureJobStage, currentAttempts, firstFailureAttempts, types)
+}
+
+func ingestJobStage(kind storage.IngestJobKind) string {
+	switch kind {
+	case storage.IngestJobKindMediaPayload:
+		return "media payload commit"
+	case storage.IngestJobKindInitPayload:
+		return "init payload commit"
+	case storage.IngestJobKindHistoricalMedia:
+		return "historical media payload commit"
+	case storage.IngestJobKindHistoricalInit:
+		return "historical init payload commit"
+	case storage.IngestJobKindManifestSnapshot:
+		return "manifest snapshot commit"
+	case storage.IngestJobKindRecordingMetadata:
+		return "recording metadata commit"
+	case storage.IngestJobKindCanonicalPayload:
+		return "canonical payload commit"
+	default:
+		return ""
+	}
 }
 
 func (m *Manager) setTerminalError(e *entry, err error) {

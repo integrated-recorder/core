@@ -386,7 +386,7 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 
 	id := recordingID(s.e)
 	at := time.Now().UTC()
-	err := s.manager.ingest.Submit(s.ctx, payload, func(data []byte) (storage.PayloadResult, error) {
+	err := s.manager.ingest.SubmitWithKind(s.ctx, payload, storage.IngestJobKindManifestSnapshot, func(data []byte) (storage.PayloadResult, error) {
 		if _, current := currentMediaVersion(s.e); current != generation {
 			return payload.Result(), nil
 		}
@@ -471,7 +471,7 @@ func (s *segmentScheduler) queueRecordingCommit() error {
 	s.signalLocked()
 	s.mu.Unlock()
 
-	err := s.manager.ingest.SubmitCommit(s.ctx, recordingID(s.e), func() error {
+	err := s.manager.ingest.SubmitCommitWithKind(s.ctx, recordingID(s.e), storage.IngestJobKindRecordingMetadata, func() error {
 		if s.manager.storageMetadataWriteHook != nil {
 			s.manager.storageMetadataWriteHook()
 		}
@@ -1041,7 +1041,7 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 	}
 	s.mu.Unlock()
 	s.wg.Add(1)
-	err = s.manager.ingest.Submit(s.ctx, payload, func(data []byte) (storage.PayloadResult, error) {
+	err = s.manager.ingest.SubmitWithKind(s.ctx, payload, storage.IngestJobKindMediaPayload, func(data []byte) (storage.PayloadResult, error) {
 		return s.persistSegment(segment, initDependency, data)
 	}, func(_ storage.PayloadResult, persistErr error) {
 		defer s.wg.Done()
@@ -1290,7 +1290,7 @@ func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epo
 	}
 	asset.PayloadSize, asset.SHA256 = payload.Result().Size, payload.Result().SHA256
 	s.wg.Add(1)
-	err = s.manager.ingest.Submit(s.ctx, payload, func(data []byte) (storage.PayloadResult, error) {
+	err = s.manager.ingest.SubmitWithKind(s.ctx, payload, storage.IngestJobKindInitPayload, func(data []byte) (storage.PayloadResult, error) {
 		if s.manager.storageWriteHook != nil {
 			s.manager.storageWriteHook()
 		}

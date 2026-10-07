@@ -702,7 +702,7 @@ func TestIngestGlobalLeaseAcquisitionErrorsRetainCause(t *testing.T) {
 		coordinator := &failingIngestCoordinator{queueErr: cause}
 		service := newSmallIngestWithCoordinator(t, coordinator)
 		err := service.SubmitCommit(context.Background(), "queue-failure", func() error { return nil }, func(error) {})
-		if !errors.Is(err, cause) || !strings.Contains(err.Error(), "global storage queue is unavailable") {
+		if !errors.Is(err, cause) || !errors.Is(err, ErrIngestCoordinatorUnavailable) || !strings.Contains(err.Error(), "storage coordinator acquire queue failed") {
 			t.Fatalf("queue acquisition error = %v, want wrapped cause and classification", err)
 		}
 		if coordinator.queueRelease.Load() != 1 || service.Snapshot().QueueObjects != 0 {
@@ -720,7 +720,7 @@ func TestIngestGlobalLeaseAcquisitionErrorsRetainCause(t *testing.T) {
 		}
 		select {
 		case err := <-completed:
-			if !errors.Is(err, cause) || !errors.Is(err, ErrCanonicalCommitFailed) || !strings.Contains(err.Error(), "global storage writer is unavailable") {
+			if !errors.Is(err, cause) || !errors.Is(err, ErrIngestCoordinatorUnavailable) || errors.Is(err, ErrCanonicalCommitFailed) || !strings.Contains(err.Error(), "global storage writer is unavailable") {
 				t.Fatalf("writer acquisition error = %v, want wrapped cause and classification", err)
 			}
 			var details IngestFailureDetails

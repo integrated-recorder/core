@@ -1591,7 +1591,7 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 				info, statErr := os.Lstat(markerPath)
 				return statErr == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm() == 0600 && info.Size() == 0
 			}, "orphan Engine common-fence stale-owner rejection marker"); err != nil {
-				t.Fatalf("released Engine did not prove its staged canonical commit was rejected by the owner fence: %v; child=%s", err, readRuntimeE2EChildDiagnostics(currentHost.diagnosticDir))
+				t.Fatalf("released Engine did not prove its staged canonical commit was rejected by the owner fence: %v; child=%s", err, readRuntimeE2EChildDiagnostics(markerDir))
 			}
 		}
 		staleCommitCalled := false

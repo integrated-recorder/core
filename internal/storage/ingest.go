@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -22,25 +24,34 @@ const (
 	DefaultIngestGlobalBytes int64 = 1 << 30
 	// DefaultIngestPerRecordingBytes accounts for both the old and new backing
 	// arrays while a maximum-sized payload grows from 256 MiB to 512 MiB.
-	DefaultIngestPerRecordingBytes int64 = 768 << 20
-	DefaultIngestWriters                 = 1
-	DefaultPersistAttempts               = 5
-	DefaultRetryInitialBackoff           = 100 * time.Millisecond
-	DefaultRetryMaxBackoff               = 800 * time.Millisecond
-	DefaultPoolSampleInterval            = 5 * time.Second
-	DefaultPoolMetricsRetention          = 24 * time.Hour
-	runtimeResourceReleaseTimeout        = 3 * time.Second
-	MaxIngestGlobalBytes           int64 = 2 << 30
-	MaxIngestPerRecordingBytes     int64 = 1536 << 20
-	MaxIngestPayloadBytes          int64 = 1 << 30
+	DefaultIngestPerRecordingBytes       int64 = 768 << 20
+	DefaultIngestWriters                       = 1
+	DefaultPersistAttempts                     = 5
+	DefaultRetryInitialBackoff                 = 100 * time.Millisecond
+	DefaultRetryMaxBackoff                     = 800 * time.Millisecond
+	DefaultPoolSampleInterval                  = 5 * time.Second
+	DefaultPoolMetricsRetention                = 24 * time.Hour
+	runtimeResourceReleaseTimeout              = 3 * time.Second
+	runtimeResourceOperationTimeout            = 3 * time.Second
+	runtimeResourceReleaseAttemptTimeout       = time.Second
+	runtimeResourceOperationAttempts           = 3
+	runtimeResourceRetryBackoff                = 20 * time.Millisecond
+	runtimeResourceOperationRetryBackoff       = 50 * time.Millisecond
+	runtimeResourceReleaseRetryBase            = 100 * time.Millisecond
+	runtimeResourceReleaseRetryMaximum         = 5 * time.Second
+	runtimeResourceReleaseRetryBatch           = 8
+	MaxIngestGlobalBytes                 int64 = 2 << 30
+	MaxIngestPerRecordingBytes           int64 = 1536 << 20
+	MaxIngestPayloadBytes                int64 = 1 << 30
 )
 
 var (
-	ErrIngestClosed          = errors.New("storage ingest service is closed")
-	ErrIngestTooLarge        = errors.New("ingest payload exceeds size limit")
-	ErrIngestReservation     = errors.New("ingest payload exceeded its reserved byte budget")
-	ErrIngestSizeMismatch    = ErrPayloadSizeMismatch
-	ErrCanonicalCommitFailed = errors.New("canonical storage commit failed")
+	ErrIngestClosed                 = errors.New("storage ingest service is closed")
+	ErrIngestTooLarge               = errors.New("ingest payload exceeds size limit")
+	ErrIngestReservation            = errors.New("ingest payload exceeded its reserved byte budget")
+	ErrIngestSizeMismatch           = ErrPayloadSizeMismatch
+	ErrCanonicalCommitFailed        = errors.New("canonical storage commit failed")
+	ErrIngestCoordinatorUnavailable = errors.New("storage coordinator unavailable")
 )
 
 type canonicalCommitFailure struct {
@@ -150,7 +161,7 @@ type ingestWriterAcquireFailure struct {
 func (e *ingestWriterAcquireFailure) Error() string { return "global storage writer is unavailable" }
 
 func (e *ingestWriterAcquireFailure) Is(target error) bool {
-	return target == ErrCanonicalCommitFailed
+	return target == ErrIngestCoordinatorUnavailable
 }
 
 func (e *ingestWriterAcquireFailure) Unwrap() error { return e.cause }
@@ -164,6 +175,110 @@ func (e *ingestWriterAcquireFailure) FirstFailureJobKind() IngestJobKind { retur
 func (e *ingestWriterAcquireFailure) CurrentAttempts() int { return 0 }
 
 func (e *ingestWriterAcquireFailure) FirstFailureAttempts() int { return 0 }
+
+type ingestCoordinatorFailure struct {
+	operation string
+	cause     error
+}
+
+func (e *ingestCoordinatorFailure) Error() string {
+	return "storage coordinator " + e.operation + " failed"
+}
+
+func (e *ingestCoordinatorFailure) Is(target error) bool {
+	return target == ErrIngestCoordinatorUnavailable
+}
+
+func (e *ingestCoordinatorFailure) Unwrap() error { return e.cause }
+
+func coordinatorFailure(operation string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &ingestCoordinatorFailure{operation: operation, cause: cause}
+}
+
+func callCoordinator(ctx context.Context, operation string, call func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var lastErr error
+	for attempt := 0; attempt < runtimeResourceOperationAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return coordinatorFailure(operation, err)
+		}
+		callCtx, cancel := context.WithTimeout(ctx, runtimeResourceOperationTimeout)
+		lastErr = call(callCtx)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil || attempt+1 == runtimeResourceOperationAttempts {
+			break
+		}
+		if !waitCoordinatorOperationRetry(ctx, attempt) {
+			lastErr = ctx.Err()
+			break
+		}
+	}
+	return coordinatorFailure(operation, lastErr)
+}
+
+func callCoordinatorRelease(operation string, call func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
+	defer cancel()
+	return callCoordinatorReleaseContext(ctx, operation, call)
+}
+
+func callCoordinatorReleaseContext(ctx context.Context, operation string, call func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var lastErr error
+	for attempt := 0; attempt < runtimeResourceOperationAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			break
+		}
+		callCtx, callCancel := context.WithTimeout(ctx, runtimeResourceReleaseAttemptTimeout)
+		lastErr = call(callCtx)
+		callCancel()
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil || attempt+1 == runtimeResourceOperationAttempts {
+			break
+		}
+		if !waitCoordinatorRetry(ctx, attempt) {
+			lastErr = ctx.Err()
+			break
+		}
+	}
+	return coordinatorFailure(operation, lastErr)
+}
+
+func waitCoordinatorRetry(ctx context.Context, attempt int) bool {
+	delay := runtimeResourceRetryBackoff * time.Duration(attempt+1)
+	return waitCoordinatorDelay(ctx, delay)
+}
+
+func waitCoordinatorOperationRetry(ctx context.Context, attempt int) bool {
+	delay := runtimeResourceOperationRetryBackoff * time.Duration(attempt+1)
+	return waitCoordinatorDelay(ctx, delay)
+}
+
+func waitCoordinatorDelay(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
 
 // RuntimeIngestCoordinator is the transport-neutral process-wide accounting
 // contract used when multiple recorder-engine generations share one Runtime
@@ -308,6 +423,8 @@ type IngestSnapshot struct {
 	ActiveWriters             int     `json:"active_writers"`
 	WriterConcurrency         int     `json:"writer_concurrency"`
 	StorageErrorsTotal        uint64  `json:"storage_errors_total"`
+	CoordinatorErrorsTotal    uint64  `json:"coordinator_errors_total"`
+	PendingCoordinatorLeases  int     `json:"pending_coordinator_leases"`
 }
 
 type IngestService struct {
@@ -317,45 +434,121 @@ type IngestService struct {
 	jobs    chan *ingestJob
 	slots   chan struct{}
 
-	mu                  sync.Mutex
-	closed              bool
-	changed             chan struct{}
-	overflowing         bool
-	reservedGlobal      int64
-	reservedByRecording map[string]int64
-	usedBytes           int64
-	queuedBytes         int64
-	queuedObjects       int
-	oldestQueued        time.Time
-	queueTimes          map[*ingestJob]time.Time
-	activeWriters       int
-	activeSubmits       int
-	storageErrors       uint64
-	failedRecordings    map[string]ingestFailureRecord
+	mu                         sync.Mutex
+	closed                     bool
+	changed                    chan struct{}
+	overflowing                bool
+	reservedGlobal             int64
+	reservedByRecording        map[string]int64
+	usedBytes                  int64
+	queuedBytes                int64
+	queuedObjects              int
+	oldestQueued               time.Time
+	queueTimes                 map[*ingestJob]time.Time
+	activeWriters              int
+	activeSubmits              int
+	storageErrors              uint64
+	coordinatorErrors          uint64
+	pendingCoordinatorReleases map[string]pendingCoordinatorRelease
+	failedRecordings           map[string]ingestFailureRecord
 	// reallocationHook is a deterministic test seam for observing transient
 	// old+new backing-array reservations. Production leaves it nil.
 	reallocationHook func(oldCapacity, newCapacity int64)
 
-	workers     sync.WaitGroup
-	closeOnce   sync.Once
-	closeDone   chan struct{}
-	samplerStop chan struct{}
-	samplerDone chan struct{}
+	workers          sync.WaitGroup
+	closeOnce        sync.Once
+	closeDone        chan struct{}
+	samplerStop      chan struct{}
+	samplerDone      chan struct{}
+	releaseRetryStop chan struct{}
+	releaseRetryDone chan struct{}
 }
 
 type storageErrorRecorder interface{ recordStorageError() }
 
 type ingestJob struct {
-	recordingID string
-	kind        IngestJobKind
-	queueLease  string
-	writerLease string
-	payload     *IngestPayload
-	persist     func([]byte) (PayloadResult, error)
-	complete    func(PayloadResult, error)
-	queuedAt    time.Time
-	queueOnce   sync.Once
-	writerOnce  sync.Once
+	recordingID   string
+	kind          IngestJobKind
+	queueLease    string
+	writerLease   string
+	payload       *IngestPayload
+	persist       func([]byte) (PayloadResult, error)
+	complete      func(PayloadResult, error)
+	queuedAt      time.Time
+	queueRelease  leaseReleaseState
+	writerRelease leaseReleaseState
+}
+
+// leaseReleaseState serializes release attempts for one idempotent remote
+// lease. A failed attempt returns the state to unreleased, so a later call can
+// retry the same ID. Concurrent callers wait for the active bounded attempt.
+type leaseReleaseState struct {
+	mu        sync.Mutex
+	releasing bool
+	released  bool
+	done      chan struct{}
+}
+
+type pendingCoordinatorRelease struct {
+	leaseID    string
+	operation  string
+	state      *leaseReleaseState
+	call       func(context.Context) error
+	onResolved func()
+	attempts   int
+	next       time.Time
+}
+
+func (s *leaseReleaseState) release(run func() error) error {
+	return s.releaseContext(context.Background(), run)
+}
+
+func (s *leaseReleaseState) releaseContext(ctx context.Context, run func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		s.mu.Lock()
+		if s.released {
+			s.mu.Unlock()
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if s.releasing {
+			done := s.done
+			s.mu.Unlock()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
+		s.releasing = true
+		s.done = make(chan struct{})
+		done := s.done
+		s.mu.Unlock()
+
+		err := run()
+
+		s.mu.Lock()
+		s.releasing = false
+		s.released = err == nil
+		close(done)
+		s.mu.Unlock()
+		return err
+	}
+}
+
+func (s *leaseReleaseState) reset() {
+	s.mu.Lock()
+	if !s.releasing {
+		s.released = false
+	}
+	s.mu.Unlock()
 }
 
 func (j *ingestJob) payloadBytes() int64 {
@@ -378,6 +571,8 @@ type IngestPayload struct {
 	reservationID  string
 	globalReserved int64
 	once           sync.Once
+	globalRelease  leaseReleaseState
+	reservationMu  sync.Mutex
 }
 
 func (p *IngestPayload) Result() PayloadResult { return p.result }
@@ -389,7 +584,7 @@ func (p *IngestPayload) Release() {
 	if p == nil || p.service == nil {
 		return
 	}
-	p.once.Do(func() { p.service.releasePayload(p) })
+	p.service.releasePayload(p)
 }
 
 func NewIngestService(store *Store, options IngestOptions) (*IngestService, error) {
@@ -437,12 +632,17 @@ func newIngestService(store *Store, options IngestOptions, global RuntimeIngestC
 	if backend, ok := store.StorageBackend.(*LocalFilesystemBackend); ok {
 		backend.telemetry.configure(options.SampleInterval, options.MetricsRetention)
 	}
-	s := &IngestService{store: store, options: options, global: global, jobs: make(chan *ingestJob, options.QueueObjects), slots: make(chan struct{}, options.QueueObjects), changed: make(chan struct{}), reservedByRecording: map[string]int64{}, queueTimes: map[*ingestJob]time.Time{}, failedRecordings: map[string]ingestFailureRecord{}, closeDone: make(chan struct{}), samplerStop: make(chan struct{}), samplerDone: make(chan struct{})}
+	s := &IngestService{store: store, options: options, global: global, jobs: make(chan *ingestJob, options.QueueObjects), slots: make(chan struct{}, options.QueueObjects), changed: make(chan struct{}), reservedByRecording: map[string]int64{}, queueTimes: map[*ingestJob]time.Time{}, failedRecordings: map[string]ingestFailureRecord{}, pendingCoordinatorReleases: map[string]pendingCoordinatorRelease{}, closeDone: make(chan struct{}), samplerStop: make(chan struct{}), samplerDone: make(chan struct{}), releaseRetryStop: make(chan struct{}), releaseRetryDone: make(chan struct{})}
 	for i := 0; i < options.Writers; i++ {
 		s.workers.Add(1)
 		go s.writer()
 	}
 	go s.sampleLoop()
+	if global != nil {
+		go s.releaseRetryLoop()
+	} else {
+		close(s.releaseRetryDone)
+	}
 	return s, nil
 }
 
@@ -694,14 +894,21 @@ func (s *IngestService) reserve(ctx context.Context, payload *IngestPayload, byt
 			s.releaseReservation(payload.recordingID, bytes)
 			return errors.New("ingest reservation identity is missing")
 		}
-		desired := payload.globalReserved + bytes
 		// Record the desired amount before the RPC. If the response is lost after
 		// the Host applied it, ReleasePayload still knows which lease to release.
+		payload.reservationMu.Lock()
+		desired := payload.globalReserved + bytes
 		payload.globalReserved = desired
-		if err := s.global.SetReservation(ctx, payload.recordingID, payload.reservationID, desired); err != nil {
+		if err := callCoordinator(ctx, "set reservation", func(callCtx context.Context) error {
+			return s.global.SetReservation(callCtx, payload.recordingID, payload.reservationID, desired)
+		}); err != nil {
+			payload.reservationMu.Unlock()
+			s.recordCoordinatorFailure(err)
 			s.releaseReservation(payload.recordingID, bytes)
 			return err
 		}
+		payload.globalRelease.reset()
+		payload.reservationMu.Unlock()
 	}
 	payload.reserved += bytes
 	return nil
@@ -736,43 +943,69 @@ func (s *IngestService) releasePayloadReservation(payload *IngestPayload, bytes 
 		return
 	}
 	s.releaseReservation(payload.recordingID, bytes)
-	if s.global == nil || payload.globalReserved <= 0 {
+	if s.global == nil {
+		return
+	}
+	payload.reservationMu.Lock()
+	defer payload.reservationMu.Unlock()
+	if payload.globalReserved <= 0 {
 		return
 	}
 	desired := payload.globalReserved - bytes
 	if desired <= 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
-		err := s.global.ReleaseReservation(ctx, payload.recordingID, payload.reservationID)
-		cancel()
+		err := payload.globalRelease.release(func() error {
+			return s.releaseCoordinatorLease(&payload.globalRelease, payload.reservationID, "release reservation", func(ctx context.Context) error {
+				return s.global.ReleaseReservation(ctx, payload.recordingID, payload.reservationID)
+			}, func() {
+				payload.reservationMu.Lock()
+				payload.globalReserved = 0
+				payload.reservationMu.Unlock()
+			})
+		})
 		if err == nil {
 			payload.globalReserved = 0
 		}
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
-	err := s.global.SetReservation(ctx, payload.recordingID, payload.reservationID, desired)
-	cancel()
+	err := callCoordinator(context.Background(), "set reservation", func(ctx context.Context) error {
+		return s.global.SetReservation(ctx, payload.recordingID, payload.reservationID, desired)
+	})
 	if err == nil {
 		payload.globalReserved = desired
+		payload.globalRelease.reset()
+	} else {
+		s.recordCoordinatorFailure(err)
 	}
 }
 
 func (s *IngestService) releasePayload(payload *IngestPayload) {
-	s.mu.Lock()
-	s.usedBytes -= payload.used
-	s.reservedGlobal -= payload.reserved
-	s.reservedByRecording[payload.recordingID] -= payload.reserved
-	if s.reservedByRecording[payload.recordingID] <= 0 {
-		delete(s.reservedByRecording, payload.recordingID)
-	}
-	s.signalLocked()
-	s.mu.Unlock()
-	payload.data = nil
+	payload.once.Do(func() {
+		s.mu.Lock()
+		s.usedBytes -= payload.used
+		s.reservedGlobal -= payload.reserved
+		s.reservedByRecording[payload.recordingID] -= payload.reserved
+		if s.reservedByRecording[payload.recordingID] <= 0 {
+			delete(s.reservedByRecording, payload.recordingID)
+		}
+		s.signalLocked()
+		s.mu.Unlock()
+		payload.data = nil
+	})
+	payload.reservationMu.Lock()
+	defer payload.reservationMu.Unlock()
 	if s.global != nil && payload.globalReserved > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
-		_ = s.global.ReleaseReservation(ctx, payload.recordingID, payload.reservationID)
-		cancel()
-		payload.globalReserved = 0
+		err := payload.globalRelease.release(func() error {
+			return s.releaseCoordinatorLease(&payload.globalRelease, payload.reservationID, "release reservation", func(ctx context.Context) error {
+				return s.global.ReleaseReservation(ctx, payload.recordingID, payload.reservationID)
+			}, func() {
+				payload.reservationMu.Lock()
+				payload.globalReserved = 0
+				payload.reservationMu.Unlock()
+			})
+		})
+		if err == nil {
+			payload.globalReserved = 0
+		}
 	}
 }
 
@@ -866,10 +1099,13 @@ func (s *IngestService) submit(_ context.Context, job *ingestJob) error {
 
 slotAcquired:
 	if s.global != nil {
-		if err := s.global.AcquireQueue(context.Background(), job.queueLease); err != nil {
+		if err := callCoordinator(context.Background(), "acquire queue", func(ctx context.Context) error {
+			return s.global.AcquireQueue(ctx, job.queueLease)
+		}); err != nil {
+			s.recordCoordinatorFailure(err)
 			_ = s.releaseGlobalQueue(job)
 			<-s.slots
-			return fmt.Errorf("global storage queue is unavailable: %w", err)
+			return &ingestCoordinatorFailure{operation: "acquire queue", cause: err}
 		}
 	}
 	s.mu.Lock()
@@ -906,7 +1142,10 @@ func (s *IngestService) writer() {
 			err = &poisonedIngestFailure{currentKind: job.kind, first: firstFailure}
 			_ = s.releaseGlobalQueue(job)
 		} else if s.global != nil {
-			if acquireErr := s.global.AcquireWriter(context.Background(), job.writerLease); acquireErr != nil {
+			if acquireErr := callCoordinator(context.Background(), "acquire writer", func(ctx context.Context) error {
+				return s.global.AcquireWriter(ctx, job.writerLease)
+			}); acquireErr != nil {
+				s.recordCoordinatorFailure(acquireErr)
 				err = &ingestWriterAcquireFailure{kind: job.kind, cause: acquireErr}
 				_ = s.releaseGlobalWriter(job)
 				_ = s.releaseGlobalQueue(job)
@@ -925,15 +1164,19 @@ func (s *IngestService) writer() {
 		}
 		if err != nil {
 			s.mu.Lock()
-			s.storageErrors++
-			if _, exists := s.failedRecordings[job.recordingID]; !exists {
-				s.failedRecordings[job.recordingID] = ingestFailureRecord{
-					kind: job.kind, err: err, attempts: ingestFailureAttempts(err),
+			if errors.Is(err, ErrCanonicalCommitFailed) {
+				s.storageErrors++
+				if _, exists := s.failedRecordings[job.recordingID]; !exists {
+					s.failedRecordings[job.recordingID] = ingestFailureRecord{
+						kind: job.kind, err: err, attempts: ingestFailureAttempts(err),
+					}
 				}
 			}
 			s.mu.Unlock()
-			if recorder, ok := s.store.StorageBackend.(storageErrorRecorder); ok {
-				recorder.recordStorageError()
+			if errors.Is(err, ErrCanonicalCommitFailed) {
+				if recorder, ok := s.store.StorageBackend.(storageErrorRecorder); ok {
+					recorder.recordStorageError()
+				}
 			}
 		}
 		if job.payload != nil {
@@ -951,26 +1194,130 @@ func (s *IngestService) releaseGlobalQueue(job *ingestJob) error {
 	if s.global == nil || job == nil {
 		return nil
 	}
-	var err error
-	job.queueOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
-		err = s.global.ReleaseQueue(ctx, job.queueLease)
-		cancel()
+	return job.queueRelease.release(func() error {
+		return s.releaseCoordinatorLease(&job.queueRelease, job.queueLease, "release queue", func(ctx context.Context) error {
+			return s.global.ReleaseQueue(ctx, job.queueLease)
+		}, nil)
 	})
-	return err
 }
 
 func (s *IngestService) releaseGlobalWriter(job *ingestJob) error {
 	if s.global == nil || job == nil {
 		return nil
 	}
-	var err error
-	job.writerOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
-		err = s.global.ReleaseWriter(ctx, job.writerLease)
-		cancel()
+	return job.writerRelease.release(func() error {
+		return s.releaseCoordinatorLease(&job.writerRelease, job.writerLease, "release writer", func(ctx context.Context) error {
+			return s.global.ReleaseWriter(ctx, job.writerLease)
+		}, nil)
 	})
+}
+
+func (s *IngestService) recordCoordinatorFailure(err error) {
+	if err == nil {
+		return
+	}
+	var failure *ingestCoordinatorFailure
+	if !errors.As(err, &failure) {
+		return
+	}
+	s.mu.Lock()
+	s.coordinatorErrors++
+	s.signalLocked()
+	s.mu.Unlock()
+}
+
+func (s *IngestService) releaseCoordinatorLease(state *leaseReleaseState, leaseID, operation string, call func(context.Context) error, onResolved func()) error {
+	return s.releaseCoordinatorLeaseContext(state, leaseID, operation, nil, call, onResolved)
+}
+
+func (s *IngestService) releaseCoordinatorLeaseContext(state *leaseReleaseState, leaseID, operation string, ctx context.Context, call func(context.Context) error, onResolved func()) error {
+	var err error
+	if ctx == nil {
+		err = callCoordinatorRelease(operation, call)
+	} else {
+		err = callCoordinatorReleaseContext(ctx, operation, call)
+	}
+	s.mu.Lock()
+	wasPending := false
+	firstPendingAttempt := false
+	if err == nil {
+		_, wasPending = s.pendingCoordinatorReleases[leaseID]
+		delete(s.pendingCoordinatorReleases, leaseID)
+	} else {
+		s.coordinatorErrors++
+		previous := s.pendingCoordinatorReleases[leaseID]
+		firstPendingAttempt = previous.attempts == 0
+		attempts := previous.attempts + 1
+		s.pendingCoordinatorReleases[leaseID] = pendingCoordinatorRelease{
+			leaseID: leaseID, operation: operation, state: state, call: call,
+			onResolved: onResolved, attempts: attempts, next: time.Now().Add(coordinatorReleaseRetryDelay(attempts)),
+		}
+	}
+	s.signalLocked()
+	s.mu.Unlock()
+	if firstPendingAttempt {
+		log.Printf("storage coordinator lease release pending: operation=%q", operation)
+	} else if wasPending {
+		log.Printf("storage coordinator lease release retry resolved: operation=%q", operation)
+	}
 	return err
+}
+
+func coordinatorReleaseRetryDelay(attempt int) time.Duration {
+	delay := runtimeResourceReleaseRetryBase
+	for i := 1; i < attempt && delay < runtimeResourceReleaseRetryMaximum; i++ {
+		if delay > runtimeResourceReleaseRetryMaximum/2 {
+			return runtimeResourceReleaseRetryMaximum
+		}
+		delay *= 2
+	}
+	if delay > runtimeResourceReleaseRetryMaximum {
+		return runtimeResourceReleaseRetryMaximum
+	}
+	return delay
+}
+
+func (s *IngestService) releaseRetryLoop() {
+	defer close(s.releaseRetryDone)
+	ticker := time.NewTicker(runtimeResourceReleaseRetryBase)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
+			s.retryPendingCoordinatorReleases(ctx, runtimeResourceReleaseRetryBatch, false)
+			cancel()
+		case <-s.releaseRetryStop:
+			return
+		}
+	}
+}
+
+func (s *IngestService) retryPendingCoordinatorReleases(ctx context.Context, limit int, force bool) {
+	s.mu.Lock()
+	now := time.Now()
+	entries := make([]pendingCoordinatorRelease, 0, len(s.pendingCoordinatorReleases))
+	for _, pending := range s.pendingCoordinatorReleases {
+		if force || !pending.next.After(now) {
+			entries = append(entries, pending)
+		}
+	}
+	s.mu.Unlock()
+	sort.Slice(entries, func(i, j int) bool { return entries[i].leaseID < entries[j].leaseID })
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	for _, pending := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		err := pending.state.releaseContext(ctx, func() error {
+			return s.releaseCoordinatorLeaseContext(pending.state, pending.leaseID, pending.operation, ctx, pending.call, pending.onResolved)
+		})
+		if err == nil && pending.onResolved != nil {
+			pending.onResolved()
+		}
+	}
 }
 
 func (s *IngestService) persistWithRetry(job *ingestJob) (PayloadResult, error) {
@@ -1034,7 +1381,7 @@ func (s *IngestService) Snapshot() IngestSnapshot {
 	if !oldestQueued.IsZero() {
 		oldest = time.Since(oldestQueued).Seconds()
 	}
-	return IngestSnapshot{BufferCapacityBytes: s.options.GlobalBytes, PerRecordingCapacityBytes: s.options.PerRecordingBytes, BufferUsedBytes: s.usedBytes, ReservedBytes: s.reservedGlobal, QueueObjects: s.queuedObjects, QueueBytes: s.queuedBytes, OldestPersistAgeSeconds: oldest, ActiveWriters: s.activeWriters, WriterConcurrency: s.options.Writers, StorageErrorsTotal: s.storageErrors}
+	return IngestSnapshot{BufferCapacityBytes: s.options.GlobalBytes, PerRecordingCapacityBytes: s.options.PerRecordingBytes, BufferUsedBytes: s.usedBytes, ReservedBytes: s.reservedGlobal, QueueObjects: s.queuedObjects, QueueBytes: s.queuedBytes, OldestPersistAgeSeconds: oldest, ActiveWriters: s.activeWriters, WriterConcurrency: s.options.Writers, StorageErrorsTotal: s.storageErrors, CoordinatorErrorsTotal: s.coordinatorErrors, PendingCoordinatorLeases: len(s.pendingCoordinatorReleases)}
 }
 
 // Options returns the immutable runtime options used when this service was
@@ -1096,7 +1443,8 @@ func (s *IngestService) refreshOldestQueuedLocked() {
 }
 
 // Close stops admission and drains every accepted object. Calls may be
-// repeated after a deadline to continue waiting for a blocked local writer.
+// repeated after a deadline to continue waiting for a blocked local writer or
+// retry unresolved remote lease releases.
 func (s *IngestService) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1111,12 +1459,30 @@ func (s *IngestService) Close(ctx context.Context) error {
 			s.waitForSubmits()
 			close(s.jobs)
 			s.workers.Wait()
+			if s.global != nil {
+				close(s.releaseRetryStop)
+				<-s.releaseRetryDone
+			}
 			<-s.samplerDone
 			close(s.closeDone)
 		}()
 	})
 	select {
 	case <-s.closeDone:
+		if s.global != nil {
+			releaseCtx, cancel := context.WithTimeout(ctx, runtimeResourceReleaseTimeout)
+			s.retryPendingCoordinatorReleases(releaseCtx, runtimeResourceReleaseRetryBatch, true)
+			cancel()
+		}
+		s.mu.Lock()
+		pending := len(s.pendingCoordinatorReleases)
+		s.mu.Unlock()
+		if pending > 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: %d remote lease releases remain pending", ErrIngestCoordinatorUnavailable, pending)
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

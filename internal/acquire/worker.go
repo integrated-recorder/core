@@ -682,52 +682,9 @@ func (m *Manager) downloadObjectBufferedOnceAtGeneration(ctx context.Context, ur
 
 func (m *Manager) downloadObjectBufferedOnceAtGenerationScope(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID string, media adapterproto.MediaSource, e *entry, expectedGeneration uint64, scope adapterproto.ResourceRequestScope) (*storage.IngestPayload, error) {
 	maxPayloadBytes := m.ingest.Options().MaxPayloadBytes
-	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
-		return nil, newFetchError("segment", 0, false, false)
-	}
-	requestURL, err := m.transformedRequestURL(ctx, media, media.ManifestURL, uri, scope)
+	response, expectedSize, err := m.openObjectResponseAtGenerationScope(ctx, uri, byteRange, media, e, expectedGeneration, scope)
 	if err != nil {
-		return nil, newFetchError("segment", 0, false, false)
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
-	if err != nil {
-		return nil, newFetchError("segment", 0, false, false)
-	}
-	if byteRange != nil {
-		end := byteRange.Offset + byteRange.Length - 1
-		request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Offset, end))
-	}
-	response, err := doMediaRequestAtGeneration(m.client, request, media.Headers, media.ManifestURL, media.RequestPolicy, e, expectedGeneration, m.fetchBoundaryHook)
-	if err != nil {
-		if errors.Is(err, errStaleMediaGeneration) {
-			return nil, errStaleMediaGeneration
-		}
-		return nil, newFetchError("segment", 0, true, false)
-	}
-	expectedStatus := http.StatusOK
-	expectedSize := int64(-1)
-	if byteRange != nil {
-		expectedStatus = http.StatusPartialContent
-		expectedSize = int64(byteRange.Length)
-	}
-	if response.StatusCode != expectedStatus {
-		status := response.StatusCode
-		response.Body.Close()
-		return nil, newFetchError("segment", status, isRetryableStatus(status), true)
-	}
-	if hasNonIdentityContentEncoding(response.Header) {
-		response.Body.Close()
-		return nil, newFetchError("segment", 0, false, false)
-	}
-	if byteRange != nil {
-		if err = validateContentRange(response.Header.Get("Content-Range"), *byteRange); err != nil {
-			response.Body.Close()
-			return nil, newFetchError("segment", response.StatusCode, false, false)
-		}
-	}
-	if response.ContentLength > maxPayloadBytes {
-		response.Body.Close()
-		return nil, newFetchError("segment", 0, false, false)
+		return nil, err
 	}
 	reservationHint := response.ContentLength
 	if byteRange != nil {
@@ -739,10 +696,89 @@ func (m *Manager) downloadObjectBufferedOnceAtGenerationScope(ctx context.Contex
 		if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
 			return nil, readErr
 		}
-		retryable := !errors.Is(readErr, storage.ErrIngestTooLarge)
+		retryable := !errors.Is(readErr, storage.ErrIngestTooLarge) && !errors.Is(readErr, storage.ErrIngestClosed)
 		return nil, newFetchError("segment", 0, retryable, false)
 	}
 	return payload, nil
+}
+
+func (m *Manager) openObjectResponseAtGenerationScope(ctx context.Context, uri string, byteRange *domain.ByteRange, media adapterproto.MediaSource, e *entry, expectedGeneration uint64, scope adapterproto.ResourceRequestScope) (*http.Response, int64, error) {
+	maxPayloadBytes := m.ingest.Options().MaxPayloadBytes
+	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
+		return nil, -1, newFetchError("segment", 0, false, false)
+	}
+	requestURL, err := m.transformedRequestURL(ctx, media, media.ManifestURL, uri, scope)
+	if err != nil {
+		return nil, -1, newFetchError("segment", 0, false, false)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil, -1, newFetchError("segment", 0, false, false)
+	}
+	if byteRange != nil {
+		end := byteRange.Offset + byteRange.Length - 1
+		request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Offset, end))
+	}
+	response, err := doMediaRequestAtGeneration(m.client, request, media.Headers, media.ManifestURL, media.RequestPolicy, e, expectedGeneration, m.fetchBoundaryHook)
+	if err != nil {
+		if errors.Is(err, errStaleMediaGeneration) {
+			return nil, -1, errStaleMediaGeneration
+		}
+		return nil, -1, newFetchError("segment", 0, true, false)
+	}
+	expectedStatus := http.StatusOK
+	expectedSize := int64(-1)
+	if byteRange != nil {
+		expectedStatus = http.StatusPartialContent
+		expectedSize = int64(byteRange.Length)
+	}
+	if response.StatusCode != expectedStatus {
+		status := response.StatusCode
+		response.Body.Close()
+		return nil, -1, newFetchError("segment", status, isRetryableStatus(status), true)
+	}
+	if hasNonIdentityContentEncoding(response.Header) {
+		response.Body.Close()
+		return nil, -1, newFetchError("segment", 0, false, false)
+	}
+	if byteRange != nil {
+		if err = validateContentRange(response.Header.Get("Content-Range"), *byteRange); err != nil {
+			response.Body.Close()
+			return nil, -1, newFetchError("segment", response.StatusCode, false, false)
+		}
+	}
+	if response.ContentLength > maxPayloadBytes {
+		response.Body.Close()
+		return nil, -1, newFetchError("segment", 0, false, false)
+	}
+	if byteRange != nil && response.ContentLength >= 0 && response.ContentLength != expectedSize {
+		response.Body.Close()
+		return nil, -1, newFetchError("segment", 0, false, false)
+	}
+	return response, expectedSize, nil
+}
+
+func (m *Manager) downloadHistoricalToSpool(ctx context.Context, source hls.MediaSegment, media adapterproto.MediaSource, e *entry, generation uint64, spool *historicalPayloadSpool) error {
+	response, expectedSize, err := m.openObjectResponseAtGenerationScope(ctx, source.URI, source.ByteRange, media, e, generation, adapterproto.RequestScopeMedia)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if expectedSize < 0 && response.ContentLength >= 0 {
+		expectedSize = response.ContentLength
+	}
+	err = spool.write(response.Body, m.ingest.Options().MaxPayloadBytes, expectedSize)
+	if err != nil {
+		if errors.Is(err, errHistoricalScratch) {
+			return errHistoricalScratch
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		retryable := !errors.Is(err, storage.ErrIngestTooLarge) && !errors.Is(err, storage.ErrIngestClosed)
+		return newFetchError("segment", 0, retryable, false)
+	}
+	return nil
 }
 
 func (m *Manager) acquireMediaUsing(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, firstInEpoch bool, media adapterproto.MediaSource, download func(context.Context, string, *domain.ByteRange, string, string, adapterproto.MediaSource) (storage.PayloadResult, error)) (domain.Segment, error) {

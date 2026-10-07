@@ -118,16 +118,18 @@ type entry struct {
 }
 
 type Manager struct {
-	store           *storage.Store
-	ingest          *storage.IngestService
-	client          *http.Client
-	resolver        Resolver
-	validate        SourceValidator
-	mu              sync.RWMutex
-	startCreationMu sync.Mutex
-	entries         map[string]*entry
-	prepared        map[string]preparedHandover
-	handoverMu      sync.Mutex
+	store            *storage.Store
+	ingest           *storage.IngestService
+	client           *http.Client
+	historicalFetch  *historicalFetchGovernor
+	historicalSpools *historicalSpoolPool
+	resolver         Resolver
+	validate         SourceValidator
+	mu               sync.RWMutex
+	startCreationMu  sync.Mutex
+	entries          map[string]*entry
+	prepared         map[string]preparedHandover
+	handoverMu       sync.Mutex
 	// freshGeneration leaves existing archive documents read-only and does
 	// not take ownership of them. It is used for a candidate Engine generation
 	// that must not recover/interrupt work owned by an older Engine.
@@ -298,7 +300,20 @@ func newManagerWithMode(store *storage.Store, client *http.Client, resolver Reso
 	if resolver == nil {
 		resolver = unavailableResolver{}
 	}
-	m := &Manager{store: store, ingest: ingest, client: client, resolver: resolver, validate: validate, entries: map[string]*entry{}, prepared: make(map[string]preparedHandover), freshGeneration: mode == FreshGeneration, startsDone: make(chan struct{})}
+	clientCopy := *client
+	baseTransport := clientCopy.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	historicalFetch := newHistoricalFetchGovernor(func() storage.IngestSnapshot { return ingest.Snapshot() })
+	clientCopy.Transport = historicalPriorityRoundTripper{base: baseTransport, governor: historicalFetch}
+	options := ingest.Options()
+	m := &Manager{
+		store: store, ingest: ingest, client: &clientCopy,
+		historicalFetch: historicalFetch, historicalSpools: newHistoricalSpoolPool(maxConcurrentHistoricalSpools(options)),
+		resolver: resolver, validate: validate, entries: map[string]*entry{}, prepared: make(map[string]preparedHandover),
+		freshGeneration: mode == FreshGeneration, startsDone: make(chan struct{}),
+	}
 	for _, recording := range loaded {
 		m.entries[recording.ID] = &entry{recording: recording, done: closedChannel()}
 	}
@@ -1540,7 +1555,13 @@ func (m *Manager) withOwnershipCommit(owner *OwnershipToken, commit func() error
 	if fence == nil {
 		return ErrCanonicalFenceRequired
 	}
-	return fence.WithCommit(*owner, commit)
+	err := fence.WithCommit(*owner, commit)
+	if errors.Is(err, recordingowner.ErrNotFound) || errors.Is(err, recordingowner.ErrStaleOwner) {
+		// Observe rejects from every caller of the shared fence, including
+		// multi-object archive commits that do not use withCanonicalCommit.
+		_ = runtimehook.Observe(runtimehook.StaleOwnerCommitRejected, owner.RecordingID)
+	}
+	return err
 }
 
 func (m *Manager) withCanonicalCommit(e *entry, commit func() error) error {
@@ -1559,14 +1580,7 @@ func (m *Manager) withCanonicalCommit(e *entry, commit func() error) error {
 	}
 	e.mu.Unlock()
 
-	err := m.withOwnershipCommit(owner, commit)
-	if owner != nil && (errors.Is(err, recordingowner.ErrNotFound) || errors.Is(err, recordingowner.ErrStaleOwner)) {
-		// This is a non-blocking, private marker compiled only into the
-		// production-process runtime_e2e acceptance binaries. It observes the
-		// real common-fence rejection and never affects authorization.
-		_ = runtimehook.Observe(runtimehook.StaleOwnerCommitRejected, owner.RecordingID)
-	}
-	return err
+	return m.withOwnershipCommit(owner, commit)
 }
 
 // withCanonicalMutation serializes local root updates before acquiring the
@@ -2184,7 +2198,9 @@ func logStorageCommitFailure(err error) {
 	for current := err; current != nil; current = errors.Unwrap(current) {
 		types = append(types, fmt.Sprintf("%T", current))
 	}
-	log.Printf("recording storage commit diagnostic: stages=%q attempts=%d current_job_kind=%q current_job_stage=%q first_failure_job_kind=%q first_failure_job_stage=%q current_attempts=%d first_failure_attempts=%d error_types=%q", stages, attempts, currentJobKind, currentJobStage, firstFailureJobKind, firstFailureJobStage, currentAttempts, firstFailureAttempts, types)
+	coordinatorUnavailable := errors.Is(err, storage.ErrIngestCoordinatorUnavailable)
+	canonicalCommitFailed := errors.Is(err, storage.ErrCanonicalCommitFailed)
+	log.Printf("recording storage commit diagnostic: coordinator_unavailable=%t canonical_commit_failed=%t stages=%q attempts=%d current_job_kind=%q current_job_stage=%q first_failure_job_kind=%q first_failure_job_stage=%q current_attempts=%d first_failure_attempts=%d error_types=%q", coordinatorUnavailable, canonicalCommitFailed, stages, attempts, currentJobKind, currentJobStage, firstFailureJobKind, firstFailureJobStage, currentAttempts, firstFailureAttempts, types)
 }
 
 func ingestJobStage(kind storage.IngestJobKind) string {

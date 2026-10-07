@@ -22,6 +22,13 @@ type historicalRepairProgress struct {
 	needsRecheck bool
 }
 
+type historicalRecoveryWork struct {
+	source     hls.MediaSegment
+	coordinate archiveindex.Coordinate
+	epoch      uint64
+	gap        bool
+}
+
 type retryableHistoricalError struct{ cause error }
 
 func (e *retryableHistoricalError) Error() string { return e.cause.Error() }
@@ -57,6 +64,7 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 	if ctx == nil {
 		return context.Canceled
 	}
+	ctx = withHistoricalAcquisitionPriority(ctx)
 	if !validOwnershipToken(owner) || owner.RecordingID != id {
 		return ErrInvalidOwnershipToken
 	}
@@ -202,14 +210,7 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 	if rootTrack == nil {
 		return errors.New("main track is missing")
 	}
-	candidateCapacity := len(playlist.Segments)
-	if candidateCapacity > maxHistoricalRecoveryWorkPerPass {
-		candidateCapacity = maxHistoricalRecoveryWorkPerPass
-	}
-	type recoveryCandidate struct {
-		source hls.MediaSegment
-	}
-	candidates := make([]recoveryCandidate, 0, candidateCapacity)
+	candidates := make([]historicalRecoveryWork, 0, min(len(playlist.Segments), maxHistoricalRecoveryWorkPerPass))
 	selected := historicalAvailabilitySelection(media.HistoricalAvailability, playlist.Segments, time.Now())
 	work := 0
 	plannedInit := make(map[string]struct{})
@@ -241,9 +242,7 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				}
 				break
 			}
-			if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), coordinate, archiveindex.CoverageKnownMissing, "source manifest declared media missing"); err != nil {
-				return err
-			}
+			candidates = append(candidates, historicalRecoveryWork{source: source, coordinate: coordinate, epoch: epoch, gap: true})
 			work++
 			continue
 		}
@@ -272,10 +271,10 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 		if initID != "" {
 			plannedInit[initID] = struct{}{}
 		}
-		candidates = append(candidates, recoveryCandidate{source: source})
+		candidates = append(candidates, historicalRecoveryWork{source: source, coordinate: coordinate, epoch: epoch})
 	}
-	for _, candidate := range candidates {
-		source := candidate.source
+	for cursor := 0; cursor < len(candidates); {
+		candidate := candidates[cursor]
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -288,77 +287,120 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				return errStaleMediaGeneration
 			}
 		}
-		epoch := historicalSourceEpoch(root, source)
-		payload, fetchErr := m.downloadObjectBufferedOnceAtGenerationScope(ctx, source.URI, source.ByteRange, id, historicalMedia, e, generation, adapterproto.RequestScopeMedia)
-		if fetchErr != nil {
-			if errors.Is(fetchErr, context.Canceled) || errors.Is(fetchErr, context.DeadlineExceeded) {
-				return fetchErr
-			}
-			if m.shouldRefresh(historicalMedia, fetchErr) {
-				if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, historicalMedia, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
-					return retryableHistorical(errors.New("historical source refresh failed"))
-				}
-				return retryableHistorical(errors.New("historical source refreshed; retry recovery pass"))
-			}
-			coordinate := archiveindex.Coordinate{SessionID: identity.ID, TrackID: trackID, SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence, Sequence: source.Sequence, Kind: archiveindex.ObjectMedia}
-			if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), coordinate, archiveindex.CoverageAcquisitionFailed, "historical media acquisition failed"); err != nil {
+		if candidate.gap {
+			if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), candidate.coordinate, archiveindex.CoverageKnownMissing, "source manifest declared media missing"); err != nil {
 				return err
 			}
-			if progress != nil {
-				if retryableHistoricalFetch(fetchErr) {
-					progress.failed++
-				}
-			}
+			cursor++
 			continue
 		}
-		initID, initErr := m.acquireHistoricalInit(ctx, e, owner, terminalRepairMutationAllowed(e, !active), historicalMedia, generation, identity.ID, rootTrack, source, epoch)
-		if initErr != nil {
-			payload.Release()
-			if m.shouldRefresh(historicalMedia, initErr) {
-				if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, historicalMedia, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
-					return retryableHistorical(errors.New("historical source refresh failed"))
-				}
-				return retryableHistorical(errors.New("historical source refreshed; retry recovery pass"))
-			}
-			if !errors.Is(initErr, context.Canceled) && !errors.Is(initErr, context.DeadlineExceeded) {
-				coordinate := archiveindex.Coordinate{SessionID: identity.ID, TrackID: trackID, SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence, Sequence: source.Sequence, Kind: archiveindex.ObjectMedia}
-				if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), coordinate, archiveindex.CoverageAcquisitionFailed, "historical initialization media acquisition failed"); err != nil {
-					return err
-				}
-				if progress != nil {
-					if retryableHistoricalFetch(initErr) {
-						progress.failed++
-					}
-				}
-				continue
-			}
-			return initErr
-		}
-		segment := makeArchiveSegment(source, epoch, 0, initID, payload.Result())
-		if commitErr := m.commitHistoricalPayload(ctx, e, owner, terminalRepairMutationAllowed(e, !active), segment, payload); commitErr != nil {
-			return commitErr
-		}
-		if progress != nil {
-			progress.acquired++
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if active {
-			_, generation = currentMediaVersion(e)
-		}
-		root = m.recordingSnapshotForArchive(e)
-		if root == nil {
-			return storage.ErrNotFound
-		}
-		rootTrack = root.Tracks[trackID]
-		if rootTrack == nil {
-			return errors.New("main track is missing")
-		}
-		inventory, err = m.ArchiveInventory(id)
+
+		windowSize, err := m.historicalFetch.waitWindow(ctx, m.historicalSpools.capacity())
 		if err != nil {
 			return err
 		}
+		windowEnd := cursor
+		for windowEnd < len(candidates) && windowEnd-cursor < windowSize && !candidates[windowEnd].gap {
+			windowEnd++
+		}
+		results, cleanup, fetchErr := m.fetchHistoricalWindow(ctx, id, historicalMedia, e, generation, candidates[cursor:windowEnd])
+		if fetchErr != nil {
+			return fetchErr
+		}
+		windowErr := func() error {
+			for offset := range results {
+				candidate := candidates[cursor+offset]
+				result := results[offset]
+				source, epoch, coordinate := candidate.source, candidate.epoch, candidate.coordinate
+				if result.err != nil {
+					if errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded) {
+						return result.err
+					}
+					if errors.Is(result.err, errHistoricalScratch) {
+						return retryableHistorical(errHistoricalScratch)
+					}
+					if m.shouldRefresh(historicalMedia, result.err) {
+						if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, historicalMedia, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
+							return retryableHistorical(errors.New("historical source refresh failed"))
+						}
+						return retryableHistorical(errors.New("historical source refreshed; retry recovery pass"))
+					}
+					if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), coordinate, archiveindex.CoverageAcquisitionFailed, "historical media acquisition failed"); err != nil {
+						return err
+					}
+					if progress != nil && retryableHistoricalFetch(result.err) {
+						progress.failed++
+					}
+					continue
+				}
+				initID, initErr := m.acquireHistoricalInit(ctx, e, owner, terminalRepairMutationAllowed(e, !active), historicalMedia, generation, identity.ID, rootTrack, source, epoch)
+				if initErr != nil {
+					if m.shouldRefresh(historicalMedia, initErr) {
+						if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, historicalMedia, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
+							return retryableHistorical(errors.New("historical source refresh failed"))
+						}
+						return retryableHistorical(errors.New("historical source refreshed; retry recovery pass"))
+					}
+					if errors.Is(initErr, errHistoricalScratch) {
+						return retryableHistorical(errHistoricalScratch)
+					}
+					if !errors.Is(initErr, context.Canceled) && !errors.Is(initErr, context.DeadlineExceeded) {
+						if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), coordinate, archiveindex.CoverageAcquisitionFailed, "historical initialization media acquisition failed"); err != nil {
+							return err
+						}
+						if progress != nil && retryableHistoricalFetch(initErr) {
+							progress.failed++
+						}
+						continue
+					}
+					return initErr
+				}
+				payload, err := result.spool.readPayload(ctx, m.ingest, id)
+				if err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return err
+					}
+					return retryableHistorical(errHistoricalScratch)
+				}
+				segment := makeArchiveSegment(source, epoch, 0, initID, payload.Result())
+				if commitErr := m.commitHistoricalPayload(ctx, e, owner, terminalRepairMutationAllowed(e, !active), segment, payload); commitErr != nil {
+					return commitErr
+				}
+				if progress != nil {
+					progress.acquired++
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if active {
+					_, generation = currentMediaVersion(e)
+				}
+				root = m.recordingSnapshotForArchive(e)
+				if root == nil {
+					return storage.ErrNotFound
+				}
+				rootTrack = root.Tracks[trackID]
+				if rootTrack == nil {
+					return errors.New("main track is missing")
+				}
+				inventory, err = m.ArchiveInventory(id)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		}()
+		cleanupErr := cleanup()
+		if windowErr != nil {
+			if cleanupErr != nil {
+				return errors.Join(windowErr, retryableHistorical(errHistoricalScratch))
+			}
+			return windowErr
+		}
+		if cleanupErr != nil {
+			return retryableHistorical(errHistoricalScratch)
+		}
+		cursor = windowEnd
 	}
 	return nil
 }

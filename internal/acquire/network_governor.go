@@ -168,7 +168,12 @@ func (g *historicalFetchGovernor) setLimitLocked(limit int) {
 
 func classifyHistoricalPressure(snapshot storage.IngestSnapshot) historicalPressure {
 	capacity := snapshot.BufferCapacityBytes
-	used := snapshot.BufferUsedBytes + snapshot.ReservedBytes
+	// BufferUsedBytes counts payload contents. ReservedBytes counts backing
+	// capacity for those same payloads, including temporary old+new arrays
+	// during growth. Treat the larger value as resident memory; adding them
+	// double-counts most queued payloads. Queue metrics below remain separate
+	// latency and admission-pressure signals.
+	used := max(snapshot.BufferUsedBytes, snapshot.ReservedBytes)
 	if capacity > 0 {
 		if used*100 >= capacity*90 || snapshot.QueueBytes*100 >= capacity*70 ||
 			snapshot.QueueObjects >= storage.MaxIngestObjects*3/4 || snapshot.OldestPersistAgeSeconds >= 5 {

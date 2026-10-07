@@ -170,21 +170,81 @@ func TestHistoricalHTTPAdmissionLetsLiveProceedAndPausesNewHistory(t *testing.T)
 	}
 }
 
-func TestHistoricalSpoolLimitUsesIngestBudgetRatio(t *testing.T) {
+func TestHistoricalSpoolLimitUsesIndependentBound(t *testing.T) {
 	tests := []struct {
 		name    string
 		options storage.IngestOptions
 		want    int
 	}{
-		{name: "default", options: storage.DefaultIngestOptions(), want: 2},
-		{name: "four slots", options: storage.IngestOptions{GlobalBytes: 80, MaxPayloadBytes: 20}, want: 4},
-		{name: "one slot", options: storage.IngestOptions{GlobalBytes: 20, MaxPayloadBytes: 20}, want: 1},
-		{name: "minimum one", options: storage.IngestOptions{GlobalBytes: 5, MaxPayloadBytes: 10}, want: 1},
+		{name: "default", options: storage.DefaultIngestOptions(), want: maxHistoricalFetchConcurrency},
+		{name: "small ingest pool", options: storage.IngestOptions{GlobalBytes: 20, MaxPayloadBytes: 10}, want: maxHistoricalFetchConcurrency},
+		{name: "large ingest pool", options: storage.IngestOptions{GlobalBytes: 80, MaxPayloadBytes: 20}, want: maxHistoricalFetchConcurrency},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if got := maxConcurrentHistoricalSpools(test.options); got != test.want {
 				t.Fatalf("spool limit=%d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestHistoricalPressureDoesNotDoubleCountPayloadBackingMemory(t *testing.T) {
+	const capacity = int64(1 << 30)
+	tests := []struct {
+		name     string
+		snapshot storage.IngestSnapshot
+		want     historicalPressure
+	}{
+		{
+			name: "partially filled reserved payload",
+			snapshot: storage.IngestSnapshot{
+				BufferCapacityBytes: capacity, BufferUsedBytes: capacity / 8, ReservedBytes: capacity / 4,
+			},
+			want: historicalPressureHealthy,
+		},
+		{
+			name: "normal full payload backing",
+			snapshot: storage.IngestSnapshot{
+				BufferCapacityBytes: capacity, BufferUsedBytes: capacity * 3 / 8, ReservedBytes: capacity / 2,
+			},
+			want: historicalPressureHealthy,
+		},
+		{
+			name: "multiple payload backing",
+			snapshot: storage.IngestSnapshot{
+				BufferCapacityBytes: capacity, BufferUsedBytes: capacity * 5 / 8, ReservedBytes: capacity * 3 / 4,
+			},
+			want: historicalPressureModerate,
+		},
+		{
+			name: "reserved but unused capacity",
+			snapshot: storage.IngestSnapshot{
+				BufferCapacityBytes: capacity, ReservedBytes: capacity * 95 / 100,
+			},
+			want: historicalPressureSevere,
+		},
+		{
+			name: "queue bytes remain separate pressure",
+			snapshot: storage.IngestSnapshot{
+				BufferCapacityBytes: capacity, BufferUsedBytes: capacity / 8,
+				ReservedBytes: capacity / 4, QueueBytes: capacity * 3 / 4,
+			},
+			want: historicalPressureSevere,
+		},
+		{
+			name: "queue objects and age remain separate pressure",
+			snapshot: storage.IngestSnapshot{
+				BufferCapacityBytes: capacity, BufferUsedBytes: capacity / 8,
+				ReservedBytes: capacity / 4, QueueObjects: storage.MaxIngestObjects / 4,
+			},
+			want: historicalPressureModerate,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyHistoricalPressure(test.snapshot); got != test.want {
+				t.Fatalf("pressure=%v, want %v; snapshot=%+v", got, test.want, test.snapshot)
 			}
 		})
 	}

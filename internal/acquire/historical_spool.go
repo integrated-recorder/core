@@ -16,6 +16,8 @@ import (
 
 var errHistoricalScratch = errors.New("historical scratch storage is unavailable")
 
+const maxHistoricalScratchObjects = maxHistoricalFetchConcurrency
+
 type historicalSpoolPool struct {
 	mu      sync.Mutex
 	limit   int
@@ -23,18 +25,11 @@ type historicalSpoolPool struct {
 	changed chan struct{}
 }
 
-func maxConcurrentHistoricalSpools(options storage.IngestOptions) int {
-	limit := 1
-	if options.MaxPayloadBytes > 0 && options.GlobalBytes > 0 {
-		limit = int(options.GlobalBytes / options.MaxPayloadBytes)
-	}
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > maxHistoricalFetchConcurrency {
-		limit = maxHistoricalFetchConcurrency
-	}
-	return limit
+func maxConcurrentHistoricalSpools(_ storage.IngestOptions) int {
+	// Spools live on private scratch storage. Bound them independently from
+	// ingest RAM: each response still has MaxPayloadBytes cap, so this pool
+	// bounds aggregate scratch use to maxHistoricalScratchObjects payloads.
+	return maxHistoricalScratchObjects
 }
 
 func newHistoricalSpoolPool(limit int) *historicalSpoolPool {

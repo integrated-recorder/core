@@ -21,6 +21,7 @@ import (
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/hls"
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
@@ -509,7 +510,9 @@ func TestHistoricalGapOnlyPassUsesBoundedRecoveryWorkAndContinues(t *testing.T) 
 		fmt.Fprintf(&manifest, "#EXTINF:2,\n#EXT-X-GAP\nsegment-%d.m4s\n", sequence)
 	}
 	media := repairMediaContextForTest()
-	media.HistoricalAvailability.SequenceRanges = []adapterproto.HistoricalSequenceRange{{Start: 1, End: gapCount}}
+	media.HistoricalAvailability = &adapterproto.HistoricalAvailability{
+		Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: media.ManifestURL,
+	}
 	fixture := &repairFixtureTransport{manifest: []byte(manifest.String()), objects: map[string][]byte{}}
 	root := newRepairTestRoot(t, store, domain.StateCompleted, media)
 	root.Gaps = nil
@@ -581,10 +584,14 @@ func TestAutomaticRecoveryGapOnlyPassYieldsToNextRecording(t *testing.T) {
 	)
 	mediaA := repairMediaContextForTest()
 	mediaA.ManifestURL = "https://media.example/a/index.m3u8?hdnts=signed-value"
-	mediaA.HistoricalAvailability.SequenceRanges = []adapterproto.HistoricalSequenceRange{{Start: 1, End: gapCount}}
+	mediaA.HistoricalAvailability = &adapterproto.HistoricalAvailability{
+		Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: mediaA.ManifestURL,
+	}
 	mediaB := repairMediaContextForTest()
 	mediaB.ManifestURL = "https://media.example/b/index.m3u8?hdnts=signed-value"
-	mediaB.HistoricalAvailability.SequenceRanges = []adapterproto.HistoricalSequenceRange{{Start: 1, End: 1}}
+	mediaB.HistoricalAvailability = &adapterproto.HistoricalAvailability{
+		Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: mediaB.ManifestURL,
+	}
 	var gapManifest strings.Builder
 	gapManifest.WriteString("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n")
 	for sequence := 1; sequence <= gapCount; sequence++ {
@@ -697,6 +704,9 @@ func TestAutomaticArchiveRecoveryRetriesMiddleGapAfterBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	media := repairMediaContextForTest()
+	media.HistoricalAvailability = &adapterproto.HistoricalAvailability{
+		Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: media.ManifestURL,
+	}
 	manifest := bytes.Replace(repairManifestFixture(), []byte("#EXT-X-GAP\nmissing.ts"), []byte("middle.ts"), 1)
 	fixture := &repairFixtureTransport{manifest: manifest, objects: map[string][]byte{
 		"/archive/prefix.m4v": []byte("retry-prefix"),
@@ -1598,6 +1608,149 @@ func TestRepairDeclaredHistoryFillsMiddleGap(t *testing.T) {
 	assertStoredPayload(t, store, root.ID, segmentAtSequence(t, track.Segments, 11).StoragePath, []byte("middle-gap-exact-bytes"))
 	if repaired.Duration() != 12 {
 		t.Fatalf("VOD duration after gap repair = %v, want 12", repaired.Duration())
+	}
+}
+
+func TestManifestHistoricalAvailabilitySelectsEveryObservedCoordinate(t *testing.T) {
+	availability := &adapterproto.HistoricalAvailability{Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: "https://stream.example/archive"}
+	for _, count := range []int{1800, 900, 300} {
+		segments := make([]hls.MediaSegment, count)
+		for i := range segments {
+			segments[i] = hls.MediaSegment{Sequence: uint64(i + 1), URI: "https://stream.example/segment", Gap: i == 1}
+		}
+		selected := historicalAvailabilitySelection(availability, segments, time.Now())
+		if len(selected) != count {
+			t.Fatalf("selected length=%d, want %d", len(selected), count)
+		}
+		for i, ok := range selected {
+			if !ok {
+				t.Fatalf("manifest coordinate %d of %d was not selected", i, count)
+			}
+		}
+	}
+	if !historicalDeclarationNeedsRecheck(availability, nil) || !historicalDeclarationNeedsRecheck(availability, []hls.MediaSegment{{Sequence: 1}}) {
+		t.Fatal("manifest declaration must allow slow recheck after empty or unchanged observation")
+	}
+}
+
+func TestManifestHistoricalAvailabilitySlidingWindowAddsOnlyNewCoordinates(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := repairMediaContextForTest()
+	media.HistoricalAvailability = &adapterproto.HistoricalAvailability{
+		Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: media.ManifestURL,
+	}
+	manifest := func(first uint64, uris ...string) []byte {
+		var body strings.Builder
+		fmt.Fprintf(&body, "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:%d\n#EXT-X-DISCONTINUITY-SEQUENCE:7\n", first)
+		for _, uri := range uris {
+			fmt.Fprintf(&body, "#EXTINF:4,\n%s\n", uri)
+		}
+		body.WriteString("#EXT-X-ENDLIST\n")
+		return []byte(body.String())
+	}
+	fixture := &repairFixtureTransport{manifest: manifest(10, "ten.ts", "eleven.ts", "twelve.ts"), objects: map[string][]byte{
+		"/archive/ten.m4v": []byte("ten"), "/archive/eleven.m4v": []byte("eleven"), "/archive/thirteen.m4v": []byte("thirteen"),
+	}}
+	root := newRepairTestRoot(t, store, domain.StateCompleted, media)
+	manager, _, closeManager := newRepairTestManager(t, store, fixture, root, &repairOwnerFence{}, nil)
+	defer func() {
+		if closeErr := closeManager(); closeErr != nil {
+			t.Errorf("close manifest repair manager: %v", closeErr)
+		}
+	}()
+	if err := manager.RepairDeclaredHistory(context.Background(), ownerForRepair(root.ID, 1), root.ID); err != nil {
+		t.Fatalf("first manifest observation: %v", err)
+	}
+	first, err := manager.Get(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if segmentAtSequence(t, first.Tracks["main"].Segments, 10).TimelineOrdinal != 1 || segmentAtSequence(t, first.Tracks["main"].Segments, 12).TimelineOrdinal != 3 {
+		t.Fatalf("first manifest coordinates not projected: %#v", first.Tracks["main"].Segments)
+	}
+	firstTen := segmentAtSequence(t, first.Tracks["main"].Segments, 10)
+	firstTenOrdinal := firstTen.ArchiveOrdinal
+	firstTenHash := firstTen.SHA256
+
+	fixture.setManifest(manifest(11, "eleven.ts", "twelve.ts", "thirteen.ts"))
+	if err := manager.RepairDeclaredHistory(context.Background(), ownerForRepair(root.ID, 2), root.ID); err != nil {
+		t.Fatalf("sliding manifest observation: %v", err)
+	}
+	updated, err := manager.Get(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	track := updated.Tracks["main"]
+	if len(track.Segments) != 4 || segmentAtSequence(t, track.Segments, 10).ArchiveOrdinal != firstTenOrdinal || segmentAtSequence(t, track.Segments, 10).SHA256 != firstTenHash {
+		t.Fatalf("sliding window rewrote old bytes or omitted new coordinate: %#v", track.Segments)
+	}
+	if segmentAtSequence(t, track.Segments, 13).TimelineOrdinal != 4 || len(updated.Gaps) != 1 || updated.Gaps[0].DiscontinuitySequence != 8 {
+		t.Fatalf("newly advertised coordinate or timeline not reconciled: segments=%#v gaps=%#v", track.Segments, updated.Gaps)
+	}
+}
+
+func TestManifestHistoricalAvailabilityRecordsOnlyExplicitGap(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := repairMediaContextForTest()
+	media.HistoricalAvailability = &adapterproto.HistoricalAvailability{
+		Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: media.ManifestURL,
+	}
+	fixture := &repairFixtureTransport{manifest: repairManifestFixture(), objects: map[string][]byte{
+		"/archive/prefix.m4v": []byte("prefix"),
+	}}
+	root := newRepairTestRoot(t, store, domain.StateCompleted, media)
+	root.Gaps = []domain.Gap{root.Gaps[1]}
+	if err := store.SaveRecording(root); err != nil {
+		t.Fatal(err)
+	}
+	manager, _, closeManager := newRepairTestManager(t, store, fixture, root, &repairOwnerFence{}, nil)
+	defer func() {
+		if closeErr := closeManager(); closeErr != nil {
+			t.Errorf("close explicit-gap manager: %v", closeErr)
+		}
+	}()
+	if err := manager.RepairDeclaredHistory(context.Background(), ownerForRepair(root.ID, 1), root.ID); err != nil {
+		t.Fatalf("manifest repair: %v", err)
+	}
+	requests := fixture.requestedURLs()
+	for _, request := range requests {
+		parsed, parseErr := url.Parse(request)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if strings.Contains(parsed.Path, "missing") {
+			t.Fatalf("explicit EXT-X-GAP was fetched: %q", request)
+		}
+	}
+	recording, err := manager.Get(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recording.Gaps) != 2 {
+		t.Fatalf("explicit GAP and unrelated legacy gap should remain: %#v", recording.Gaps)
+	}
+	identity, err := archiveSessionIdentity(recording, recording.AdapterID, media.SessionRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := manager.ArchiveInventory(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gapCoordinate := archiveindex.Coordinate{SessionID: identity.ID, TrackID: "main", SourceEpoch: 0, DiscontinuitySequence: 7, Sequence: 11, Kind: archiveindex.ObjectMedia}
+	if state := archiveindex.CoverageAt(inventory, gapCoordinate); state != archiveindex.CoverageKnownMissing {
+		t.Fatalf("explicit EXT-X-GAP coverage=%q, want known_missing", state)
+	}
+	absoluteMissingCoordinate := gapCoordinate
+	absoluteMissingCoordinate.Sequence = 9
+	if state := archiveindex.CoverageAt(inventory, absoluteMissingCoordinate); state != archiveindex.CoverageUnknown {
+		t.Fatalf("coordinate absent from manifest coverage=%q, want unknown", state)
 	}
 }
 

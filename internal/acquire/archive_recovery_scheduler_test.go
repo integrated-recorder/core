@@ -167,6 +167,50 @@ func TestAutomaticRecoveryReadySlotRunsAheadOfFutureFIFOHead(t *testing.T) {
 	}
 }
 
+func TestAutomaticRecoveryManifestEmptyObservationUsesFiniteSlowRechecks(t *testing.T) {
+	const id = "00000000000000000000000000000003"
+	_, entries, scheduler := newSchedulerUnitFixture(id)
+	defer scheduler.cancel()
+	e := entries[id]
+	e.mu.Lock()
+	e.media.HistoricalAvailability = &adapterproto.HistoricalAvailability{
+		Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: e.media.ManifestURL,
+	}
+	e.mu.Unlock()
+	availability := e.media.HistoricalAvailability
+	if !historicalDeclarationNeedsRecheck(availability, nil) {
+		t.Fatal("empty manifest observation must remain eligible for slow recheck")
+	}
+	fixedNow := time.Now()
+	scheduler.now = func() time.Time { return fixedNow }
+	scheduler.enqueue(id, time.Time{})
+	for pass := 0; pass <= maxAutomaticRecoveryNoProgressRechecks; pass++ {
+		gotID, item, _, ok := scheduler.next()
+		if !ok || gotID != id {
+			t.Fatalf("manifest pass %d did not run: id=%q ok=%v", pass+1, gotID, ok)
+		}
+		scheduler.complete(id, item, automaticRecoveryOutcome{recheck: true})
+		wantRechecks := pass + 1
+		if wantRechecks > maxAutomaticRecoveryNoProgressRechecks {
+			wantRechecks = maxAutomaticRecoveryNoProgressRechecks
+		}
+		if e.recoveryNoProgress != wantRechecks {
+			t.Fatalf("recheck count=%d, want %d", e.recoveryNoProgress, wantRechecks)
+		}
+		if pass == maxAutomaticRecoveryNoProgressRechecks {
+			if len(scheduler.queue) != 0 || len(scheduler.queued) != 0 {
+				t.Fatalf("empty manifest did not converge after finite rechecks: queue=%v items=%v", scheduler.queue, scheduler.queued)
+			}
+			break
+		}
+		wantDue := fixedNow.Add(automaticRecoveryRecheck)
+		if gotID, _, wait, ok := scheduler.next(); !ok || gotID != "" || wait != automaticRecoveryRecheck {
+			t.Fatalf("empty manifest entered hot loop: id=%q wait=%s ok=%v", gotID, wait, ok)
+		}
+		fixedNow = wantDue
+	}
+}
+
 func TestAutomaticRecoveryRescanRetainsOverflowedImmediateTrigger(t *testing.T) {
 	ids := make([]string, maxAutomaticRecoveryQueue+1)
 	for i := range ids {

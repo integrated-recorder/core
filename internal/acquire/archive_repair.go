@@ -600,6 +600,14 @@ func historicalAvailabilitySelection(availability *adapterproto.HistoricalAvaila
 	if availability == nil {
 		return selected
 	}
+	if availability.Mode == adapterproto.HistoricalModeManifest {
+		// A manifest declaration describes only the coordinates observed in
+		// this playlist. Absence from a later playlist is not a missing claim.
+		for i := range selected {
+			selected[i] = true
+		}
+		return selected
+	}
 	if availability.Mode != adapterproto.HistoricalModeRollingWindow {
 		for i, source := range segments {
 			selected[i] = withinHistoricalAvailability(availability, source, now)
@@ -647,6 +655,10 @@ func historicalDeclarationNeedsRecheck(availability *adapterproto.HistoricalAvai
 		return false
 	}
 	switch availability.Mode {
+	case adapterproto.HistoricalModeManifest:
+		// The advertised set can move or grow without a new source declaration.
+		// Recheck slowly after no progress; external events still trigger now.
+		return true
 	case adapterproto.HistoricalModeSequenceRanges:
 		for _, span := range availability.SequenceRanges {
 			foundStart, foundEnd := false, false

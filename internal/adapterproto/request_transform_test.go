@@ -3,6 +3,7 @@ package adapterproto
 import (
 	"encoding/json"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,7 @@ func TestHistoricalAvailabilityValidation(t *testing.T) {
 		{Mode: HistoricalModeRollingWindow, WindowSeconds: 3600, HistoricalManifestURL: "https://stream.example/archive?id=1"},
 		{Mode: HistoricalModeSequenceRanges, SequenceRanges: []HistoricalSequenceRange{{Start: 10, End: 20}, {Start: 30, End: 40}}},
 		{Mode: HistoricalModeTimeRanges, TimeRanges: []HistoricalTimeRange{{Start: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), End: time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)}}},
+		{Mode: HistoricalModeManifest, HistoricalManifestURL: "https://stream.example/archive/index.m3u8?ticket=opaque"},
 	}
 	for i := range valid {
 		if err := valid[i].Validate(); err != nil {
@@ -179,12 +181,55 @@ func TestHistoricalAvailabilityValidation(t *testing.T) {
 		{Mode: HistoricalModeSequenceRanges, SequenceRanges: make([]HistoricalSequenceRange, maxHistoricalRanges+1)},
 		{Mode: HistoricalModeRollingWindow, WindowSeconds: 1, SequenceRanges: []HistoricalSequenceRange{{Start: 1, End: 1}}},
 		{Mode: HistoricalModeRollingWindow, WindowSeconds: 1, HistoricalManifestURL: "file:///tmp/archive.m3u8"},
+		{Mode: HistoricalModeManifest},
+		{Mode: HistoricalModeManifest, HistoricalManifestURL: "https://stream.example/archive", WindowSeconds: 1},
+		{Mode: HistoricalModeManifest, HistoricalManifestURL: "https://stream.example/archive", SequenceRanges: []HistoricalSequenceRange{{Start: 1, End: 1}}},
+		{Mode: HistoricalModeManifest, HistoricalManifestURL: "https://stream.example/archive", TimeRanges: []HistoricalTimeRange{{Start: time.Unix(1, 0), End: time.Unix(2, 0)}}},
 		{Mode: "unknown"},
 	}
 	for i := range invalid {
 		if err := invalid[i].Validate(); err == nil {
 			t.Errorf("invalid historical declaration %d accepted", i)
 		}
+	}
+}
+
+func TestHistoricalManifestAvailabilityJSONContract(t *testing.T) {
+	const want = `{"mode":"manifest","historical_manifest_url":"https://stream.example/archive/index.m3u8?ticket=opaque"}`
+	var availability HistoricalAvailability
+	if err := json.Unmarshal([]byte(want), &availability); err != nil {
+		t.Fatal(err)
+	}
+	if err := availability.Validate(); err != nil {
+		t.Fatalf("manifest vector rejected: %v", err)
+	}
+	wire, err := json.Marshal(availability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(wire) != want {
+		t.Fatalf("manifest wire = %s, want %s", wire, want)
+	}
+}
+
+func TestSDKManifestGoldenResponsePassesCoreValidation(t *testing.T) {
+	data, err := os.ReadFile("../../protocol/adapter-v1/resolve-historical-manifest.response.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := ParseFrame(data)
+	if err != nil {
+		t.Fatalf("SDK manifest golden response rejected: %v", err)
+	}
+	if frame.Response == nil || frame.Response.ID != "resolve-historical-manifest" {
+		t.Fatalf("unexpected SDK golden frame: %#v", frame)
+	}
+	var media MediaSource
+	if err := json.Unmarshal(frame.Response.Result, &media); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateMediaSource(media, []string{"hls"}); err != nil {
+		t.Fatalf("Core rejected SDK manifest media contract: %v", err)
 	}
 }
 

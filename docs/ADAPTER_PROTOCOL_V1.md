@@ -323,7 +323,7 @@ JSON properties are omitted when absent unless stated otherwise.
 | `StateMutation` | optional `resource`, `values`, `secrets`, `clear_values`, `clear_secrets`. |
 | `MediaSource` | `type`, `manifest_url`; optional `headers`, `request_policy`, `session_ref`, `refresh`, `metadata`, `archive_policy`, `refresh_policy`, `historical_availability`. |
 | `RequestPolicy` / `HeaderForwardingPolicy` / `URLTransformPolicy` | optional `header_forwarding`, `url_transform`; forwarding policy has optional `mode`, `origins`; URL transforms are bounded and scoped to request resources. |
-| `HistoricalAvailability` | `mode` (`rolling_window`, `sequence_ranges`, or `time_ranges`); the matching bounded window/ranges; optional `historical_manifest_url`. It declares what the source can recover, not what Core has already archived. |
+| `HistoricalAvailability` | `mode` (`rolling_window`, `sequence_ranges`, `time_ranges`, or `manifest`); the matching bounded window/ranges, or a historical manifest URL for `manifest`. It declares recoverable source coverage, not what Core has already archived. |
 | `URLTransformRule` | required `scopes`; optional literal `path_suffix` replacement and selected `query_parameters` propagation. Applies only to manifest, variant, media, init, or key requests named by the scopes. |
 | `ArchivePolicy` | optional `source_uri` classification (`sensitive` or `public`); omission means `sensitive`. |
 | `RefreshPolicy` | optional `expires_at`, `refresh_before_seconds`, `on_http_status`. |
@@ -459,14 +459,30 @@ semantics. `archive_policy.source_uri` is `sensitive` by default or explicitly
 `public`.
 
 `historical_availability` is optional. When present, Core may use it to request
-only source-declared recoverable coverage for a later archive repair. A
+only source-declared recoverable coverage for archive repair. A
 `rolling_window` declares `window_seconds`; `sequence_ranges` declares bounded
 inclusive sequence ranges; `time_ranges` declares bounded RFC3339 start/end
-ranges. A source may provide `historical_manifest_url` when the historical
-playlist differs from its current manifest. This declaration does not mark
-media as present and does not bypass Core acquisition, byte verification, or
-the recording owner/epoch commit fence. An `EXT-X-GAP` observation is recorded
-as known missing until a later manifest supplies the coordinate as media.
+ranges. These modes may also provide `historical_manifest_url` when the
+historical playlist differs from the current manifest.
+Use `rolling_window` for a duration-based source policy, sequence/time ranges
+when the source can state exact bounds, and `manifest` when the current
+historical playlist is the source's authoritative view of recoverable media.
+
+`manifest` requires `historical_manifest_url` and forbids a window or explicit
+ranges. Core treats every eligible media coordinate advertised by the current
+historical media playlist as an observed recoverable candidate. The playlist is
+a snapshot of the currently observed set, not a complete statement of all
+historically existing media. A coordinate absent from a later playlist remains
+unknown unless another archive observation already describes it; absence never
+creates `known_missing`, `acquisition_failed`, or a permanent gap. Previously
+stored bytes remain in the archive when a sliding manifest window moves.
+An explicit `EXT-X-GAP` inside the playlist retains the existing
+`known_missing` semantics and may be superseded if a later manifest supplies
+media for that coordinate.
+
+All modes remain subject to Core's bounded recovery work, retry, and owner/epoch
+commit fence. They do not mark media as present or bypass Core acquisition and
+byte verification.
 
 `request_policy.url_transform` supports only bounded declarative URL changes:
 literal path-suffix replacement and copying one selected query value to a

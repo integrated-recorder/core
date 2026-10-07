@@ -295,7 +295,11 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 			continue
 		}
 
-		windowSize, err := m.historicalFetch.waitWindow(ctx, m.historicalSpools.capacity())
+		windowCapacity := m.historicalWindowCapacity()
+		if windowCapacity < 1 {
+			return retryableHistorical(errHistoricalScratch)
+		}
+		windowSize, err := m.historicalFetch.waitWindow(ctx, windowCapacity)
 		if err != nil {
 			return err
 		}
@@ -405,12 +409,12 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 		cleanupErr := cleanup()
 		if windowErr != nil {
 			if cleanupErr != nil {
-				return errors.Join(windowErr, retryableHistorical(errHistoricalScratch))
+				return errors.Join(windowErr, retryableHistorical(cleanupErr))
 			}
 			return windowErr
 		}
 		if cleanupErr != nil {
-			return retryableHistorical(errHistoricalScratch)
+			return retryableHistorical(cleanupErr)
 		}
 		cursor = windowEnd
 	}

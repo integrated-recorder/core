@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/storage"
@@ -16,30 +17,48 @@ import (
 
 var errHistoricalScratch = errors.New("historical scratch storage is unavailable")
 
-const maxHistoricalScratchObjects = maxHistoricalFetchConcurrency
+const (
+	maxHistoricalScratchObjects            = maxHistoricalFetchConcurrency
+	maxHistoricalScratchBytes              = int64(2 << 30)
+	historicalScratchReleaseAttemptTimeout = time.Second
+)
+
+const historicalScratchReleaseAttempts = 3
+
+var processHistoricalSpools = newHistoricalSpoolPool(maxHistoricalScratchObjects, maxHistoricalScratchBytes)
 
 type historicalSpoolPool struct {
-	mu      sync.Mutex
-	limit   int
-	active  int
-	changed chan struct{}
+	mu          sync.Mutex
+	limit       int
+	byteLimit   int64
+	active      int
+	activeBytes int64
+	changed     chan struct{}
 }
 
-func maxConcurrentHistoricalSpools(_ storage.IngestOptions) int {
-	// Spools live on private scratch storage. Bound them independently from
-	// ingest RAM: each response still has MaxPayloadBytes cap, so this pool
-	// bounds aggregate scratch use to maxHistoricalScratchObjects payloads.
-	return maxHistoricalScratchObjects
+func maxConcurrentHistoricalSpools(options storage.IngestOptions) int {
+	if options.MaxPayloadBytes <= 0 {
+		return 0
+	}
+	byBytes := int(maxHistoricalScratchBytes / options.MaxPayloadBytes)
+	if byBytes < 1 {
+		return 0
+	}
+	return min(maxHistoricalScratchObjects, byBytes)
 }
 
-func newHistoricalSpoolPool(limit int) *historicalSpoolPool {
+func newHistoricalSpoolPool(limit int, byteLimits ...int64) *historicalSpoolPool {
 	if limit < 1 {
 		limit = 1
 	}
 	if limit > maxHistoricalFetchConcurrency {
 		limit = maxHistoricalFetchConcurrency
 	}
-	return &historicalSpoolPool{limit: limit, changed: make(chan struct{})}
+	byteLimit := maxHistoricalScratchBytes
+	if len(byteLimits) > 0 && byteLimits[0] > 0 {
+		byteLimit = min(byteLimits[0], maxHistoricalScratchBytes)
+	}
+	return &historicalSpoolPool{limit: limit, byteLimit: byteLimit, changed: make(chan struct{})}
 }
 
 func (p *historicalSpoolPool) capacity() int {
@@ -49,11 +68,18 @@ func (p *historicalSpoolPool) capacity() int {
 	return p.limit
 }
 
-func (p *historicalSpoolPool) acquire(ctx context.Context, count int) (func(), error) {
+func (p *historicalSpoolPool) capacityFor(maxPayloadBytes int64) int {
+	if p == nil || maxPayloadBytes <= 0 || maxPayloadBytes > p.byteLimit {
+		return 0
+	}
+	return min(p.capacity(), int(p.byteLimit/maxPayloadBytes))
+}
+
+func (p *historicalSpoolPool) acquire(ctx context.Context, count int, bytes int64) (func(), error) {
 	if p == nil {
 		return func() {}, nil
 	}
-	if count < 1 || count > p.limit {
+	if count < 1 || count > p.limit || bytes <= 0 || bytes > p.byteLimit {
 		return nil, errors.New("invalid historical spool reservation")
 	}
 	for {
@@ -61,14 +87,16 @@ func (p *historicalSpoolPool) acquire(ctx context.Context, count int) (func(), e
 			return nil, err
 		}
 		p.mu.Lock()
-		if p.limit-p.active >= count {
+		if p.limit-p.active >= count && p.byteLimit-p.activeBytes >= bytes {
 			p.active += count
+			p.activeBytes += bytes
 			p.mu.Unlock()
 			var once sync.Once
 			return func() {
 				once.Do(func() {
 					p.mu.Lock()
 					p.active -= count
+					p.activeBytes -= bytes
 					p.signalLocked()
 					p.mu.Unlock()
 				})
@@ -82,6 +110,124 @@ func (p *historicalSpoolPool) acquire(ctx context.Context, count int) (func(), e
 		case <-changed:
 		}
 	}
+}
+
+func (m *Manager) historicalWindowCapacity() int {
+	if m == nil || m.historicalSpools == nil || m.ingest == nil {
+		return 0
+	}
+	return m.historicalSpools.capacityFor(m.ingest.Options().MaxPayloadBytes)
+}
+
+func (m *Manager) acquireHistoricalScratch(ctx context.Context, count int) (func() error, error) {
+	if m == nil || m.historicalSpools == nil || m.ingest == nil || count < 1 {
+		return nil, errHistoricalScratch
+	}
+	maxPayloadBytes := m.ingest.Options().MaxPayloadBytes
+	if maxPayloadBytes <= 0 || int64(count) > int64(^uint64(0)>>1)/maxPayloadBytes {
+		return nil, errHistoricalScratch
+	}
+	reservationBytes := int64(count) * maxPayloadBytes
+	leaseID := ""
+	m.mu.RLock()
+	coordinator := m.historicalScratchCoordinator
+	m.mu.RUnlock()
+	if coordinator != nil {
+		if err := m.retryPendingHistoricalScratchReleases(ctx, coordinator); err != nil {
+			return nil, errors.Join(retryableHistorical(errHistoricalScratch), err)
+		}
+		var err error
+		leaseID, err = newID()
+		if err != nil {
+			return nil, errors.Join(errHistoricalScratch, err)
+		}
+	}
+	releaseLocal, err := m.historicalSpools.acquire(ctx, count, reservationBytes)
+	if err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	var releaseErr error
+	release := func() error {
+		once.Do(func() {
+			releaseLocal()
+			if coordinator != nil {
+				releaseErr = m.releaseHistoricalScratchLease(coordinator, leaseID)
+			}
+		})
+		return releaseErr
+	}
+	if coordinator != nil {
+		if err := coordinator.AcquireHistoricalScratch(ctx, leaseID, count, reservationBytes); err != nil {
+			releaseErr := release()
+			if ctx.Err() != nil {
+				return nil, errors.Join(err, ctx.Err(), releaseErr)
+			}
+			return nil, errors.Join(errHistoricalScratch, err, releaseErr)
+		}
+	}
+	return release, nil
+}
+
+func releaseHistoricalScratchWithRetry(parent context.Context, coordinator HistoricalScratchCoordinator, leaseID string) error {
+	if parent == nil {
+		parent = context.Background()
+	}
+	var lastErr error
+	for attempt := 0; attempt < historicalScratchReleaseAttempts; attempt++ {
+		if err := parent.Err(); err != nil {
+			return errors.Join(errHistoricalScratch, err)
+		}
+		ctx, cancel := context.WithTimeout(parent, historicalScratchReleaseAttemptTimeout)
+		lastErr = coordinator.ReleaseHistoricalScratch(ctx, leaseID)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		if err := parent.Err(); err != nil {
+			return errors.Join(errHistoricalScratch, lastErr, err)
+		}
+		if attempt == historicalScratchReleaseAttempts-1 {
+			break
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-parent.Done():
+			timer.Stop()
+			return errors.Join(errHistoricalScratch, lastErr, parent.Err())
+		case <-timer.C:
+		}
+	}
+	return errors.Join(errHistoricalScratch, lastErr)
+}
+
+func (m *Manager) releaseHistoricalScratchLease(coordinator HistoricalScratchCoordinator, leaseID string) error {
+	m.historicalScratchReleaseMu.Lock()
+	defer m.historicalScratchReleaseMu.Unlock()
+	err := releaseHistoricalScratchWithRetry(context.Background(), coordinator, leaseID)
+	if err != nil {
+		if m.pendingHistoricalScratchReleases == nil {
+			m.pendingHistoricalScratchReleases = make(map[string]struct{})
+		}
+		m.pendingHistoricalScratchReleases[leaseID] = struct{}{}
+		return err
+	}
+	delete(m.pendingHistoricalScratchReleases, leaseID)
+	return nil
+}
+
+func (m *Manager) retryPendingHistoricalScratchReleases(ctx context.Context, coordinator HistoricalScratchCoordinator) error {
+	m.historicalScratchReleaseMu.Lock()
+	defer m.historicalScratchReleaseMu.Unlock()
+	var releaseErrors []error
+	for leaseID := range m.pendingHistoricalScratchReleases {
+		if err := releaseHistoricalScratchWithRetry(ctx, coordinator, leaseID); err != nil {
+			releaseErrors = append(releaseErrors, err)
+			continue
+		}
+		delete(m.pendingHistoricalScratchReleases, leaseID)
+	}
+	return errors.Join(releaseErrors...)
 }
 
 func (p *historicalSpoolPool) signalLocked() {
@@ -239,14 +385,13 @@ func (m *Manager) fetchHistoricalWindow(ctx context.Context, recordingID string,
 	if m.historicalSpools == nil {
 		return nil, nil, retryableHistorical(errHistoricalScratch)
 	}
-	releaseSlots, err := m.historicalSpools.acquire(ctx, len(candidates))
+	releaseSlots, err := m.acquireHistoricalScratch(ctx, len(candidates))
 	if err != nil {
 		return nil, nil, err
 	}
 	directory, err := newHistoricalSpoolDirectory()
 	if err != nil {
-		releaseSlots()
-		return nil, nil, retryableHistorical(errHistoricalScratch)
+		return nil, nil, errors.Join(retryableHistorical(errHistoricalScratch), releaseSlots())
 	}
 	spools := make([]*historicalPayloadSpool, 0, len(candidates))
 	var cleanupOnce sync.Once
@@ -261,15 +406,16 @@ func (m *Manager) fetchHistoricalWindow(ctx context.Context, recordingID string,
 			if err := removeHistoricalSpoolDirectory(directory); err != nil && cleanupErr == nil {
 				cleanupErr = errHistoricalScratch
 			}
-			releaseSlots()
+			if err := releaseSlots(); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
 		})
 		return cleanupErr
 	}
 	for range candidates {
 		spool, createErr := newHistoricalPayloadSpool(directory)
 		if createErr != nil {
-			_ = cleanup()
-			return nil, nil, retryableHistorical(errHistoricalScratch)
+			return nil, nil, errors.Join(retryableHistorical(errHistoricalScratch), cleanup())
 		}
 		spools = append(spools, spool)
 	}

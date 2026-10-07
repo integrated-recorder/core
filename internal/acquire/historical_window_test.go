@@ -87,11 +87,16 @@ func historicalTestResponseStatus(request *http.Request, body []byte, status int
 	}
 }
 
-func newManifestWindowTestManager(t *testing.T, transport http.RoundTripper, id string) (*Manager, *entry, OwnershipToken) {
+func newManifestWindowTestManager(t *testing.T, transport http.RoundTripper, id string, configuredOptions ...storage.IngestOptions) (*Manager, *entry, OwnershipToken) {
 	t.Helper()
 	store, err := storage.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(configuredOptions) > 0 {
+		if err := store.ConfigureIngestOptions(configuredOptions[0]); err != nil {
+			t.Fatal(err)
+		}
 	}
 	media := adapterproto.MediaSource{
 		Type: "hls", ManifestURL: "https://media.example/archive/index.m3u8", SessionRef: "manifest-window-test",

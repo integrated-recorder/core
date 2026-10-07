@@ -125,6 +125,13 @@ func run() error {
 		adapters.Close()
 		return fmt.Errorf("initialize recorder manager: %w", err)
 	}
+	if managedRuntime {
+		if err := manager.ConfigureHistoricalScratchCoordinator(runtimeClient); err != nil {
+			_ = manager.Close(context.Background())
+			adapters.Close()
+			return fmt.Errorf("configure Host historical scratch coordinator: %w", err)
+		}
+	}
 	instanceID, err := engineInstanceID(os.Getenv)
 	if err != nil {
 		_ = manager.Close(context.Background())

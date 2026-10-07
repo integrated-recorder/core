@@ -26,6 +26,19 @@ func testCoordinator(t *testing.T, global, perRecording int64, queue int) *Coord
 	return c
 }
 
+func testCoordinatorWithScratch(t *testing.T, global, perRecording int64, queue, scratchObjects int, scratchBytes int64) *Coordinator {
+	t.Helper()
+	c, err := New(Limits{
+		GlobalBufferBytes: global, PerRecordingBufferBytes: perRecording,
+		QueueObjects: queue, WriterConcurrency: 1,
+		HistoricalScratchObjects: scratchObjects, HistoricalScratchBytes: scratchBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
 func testTelemetryCoordinator(t *testing.T, interval, retention time.Duration) *Coordinator {
 	t.Helper()
 	coordinator, err := newCoordinator(Limits{
@@ -229,8 +242,12 @@ func TestTelemetryCeilingUsesActualCadenceAndDirectionalMinimum(t *testing.T) {
 
 func TestNewValidatesExistingIngestBounds(t *testing.T) {
 	valid := Limits{GlobalBufferBytes: 2 << 30, PerRecordingBufferBytes: 1536 << 20, QueueObjects: 128, WriterConcurrency: 1}
-	if _, err := New(valid); err != nil {
+	coordinator, err := New(valid)
+	if err != nil {
 		t.Fatalf("maximum current limits rejected: %v", err)
+	}
+	if got := coordinator.Snapshot().Limits; got.HistoricalScratchObjects != DefaultHistoricalScratchObjects || got.HistoricalScratchBytes != DefaultHistoricalScratchBytes {
+		t.Fatalf("zero historical scratch limits did not use defaults: %+v", got)
 	}
 	invalid := []Limits{
 		{},
@@ -241,6 +258,10 @@ func TestNewValidatesExistingIngestBounds(t *testing.T) {
 		{GlobalBufferBytes: 10, PerRecordingBufferBytes: 10, QueueObjects: 129, WriterConcurrency: 1},
 		{GlobalBufferBytes: 10, PerRecordingBufferBytes: 10, QueueObjects: 1, WriterConcurrency: 0},
 		{GlobalBufferBytes: 10, PerRecordingBufferBytes: 10, QueueObjects: 1, WriterConcurrency: 2},
+		{GlobalBufferBytes: 10, PerRecordingBufferBytes: 10, QueueObjects: 1, WriterConcurrency: 1, HistoricalScratchObjects: -1},
+		{GlobalBufferBytes: 10, PerRecordingBufferBytes: 10, QueueObjects: 1, WriterConcurrency: 1, HistoricalScratchObjects: MaxHistoricalScratchObjects + 1},
+		{GlobalBufferBytes: 10, PerRecordingBufferBytes: 10, QueueObjects: 1, WriterConcurrency: 1, HistoricalScratchBytes: -1},
+		{GlobalBufferBytes: 10, PerRecordingBufferBytes: 10, QueueObjects: 1, WriterConcurrency: 1, HistoricalScratchBytes: MaxHistoricalScratchBytes + 1},
 	}
 	for i, limits := range invalid {
 		t.Run(string(rune('a'+i)), func(t *testing.T) {
@@ -248,6 +269,220 @@ func TestNewValidatesExistingIngestBounds(t *testing.T) {
 				t.Fatalf("New(%+v) error = %v, want ErrInvalidLimits", limits, err)
 			}
 		})
+	}
+}
+
+func TestHistoricalScratchAdmissionIsAtomicBoundedAndIdempotent(t *testing.T) {
+	c := testCoordinatorWithScratch(t, 10, 10, 2, 2, 10)
+	ctx := context.Background()
+	if err := c.AcquireHistoricalScratch(ctx, "owner-a", "scratch-a", 1, 6); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AcquireHistoricalScratch(ctx, "owner-a", "scratch-a", 1, 6); err != nil {
+		t.Fatalf("exact duplicate acquire failed: %v", err)
+	}
+	for _, mismatch := range []struct {
+		objects int
+		bytes   int64
+	}{{2, 6}, {1, 5}} {
+		if err := c.AcquireHistoricalScratch(ctx, "owner-a", "scratch-a", mismatch.objects, mismatch.bytes); !errors.Is(err, ErrLeaseMismatch) {
+			t.Errorf("mismatched reacquire %+v error=%v, want ErrLeaseMismatch", mismatch, err)
+		}
+	}
+	if got := c.Snapshot(); got.HistoricalScratchUsedObjects != 1 || got.HistoricalScratchUsedBytes != 6 {
+		t.Fatalf("duplicate or mismatched acquire changed accounting: %+v", got)
+	}
+	// Lease IDs are child-local. A second owner may use same ID independently.
+	if err := c.AcquireHistoricalScratch(ctx, "owner-b", "scratch-a", 1, 3); err != nil {
+		t.Fatalf("another owner could not use same local lease ID: %v", err)
+	}
+	if got := c.Snapshot(); got.HistoricalScratchUsedObjects != 2 || got.HistoricalScratchUsedBytes != 9 {
+		t.Fatalf("owner-scoped lease accounting = %+v", got)
+	}
+	if err := c.ReleaseHistoricalScratch("owner-b", "scratch-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AcquireHistoricalScratch(ctx, "owner-a", "scratch-impossible", 3, 1); !errors.Is(err, ErrInvalidHistoricalScratchLease) {
+		t.Fatalf("impossible object request error=%v", err)
+	}
+	if err := c.AcquireHistoricalScratch(ctx, "owner-a", "scratch-impossible", 1, 11); !errors.Is(err, ErrInvalidHistoricalScratchLease) {
+		t.Fatalf("impossible byte request error=%v", err)
+	}
+	if err := c.ReleaseHistoricalScratch("owner-a", "scratch-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ReleaseHistoricalScratch("owner-a", "scratch-a"); err != nil {
+		t.Fatalf("duplicate release failed: %v", err)
+	}
+	if err := c.ReleaseHistoricalScratch("owner-a", "absent"); err != nil {
+		t.Fatalf("absent release failed: %v", err)
+	}
+	if got := c.Snapshot(); got.HistoricalScratchUsedObjects != 0 || got.HistoricalScratchUsedBytes != 0 {
+		t.Fatalf("release leaked scratch accounting: %+v", got)
+	}
+}
+
+func TestHistoricalScratchWaitsForBothLimitsAndHonorsCancellation(t *testing.T) {
+	c := testCoordinatorWithScratch(t, 10, 10, 2, 2, 10)
+	if err := c.AcquireHistoricalScratch(context.Background(), "owner-a", "scratch-a", 1, 7); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := c.AcquireHistoricalScratch(canceled, "owner-b", "scratch-b", 1, 4); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("byte limit wait error=%v, want deadline", err)
+	}
+	if got := c.Snapshot(); got.HistoricalScratchUsedObjects != 1 || got.HistoricalScratchUsedBytes != 7 {
+		t.Fatalf("canceled acquire changed accounting: %+v", got)
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- c.AcquireHistoricalScratch(context.Background(), "owner-b", "scratch-b", 2, 3) }()
+	select {
+	case err := <-result:
+		t.Fatalf("waiter acquired before capacity release: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := c.ReleaseHistoricalScratch("owner-a", "scratch-a"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("waiter did not acquire after release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scratch release did not wake waiter")
+	}
+	if got := c.Snapshot(); got.HistoricalScratchUsedObjects != 2 || got.HistoricalScratchUsedBytes != 3 {
+		t.Fatalf("waiter accounting = %+v", got)
+	}
+}
+
+func TestHistoricalScratchOwnerCleanupWakesOtherOwner(t *testing.T) {
+	c := testCoordinatorWithScratch(t, 10, 10, 2, 1, 10)
+	if err := c.AcquireHistoricalScratch(context.Background(), "owner-dead", "scratch-dead", 1, 7); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- c.AcquireHistoricalScratch(context.Background(), "owner-live", "scratch-live", 1, 5)
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("waiter acquired before dead owner cleanup: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := c.ReleaseOwner("owner-dead"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("waiter failed after owner cleanup: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner cleanup did not wake scratch waiter")
+	}
+	if got := c.Snapshot(); got.HistoricalScratchUsedObjects != 1 || got.HistoricalScratchUsedBytes != 5 {
+		t.Fatalf("owner cleanup scratch accounting = %+v", got)
+	}
+	if err := c.ReleaseOwner("owner-live"); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Snapshot(); got.HistoricalScratchUsedObjects != 0 || got.HistoricalScratchUsedBytes != 0 {
+		t.Fatalf("live owner cleanup leaked scratch: %+v", got)
+	}
+}
+
+func TestHistoricalScratchConcurrentAdmissionsStayWithinGlobalBound(t *testing.T) {
+	const (
+		workers     = 20
+		objectLimit = 4
+		byteLimit   = int64(100)
+		bytesEach   = int64(25)
+	)
+	c := testCoordinatorWithScratch(t, 10, 10, 2, objectLimit, byteLimit)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	var workersDone sync.WaitGroup
+	defer func() {
+		cancel()
+		workersDone.Wait()
+	}()
+
+	acquired := make(chan string, workers)
+	releaseSignals := make(map[string]chan struct{}, workers)
+	for index := 0; index < workers; index++ {
+		ownerID := fmt.Sprintf("scratch-owner-%02d", index)
+		release := make(chan struct{})
+		releaseSignals[ownerID] = release
+		workersDone.Add(1)
+		go func(owner string, release <-chan struct{}) {
+			defer workersDone.Done()
+			if err := c.AcquireHistoricalScratch(ctx, owner, "window", 1, bytesEach); err != nil {
+				acquired <- "error:" + err.Error()
+				return
+			}
+			acquired <- owner
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			_ = c.ReleaseHistoricalScratch(owner, "window")
+		}(ownerID, release)
+	}
+
+	active := make(map[string]struct{}, objectLimit)
+	acquiredCount := 0
+	maxObservedObjects := 0
+	var maxObservedBytes int64
+	for releasedCount := 0; releasedCount < workers; {
+		if len(active) == objectLimit || acquiredCount == workers {
+			snapshot := c.Snapshot()
+			if snapshot.HistoricalScratchUsedObjects > objectLimit || snapshot.HistoricalScratchUsedBytes > byteLimit {
+				t.Fatalf("global scratch bound exceeded: %+v", snapshot)
+			}
+			maxObservedObjects = max(maxObservedObjects, snapshot.HistoricalScratchUsedObjects)
+			maxObservedBytes = max(maxObservedBytes, snapshot.HistoricalScratchUsedBytes)
+			for owner := range active {
+				if err := c.ReleaseHistoricalScratch(owner, "window"); err != nil {
+					t.Fatalf("release %s: %v", owner, err)
+				}
+				close(releaseSignals[owner])
+				delete(active, owner)
+				releasedCount++
+				break
+			}
+			continue
+		}
+		select {
+		case owner := <-acquired:
+			if strings.HasPrefix(owner, "error:") {
+				t.Fatal(owner)
+			}
+			if _, duplicate := active[owner]; duplicate {
+				t.Fatalf("owner %q acquired the same window twice", owner)
+			}
+			active[owner] = struct{}{}
+			acquiredCount++
+			snapshot := c.Snapshot()
+			if snapshot.HistoricalScratchUsedObjects > objectLimit || snapshot.HistoricalScratchUsedBytes > byteLimit {
+				t.Fatalf("global scratch bound exceeded: %+v", snapshot)
+			}
+			maxObservedObjects = max(maxObservedObjects, snapshot.HistoricalScratchUsedObjects)
+			maxObservedBytes = max(maxObservedBytes, snapshot.HistoricalScratchUsedBytes)
+		case <-ctx.Done():
+			t.Fatalf("concurrent scratch admissions stalled after %d acquisitions: %v", acquiredCount, ctx.Err())
+		}
+	}
+	if maxObservedObjects != objectLimit || maxObservedBytes != byteLimit {
+		t.Fatalf("observed scratch maximum objects/bytes=%d/%d, want %d/%d", maxObservedObjects, maxObservedBytes, objectLimit, byteLimit)
+	}
+	if err := c.ReleaseOwner("scratch-owner-00"); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Snapshot(); got.HistoricalScratchUsedObjects != 0 || got.HistoricalScratchUsedBytes != 0 {
+		t.Fatalf("concurrent scratch admission leaked accounting: %+v", got)
 	}
 }
 
@@ -489,15 +724,18 @@ func TestInvalidIdentitiesAndSnapshotDoesNotExposeIDs(t *testing.T) {
 	if err := c.AcquireQueue(context.Background(), "owner", "job"); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.AcquireHistoricalScratch(context.Background(), "private-owner", "private-scratch-lease", 1, 7); err != nil {
+		t.Fatal(err)
+	}
 	snapshot := c.Snapshot()
-	if snapshot.QueueObjects != 1 || snapshot.ActiveWriters != 0 || snapshot.UsedBytes != 0 {
+	if snapshot.QueueObjects != 1 || snapshot.ActiveWriters != 0 || snapshot.UsedBytes != 0 || snapshot.HistoricalScratchUsedObjects != 1 || snapshot.HistoricalScratchUsedBytes != 7 {
 		t.Fatalf("unexpected aggregate snapshot: %+v", snapshot)
 	}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, privateIdentity := range []string{"owner-a", "job-a", "recording-a", "reservation-a"} {
+	for _, privateIdentity := range []string{"owner-a", "job-a", "recording-a", "reservation-a", "private-owner", "private-scratch-lease"} {
 		if strings.Contains(string(encoded), privateIdentity) {
 			t.Fatalf("aggregate snapshot leaked %q: %s", privateIdentity, encoded)
 		}

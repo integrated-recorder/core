@@ -71,6 +71,13 @@ type CanonicalRecoveryFence interface {
 	WithFencedRecovery(func() error) error
 }
 
+// HistoricalScratchCoordinator reserves Engine-independent Host scratch
+// capacity for one historical fetch window.
+type HistoricalScratchCoordinator interface {
+	AcquireHistoricalScratch(context.Context, string, int, int64) error
+	ReleaseHistoricalScratch(context.Context, string) error
+}
+
 type SourceValidator func(context.Context, string) error
 
 type entry struct {
@@ -118,18 +125,21 @@ type entry struct {
 }
 
 type Manager struct {
-	store            *storage.Store
-	ingest           *storage.IngestService
-	client           *http.Client
-	historicalFetch  *historicalFetchGovernor
-	historicalSpools *historicalSpoolPool
-	resolver         Resolver
-	validate         SourceValidator
-	mu               sync.RWMutex
-	startCreationMu  sync.Mutex
-	entries          map[string]*entry
-	prepared         map[string]preparedHandover
-	handoverMu       sync.Mutex
+	store                            *storage.Store
+	ingest                           *storage.IngestService
+	client                           *http.Client
+	historicalFetch                  *historicalFetchGovernor
+	historicalSpools                 *historicalSpoolPool
+	historicalScratchCoordinator     HistoricalScratchCoordinator
+	historicalScratchReleaseMu       sync.Mutex
+	pendingHistoricalScratchReleases map[string]struct{}
+	resolver                         Resolver
+	validate                         SourceValidator
+	mu                               sync.RWMutex
+	startCreationMu                  sync.Mutex
+	entries                          map[string]*entry
+	prepared                         map[string]preparedHandover
+	handoverMu                       sync.Mutex
 	// freshGeneration leaves existing archive documents read-only and does
 	// not take ownership of them. It is used for a candidate Engine generation
 	// that must not recover/interrupt work owned by an older Engine.
@@ -187,13 +197,15 @@ const (
 var errManagerClosed = errors.New("recording manager is closed")
 
 var (
-	ErrOwnershipRequired              = errors.New("recording ownership token is required")
-	ErrCanonicalFenceRequired         = errors.New("canonical commit fence is not configured")
-	ErrCanonicalRecoveryFenceRequired = errors.New("managed archive recovery requires an owner fence")
-	ErrInvalidOwnershipToken          = errors.New("recording ownership token is invalid")
-	ErrFenceConfigurationClosed       = errors.New("canonical commit fence must be configured before recording starts")
-	ErrDirectPersistRequiresQueue     = errors.New("owned recording persistence requires the buffered commit path")
-	ErrHandoverUnavailable            = errors.New("recording is not eligible for handover")
+	ErrOwnershipRequired                    = errors.New("recording ownership token is required")
+	ErrCanonicalFenceRequired               = errors.New("canonical commit fence is not configured")
+	ErrCanonicalRecoveryFenceRequired       = errors.New("managed archive recovery requires an owner fence")
+	ErrInvalidOwnershipToken                = errors.New("recording ownership token is invalid")
+	ErrFenceConfigurationClosed             = errors.New("canonical commit fence must be configured before recording starts")
+	ErrHistoricalScratchCoordinatorRequired = errors.New("historical scratch coordinator is required")
+	ErrHistoricalScratchConfigurationClosed = errors.New("historical scratch coordinator must be configured before recording starts")
+	ErrDirectPersistRequiresQueue           = errors.New("owned recording persistence requires the buffered commit path")
+	ErrHandoverUnavailable                  = errors.New("recording is not eligible for handover")
 	// ErrHandoverSourceRefreshRequired tells the Runtime Host that target
 	// preflight found an expired/refresh-rejected source while the source Engine
 	// is still active. Protocol v1 does not promise concurrent/idempotent
@@ -307,10 +319,9 @@ func newManagerWithMode(store *storage.Store, client *http.Client, resolver Reso
 	}
 	historicalFetch := newHistoricalFetchGovernor(func() storage.IngestSnapshot { return ingest.Snapshot() })
 	clientCopy.Transport = historicalPriorityRoundTripper{base: baseTransport, governor: historicalFetch}
-	options := ingest.Options()
 	m := &Manager{
 		store: store, ingest: ingest, client: &clientCopy,
-		historicalFetch: historicalFetch, historicalSpools: newHistoricalSpoolPool(maxConcurrentHistoricalSpools(options)),
+		historicalFetch: historicalFetch, historicalSpools: processHistoricalSpools,
 		resolver: resolver, validate: validate, entries: map[string]*entry{}, prepared: make(map[string]preparedHandover),
 		freshGeneration: mode == FreshGeneration, startsDone: make(chan struct{}),
 	}
@@ -318,6 +329,21 @@ func newManagerWithMode(store *storage.Store, client *http.Client, resolver Reso
 		m.entries[recording.ID] = &entry{recording: recording, done: closedChannel()}
 	}
 	return m, nil
+}
+
+// ConfigureHistoricalScratchCoordinator installs Runtime Host scratch
+// admission. Configure it before the Manager starts recording work.
+func (m *Manager) ConfigureHistoricalScratchCoordinator(coordinator HistoricalScratchCoordinator) error {
+	if m == nil || coordinator == nil {
+		return ErrHistoricalScratchCoordinatorRequired
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.startAttempted || m.closed {
+		return ErrHistoricalScratchConfigurationClosed
+	}
+	m.historicalScratchCoordinator = coordinator
+	return nil
 }
 
 // ConfigureCanonicalCommitFence installs the Runtime Host ownership fence.
@@ -1820,6 +1846,14 @@ func (m *Manager) Close(ctx context.Context) error {
 				m.retainAutomaticRecoveryRelease(worker.e, owner, time.Time{}, false)
 				releaseErrors = append(releaseErrors, err)
 			}
+		}
+	}
+	m.mu.RLock()
+	scratchCoordinator := m.historicalScratchCoordinator
+	m.mu.RUnlock()
+	if scratchCoordinator != nil {
+		if err := m.retryPendingHistoricalScratchReleases(ctx, scratchCoordinator); err != nil {
+			releaseErrors = append(releaseErrors, err)
 		}
 	}
 	var terminalErrors []error

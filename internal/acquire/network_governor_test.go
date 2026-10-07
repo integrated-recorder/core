@@ -170,7 +170,7 @@ func TestHistoricalHTTPAdmissionLetsLiveProceedAndPausesNewHistory(t *testing.T)
 	}
 }
 
-func TestHistoricalSpoolLimitUsesIndependentBound(t *testing.T) {
+func TestHistoricalSpoolLimitUsesScratchByteBound(t *testing.T) {
 	tests := []struct {
 		name    string
 		options storage.IngestOptions
@@ -179,6 +179,7 @@ func TestHistoricalSpoolLimitUsesIndependentBound(t *testing.T) {
 		{name: "default", options: storage.DefaultIngestOptions(), want: maxHistoricalFetchConcurrency},
 		{name: "small ingest pool", options: storage.IngestOptions{GlobalBytes: 20, MaxPayloadBytes: 10}, want: maxHistoricalFetchConcurrency},
 		{name: "large ingest pool", options: storage.IngestOptions{GlobalBytes: 80, MaxPayloadBytes: 20}, want: maxHistoricalFetchConcurrency},
+		{name: "one gibibyte payload", options: storage.IngestOptions{GlobalBytes: 2 << 30, MaxPayloadBytes: 1 << 30}, want: 2},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

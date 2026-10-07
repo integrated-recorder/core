@@ -99,6 +99,18 @@ func (waitHandler) Handle(ctx context.Context, _ string, _ json.RawMessage) (any
 	return nil, ctx.Err()
 }
 
+type cancellationHandler struct {
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+func (h cancellationHandler) Handle(ctx context.Context, _ string, _ json.RawMessage) (any, error) {
+	close(h.started)
+	<-ctx.Done()
+	close(h.canceled)
+	return nil, ctx.Err()
+}
+
 func TestFramedClientServerRoundTripAndSocketPermissions(t *testing.T) {
 	root := shortTempDir(t)
 	socket := filepath.Join(root, "ipc", "engine.sock")
@@ -240,6 +252,38 @@ func TestRequestDeadlineCancelsHandler(t *testing.T) {
 	err = client.Call(ctx, "wait", map[string]string{}, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Call error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestClientCancellationCancelsActiveHandler(t *testing.T) {
+	handler := cancellationHandler{started: make(chan struct{}), canceled: make(chan struct{})}
+	server, socket, token := startTestServer(t, handler)
+	defer stopTestServer(t, server)
+	client, err := NewClient(socket, "generation-a", token, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- client.Call(ctx, "cancel", nil, nil) }()
+	select {
+	case <-handler.started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("client error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client call did not stop after cancellation")
+	}
+	select {
+	case <-handler.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("server handler did not observe client cancellation")
 	}
 }
 

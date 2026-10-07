@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"regexp"
 	"time"
@@ -16,20 +17,24 @@ import (
 const (
 	// IPCIdentity is stable across application generations because the resource
 	// coordinator belongs to Runtime Host rather than to an Engine generation.
-	IPCIdentity = "runtime-host-resources"
-	ipcTimeout  = 30 * time.Second
+	IPCIdentity                         = "runtime-host-resources"
+	ipcTimeout                          = 30 * time.Second
+	historicalScratchAcquireCallTimeout = time.Second
 
-	operationSetReservation     = "resource_set_reservation"
-	operationReleaseReservation = "resource_release_reservation"
-	operationAcquireQueue       = "resource_acquire_queue"
-	operationReleaseQueue       = "resource_release_queue"
-	operationAcquireWriter      = "resource_acquire_writer"
-	operationReleaseWriter      = "resource_release_writer"
-	operationSnapshot           = "resource_snapshot"
-	operationReportTelemetry    = "resource_report_telemetry"
-	operationTelemetrySnapshot  = "resource_telemetry_snapshot"
-	operationClaimRecording     = "resource_claim_recording"
-	operationReleaseRecording   = "resource_release_recording"
+	operationSetReservation           = "resource_set_reservation"
+	operationReleaseReservation       = "resource_release_reservation"
+	operationAcquireQueue             = "resource_acquire_queue"
+	operationReleaseQueue             = "resource_release_queue"
+	operationAcquireWriter            = "resource_acquire_writer"
+	operationReleaseWriter            = "resource_release_writer"
+	operationAcquireHistoricalScratch = "resource_acquire_historical_scratch"
+	operationReleaseHistoricalScratch = "resource_release_historical_scratch"
+	operationSnapshot                 = "resource_snapshot"
+	operationReportTelemetry          = "resource_report_telemetry"
+	operationTelemetrySnapshot        = "resource_telemetry_snapshot"
+	operationClaimRecording           = "resource_claim_recording"
+	operationReleaseRecording         = "resource_release_recording"
+	releaseRPCAttempts                = 3
 )
 
 var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
@@ -112,6 +117,24 @@ func (h *IPCHandler) Handle(ctx context.Context, operation string, payload json.
 			return nil, resourceIPCError("invalid_request", "writer lease release request is invalid")
 		}
 		if err := h.coordinator.ReleaseWriter(request.OwnerID, request.LeaseID); err != nil {
+			return nil, mapResourceError(err)
+		}
+		return emptyResult{}, nil
+	case operationAcquireHistoricalScratch:
+		var request historicalScratchLeaseRequest
+		if err := decodeResourceRequest(payload, &request); err != nil || validateIDs(request.OwnerID, request.LeaseID) != nil || request.Objects <= 0 || request.Objects > h.coordinator.limits.HistoricalScratchObjects || request.Bytes <= 0 || request.Bytes > h.coordinator.limits.HistoricalScratchBytes {
+			return nil, resourceIPCError("invalid_request", "historical scratch lease request is invalid")
+		}
+		if err := h.coordinator.AcquireHistoricalScratch(ctx, request.OwnerID, request.LeaseID, request.Objects, request.Bytes); err != nil {
+			return nil, mapResourceError(err)
+		}
+		return emptyResult{}, nil
+	case operationReleaseHistoricalScratch:
+		var request leaseRequest
+		if err := decodeResourceRequest(payload, &request); err != nil || validateIDs(request.OwnerID, request.LeaseID) != nil {
+			return nil, resourceIPCError("invalid_request", "historical scratch lease release request is invalid")
+		}
+		if err := h.coordinator.ReleaseHistoricalScratch(request.OwnerID, request.LeaseID); err != nil {
 			return nil, mapResourceError(err)
 		}
 		return emptyResult{}, nil
@@ -212,6 +235,13 @@ type leaseRequest struct {
 	LeaseID string `json:"lease_id"`
 }
 
+type historicalScratchLeaseRequest struct {
+	OwnerID string `json:"owner_id"`
+	LeaseID string `json:"lease_id"`
+	Objects int    `json:"objects"`
+	Bytes   int64  `json:"bytes"`
+}
+
 // OwnerID is populated from RuntimeClient's construction-time identity; the
 // client API does not permit callers to choose another owner's telemetry.
 type telemetryReportRequest struct {
@@ -292,7 +322,8 @@ func (c *RuntimeClient) ReleaseReservation(ctx context.Context, recordingID, res
 	if !validRecordingID(recordingID) {
 		return errors.New("recording identity is invalid")
 	}
-	return c.call(ctx, operationReleaseReservation, reservationReleaseRequest{OwnerID: c.ownerID, RecordingID: recordingID, ReservationID: reservationID}, nil)
+	request := reservationReleaseRequest{OwnerID: c.ownerID, RecordingID: recordingID, ReservationID: reservationID}
+	return c.release(ctx, operationReleaseReservation, request)
 }
 
 func (c *RuntimeClient) AcquireQueue(ctx context.Context, leaseID string) error {
@@ -300,11 +331,87 @@ func (c *RuntimeClient) AcquireQueue(ctx context.Context, leaseID string) error 
 }
 
 func (c *RuntimeClient) ReleaseQueue(ctx context.Context, leaseID string) error {
-	return c.call(ctx, operationReleaseQueue, leaseRequest{OwnerID: c.ownerID, LeaseID: leaseID}, nil)
+	return c.release(ctx, operationReleaseQueue, leaseRequest{OwnerID: c.ownerID, LeaseID: leaseID})
 }
 
 func (c *RuntimeClient) AcquireWriter(ctx context.Context, leaseID string) error {
 	return c.wait(ctx, operationAcquireWriter, leaseRequest{OwnerID: c.ownerID, LeaseID: leaseID})
+}
+
+// AcquireHistoricalScratch reserves Host-wide historical fetch scratch under
+// this RuntimeClient's supervised process owner identity.
+func (c *RuntimeClient) AcquireHistoricalScratch(ctx context.Context, leaseID string, objects int, bytes int64) error {
+	if c == nil || c.client == nil {
+		return errors.New("runtime resource coordinator is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	request := historicalScratchLeaseRequest{
+		OwnerID: c.ownerID, LeaseID: leaseID, Objects: objects, Bytes: bytes,
+	}
+	pendingUncertainAcquire := false
+	var pendingRequestDeadline time.Time
+	for {
+		if err := ctx.Err(); err != nil {
+			if pendingUncertainAcquire {
+				if cleanupErr := c.cleanupUncertainHistoricalScratchAcquire(leaseID, pendingRequestDeadline); cleanupErr != nil {
+					return fmt.Errorf("%w; historical scratch cleanup failed: %v", err, cleanupErr)
+				}
+			}
+			return err
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, historicalScratchAcquireCallTimeout)
+		requestDeadline, _ := requestCtx.Deadline()
+		err := c.call(requestCtx, operationAcquireHistoricalScratch, request, nil)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			if cleanupErr := c.cleanupUncertainHistoricalScratchAcquire(leaseID, requestDeadline); cleanupErr != nil {
+				return fmt.Errorf("%w; historical scratch cleanup failed: %v", ctx.Err(), cleanupErr)
+			}
+			return ctx.Err()
+		}
+		var remote *runtimeipc.RemoteError
+		if errors.As(err, &remote) && remote.Code == "deadline_exceeded" {
+			// The Host stopped this bounded wait. Retry same lease identity;
+			// uncertain prior success becomes an idempotent acquire.
+			pendingUncertainAcquire = true
+			pendingRequestDeadline = requestDeadline
+			continue
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			pendingUncertainAcquire = true
+			pendingRequestDeadline = requestDeadline
+			continue
+		}
+		if !errors.As(err, &remote) {
+			// Transport failure may follow Host admission. Let the server-side
+			// request deadline expire, then release any uncertain admission.
+			if cleanupErr := c.cleanupUncertainHistoricalScratchAcquire(leaseID, requestDeadline); cleanupErr != nil {
+				return fmt.Errorf("%w; historical scratch cleanup failed: %v", err, cleanupErr)
+			}
+		}
+		pendingUncertainAcquire = false
+		return err
+	}
+}
+
+func (c *RuntimeClient) cleanupUncertainHistoricalScratchAcquire(leaseID string, requestDeadline time.Time) error {
+	if remaining := time.Until(requestDeadline); remaining > 0 {
+		timer := time.NewTimer(remaining)
+		<-timer.C
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*historicalScratchAcquireCallTimeout+100*time.Millisecond)
+	defer cancel()
+	return c.ReleaseHistoricalScratch(cleanupCtx, leaseID)
+}
+
+// ReleaseHistoricalScratch releases one Host-wide historical scratch lease.
+func (c *RuntimeClient) ReleaseHistoricalScratch(ctx context.Context, leaseID string) error {
+	return c.release(ctx, operationReleaseHistoricalScratch, leaseRequest{OwnerID: c.ownerID, LeaseID: leaseID})
 }
 
 // ClaimRecording asks the Host to authorize one canonical Recording writer.
@@ -333,7 +440,53 @@ func (c *RuntimeClient) ReleaseRecording(ctx context.Context, owner recordingown
 }
 
 func (c *RuntimeClient) ReleaseWriter(ctx context.Context, leaseID string) error {
-	return c.call(ctx, operationReleaseWriter, leaseRequest{OwnerID: c.ownerID, LeaseID: leaseID}, nil)
+	return c.release(ctx, operationReleaseWriter, leaseRequest{OwnerID: c.ownerID, LeaseID: leaseID})
+}
+
+// release retries only uncertain RPC outcomes. All lease release operations
+// are idempotent, so repeating the same request is safe after a lost response.
+func (c *RuntimeClient) release(ctx context.Context, operation string, request any) error {
+	if c == nil || c.client == nil {
+		return errors.New("runtime resource coordinator is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return retryLeaseRelease(ctx, func() error { return c.call(ctx, operation, request, nil) })
+}
+
+func retryLeaseRelease(ctx context.Context, call func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < releaseRPCAttempts; attempt++ {
+		lastErr = call()
+		if lastErr == nil || !retryableReleaseError(ctx, lastErr) {
+			return lastErr
+		}
+		if attempt+1 == releaseRPCAttempts {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
+}
+
+func retryableReleaseError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var remote *runtimeipc.RemoteError
+	if errors.As(err, &remote) {
+		return remote.Code == "deadline_exceeded"
+	}
+	// Local transport errors can occur after the Host applied a release but
+	// before the client received its response. Retry with the same lease ID.
+	return true
 }
 
 func (c *RuntimeClient) Snapshot(ctx context.Context) (Snapshot, error) {
@@ -396,6 +549,8 @@ var _ interface {
 	ReleaseQueue(context.Context, string) error
 	AcquireWriter(context.Context, string) error
 	ReleaseWriter(context.Context, string) error
+	AcquireHistoricalScratch(context.Context, string, int, int64) error
+	ReleaseHistoricalScratch(context.Context, string) error
 	ReportTelemetry(context.Context, uint64, uint64, uint64) error
 	ReportProcessTelemetry(context.Context, uint64, uint64, uint64, int64, float64) error
 	TelemetrySnapshot(context.Context) (TelemetrySnapshot, error)

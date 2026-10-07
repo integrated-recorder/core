@@ -148,13 +148,14 @@ func TestDefaultHistoricalScratchWindowReachesGovernorMaximum(t *testing.T) {
 
 func TestHistoricalSpoolPoolBoundsConcurrentWindows(t *testing.T) {
 	pool := newHistoricalSpoolPool(maxHistoricalScratchObjects)
+	maxPayloadBytes := storage.DefaultIngestOptions().MaxPayloadBytes
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	first, err := pool.acquire(context.Background(), 2)
+	first, err := pool.acquire(context.Background(), 2, 2*maxPayloadBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := pool.acquire(context.Background(), 2)
+	second, err := pool.acquire(context.Background(), 2, 2*maxPayloadBytes)
 	if err != nil {
 		first()
 		t.Fatal(err)
@@ -162,7 +163,7 @@ func TestHistoricalSpoolPoolBoundsConcurrentWindows(t *testing.T) {
 	third := make(chan func(), 1)
 	thirdErr := make(chan error, 1)
 	go func() {
-		release, acquireErr := pool.acquire(ctx, 1)
+		release, acquireErr := pool.acquire(ctx, 1, maxPayloadBytes)
 		if acquireErr != nil {
 			thirdErr <- acquireErr
 			return
@@ -206,6 +207,139 @@ func TestHistoricalSpoolPoolBoundsConcurrentWindows(t *testing.T) {
 	pool.mu.Unlock()
 	if active != 0 {
 		t.Fatalf("scratch pool leaked %d object reservations", active)
+	}
+}
+
+func TestManagersShareProcessHistoricalSpoolPool(t *testing.T) {
+	firstManager, _, _ := newManifestWindowTestManager(t, nil, "15151515151515151515151515151515")
+	secondManager, _, _ := newManifestWindowTestManager(t, nil, "16161616161616161616161616161616")
+	if firstManager.historicalSpools != secondManager.historicalSpools {
+		t.Fatal("Managers do not share process historical scratch pool")
+	}
+
+	maxPayloadBytes := storage.DefaultIngestOptions().MaxPayloadBytes
+	firstRelease, err := firstManager.historicalSpools.acquire(context.Background(), maxHistoricalScratchObjects, maxHistoricalScratchBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	secondResult := make(chan func(), 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		release, acquireErr := secondManager.historicalSpools.acquire(ctx, 1, maxPayloadBytes)
+		if acquireErr != nil {
+			secondErr <- acquireErr
+			return
+		}
+		secondResult <- release
+	}()
+	select {
+	case <-secondResult:
+		firstRelease()
+		t.Fatal("second Manager exceeded process scratch quota")
+	case err := <-secondErr:
+		firstRelease()
+		t.Fatal(err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	firstRelease()
+	select {
+	case release := <-secondResult:
+		release()
+	case err := <-secondErr:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("second Manager did not acquire scratch after first release")
+	}
+
+	firstManager.historicalSpools.mu.Lock()
+	activeObjects, activeBytes := firstManager.historicalSpools.active, firstManager.historicalSpools.activeBytes
+	firstManager.historicalSpools.mu.Unlock()
+	if activeObjects != 0 || activeBytes != 0 {
+		t.Fatalf("process scratch reservations leaked: objects=%d bytes=%d", activeObjects, activeBytes)
+	}
+}
+
+func TestHistoricalSpoolPoolBoundsBytesAndReleaseIsIdempotent(t *testing.T) {
+	pool := newHistoricalSpoolPool(maxHistoricalScratchObjects, 1<<30)
+	if got := pool.capacityFor(2 << 30); got != 0 {
+		t.Fatalf("payload larger than scratch byte budget has capacity %d, want zero", got)
+	}
+	first, err := pool.acquire(context.Background(), 2, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first()
+	first()
+	pool.mu.Lock()
+	activeObjects, activeBytes := pool.active, pool.activeBytes
+	pool.mu.Unlock()
+	if activeObjects != 0 || activeBytes != 0 {
+		t.Fatalf("idempotent release left reservations: objects=%d bytes=%d", activeObjects, activeBytes)
+	}
+
+	first, err = pool.acquire(context.Background(), 2, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	secondResult := make(chan func(), 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		release, acquireErr := pool.acquire(ctx, 1, 512<<20)
+		if acquireErr != nil {
+			secondErr <- acquireErr
+			return
+		}
+		secondResult <- release
+	}()
+	select {
+	case <-secondResult:
+		first()
+		t.Fatal("scratch reservation exceeded byte quota")
+	case err := <-secondErr:
+		first()
+		t.Fatal(err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	first()
+	select {
+	case second := <-secondResult:
+		second()
+	case err := <-secondErr:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("byte-limited scratch reservation did not proceed after release")
+	}
+}
+
+func TestHistoricalWindowCapacityFitsConfiguredPayloadLimit(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := storage.DefaultIngestOptions()
+	options.GlobalBytes = 2 << 30
+	options.PerRecordingBytes = 1536 << 20
+	options.MaxPayloadBytes = 1 << 30
+	if err := store.ConfigureIngestOptions(options); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManagerWithMode(store, nil, nil, nil, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := manager.Close(ctx); err != nil {
+			t.Errorf("close configured scratch manager: %v", err)
+		}
+	})
+	if got := manager.historicalWindowCapacity(); got != 2 {
+		t.Fatalf("1 GiB payload window capacity=%d, want 2", got)
 	}
 }
 

@@ -249,6 +249,14 @@ func (s *Server) handleConn(parent context.Context, conn net.Conn) {
 	_ = conn.SetDeadline(deadline)
 	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
+	// A request owns its connection for one operation. Detect an early client
+	// disconnect so a caller-cancelled bounded admission also cancels the Host
+	// handler instead of leaving it blocked until the request deadline.
+	go func() {
+		var probe [1]byte
+		_, _ = conn.Read(probe[:])
+		cancel()
+	}()
 	var result any
 	var opErr error
 	func() {
@@ -386,6 +394,8 @@ func (c *Client) Call(ctx context.Context, operation string, payload any, result
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	if err := writeFrame(conn, request); err != nil {
 		return err
 	}

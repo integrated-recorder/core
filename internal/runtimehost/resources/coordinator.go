@@ -16,34 +16,43 @@ import (
 const (
 	// MaxGlobalBufferBytes and MaxPerRecordingBufferBytes mirror the validated
 	// storage ingest limits. Keep these bounds aligned with storage settings.
-	MaxGlobalBufferBytes          int64 = 2 << 30
-	MaxPerRecordingBufferBytes    int64 = 1536 << 20
-	MaxQueueObjects                     = 128
-	MaxWriterConcurrency                = 1
-	maxTokenLength                      = 128
-	defaultTelemetryInterval            = 5 * time.Second
-	defaultTelemetryRetention           = 24 * time.Hour
-	maxTelemetryProjectionSamples       = 24000
+	MaxGlobalBufferBytes       int64 = 2 << 30
+	MaxPerRecordingBufferBytes int64 = 1536 << 20
+	MaxQueueObjects                  = 128
+	MaxWriterConcurrency             = 1
+	// MaxHistoricalScratchObjects and MaxHistoricalScratchBytes bound the
+	// Runtime Host temporary disk space used by parallel historical fetches.
+	MaxHistoricalScratchObjects           = 4
+	MaxHistoricalScratchBytes       int64 = 2 << 30
+	DefaultHistoricalScratchObjects       = MaxHistoricalScratchObjects
+	DefaultHistoricalScratchBytes   int64 = MaxHistoricalScratchBytes
+	maxTokenLength                        = 128
+	defaultTelemetryInterval              = 5 * time.Second
+	defaultTelemetryRetention             = 24 * time.Hour
+	maxTelemetryProjectionSamples         = 24000
 )
 
 var (
-	ErrInvalidLimits         = errors.New("invalid runtime resource limits")
-	ErrInvalidIdentity       = errors.New("invalid runtime resource identity")
-	ErrLeaseMismatch         = errors.New("runtime resource lease identity mismatch")
-	ErrInvalidReservation    = errors.New("reservation size must be greater than zero")
-	ErrInvalidTelemetryGauge = errors.New("runtime storage telemetry gauge is invalid")
-	ErrTelemetryRegression   = errors.New("runtime storage telemetry counters cannot decrease")
-	ErrTelemetryOverflow     = errors.New("runtime storage telemetry counter overflow")
+	ErrInvalidLimits                 = errors.New("invalid runtime resource limits")
+	ErrInvalidIdentity               = errors.New("invalid runtime resource identity")
+	ErrLeaseMismatch                 = errors.New("runtime resource lease identity mismatch")
+	ErrInvalidReservation            = errors.New("reservation size must be greater than zero")
+	ErrInvalidHistoricalScratchLease = errors.New("historical scratch lease is invalid")
+	ErrInvalidTelemetryGauge         = errors.New("runtime storage telemetry gauge is invalid")
+	ErrTelemetryRegression           = errors.New("runtime storage telemetry counters cannot decrease")
+	ErrTelemetryOverflow             = errors.New("runtime storage telemetry counter overflow")
 )
 
 // Limits are the process-wide resource limits enforced by the Runtime Host.
 // WriterConcurrency is intentionally fixed at one to preserve canonical
 // storage publication ordering across overlapping generations.
 type Limits struct {
-	GlobalBufferBytes       int64 `json:"global_buffer_bytes"`
-	PerRecordingBufferBytes int64 `json:"per_recording_buffer_bytes"`
-	QueueObjects            int   `json:"queue_objects"`
-	WriterConcurrency       int   `json:"writer_concurrency"`
+	GlobalBufferBytes        int64 `json:"global_buffer_bytes"`
+	PerRecordingBufferBytes  int64 `json:"per_recording_buffer_bytes"`
+	QueueObjects             int   `json:"queue_objects"`
+	WriterConcurrency        int   `json:"writer_concurrency"`
+	HistoricalScratchObjects int   `json:"historical_scratch_objects"`
+	HistoricalScratchBytes   int64 `json:"historical_scratch_bytes"`
 }
 
 // Validate rejects limits that exceed the existing storage ingest contract.
@@ -63,18 +72,36 @@ func (l Limits) Validate() error {
 	if l.WriterConcurrency != 1 {
 		return fmt.Errorf("%w: writer concurrency must be 1", ErrInvalidLimits)
 	}
+	if l.HistoricalScratchObjects < 0 || l.HistoricalScratchObjects > MaxHistoricalScratchObjects {
+		return fmt.Errorf("%w: historical scratch objects must be between 0 and %d", ErrInvalidLimits, MaxHistoricalScratchObjects)
+	}
+	if l.HistoricalScratchBytes < 0 || l.HistoricalScratchBytes > MaxHistoricalScratchBytes {
+		return fmt.Errorf("%w: historical scratch bytes must be between 0 and %d", ErrInvalidLimits, MaxHistoricalScratchBytes)
+	}
 	return nil
 }
 
+func (l Limits) withDefaults() Limits {
+	if l.HistoricalScratchObjects == 0 {
+		l.HistoricalScratchObjects = DefaultHistoricalScratchObjects
+	}
+	if l.HistoricalScratchBytes == 0 {
+		l.HistoricalScratchBytes = DefaultHistoricalScratchBytes
+	}
+	return l
+}
+
 // Snapshot contains aggregate coordinator usage only. It never includes owner,
-// recording, reservation, job, or writer identities.
+// recording, reservation, queue, writer, or scratch lease identities.
 type Snapshot struct {
-	Limits           Limits  `json:"limits"`
-	UsedBytes        int64   `json:"used_bytes"`
-	QueueObjects     int     `json:"queue_objects"`
-	QueueBytes       int64   `json:"queue_bytes"`
-	OldestAgeSeconds float64 `json:"oldest_age_seconds"`
-	ActiveWriters    int     `json:"active_writers"`
+	Limits                       Limits  `json:"limits"`
+	UsedBytes                    int64   `json:"used_bytes"`
+	QueueObjects                 int     `json:"queue_objects"`
+	QueueBytes                   int64   `json:"queue_bytes"`
+	OldestAgeSeconds             float64 `json:"oldest_age_seconds"`
+	ActiveWriters                int     `json:"active_writers"`
+	HistoricalScratchUsedObjects int     `json:"historical_scratch_used_objects"`
+	HistoricalScratchUsedBytes   int64   `json:"historical_scratch_used_bytes"`
 }
 
 type reservation struct {
@@ -85,6 +112,12 @@ type reservation struct {
 
 type lease struct {
 	ownerID string
+}
+
+type historicalScratchLease struct {
+	ownerID string
+	objects int
+	bytes   int64
 }
 
 type telemetryOwner struct {
@@ -104,12 +137,15 @@ type Coordinator struct {
 
 	limits Limits
 
-	reservations   map[string]reservation
-	recordingBytes map[string]int64
-	usedBytes      int64
-	queue          map[string]lease
-	writers        map[string]lease
-	changed        chan struct{}
+	reservations             map[string]reservation
+	recordingBytes           map[string]int64
+	usedBytes                int64
+	queue                    map[string]lease
+	writers                  map[string]lease
+	historicalScratch        map[string]historicalScratchLease
+	historicalScratchObjects int
+	historicalScratchBytes   int64
+	changed                  chan struct{}
 
 	telemetryInterval    time.Duration
 	telemetryRetention   time.Duration
@@ -146,6 +182,7 @@ func NewWithTelemetry(limits Limits, sampleInterval, retention time.Duration) (*
 }
 
 func newCoordinator(limits Limits, sampleInterval, retention time.Duration, startSampler bool) (*Coordinator, error) {
+	limits = limits.withDefaults()
 	if err := limits.Validate(); err != nil {
 		return nil, err
 	}
@@ -162,6 +199,7 @@ func newCoordinator(limits Limits, sampleInterval, retention time.Duration, star
 		recordingBytes:    make(map[string]int64),
 		queue:             make(map[string]lease),
 		writers:           make(map[string]lease),
+		historicalScratch: make(map[string]historicalScratchLease),
 		changed:           make(chan struct{}),
 		telemetryInterval: sampleInterval, telemetryRetention: retention,
 		telemetryMax: maxSamples, telemetryOwners: make(map[string]telemetryOwner),
@@ -663,6 +701,68 @@ func (c *Coordinator) ReleaseWriter(ownerID, writerID string) error {
 	return nil
 }
 
+// AcquireHistoricalScratch reserves bounded process-wide scratch capacity for
+// one historical fetch. Object and byte capacity are admitted atomically.
+// Repeating the exact owner, lease, and size is idempotent.
+func (c *Coordinator) AcquireHistoricalScratch(ctx context.Context, ownerID, leaseID string, objects int, bytes int64) error {
+	if err := validateContextAndIDs(ctx, ownerID, leaseID); err != nil {
+		return err
+	}
+	if objects <= 0 || bytes <= 0 || objects > c.limits.HistoricalScratchObjects || bytes > c.limits.HistoricalScratchBytes {
+		return fmt.Errorf("%w: request exceeds configured capacity", ErrInvalidHistoricalScratchLease)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		key := leaseKey(ownerID, leaseID)
+		current, exists := c.historicalScratch[key]
+		if exists {
+			if current.objects != objects || current.bytes != bytes {
+				c.mu.Unlock()
+				return ErrLeaseMismatch
+			}
+			c.mu.Unlock()
+			return nil
+		}
+		if c.historicalScratchObjects <= c.limits.HistoricalScratchObjects-objects && c.historicalScratchBytes <= c.limits.HistoricalScratchBytes-bytes {
+			c.historicalScratch[key] = historicalScratchLease{ownerID: ownerID, objects: objects, bytes: bytes}
+			c.historicalScratchObjects += objects
+			c.historicalScratchBytes += bytes
+			c.mu.Unlock()
+			return nil
+		}
+		changed := c.changed
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+// ReleaseHistoricalScratch releases one process-wide historical scratch lease.
+// Releasing an absent lease is idempotent. A live lease requires its exact owner.
+func (c *Coordinator) ReleaseHistoricalScratch(ownerID, leaseID string) error {
+	if err := validateIDs(ownerID, leaseID); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := leaseKey(ownerID, leaseID)
+	current, exists := c.historicalScratch[key]
+	if !exists {
+		return nil
+	}
+	delete(c.historicalScratch, key)
+	c.historicalScratchObjects -= current.objects
+	c.historicalScratchBytes -= current.bytes
+	c.signalLocked()
+	return nil
+}
+
 // ReleaseOwner reclaims every lease held by ownerID. The supervisor must call
 // this only after confirming the child process is dead. It is safe to repeat.
 func (c *Coordinator) ReleaseOwner(ownerID string) error {
@@ -696,6 +796,14 @@ func (c *Coordinator) ReleaseOwner(ownerID string) error {
 			changed = true
 		}
 	}
+	for key, item := range c.historicalScratch {
+		if item.ownerID == ownerID {
+			delete(c.historicalScratch, key)
+			c.historicalScratchObjects -= item.objects
+			c.historicalScratchBytes -= item.bytes
+			changed = true
+		}
+	}
 	delete(c.telemetryOwners, ownerID)
 	if changed {
 		c.signalLocked()
@@ -713,6 +821,8 @@ func (c *Coordinator) Snapshot() Snapshot {
 		Limits: c.limits, UsedBytes: c.usedBytes,
 		QueueObjects: len(c.queue), QueueBytes: queueBytes,
 		OldestAgeSeconds: oldestQueueAge, ActiveWriters: len(c.writers),
+		HistoricalScratchUsedObjects: c.historicalScratchObjects,
+		HistoricalScratchUsedBytes:   c.historicalScratchBytes,
 	}
 }
 

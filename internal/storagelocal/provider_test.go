@@ -482,6 +482,78 @@ func TestListRoundTripsLogicalKeysWithBoundedPagination(t *testing.T) {
 	}
 }
 
+func TestListPrunesUnrelatedRecordingSubtreesAndKeepsPrefixPagination(t *testing.T) {
+	provider, _ := configuredProvider(t)
+	for index := 0; index < 40; index++ {
+		for _, key := range []string{
+			fmt.Sprintf("recordings/A/nested/%03d.bin", index),
+			fmt.Sprintf("recordings/B/nested/%03d.bin", index),
+		} {
+			payload := []byte(key)
+			if _, err := provider.Put(context.Background(), key, bytes.NewReader(payload), int64(len(payload))); err != nil {
+				t.Fatalf("put %s: %v", key, err)
+			}
+		}
+	}
+	beePayload := []byte("partial component match")
+	if _, err := provider.Put(context.Background(), "recordings/Bee/item.bin", bytes.NewReader(beePayload), int64(len(beePayload))); err != nil {
+		t.Fatal(err)
+	}
+
+	var visited []string
+	limits := listLimits{
+		maxEntries: maxListVisitedEntries,
+		maxDepth:   maxListTraversalDepth,
+		onVisit:    func(key string) { visited = append(visited, key) },
+	}
+	var got []string
+	cursor := ""
+	for pageIndex := 0; ; pageIndex++ {
+		if pageIndex > 20 {
+			t.Fatal("prefix pagination did not terminate")
+		}
+		page, err := provider.listWithLimits(context.Background(), "recordings/B/", cursor, 7, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) > 7 {
+			t.Fatalf("page exceeded requested bound: %d", len(page.Items))
+		}
+		for _, item := range page.Items {
+			got = append(got, item.Key)
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		if len(page.Items) == 0 || page.NextCursor != page.Items[len(page.Items)-1].Key {
+			t.Fatalf("invalid continuation cursor: %#v", page)
+		}
+		cursor = page.NextCursor
+	}
+
+	want := make([]string, 0, 40)
+	for index := 0; index < 40; index++ {
+		want = append(want, fmt.Sprintf("recordings/B/nested/%03d.bin", index))
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("listed keys=%q, want %q", got, want)
+	}
+	for _, key := range visited {
+		if strings.HasPrefix(key, "recordings/A/") {
+			t.Fatalf("unrelated recording subtree was traversed: %q", key)
+		}
+	}
+
+	// A prefix that ends within a component follows protocol lexical semantics.
+	page, err := provider.List(context.Background(), "recordings/B", "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys := entryKeys(page.Items); len(keys) != 41 || keys[len(keys)-1] != "recordings/Bee/item.bin" {
+		t.Fatalf("partial-component prefix returned %d keys, last=%q", len(keys), keys[len(keys)-1])
+	}
+}
+
 func TestListTraversalBoundsAndCancellation(t *testing.T) {
 	provider, _ := configuredProvider(t)
 	for index := 0; index < 8; index++ {

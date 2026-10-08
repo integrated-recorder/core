@@ -308,28 +308,49 @@ func (p *Provider) listWithLimits(ctx context.Context, prefix, cursor string, li
 
 	selected := make([]storageproto.ObjectEntry, 0, limit+1)
 	budget := listBudget{limits: limits}
-	if err = p.walkTree(ctx, root, "", true, prefix, cursor, limit+1, 0, &budget, &selected); err != nil {
-		return storageproto.ListPage{}, err
-	}
-	privateFD, privateErr := openDirAt(root, privateDirectory)
-	if privateErr == nil {
-		otherFD, otherErr := openDirAt(privateFD, privateObjects)
-		_ = closeFD(privateFD)
-		if otherErr == nil {
-			if err = budget.visit(2); err != nil {
-				_ = closeFD(otherFD)
-				return storageproto.ListPage{}, err
-			}
-			err = p.walkTree(ctx, otherFD, "", false, prefix, cursor, limit+1, 2, &budget, &selected)
-			_ = closeFD(otherFD)
+	if prefixCanMatchRecordings(prefix) {
+		components := listPrefixDirectoryComponents(prefix, true)
+		startFD, relative, depth, ok, startErr := openListSubtree(ctx, root, components, 0, true, &budget)
+		if startErr != nil {
+			return storageproto.ListPage{}, startErr
+		}
+		if ok {
+			err = p.walkTree(ctx, startFD, relative, true, prefix, cursor, limit+1, depth, &budget, &selected)
+			_ = closeFD(startFD)
 			if err != nil {
 				return storageproto.ListPage{}, err
 			}
-		} else if !isMissing(otherErr) {
-			return storageproto.ListPage{}, fmt.Errorf("open local storage private object directory: %w", otherErr)
 		}
-	} else if !isMissing(privateErr) {
-		return storageproto.ListPage{}, fmt.Errorf("open local storage private directory: %w", privateErr)
+	}
+	if prefixCanMatchPrivate(prefix) {
+		privateFD, privateErr := openDirAt(root, privateDirectory)
+		if privateErr == nil {
+			otherFD, otherErr := openDirAt(privateFD, privateObjects)
+			_ = closeFD(privateFD)
+			if otherErr == nil {
+				if err = budget.visit(2); err != nil {
+					_ = closeFD(otherFD)
+					return storageproto.ListPage{}, err
+				}
+				components := listPrefixDirectoryComponents(prefix, false)
+				startFD, relative, depth, ok, startErr := openListSubtree(ctx, otherFD, components, 2, false, &budget)
+				_ = closeFD(otherFD)
+				if startErr != nil {
+					return storageproto.ListPage{}, startErr
+				}
+				if ok {
+					err = p.walkTree(ctx, startFD, relative, false, prefix, cursor, limit+1, depth, &budget, &selected)
+					_ = closeFD(startFD)
+					if err != nil {
+						return storageproto.ListPage{}, err
+					}
+				}
+			} else if !isMissing(otherErr) {
+				return storageproto.ListPage{}, fmt.Errorf("open local storage private object directory: %w", otherErr)
+			}
+		} else if !isMissing(privateErr) {
+			return storageproto.ListPage{}, fmt.Errorf("open local storage private directory: %w", privateErr)
+		}
 	}
 
 	sortEntries(selected)
@@ -533,6 +554,81 @@ func (p *Provider) digestCacheHitCount() uint64 {
 	return p.digestCacheHits
 }
 
+func prefixCanMatchRecordings(prefix string) bool {
+	return prefix == "" || strings.HasPrefix("recordings/", prefix) || strings.HasPrefix(prefix, "recordings/")
+}
+
+func prefixCanMatchPrivate(prefix string) bool {
+	return prefix == "" || !strings.HasPrefix(prefix, "recordings/")
+}
+
+// listPrefixDirectoryComponents returns only path components known to be
+// directories from prefix. A partial final component must remain in walkTree
+// because List uses lexical key-prefix matching, not component matching.
+func listPrefixDirectoryComponents(prefix string, recordings bool) []string {
+	if prefix == "" {
+		return nil
+	}
+	if recordings {
+		if !strings.HasPrefix(prefix, "recordings/") {
+			return nil
+		}
+		prefix = strings.TrimPrefix(prefix, "recordings/")
+	}
+	trailingSlash := strings.HasSuffix(prefix, "/")
+	if trailingSlash {
+		prefix = strings.TrimSuffix(prefix, "/")
+	}
+	if prefix == "" {
+		return nil
+	}
+	components := strings.Split(prefix, "/")
+	if !trailingSlash {
+		components = components[:len(components)-1]
+	}
+	return components
+}
+
+// openListSubtree opens the deepest directory guaranteed by prefix. It uses
+// descriptor-relative no-follow opens and treats missing, non-directory, or
+// symlinked prefix components as an empty match, as a full walk would.
+func openListSubtree(ctx context.Context, root int, components []string, depth int, recordings bool, budget *listBudget) (int, string, int, bool, error) {
+	fd, err := duplicateFD(root)
+	if err != nil {
+		return -1, "", depth, false, err
+	}
+	physicalParts := make([]string, 0, len(components))
+	for _, component := range components {
+		if err = ctx.Err(); err != nil {
+			_ = closeFD(fd)
+			return -1, "", depth, false, err
+		}
+		depth++
+		if err = budget.visit(depth); err != nil {
+			_ = closeFD(fd)
+			return -1, "", depth, false, err
+		}
+		physicalParts = append(physicalParts, component)
+		physical := strings.Join(physicalParts, "/")
+		logical := physical
+		if recordings {
+			logical = "recordings/" + physical
+		}
+		budget.observe(logical)
+		next, openErr := openDirAt(fd, component)
+		if openErr != nil {
+			_ = closeFD(fd)
+			if isMissing(openErr) || isNotDirectory(openErr) || isSymlink(openErr) || isUnsafeEntry(openErr) {
+				return -1, "", depth, false, nil
+			}
+			return -1, "", depth, false, fmt.Errorf("open local storage listing prefix: %w", openErr)
+		}
+		_ = closeFD(fd)
+		fd = next
+	}
+	return fd, strings.Join(physicalParts, "/"), depth, true, nil
+}
+
 func (p *Provider) walkTree(ctx context.Context, directory int, relative string, recordings bool, prefix, cursor string, retain, depth int, budget *listBudget, selected *[]storageproto.ObjectEntry) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -577,9 +673,22 @@ func (p *Provider) walkTree(ctx context.Context, directory int, relative string,
 			if storageproto.ValidateKey(logical) != nil || len(physical) > 1024 || !recordings && strings.HasPrefix(logical, "recordings/") {
 				continue
 			}
+			budget.observe(logical)
 
+			logicalDirectory := physical + "/"
+			if recordings {
+				logicalDirectory = "recordings/" + logicalDirectory
+			}
+			if !directoryMayMatchPrefix(logicalDirectory, prefix) {
+				continue
+			}
 			childFD, openErr := openDirAt(int(dir.Fd()), name)
 			if openErr == nil {
+				// A directory can contain matching keys only when its logical path
+				// and the requested prefix overlap. Prune unrelated subtrees before
+				// opening their contents. Keep lexical partial-component matches:
+				// prefix "recordings/ab" must still include both "ab/..." and
+				// "abc/..." keys.
 				childErr := p.walkTree(ctx, childFD, physical, recordings, prefix, cursor, retain, entryDepth, budget, selected)
 				_ = closeFD(childFD)
 				if childErr != nil {
@@ -616,6 +725,16 @@ func (p *Provider) walkTree(ctx context.Context, directory int, relative string,
 			return fmt.Errorf("read local storage listing directory: %w", err)
 		}
 	}
+}
+
+// directoryMayMatchPrefix reports whether a logical directory can contain a
+// key with prefix. Directories include a trailing slash so component-boundary
+// prefixes prune sibling names without changing lexical List semantics.
+func directoryMayMatchPrefix(directory, prefix string) bool {
+	if prefix == "" || directory == "" {
+		return true
+	}
+	return strings.HasPrefix(directory, prefix) || strings.HasPrefix(prefix, directory)
 }
 
 func (p *Provider) configuredRoot() (string, error) {
@@ -803,6 +922,7 @@ func sortEntries(entries []storageproto.ObjectEntry) {
 type listLimits struct {
 	maxEntries int
 	maxDepth   int
+	onVisit    func(string)
 }
 
 type listBudget struct {
@@ -816,4 +936,10 @@ func (budget *listBudget) visit(depth int) error {
 	}
 	budget.visited++
 	return nil
+}
+
+func (budget *listBudget) observe(logical string) {
+	if budget.limits.onVisit != nil {
+		budget.limits.onVisit(logical)
+	}
 }

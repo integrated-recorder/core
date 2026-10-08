@@ -403,16 +403,16 @@ func (m *Manager) persistCoverage(recordingID string, inventory archiveindex.Inv
 func (m *Manager) persistClaimShard(recordingID string, inventory archiveindex.Inventory, segmentID string, coordinate archiveindex.Coordinate, rootSegmentID string) error {
 	shard, encoded, err := archiveClaimShardForInventory(inventory, segmentID, coordinate, rootSegmentID)
 	if err != nil {
-		return err
+		return newStorageStageError("build archive claim shard", err)
 	}
 	if len(encoded) == 0 {
 		return nil
 	}
 	if err := m.store.SaveSidecar(recordingID, claimShardPath(segmentID), shard); err != nil {
-		return err
+		return newStorageStageError("persist archive claim shard", err)
 	}
 	if err := m.ensureArchiveIndexManifest(recordingID, inventory); err != nil {
-		return err
+		return newStorageStageError("persist archive index manifest", err)
 	}
 	// The shard is addressed by the stable coordinate ID and discovered by
 	// walking canonical root segments. Do not append it to a growing manifest
@@ -425,18 +425,21 @@ func (m *Manager) ensureArchiveIndexManifest(recordingID string, inventory archi
 	err := m.store.LoadSidecar(recordingID, archiveIndexManifestPath, archiveIndexMaxBytes, &existing)
 	if err == nil {
 		if existing.SchemaVersion != archiveindex.SchemaVersion || existing.RecordingID != recordingID || existing.Session.ID != inventory.Session.ID || len(existing.ClaimShards) > archiveindex.MaxSegments {
-			return ErrArchiveIndexUnavailable
+			return newStorageStageError("validate archive index manifest", ErrArchiveIndexUnavailable)
 		}
 		return nil
 	}
 	if errors.Is(err, storage.ErrSidecarReadUnsupported) {
-		return ErrArchiveIndexUnavailable
+		return newStorageStageError("read archive index manifest", ErrArchiveIndexUnavailable)
 	}
 	if !isMissingArchiveSidecar(err) {
-		return ErrArchiveIndexUnavailable
+		return newStorageStageError("read archive index manifest", ErrArchiveIndexUnavailable)
 	}
 	manifest := archiveIndexManifest{SchemaVersion: archiveindex.SchemaVersion, RecordingID: recordingID, Session: inventory.Session}
-	return m.store.SaveSidecar(recordingID, archiveIndexManifestPath, manifest)
+	if err := m.store.SaveSidecar(recordingID, archiveIndexManifestPath, manifest); err != nil {
+		return newStorageStageError("write archive index manifest", err)
+	}
+	return nil
 }
 
 func archiveClaimShardForInventory(inventory archiveindex.Inventory, segmentID string, coordinate archiveindex.Coordinate, rootSegmentID string) (archiveClaimShard, []byte, error) {
@@ -599,7 +602,7 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 		inventory, inventoryErr := m.inventoryForCoordinate(rootSnapshot, coordinate)
 		capacityExceeded := inventoryErr != nil && errors.Is(inventoryErr, ErrArchiveIndexLimit)
 		if inventoryErr != nil && !capacityExceeded {
-			return inventoryErr
+			return newStorageStageError("load archive inventory", inventoryErr)
 		}
 
 		existing, exists := findRootSegment(rootSnapshot, coordinate)
@@ -633,7 +636,7 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 				if isArchiveIndexCapacityError(err) {
 					capacityExceeded = true
 				} else {
-					return err
+					return newStorageStageError("apply archive claim", err)
 				}
 			}
 		}
@@ -659,7 +662,7 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 					capacityExceeded = true
 					inventory = archiveindex.Inventory{}
 				} else {
-					return shardErr
+					return newStorageStageError("build archive claim shard", shardErr)
 				}
 			}
 		}
@@ -674,10 +677,10 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 		}
 		if exists && disposition == archiveindex.DispositionConflict {
 			if err := m.saveImmutablePayload(rootSnapshot.ID, segment.StoragePath, data, result); err != nil {
-				return err
+				return newStorageStageError("persist immutable archive payload", err)
 			}
 			if err := m.store.SaveSidecar(rootSnapshot.ID, segment.StoragePath, segment); err != nil {
-				return err
+				return newStorageStageError("persist segment sidecar", err)
 			}
 			if err := m.persistClaimShard(rootSnapshot.ID, inventory, segmentID, coordinate, existing.ID); err != nil {
 				return err
@@ -710,7 +713,7 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			segment.ID = fmt.Sprintf("seg-%020d", segment.ArchiveOrdinal)
 		}
 		if err := m.saveImmutablePayload(rootSnapshot.ID, segment.StoragePath, data, result); err != nil {
-			return err
+			return newStorageStageError("persist immutable archive payload", err)
 		}
 
 		sourceDiscontinuity := segment.Discontinuity
@@ -759,11 +762,11 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 		}
 		if previousUpdate != nil {
 			if err := m.store.SaveSidecar(rootSnapshot.ID, previousUpdate.StoragePath, *previousUpdate); err != nil {
-				return err
+				return newStorageStageError("persist prior segment sidecar", err)
 			}
 		}
 		if err := m.store.SaveSidecar(rootSnapshot.ID, segment.StoragePath, segment); err != nil {
-			return err
+			return newStorageStageError("persist segment sidecar", err)
 		}
 		if !capacityExceeded {
 			if err := m.persistClaimShard(rootSnapshot.ID, inventory, segmentID, coordinate, segment.ID); err != nil {
@@ -811,7 +814,7 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			}
 			if !segment.IsInit && !capacityExceeded {
 				if err := applyTimelineProjection(recording, inventory); err != nil {
-					return err
+					return newStorageStageError("apply timeline projection", err)
 				}
 			} else if !segment.IsInit && assignRootTimeline(recording) {
 				if recording.TimelineRevision == ^uint64(0) {
@@ -822,11 +825,15 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			recording.LastError = ""
 			return nil
 		}); err != nil {
-			return err
+			return newStorageStageError("persist recording root", err)
 		}
 		return nil
 	})
 	if commitErr != nil {
+		var staged interface{ Stage() string }
+		if !errors.As(commitErr, &staged) {
+			commitErr = newStorageStageError("canonical ownership validation", commitErr)
+		}
 		return storage.PayloadResult{}, nil, commitErr
 	}
 	if source == archiveindex.ClaimLiveOrigin {

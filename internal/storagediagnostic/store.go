@@ -265,7 +265,9 @@ func validJobKind(kind string) bool {
 
 func validErrorCategory(category string) bool {
 	switch category {
-	case "not_found", "permission_denied", "payload_size_mismatch", "canonical_commit_failed", "coordinator_unavailable", "ingest_closed", "ingest_too_large", "ingest_reservation", "short_write", "io_error":
+	case "not_found", "permission_denied", "payload_size_mismatch", "canonical_commit_failed", "coordinator_unavailable", "ingest_closed", "ingest_too_large", "ingest_reservation", "short_write", "io_error",
+		"archive_index_unavailable", "archive_index_limit", "archive_inventory_invalid", "archive_claim_invalid", "archive_claim_identity_changed", "archive_sealed",
+		"stale_owner", "owner_not_found", "owner_identity_invalid", "owner_state_invalid":
 		return true
 	default:
 		return false

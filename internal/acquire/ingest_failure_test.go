@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
 	"github.com/integrated-recorder/core/internal/storage"
 	"github.com/integrated-recorder/core/internal/storagediagnostic"
 )
@@ -173,6 +175,9 @@ func TestHistoricalFirstFailureSurvivesQueuedLivePoison(t *testing.T) {
 		durable.CurrentAttempts != 1 || durable.FirstFailureAttempts != 1 || len(durable.StageChain) == 0 || durable.StageChain[0] != "historical media payload commit" {
 		t.Fatalf("durable historical failure details = %+v", durable)
 	}
+	if len(durable.StageChain) < 2 || durable.StageChain[1] != "persist archive claim shard" {
+		t.Fatalf("durable operation stage chain = %v, want claim shard persistence", durable.StageChain)
+	}
 	encoded, err := os.ReadFile(filepath.Join(base.Root(), "management", "diagnostics", "recordings", root.ID+".json"))
 	if err != nil {
 		t.Fatal(err)
@@ -230,6 +235,29 @@ func TestHistoricalFirstFailureSurvivesQueuedLivePoison(t *testing.T) {
 	}
 	if got := len(current.Tracks["main"].Segments); got != 1 {
 		t.Fatalf("poisoned live payload changed canonical root: segment count=%d", got)
+	}
+}
+
+func TestStorageDiagnosticClassifiesArchiveAndFenceCauses(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"archive index unavailable", fmt.Errorf("%w: claim shard is unreadable", ErrArchiveIndexUnavailable), "archive_index_unavailable"},
+		{"invalid archive claim", fmt.Errorf("%w: invalid segment metadata", archiveindex.ErrInvalidClaim), "archive_claim_invalid"},
+		{"stale owner", recordingowner.ErrStaleOwner, "stale_owner"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := buildStorageFailureDiagnostic(strings.Repeat("a", 32), "recording", newStorageCommitFailure("historical media payload commit", test.err), storage.IngestSnapshot{})
+			for _, category := range got.ErrorCategories {
+				if category == test.want {
+					return
+				}
+			}
+			t.Fatalf("categories = %v, want %q", got.ErrorCategories, test.want)
+		})
 	}
 }
 

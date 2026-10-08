@@ -2388,6 +2388,16 @@ func diagnosticErrorCategories(err error) []string {
 	add(errors.Is(err, io.ErrShortWrite), "short_write")
 	var errno syscall.Errno
 	add(errors.As(err, &errno), "io_error")
+	add(errors.Is(err, ErrArchiveIndexUnavailable), "archive_index_unavailable")
+	add(errors.Is(err, ErrArchiveIndexLimit), "archive_index_limit")
+	add(errors.Is(err, archiveindex.ErrInvalidInventory), "archive_inventory_invalid")
+	add(errors.Is(err, archiveindex.ErrInvalidClaim), "archive_claim_invalid")
+	add(errors.Is(err, archiveindex.ErrClaimIdentityChange), "archive_claim_identity_changed")
+	add(errors.Is(err, archiveindex.ErrSealed), "archive_sealed")
+	add(errors.Is(err, recordingowner.ErrStaleOwner), "stale_owner")
+	add(errors.Is(err, recordingowner.ErrNotFound), "owner_not_found")
+	add(errors.Is(err, recordingowner.ErrInvalidIdentity), "owner_identity_invalid")
+	add(errors.Is(err, recordingowner.ErrInvalidState), "owner_state_invalid")
 	return categories
 }
 

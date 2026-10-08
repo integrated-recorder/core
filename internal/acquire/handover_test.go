@@ -970,7 +970,17 @@ func TestHandoverPreflightRejectsEmptyCandidateObjectsWithoutMutation(t *testing
 		t.Run(test.name, func(t *testing.T) {
 			fixture := &handoverFixture{max: 1, metadata: "title"}
 			store, owners, source, owner, recording, snapshot := pausedHandoverRecording(t, fixture, "https://fixture.invalid/live.m3u8", 1)
-			defer func() { resumeAndStopHandoverSource(t, source, owner, snapshot) }()
+			defer func() {
+				// The source and preflight target share this fixture. Clear the
+				// target-only response and playlist mutations before resuming the
+				// source scheduler.
+				fixture.mu.Lock()
+				fixture.max = 1
+				fixture.emptyPayloadPath = ""
+				fixture.includeInitMap = false
+				fixture.mu.Unlock()
+				resumeAndStopHandoverSource(t, source, owner, snapshot)
+			}()
 			setHandoverFixtureMax(fixture, 2)
 			fixture.mu.Lock()
 			fixture.emptyPayloadPath = test.emptyPath

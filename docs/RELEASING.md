@@ -44,8 +44,12 @@ the secret store; no development or test key is used to publish releases.
 
 The Runtime Host must separately be configured with the matching trusted
 Ed25519 public key under the same key ID before it can install a remote
-release. The release manifest and signature establish authenticity only when
-verified against that externally provisioned trust root. In a deployed Host,
+release. Set `IR_RELEASE_TRUSTED_KEYS_JSON` in the Runtime Host environment.
+The repository's Compose deployment passes this variable through from the
+operator environment or Compose `.env` file. It contains public keys only; the
+private signing key stays in the GitHub Actions secret store. The release
+manifest and signature establish authenticity only when verified against that
+externally provisioned trust root. In a deployed Host,
 `GET /api/runtime/update` reports status and authenticated, CSRF-protected
 `POST` requests to `/check`, `/stage`, `/activate`, and `/rollback` operate the
 application release lifecycle. Development builds and deployments without a

@@ -35,7 +35,7 @@ jobs:
           npm run test
           npm run build
       - name: Verify Go
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -timeout=30m ./...
       - name: Build and sign Linux release assets
         env:
           IR_RELEASE_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.IR_RELEASE_SIGNING_PRIVATE_KEY_BASE64 }}

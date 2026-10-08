@@ -263,9 +263,15 @@ func (p *process) shutdown() {
 func (p *process) kill() {
 	p.killOnce.Do(func() {
 		p.unusable.Store(true)
-		_ = p.stdin.Close()
+		// Kill the child before closing its stdin. A request writer can be
+		// blocked in a large pipe write while the child keeps the read end open
+		// but does not consume input. On some platforms, closing that pipe from
+		// another goroutine does not unblock the pending write until the reader
+		// exits. Terminating the child first closes the read end and releases the
+		// writer; closing stdin then prevents any further writes.
 		if p.cmd.Process != nil {
 			_ = p.cmd.Process.Kill()
 		}
+		_ = p.stdin.Close()
 	})
 }

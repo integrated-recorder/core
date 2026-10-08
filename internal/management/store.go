@@ -72,7 +72,7 @@ func Open(root string) (*Store, error) {
 	if err := ensurePrivateDir(managementRoot); err != nil {
 		return nil, fmt.Errorf("prepare management directory: %w", err)
 	}
-	for _, name := range []string{"recordings", "recording-events"} {
+	for _, name := range []string{"recordings", "recording-events", filepath.Join("diagnostics", "recordings")} {
 		if err := ensurePrivateDir(filepath.Join(managementRoot, name)); err != nil {
 			return nil, fmt.Errorf("prepare management %s directory: %w", name, err)
 		}
@@ -255,6 +255,9 @@ func (s *Store) removeRecordingProjections(id string) error {
 		return err
 	}
 	if err := removeThroughTombstone(s.recordingEventsPath(id), id+"-events"); err != nil {
+		return err
+	}
+	if err := removeThroughTombstone(filepath.Join(s.root, "diagnostics", "recordings", id+".json"), id+"-storage-diagnostic"); err != nil {
 		return err
 	}
 	return nil

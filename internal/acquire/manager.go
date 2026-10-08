@@ -10,12 +10,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
@@ -26,6 +30,7 @@ import (
 	"github.com/integrated-recorder/core/internal/runtimehook"
 	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
 	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storagediagnostic"
 )
 
 type Resolver interface {
@@ -99,10 +104,11 @@ type entry struct {
 	terminalErr     error
 	// storageFailureDiagnostic retains the first internal storage error chain.
 	// Public state and Stop errors continue to use sanitized terminalErr.
-	storageFailureDiagnostic error
-	recoveryAttempts         int
-	recoveryNoProgress       int
-	recoveryManifestStarted  bool
+	storageFailureDiagnostic             error
+	storageDiagnosticPersistenceFailures uint64
+	recoveryAttempts                     int
+	recoveryNoProgress                   int
+	recoveryManifestStarted              bool
 	// pendingRecoveryRelease retains an exact terminal owner token when Host
 	// release fails. Scheduler queue capacity never owns this obligation.
 	pendingRecoveryRelease  *OwnershipToken
@@ -127,6 +133,7 @@ type entry struct {
 type Manager struct {
 	store                            *storage.Store
 	ingest                           *storage.IngestService
+	storageDiagnostics               StorageFailureDiagnosticRecorder
 	client                           *http.Client
 	historicalFetch                  *historicalFetchGovernor
 	historicalSpools                 *historicalSpoolPool
@@ -173,6 +180,12 @@ type Manager struct {
 	metadataPollInterval time.Duration
 	// metadataClock is a deterministic test seam. Production leaves it nil.
 	metadataClock func() time.Time
+}
+
+// StorageFailureDiagnosticRecorder is the private durable sink for the first
+// structured storage failure associated with a recording.
+type StorageFailureDiagnosticRecorder interface {
+	RecordFirst(storagediagnostic.Diagnostic) (storagediagnostic.Diagnostic, bool, error)
 }
 
 // OwnedRecordingState is a bounded, non-payload runtime snapshot. It avoids
@@ -343,6 +356,22 @@ func (m *Manager) ConfigureHistoricalScratchCoordinator(coordinator HistoricalSc
 		return ErrHistoricalScratchConfigurationClosed
 	}
 	m.historicalScratchCoordinator = coordinator
+	return nil
+}
+
+// ConfigureStorageFailureDiagnostics installs the private management sink.
+// Diagnostic persistence is best effort and never changes canonical commit
+// failure behavior.
+func (m *Manager) ConfigureStorageFailureDiagnostics(recorder StorageFailureDiagnosticRecorder) error {
+	if m == nil || recorder == nil {
+		return errors.New("storage failure diagnostic recorder is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.startAttempted || m.closed {
+		return ErrFenceConfigurationClosed
+	}
+	m.storageDiagnostics = recorder
 	return nil
 }
 
@@ -2192,17 +2221,174 @@ func (m *Manager) fail(e *entry, err error) {
 
 func (m *Manager) recordStorageFailureDiagnostic(e *entry, err error) {
 	var stagedError interface{ Stage() string }
-	if errors.Is(err, errStorageCommit) || (errors.As(err, &stagedError) && stagedError.Stage() != "") {
-		e.mu.Lock()
-		firstStorageFailure := e.storageFailureDiagnostic == nil
-		if firstStorageFailure {
-			e.storageFailureDiagnostic = err
-		}
-		e.mu.Unlock()
-		if firstStorageFailure {
-			logStorageCommitFailure(err)
+	if err == nil || !(errors.Is(err, errStorageCommit) || errors.Is(err, storage.ErrCanonicalCommitFailed) ||
+		errors.Is(err, storage.ErrIngestCoordinatorUnavailable) || (errors.As(err, &stagedError) && stagedError.Stage() != "")) {
+		return
+	}
+	e.mu.Lock()
+	firstStorageFailure := e.storageFailureDiagnostic == nil
+	var recordingID, recordingState string
+	if firstStorageFailure {
+		e.storageFailureDiagnostic = err
+		if e.recording != nil {
+			recordingID = e.recording.ID
+			recordingState = string(e.recording.State)
 		}
 	}
+	e.mu.Unlock()
+	if !firstStorageFailure {
+		return
+	}
+
+	diagnostic := buildStorageFailureDiagnostic(recordingID, recordingState, err, m.ingest.Snapshot())
+	m.mu.RLock()
+	recorder := m.storageDiagnostics
+	m.mu.RUnlock()
+	if recorder == nil {
+		e.mu.Lock()
+		e.storageDiagnosticPersistenceFailures++
+		e.mu.Unlock()
+		log.Printf("recording storage failure diagnostic was not persisted")
+	} else if _, _, persistErr := recorder.RecordFirst(diagnostic); persistErr != nil {
+		e.mu.Lock()
+		e.storageDiagnosticPersistenceFailures++
+		e.mu.Unlock()
+		// Never log the persistence error: it can contain a private path.
+		log.Printf("recording storage failure diagnostic persistence failed")
+	}
+	logStorageCommitFailure(err)
+}
+
+func buildStorageFailureDiagnostic(recordingID, recordingState string, err error, snapshot storage.IngestSnapshot) storagediagnostic.Diagnostic {
+	diagnostic := storagediagnostic.Diagnostic{
+		Version:        storagediagnostic.SchemaVersion,
+		RecordedAt:     time.Now().UTC(),
+		RecordingID:    recordingID,
+		Classification: storagediagnostic.ClassificationOther,
+		RecordingState: safeDiagnosticState(recordingState),
+		IngestSnapshot: storagediagnostic.IngestSnapshot{
+			BufferUsedBytes: snapshot.BufferUsedBytes, ReservedBytes: snapshot.ReservedBytes,
+			QueueObjects: snapshot.QueueObjects, QueueBytes: snapshot.QueueBytes,
+			OldestPersistAgeSeconds: snapshot.OldestPersistAgeSeconds,
+			ActiveWriters:           snapshot.ActiveWriters, WriterConcurrency: snapshot.WriterConcurrency,
+			StorageErrorsTotal: snapshot.StorageErrorsTotal, CoordinatorErrorsTotal: snapshot.CoordinatorErrorsTotal,
+			PendingCoordinatorLeases: snapshot.PendingCoordinatorLeases,
+		},
+	}
+	if errors.Is(err, storage.ErrIngestCoordinatorUnavailable) {
+		diagnostic.Classification = storagediagnostic.ClassificationCoordinatorUnavailable
+	} else if errors.Is(err, errStorageCommit) || errors.Is(err, storage.ErrCanonicalCommitFailed) {
+		diagnostic.Classification = storagediagnostic.ClassificationCanonicalCommitFailed
+	}
+	var ingestFailure storage.IngestFailureDetails
+	if errors.As(err, &ingestFailure) {
+		diagnostic.CurrentJobKind = string(ingestFailure.CurrentJobKind())
+		diagnostic.FirstFailureJobKind = string(ingestFailure.FirstFailureJobKind())
+		diagnostic.CurrentAttempts = max(0, ingestFailure.CurrentAttempts())
+		diagnostic.FirstFailureAttempts = max(0, ingestFailure.FirstFailureAttempts())
+		diagnostic.SourceClass = sourceClassForJob(ingestFailure.FirstFailureJobKind())
+	}
+	for current, count := err, 0; current != nil && count < 12; current, count = errors.Unwrap(current), count+1 {
+		if staged, ok := current.(interface{ Stage() string }); ok {
+			if value := safeDiagnosticStage(staged.Stage()); value != "" {
+				diagnostic.StageChain = append(diagnostic.StageChain, value)
+			}
+		}
+		typeName := fmt.Sprintf("%T", current)
+		if safeDiagnosticErrorType(typeName) {
+			diagnostic.ErrorTypeChain = append(diagnostic.ErrorTypeChain, typeName)
+		}
+	}
+	diagnostic.ErrorCategories = diagnosticErrorCategories(err)
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		diagnostic.FileOperation = safeFileOperation(pathErr.Op)
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		diagnostic.ErrnoCode = int(errno)
+	}
+	return diagnostic
+}
+
+func sourceClassForJob(kind storage.IngestJobKind) string {
+	switch kind {
+	case storage.IngestJobKindHistoricalMedia, storage.IngestJobKindHistoricalInit:
+		return "historical"
+	case storage.IngestJobKindMediaPayload, storage.IngestJobKindInitPayload:
+		return "live"
+	default:
+		return "unknown"
+	}
+}
+
+func safeDiagnosticStage(value string) string {
+	if len(value) == 0 || len(value) > 128 {
+		return ""
+	}
+	for _, character := range value {
+		if !(character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' ||
+			character >= '0' && character <= '9' || character == ' ' || character == '.' || character == '_' || character == ':' || character == '-') {
+			return ""
+		}
+	}
+	return value
+}
+
+func safeDiagnosticErrorType(value string) bool {
+	if len(value) == 0 || len(value) > 160 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' ||
+			character >= '0' && character <= '9' || character == '_' || character == '.' || character == '*' || character == '[' || character == ']') {
+			return false
+		}
+	}
+	return true
+}
+
+func safeDiagnosticState(value string) string {
+	if value == "recording" || value == "stopped" || value == "completed" || value == "interrupted" {
+		return value
+	}
+	return ""
+}
+
+func safeFileOperation(value string) string {
+	switch value {
+	case "open", "create", "read", "write", "close", "sync", "rename", "link", "remove", "mkdir", "stat", "chmod":
+		return value
+	default:
+		return "filesystem"
+	}
+}
+
+func diagnosticErrorCategories(err error) []string {
+	var categories []string
+	add := func(condition bool, name string) {
+		if !condition {
+			return
+		}
+		for _, existing := range categories {
+			if existing == name {
+				return
+			}
+		}
+		categories = append(categories, name)
+	}
+	add(errors.Is(err, fs.ErrNotExist), "not_found")
+	add(errors.Is(err, fs.ErrPermission), "permission_denied")
+	add(errors.Is(err, storage.ErrPayloadSizeMismatch), "payload_size_mismatch")
+	add(errors.Is(err, storage.ErrCanonicalCommitFailed) || errors.Is(err, errStorageCommit), "canonical_commit_failed")
+	add(errors.Is(err, storage.ErrIngestCoordinatorUnavailable), "coordinator_unavailable")
+	add(errors.Is(err, storage.ErrIngestClosed), "ingest_closed")
+	add(errors.Is(err, storage.ErrIngestTooLarge), "ingest_too_large")
+	add(errors.Is(err, storage.ErrIngestReservation), "ingest_reservation")
+	add(errors.Is(err, io.ErrShortWrite), "short_write")
+	var errno syscall.Errno
+	add(errors.As(err, &errno), "io_error")
+	return categories
 }
 
 func logStorageCommitFailure(err error) {

@@ -19,6 +19,7 @@ import (
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/hls"
 	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storagediagnostic"
 )
 
 func TestBlockedStorageWriterDoesNotBlockSegmentFetchWorkers(t *testing.T) {
@@ -451,6 +452,11 @@ func TestPermanentStorageFailureIsNotRecordedAsSourceGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	diagnostics, err := storagediagnostic.Open(store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.storageDiagnostics = diagnostics
 	manager.storageWriteFailureHook = func() error { return errors.New("permanent storage failure") }
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -477,6 +483,15 @@ func TestPermanentStorageFailureIsNotRecordedAsSourceGap(t *testing.T) {
 	}
 	if requests.Load() != 1 {
 		t.Fatalf("source was downloaded %d times after storage failure", requests.Load())
+	}
+	diagnostic, err := diagnostics.Read(recording.ID)
+	if err != nil {
+		t.Fatalf("durable live media diagnostic: %v", err)
+	}
+	if diagnostic.Classification != storagediagnostic.ClassificationCanonicalCommitFailed || diagnostic.SourceClass != "live" ||
+		diagnostic.CurrentJobKind != string(storage.IngestJobKindMediaPayload) || diagnostic.FirstFailureJobKind != string(storage.IngestJobKindMediaPayload) ||
+		len(diagnostic.StageChain) == 0 || diagnostic.StageChain[0] != "media payload commit" || diagnostic.CurrentAttempts < 1 {
+		t.Fatalf("durable live media diagnostic=%+v", diagnostic)
 	}
 }
 

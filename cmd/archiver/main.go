@@ -26,6 +26,7 @@ import (
 	"github.com/integrated-recorder/core/internal/preview"
 	"github.com/integrated-recorder/core/internal/server"
 	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storagediagnostic"
 	"github.com/integrated-recorder/core/internal/systemsettings"
 	"github.com/integrated-recorder/core/internal/watch"
 )
@@ -80,6 +81,16 @@ func run() error {
 	if err != nil {
 		adapters.Close()
 		return fmt.Errorf("load recordings: %w", err)
+	}
+	storageDiagnostics, diagnosticErr := storagediagnostic.Open(dataDir)
+	if diagnosticErr == nil {
+		if err := manager.ConfigureStorageFailureDiagnostics(storageDiagnostics); err != nil {
+			_ = manager.Close(context.Background())
+			adapters.Close()
+			return fmt.Errorf("configure storage failure diagnostics: %w", err)
+		}
+	} else {
+		log.Printf("private storage failure diagnostics are unavailable")
 	}
 	for _, issue := range store.RecoveryIssues() {
 		log.Printf("storage recovery: recording=%s code=%s: %s", issue.ID, issue.Code, issue.Message)
@@ -173,7 +184,7 @@ func run() error {
 	startedAt := time.Now().UTC()
 
 	build := buildinfo.Current()
-	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Watches: watchService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage, ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, BuildInfo: build})
+	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Watches: watchService, Auth: authService, StorageDiagnostics: storageDiagnostics, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage, ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, BuildInfo: build})
 	httpServer := &http.Server{Addr: addr, Handler: apiServer, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

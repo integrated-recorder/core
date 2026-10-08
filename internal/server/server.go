@@ -32,6 +32,7 @@ import (
 	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/preview"
 	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storagediagnostic"
 	"github.com/integrated-recorder/core/internal/systemsettings"
 	"github.com/integrated-recorder/core/internal/watch"
 )
@@ -48,6 +49,7 @@ type Server struct {
 	previews                    *preview.Service
 	watches                     *watch.Service
 	auth                        *authn.Service
+	storageDiagnostics          *storagediagnostic.Store
 	settings                    *systemsettings.Store
 	effectiveStorage            systemsettings.StorageSettings
 	logs                        *applog.Store
@@ -92,6 +94,7 @@ type Options struct {
 	Previews                    *preview.Service
 	Watches                     *watch.Service
 	Auth                        *authn.Service
+	StorageDiagnostics          *storagediagnostic.Store
 	Settings                    *systemsettings.Store
 	Logs                        *applog.Store
 	InitialIntegrityConcurrency int
@@ -167,7 +170,7 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 			archiveStore = local.Store()
 		}
 	}
-	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, adapterTrust: validatedAdapterTrust(options.AdapterTrust), configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, installationManaged: options.InstallationManaged, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
+	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, adapterTrust: validatedAdapterTrust(options.AdapterTrust), configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, storageDiagnostics: options.StorageDiagnostics, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, installationManaged: options.InstallationManaged, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
 	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
@@ -191,6 +194,7 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 	s.registerSettingsRoutes()
 	s.mux.Handle("GET /api/logs", NewLogHandler(s.logs))
 	s.mux.HandleFunc("GET /api/recordings/{id}", s.get)
+	s.mux.HandleFunc("GET /api/recordings/{id}/diagnostics/storage", s.storageFailureDiagnostic)
 	s.mux.HandleFunc("POST /api/recordings/{id}/stop", s.stop)
 	s.registerWatchRoutes()
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/master.m3u8", s.masterPlaylist)

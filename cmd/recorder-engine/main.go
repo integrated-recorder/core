@@ -25,6 +25,7 @@ import (
 	"github.com/integrated-recorder/core/internal/runtimehost/resources"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
 	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storagediagnostic"
 	"github.com/integrated-recorder/core/internal/storageprocess"
 	"github.com/integrated-recorder/core/internal/systemsettings"
 )
@@ -124,6 +125,18 @@ func run() error {
 		}
 		adapters.Close()
 		return fmt.Errorf("initialize recorder manager: %w", err)
+	}
+	storageDiagnostics, diagnosticErr := storagediagnostic.Open(dataDir)
+	if diagnosticErr == nil {
+		if err := manager.ConfigureStorageFailureDiagnostics(storageDiagnostics); err != nil {
+			_ = manager.Close(context.Background())
+			adapters.Close()
+			return fmt.Errorf("configure storage failure diagnostics: %w", err)
+		}
+	} else {
+		// Diagnostics are best effort. Keep recording behavior unchanged if the
+		// private management directory is unavailable.
+		log.Printf("private storage failure diagnostics are unavailable")
 	}
 	if managedRuntime {
 		if err := manager.ConfigureHistoricalScratchCoordinator(runtimeClient); err != nil {

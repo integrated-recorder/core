@@ -85,6 +85,21 @@ type storageCommitFailure struct {
 	cause error
 }
 
+// storageCoordinatorFailure records a terminal coordinator failure without
+// classifying it as a canonical archive commit failure.
+type storageCoordinatorFailure struct {
+	stage string
+	cause error
+}
+
+func (e storageCoordinatorFailure) Error() string {
+	return fmt.Sprintf("storage coordinator unavailable during %s: %v", e.stage, e.cause)
+}
+
+func (e storageCoordinatorFailure) Unwrap() error { return e.cause }
+
+func (e storageCoordinatorFailure) Stage() string { return e.stage }
+
 // storageStageError adds internal operation context without changing existing
 // failure classification for callers that handle canonical commits.
 type storageStageError struct {
@@ -1495,14 +1510,26 @@ func (s *segmentScheduler) failStorage(stage string, cause error) {
 		s.failCoordinator(stage, cause)
 		return
 	}
-	s.failFatal(newStorageCommitFailure(stage, cause))
+	failure := newStorageCommitFailure(stage, cause)
+	if s.manager != nil {
+		// Persist the sanitized first-failure record at the canonical failure
+		// boundary, before scheduler shutdown or caller polling can lose context.
+		s.manager.recordStorageFailureDiagnostic(s.e, failure)
+	}
+	s.failFatal(failure)
 }
 
 func (s *segmentScheduler) failCoordinator(stage string, cause error) {
 	if cause == nil {
 		cause = storage.ErrIngestCoordinatorUnavailable
 	}
-	s.failFatal(fmt.Errorf("storage coordinator unavailable during %s: %w", stage, cause))
+	failure := storageCoordinatorFailure{stage: stage, cause: cause}
+	if s.manager != nil {
+		// Coordinator exhaustion is distinct from canonical corruption, but it
+		// still needs a durable, sanitized record when it terminates a recording.
+		s.manager.recordStorageFailureDiagnostic(s.e, failure)
+	}
+	s.failFatal(failure)
 }
 
 func (s *segmentScheduler) drain(ctx context.Context) error {

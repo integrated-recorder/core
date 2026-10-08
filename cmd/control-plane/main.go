@@ -39,6 +39,7 @@ import (
 	"github.com/integrated-recorder/core/internal/runtimeipc"
 	"github.com/integrated-recorder/core/internal/server"
 	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storagediagnostic"
 	"github.com/integrated-recorder/core/internal/storageprocess"
 	"github.com/integrated-recorder/core/internal/systemsettings"
 	"github.com/integrated-recorder/core/internal/watch"
@@ -556,6 +557,11 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 	if err != nil {
 		return nil, fmt.Errorf("initialize management projections: %w", err)
 	}
+	storageDiagnostics, diagnosticErr := storagediagnostic.Open(config.dataDir)
+	if diagnosticErr != nil {
+		// Diagnostic storage is best effort; it must not change archive behavior.
+		storageDiagnostics = nil
+	}
 	for _, id := range products.DisabledAdapters() {
 		if discovered, getErr := adapters.Get(id); getErr == nil && discovered.Descriptor != nil {
 			if setErr := adapters.SetEnabled(id, false); setErr != nil {
@@ -629,7 +635,8 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 	}
 	api := server.NewWithOptions(manager, adapters, configs, server.Options{
 		Storage: store, Management: products, Integrity: integrityService, Derivatives: exportService,
-		Previews: previewService, Watches: watchService, Auth: authService, Settings: settings,
+		StorageDiagnostics: storageDiagnostics,
+		Previews:           previewService, Watches: watchService, Auth: authService, Settings: settings,
 		InitialIntegrityConcurrency: settings.IntegrityConcurrency(), InitialStorageSettings: &startupSettings.Storage,
 		ForceSecureCookies: config.forceSecureCookies, StartedAt: time.Now().UTC(), BuildInfo: buildinfo.Current(),
 		MutationGate: gate, BackgroundMutationGate: gate,

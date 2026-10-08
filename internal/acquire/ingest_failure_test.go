@@ -5,14 +5,19 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storagediagnostic"
 )
 
 type firstFailureSidecarBackend struct {
@@ -96,7 +101,7 @@ func TestHistoricalFirstFailureSurvivesQueuedLivePoison(t *testing.T) {
 	}
 	media := repairMediaContextForTest()
 	root := newRepairTestRoot(t, base, domain.StateRecording, media)
-	cause := errors.New("synthetic canonical claim-store failure")
+	cause := errors.New("synthetic canonical claim-store failure https://private.invalid/media.m4v?token=signed-secret Authorization: Bearer header-secret")
 	backend := &firstFailureSidecarBackend{StorageBackend: base.StorageBackend, cause: cause}
 	base.StorageBackend = backend
 	options := storage.DefaultIngestOptions()
@@ -114,6 +119,11 @@ func TestHistoricalFirstFailureSurvivesQueuedLivePoison(t *testing.T) {
 	if err := manager.ConfigureCanonicalCommitFence(fence); err != nil {
 		t.Fatal(err)
 	}
+	diagnostics, err := storagediagnostic.Open(base.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.storageDiagnostics = diagnostics
 	loaded, err := base.LoadRecordingReadOnly(root.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -154,6 +164,24 @@ func TestHistoricalFirstFailureSurvivesQueuedLivePoison(t *testing.T) {
 		firstDetails.FirstFailureJobKind() != storage.IngestJobKindHistoricalMedia || firstDetails.CurrentAttempts() != 1 || firstDetails.FirstFailureAttempts() != 1 {
 		t.Fatalf("first historical failure details = %#v", firstDetails)
 	}
+	durable, err := diagnostics.Read(root.ID)
+	if err != nil {
+		t.Fatalf("read durable first failure: %v", err)
+	}
+	if durable.Classification != storagediagnostic.ClassificationCanonicalCommitFailed || durable.SourceClass != "historical" ||
+		durable.CurrentJobKind != string(storage.IngestJobKindHistoricalMedia) || durable.FirstFailureJobKind != string(storage.IngestJobKindHistoricalMedia) ||
+		durable.CurrentAttempts != 1 || durable.FirstFailureAttempts != 1 || len(durable.StageChain) == 0 || durable.StageChain[0] != "historical media payload commit" {
+		t.Fatalf("durable historical failure details = %+v", durable)
+	}
+	encoded, err := os.ReadFile(filepath.Join(base.Root(), "management", "diagnostics", "recordings", root.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"private.invalid", "signed-secret", "header-secret", "Authorization"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("durable diagnostic leaked %q", secret)
+		}
+	}
 
 	liveCalls := atomic.Int32{}
 	liveDone := make(chan error, 1)
@@ -182,6 +210,10 @@ func TestHistoricalFirstFailureSurvivesQueuedLivePoison(t *testing.T) {
 	}
 	if liveCalls.Load() != 0 {
 		t.Fatalf("poisoned live persistence callback ran %d times", liveCalls.Load())
+	}
+	afterPoison, err := diagnostics.Read(root.ID)
+	if err != nil || afterPoison.StageChain[0] != durable.StageChain[0] || afterPoison.FirstFailureJobKind != durable.FirstFailureJobKind {
+		t.Fatalf("poisoned follow-up replaced the first durable diagnostic: %+v err=%v", afterPoison, err)
 	}
 	var followupDetails storage.IngestFailureDetails
 	if !errors.As(followupErr, &followupDetails) || followupDetails.CurrentJobKind() != storage.IngestJobKindMediaPayload ||
@@ -331,5 +363,132 @@ func TestConcurrentLiveAndHistoricalCommitsShareOrderedIngestWriter(t *testing.T
 	}
 	if sequence13Accepted != 1 || sequence13Duplicate != 1 {
 		t.Fatalf("identical coordinate dispositions: accepted=%d duplicate=%d, want one each", sequence13Accepted, sequence13Duplicate)
+	}
+}
+
+func TestHistoricalInitFailureDiagnosticStoresOnlyFilesystemOperationAndErrno(t *testing.T) {
+	manager, e, owner, store, _ := newIngestFailureArchive(t, nil, domain.StateRecording)
+	diagnostics, err := storagediagnostic.Open(store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.storageDiagnostics = diagnostics
+	pathSecret := "/private/archive?token=filesystem-secret"
+	cause := &os.PathError{Op: "rename", Path: pathSecret, Err: syscall.ENOSPC}
+	store.StorageBackend = &firstFailureSidecarBackend{StorageBackend: store.StorageBackend, cause: cause}
+	segment := domain.Segment{
+		TrackID: "main", SourceEpoch: 0, DiscontinuitySequence: 7, Sequence: 13,
+		Duration: 4, IsInit: true, SourceURI: "https://media.example/init.mp4",
+	}
+	err = manager.commitHistoricalPayload(context.Background(), e, owner, false, segment,
+		readFailureTestPayload(t, store, e.recording.ID, []byte("historical init bytes")))
+	if err == nil || !errors.Is(err, syscall.ENOSPC) || !errors.Is(err, storage.ErrCanonicalCommitFailed) {
+		t.Fatalf("historical init commit error=%v, want canonical ENOSPC", err)
+	}
+	diagnostic, err := diagnostics.Read(e.recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.FileOperation != "rename" || diagnostic.ErrnoCode != int(syscall.ENOSPC) ||
+		diagnostic.SourceClass != "historical" || diagnostic.CurrentJobKind != string(storage.IngestJobKindHistoricalInit) ||
+		len(diagnostic.StageChain) == 0 || diagnostic.StageChain[0] != "historical init payload commit" {
+		t.Fatalf("historical init diagnostic=%+v", diagnostic)
+	}
+	encoded, err := os.ReadFile(filepath.Join(store.Root(), "management", "diagnostics", "recordings", e.recording.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), pathSecret) || strings.Contains(string(encoded), "filesystem-secret") {
+		t.Fatal("filesystem path or query credential was persisted")
+	}
+}
+
+type failingStorageDiagnosticRecorder struct {
+	err   error
+	calls atomic.Int32
+}
+
+func (r *failingStorageDiagnosticRecorder) RecordFirst(d storagediagnostic.Diagnostic) (storagediagnostic.Diagnostic, bool, error) {
+	r.calls.Add(1)
+	return storagediagnostic.Diagnostic{}, false, r.err
+}
+
+func TestDiagnosticPersistenceFailureDoesNotReplaceCanonicalFailure(t *testing.T) {
+	manager, e, _, _, _ := newIngestFailureArchive(t, nil, domain.StateRecording)
+	persistFailure := errors.New("private diagnostic filesystem failure")
+	recorder := &failingStorageDiagnosticRecorder{err: persistFailure}
+	manager.storageDiagnostics = recorder
+	cause := errors.New("original canonical cause")
+	failure := newStorageCommitFailure("media payload commit", cause)
+	manager.recordStorageFailureDiagnostic(e, failure)
+
+	e.mu.Lock()
+	got := e.storageFailureDiagnostic
+	writeFailures := e.storageDiagnosticPersistenceFailures
+	e.mu.Unlock()
+	if !errors.Is(got, cause) || !errors.Is(got, errStorageCommit) || writeFailures != 1 || recorder.calls.Load() != 1 {
+		t.Fatalf("canonical failure changed after diagnostic write error: err=%v write_failures=%d calls=%d", got, writeFailures, recorder.calls.Load())
+	}
+	if safeFailureDescription(got) != "recording storage commit failed" {
+		t.Fatalf("public error=%q", safeFailureDescription(got))
+	}
+}
+
+func TestTerminalCoordinatorFailurePersistsSeparateClassification(t *testing.T) {
+	manager, e, _, store, _ := newIngestFailureArchive(t, nil, domain.StateRecording)
+	diagnostics, err := storagediagnostic.Open(store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.storageDiagnostics = diagnostics
+	ctx, cancel := context.WithCancel(context.Background())
+	scheduler := &segmentScheduler{manager: manager, e: e, ctx: ctx, cancel: cancel, changed: make(chan struct{})}
+	scheduler.failCoordinator("media payload commit", storage.ErrIngestCoordinatorUnavailable)
+	if !errors.Is(scheduler.failure(), storage.ErrIngestCoordinatorUnavailable) || errors.Is(scheduler.failure(), errStorageCommit) {
+		t.Fatalf("coordinator failure classification changed: %v", scheduler.failure())
+	}
+	diagnostic, err := diagnostics.Read(e.recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.Classification != storagediagnostic.ClassificationCoordinatorUnavailable ||
+		len(diagnostic.StageChain) != 1 || diagnostic.StageChain[0] != "media payload commit" {
+		t.Fatalf("coordinator diagnostic=%+v", diagnostic)
+	}
+}
+
+func TestConcurrentStorageFailureDiagnosticUsesTheFirstMemoryAndDurableCause(t *testing.T) {
+	manager, e, _, store, _ := newIngestFailureArchive(t, nil, domain.StateRecording)
+	diagnostics, err := storagediagnostic.Open(store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.storageDiagnostics = diagnostics
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, stage := range []string{"live media payload commit", "historical media payload commit"} {
+		stage := stage
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			manager.recordStorageFailureDiagnostic(e, newStorageCommitFailure(stage, errors.New(stage+" cause")))
+		}()
+	}
+	close(start)
+	wg.Wait()
+	e.mu.Lock()
+	memoryFailure := e.storageFailureDiagnostic
+	e.mu.Unlock()
+	var memoryStage interface{ Stage() string }
+	if !errors.As(memoryFailure, &memoryStage) {
+		t.Fatalf("first in-memory diagnostic has no stage: %v", memoryFailure)
+	}
+	durable, err := diagnostics.Read(e.recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(durable.StageChain) == 0 || durable.StageChain[0] != memoryStage.Stage() {
+		t.Fatalf("first diagnostic diverged across memory/disk: memory=%q durable=%+v", memoryStage.Stage(), durable)
 	}
 }

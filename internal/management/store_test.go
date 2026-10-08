@@ -10,9 +10,38 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/integrated-recorder/core/internal/storagediagnostic"
 )
 
 const testRecordingID = "0123456789abcdef0123456789abcdef"
+
+func TestForgetRecordingRemovesPrivateStorageDiagnostic(t *testing.T) {
+	store, root := openTestStore(t)
+	diagnostics, err := storagediagnostic.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := storagediagnostic.Diagnostic{
+		Version: storagediagnostic.SchemaVersion, RecordedAt: time.Now().UTC(), RecordingID: testRecordingID,
+		Classification: storagediagnostic.ClassificationCanonicalCommitFailed,
+		StageChain:     []string{"recording root commit"}, ErrorTypeChain: []string{"*os.PathError"},
+		FileOperation: "rename", ErrnoCode: 5,
+		IngestSnapshot: storagediagnostic.IngestSnapshot{},
+	}
+	if _, _, err := diagnostics.RecordFirst(diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTags(testRecordingID, []string{"temporary"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ForgetRecording(testRecordingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := diagnostics.Read(testRecordingID); err != storagediagnostic.ErrNotFound {
+		t.Fatalf("diagnostic after recording deletion: %v", err)
+	}
+}
 
 func openTestStore(t *testing.T) (*Store, string) {
 	t.Helper()

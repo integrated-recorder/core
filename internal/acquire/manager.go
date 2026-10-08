@@ -96,6 +96,7 @@ type entry struct {
 	done            chan struct{}
 	media           adapterproto.MediaSource
 	mediaGeneration uint64
+	livePlayback    *livePlaybackProjection
 	refreshGate     chan struct{}
 	scheduler       *segmentScheduler
 	adapterID       string
@@ -283,7 +284,24 @@ func NewManagerWithFencedRecovery(store *storage.Store, client *http.Client, res
 	if err := recovery.WithFencedRecovery(func() error {
 		var loadErr error
 		loaded, loadErr = store.LoadAll()
-		return loadErr
+		if loadErr != nil {
+			return loadErr
+		}
+		for _, recording := range loaded {
+			if recording.State != domain.StateRecording {
+				continue
+			}
+			migrated, migrationErr := migrateLivePresentation(recording)
+			if migrationErr != nil {
+				return migrationErr
+			}
+			if migrated {
+				if saveErr := store.SaveRecording(recording); saveErr != nil {
+					return saveErr
+				}
+			}
+		}
+		return nil
 	}); err != nil {
 		_ = m.Close(context.Background())
 		return nil, err
@@ -291,7 +309,9 @@ func NewManagerWithFencedRecovery(store *storage.Store, client *http.Client, res
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, recording := range loaded {
-		m.entries[recording.ID] = &entry{recording: recording, done: closedChannel()}
+		m.entries[recording.ID] = &entry{
+			recording: recording, done: closedChannel(), livePlayback: buildLivePlaybackProjection(recording),
+		}
 	}
 	m.freshGeneration = false
 	return m, nil
@@ -317,6 +337,20 @@ func newManagerWithMode(store *storage.Store, client *http.Client, resolver Reso
 		if err != nil {
 			return nil, err
 		}
+		for _, recording := range loaded {
+			if recording.State != domain.StateRecording {
+				continue
+			}
+			migrated, migrationErr := migrateLivePresentation(recording)
+			if migrationErr != nil {
+				return nil, migrationErr
+			}
+			if migrated {
+				if saveErr := store.SaveRecording(recording); saveErr != nil {
+					return nil, saveErr
+				}
+			}
+		}
 	}
 	ingest, err := store.IngestService()
 	if err != nil {
@@ -339,7 +373,9 @@ func newManagerWithMode(store *storage.Store, client *http.Client, resolver Reso
 		freshGeneration: mode == FreshGeneration, startsDone: make(chan struct{}),
 	}
 	for _, recording := range loaded {
-		m.entries[recording.ID] = &entry{recording: recording, done: closedChannel()}
+		m.entries[recording.ID] = &entry{
+			recording: recording, done: closedChannel(), livePlayback: buildLivePlaybackProjection(recording),
+		}
 	}
 	return m, nil
 }
@@ -1196,6 +1232,24 @@ func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) error {
 				return ErrHandoverUnavailable
 			}
 		}
+		migrated, migrationErr := migrateLivePresentation(recording)
+		if migrationErr != nil {
+			return ErrHandoverUnavailable
+		}
+		if migrated {
+			if saveErr := m.store.SaveRecording(recording); saveErr != nil {
+				return ErrHandoverUnavailable
+			}
+			fingerprint, fingerprintErr = handoverRootFingerprint(recording)
+			if fingerprintErr != nil {
+				return ErrHandoverUnavailable
+			}
+			prepared.rootFingerprint = fingerprint
+			prepared.continuation.rootFingerprint = fingerprint
+			m.mu.Lock()
+			m.prepared[owner.RecordingID] = prepared
+			m.mu.Unlock()
+		}
 		return nil
 	})
 	if err != nil {
@@ -1205,7 +1259,7 @@ func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) error {
 	ownerCopy := owner
 	workerCtx, cancel := context.WithCancel(context.Background())
 	e := &entry{
-		recording: recording, cancel: cancel, done: make(chan struct{}),
+		recording: recording, cancel: cancel, done: make(chan struct{}), livePlayback: buildLivePlaybackProjection(recording),
 		media: cloneMediaSource(prepared.media), refreshGate: make(chan struct{}, 1),
 		adapterID: prepared.snapshot.AdapterID, resource: cloneResourceRef(prepared.snapshot.Resource), ownership: &ownerCopy,
 		handoverGate: make(chan struct{}, 1), handoverWake: make(chan struct{}, 1),
@@ -1558,7 +1612,7 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 	now := time.Now().UTC()
 	classification := media.SourceURIClassification()
 	recording := &domain.Recording{FormatVersion: 1, ID: id, SourceSessionID: sessionIdentity.ID, Title: title, AdapterID: adapterID, Adapter: archiveProvenance(provenance), Resource: archiveResource(resource), SourceURIClassification: classification, State: domain.StateRecording, CreatedAt: now, StartedAt: now, Tracks: map[string]*domain.Track{
-		"main": {ID: "main", SourcePlaylistURL: media.ManifestURL, NextArchiveOrdinal: 1, Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
+		"main": {ID: "main", SourcePlaylistURL: media.ManifestURL, NextArchiveOrdinal: 1, LivePresentation: &domain.LivePresentationState{NextOrdinal: 1}, Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
 	}}
 	if err = m.withOwnershipCommit(owner, func() error {
 		if _, loadErr := m.store.LoadRecordingReadOnly(id); loadErr == nil {
@@ -1576,7 +1630,7 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 		copy := *owner
 		ownershipCopy = &copy
 	}
-	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), media: cloneMediaSource(media), refreshGate: make(chan struct{}, 1), adapterID: adapterID, resource: cloneResourceRef(resource), ownership: ownershipCopy, recoveryGate: newArchiveRecoveryGate()}
+	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), media: cloneMediaSource(media), livePlayback: newLivePlaybackProjection(), refreshGate: make(chan struct{}, 1), adapterID: adapterID, resource: cloneResourceRef(resource), ownership: ownershipCopy, recoveryGate: newArchiveRecoveryGate()}
 	if ownershipCopy != nil {
 		e.handoverGate = make(chan struct{}, 1)
 		e.handoverGate <- struct{}{}

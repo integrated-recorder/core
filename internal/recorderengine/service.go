@@ -29,6 +29,7 @@ const (
 	OperationBeginDrain             = "begin_drain"
 	OperationActiveCount            = "active_recordings"
 	OperationGet                    = "get"
+	OperationLivePlaybackSnapshot   = "live_playback_snapshot"
 	OperationList                   = "list"
 	OperationStop                   = "stop"
 	OperationDelete                 = "delete"
@@ -367,6 +368,19 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 				return nil, publicError("not_found", "recording was not found")
 			}
 			return nil, publicError("read_failed", "recording could not be read")
+		}
+		return result, nil
+	case OperationLivePlaybackSnapshot:
+		var request RecordingIDRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {
+			return nil, publicError("invalid_request", "recording identity is invalid")
+		}
+		result, err := e.manager.LivePlaybackSnapshot(ctx, request.RecordingID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, publicError("not_found", "recording was not found")
+			}
+			return nil, publicError("read_failed", "live playback snapshot could not be read")
 		}
 		return result, nil
 	case OperationList:

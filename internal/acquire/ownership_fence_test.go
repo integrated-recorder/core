@@ -75,9 +75,25 @@ func (f *ownershipTestFence) counts() (calls, callbacks, nested int) {
 	return f.calls, f.callbacks, f.nested
 }
 
-type ownershipRoundTripper struct{}
+type ownershipRoundTripper struct {
+	requestStarted  chan<- struct{}
+	continueRequest <-chan struct{}
+}
 
-func (ownershipRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+func (transport ownershipRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if transport.requestStarted != nil {
+		select {
+		case transport.requestStarted <- struct{}{}:
+		default:
+		}
+	}
+	if transport.continueRequest != nil {
+		select {
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		case <-transport.continueRequest:
+		}
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     make(http.Header),
@@ -149,9 +165,20 @@ func TestOwnedStartPersistsWithinFenceAndRetainsToken(t *testing.T) {
 	owner := ownershipTestToken(id)
 	fence := &ownershipTestFence{expected: owner}
 	manager, _ := newOwnershipTestManager(t, fence)
+	requestStarted := make(chan struct{}, 1)
+	continueRequest := make(chan struct{})
+	manager.client.Transport = ownershipRoundTripper{requestStarted: requestStarted, continueRequest: continueRequest}
+	var releaseOnce sync.Once
+	releaseRequest := func() { releaseOnce.Do(func() { close(continueRequest) }) }
+	t.Cleanup(releaseRequest)
 	recording, err := manager.StartResolvedWithIDOwned(context.Background(), owner, id, "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: "https://media.example/live.m3u8"}, nil, "owned", nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recording worker did not begin the blocked manifest request")
 	}
 	e, ok := manager.entry(id)
 	if !ok {
@@ -170,6 +197,7 @@ func TestOwnedStartPersistsWithinFenceAndRetainsToken(t *testing.T) {
 	if calls != 1 || callbacks != 1 {
 		t.Fatalf("initial creation fence calls=%d callbacks=%d, want 1 each", calls, callbacks)
 	}
+	releaseRequest()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

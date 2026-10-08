@@ -343,6 +343,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		e.mu.Unlock()
 		return false, errors.New("recording state could not be copied")
 	}
+	var observedEpoch uint64
 	if err := func() error {
 		t := r.Tracks["main"]
 		if t == nil {
@@ -395,9 +396,14 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			t.HasLastObservedSequence = false
 		}
 		epoch := t.SourceEpoch
+		observedEpoch = epoch
+		if err := configureLivePresentationEpoch(t, epoch, playlist); err != nil {
+			return err
+		}
 		for _, seg := range playlist.Segments {
 			if seg.Gap {
 				addMissingRangesDS(r, t, epoch, seg.DiscontinuitySequence, seg.Sequence, seg.Sequence, "source manifest marked segment as a gap", capturedSequenceSetDS(t, epoch, seg.DiscontinuitySequence))
+				annotateLiveGap(r, t, epoch, seg.DiscontinuitySequence, seg.Sequence, seg.Duration, seg.ProgramTime, seg.Discontinuity)
 			}
 		}
 		if t.HasLastObservedSequence && t.LastObservedSequence < ^uint64(0) && minSeq > t.LastObservedSequence && minSeq-t.LastObservedSequence > 1 {
@@ -444,6 +450,44 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			pending = append(pending, item)
 		}
 		t.PendingSegments = pending
+		for _, source := range playlist.Segments {
+			if source.Gap || capturedSequenceSetDS(t, epoch, source.DiscontinuitySequence)[source.Sequence] || gapCoversCoordinate(r, t.ID, epoch, source.DiscontinuitySequence, source.Sequence) {
+				continue
+			}
+			ordinal, discSequence, boundary, assigned := livePresentationForCoordinate(t, epoch, source.DiscontinuitySequence, source.Sequence, source.Discontinuity)
+			if !assigned {
+				continue
+			}
+			found := false
+			for i := range t.PendingSegments {
+				item := &t.PendingSegments[i]
+				if item.SourceEpoch != epoch || item.DiscontinuitySequence != source.DiscontinuitySequence || item.Sequence != source.Sequence {
+					continue
+				}
+				item.LivePresentationOrdinal = ordinal
+				item.LiveDiscontinuity = boundary
+				item.LiveDiscontinuitySequence = discSequence
+				item.Duration = source.Duration
+				item.ProgramDateTime = cloneLiveTime(source.ProgramTime)
+				if source.Init != nil {
+					item.InitSegmentID = initSegmentID(*source.Init, epoch, source.DiscontinuitySequence)
+				}
+				found = true
+				break
+			}
+			if !found {
+				item := domain.PendingSequence{
+					SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence,
+					Sequence: source.Sequence, LivePresentationOrdinal: ordinal,
+					LiveDiscontinuity: boundary, LiveDiscontinuitySequence: discSequence,
+					Duration: source.Duration, ProgramDateTime: cloneLiveTime(source.ProgramTime),
+				}
+				if source.Init != nil {
+					item.InitSegmentID = initSegmentID(*source.Init, epoch, source.DiscontinuitySequence)
+				}
+				t.PendingSegments = append(t.PendingSegments, item)
+			}
+		}
 		if epoch == 0 {
 			legacyPending := t.PendingSequences[:0]
 			for _, seq := range t.PendingSequences {
@@ -485,6 +529,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		e.mu.Unlock()
 		e.persistMu.Unlock()
 		persistLocked = false
+		m.refreshLivePlaybackObservation(e, r, playlist.Segments, observedEpoch)
 		if err := scheduler.queueRecordingCommit(); err != nil {
 			return false, err
 		}
@@ -508,6 +553,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		}
 		return false, fmt.Errorf("recording metadata persistence failed: %w", err)
 	}
+	m.refreshLivePlaybackObservation(e, r, playlist.Segments, observedEpoch)
 	return true, nil
 }
 
@@ -1843,6 +1889,14 @@ func (m *Manager) markGap(e *entry, epoch, discontinuitySequence, sequence uint6
 		return nil
 	})
 	if updateErr == nil {
+		if recording := m.recordingSnapshotForArchive(e); recording != nil {
+			for _, gap := range recording.Gaps {
+				if gap.TrackID == "main" && gap.SourceEpoch == epoch && gap.DiscontinuitySequence == discontinuitySequence && sequence >= gap.FromSequence && sequence <= gap.ToSequence {
+					m.updateLivePlaybackGap(e, gap)
+					break
+				}
+			}
+		}
 		m.signalAutomaticArchiveRecovery(recordingID(e))
 	}
 	return updateErr
@@ -2031,7 +2085,7 @@ func addMissingRangesDS(r *domain.Recording, t *domain.Track, epoch, discontinui
 			continue
 		}
 		if item.start > cursor {
-			r.Gaps = append(r.Gaps, domain.Gap{TrackID: t.ID, SourceEpoch: epoch, DiscontinuitySequence: discontinuitySequence, FromSequence: cursor, ToSequence: item.start - 1, DetectedAt: time.Now().UTC(), Reason: reason})
+			r.Gaps = append(r.Gaps, liveGapForRange(t, epoch, discontinuitySequence, cursor, item.start-1, reason))
 		}
 		if item.end == ^uint64(0) {
 			return
@@ -2044,9 +2098,53 @@ func addMissingRangesDS(r *domain.Recording, t *domain.Track, epoch, discontinui
 		}
 	}
 	if cursor <= to {
-		r.Gaps = append(r.Gaps, domain.Gap{TrackID: t.ID, SourceEpoch: epoch, DiscontinuitySequence: discontinuitySequence, FromSequence: cursor, ToSequence: to, DetectedAt: time.Now().UTC(), Reason: reason})
+		r.Gaps = append(r.Gaps, liveGapForRange(t, epoch, discontinuitySequence, cursor, to, reason))
 	}
 }
+
+func liveGapForRange(track *domain.Track, epoch, discontinuitySequence, from, to uint64, reason string) domain.Gap {
+	gap := domain.Gap{TrackID: track.ID, SourceEpoch: epoch, DiscontinuitySequence: discontinuitySequence, FromSequence: from, ToSequence: to, DetectedAt: time.Now().UTC(), Reason: reason}
+	if ordinal, discSequence, boundary, ok := livePresentationForCoordinate(track, epoch, discontinuitySequence, from, false); ok {
+		gap.LivePresentationOrdinal = ordinal
+		gap.LiveDiscontinuitySequence = discSequence
+		gap.LiveDiscontinuity = boundary
+	}
+	for _, pending := range track.PendingSegments {
+		if pending.SourceEpoch == epoch && pending.DiscontinuitySequence == discontinuitySequence && pending.Sequence == from {
+			gap.LiveDuration = pending.Duration
+			gap.ProgramDateTime = cloneLiveTime(pending.ProgramDateTime)
+			if pending.LivePresentationOrdinal != 0 {
+				gap.LivePresentationOrdinal = pending.LivePresentationOrdinal
+				gap.LiveDiscontinuity = pending.LiveDiscontinuity
+				gap.LiveDiscontinuitySequence = pending.LiveDiscontinuitySequence
+			}
+			break
+		}
+	}
+	return gap
+}
+
+func annotateLiveGap(recording *domain.Recording, track *domain.Track, epoch, discontinuitySequence, sequence uint64, duration float64, programTime *time.Time, discontinuity bool) {
+	if recording == nil || track == nil {
+		return
+	}
+	ordinal, discSequence, boundary, ok := livePresentationForCoordinate(track, epoch, discontinuitySequence, sequence, discontinuity)
+	if !ok {
+		return
+	}
+	for i := range recording.Gaps {
+		gap := &recording.Gaps[i]
+		if gap.TrackID == track.ID && gap.SourceEpoch == epoch && gap.DiscontinuitySequence == discontinuitySequence && sequence >= gap.FromSequence && sequence <= gap.ToSequence {
+			gap.LivePresentationOrdinal = ordinal - (sequence - gap.FromSequence)
+			gap.LiveDiscontinuity = boundary && sequence == gap.FromSequence
+			gap.LiveDiscontinuitySequence = discSequence
+			gap.LiveDuration = duration
+			gap.ProgramDateTime = cloneLiveTime(programTime)
+			return
+		}
+	}
+}
+
 func gapCovers(r *domain.Recording, track string, seq uint64) bool {
 	return gapCoversEpoch(r, track, 0, seq)
 }

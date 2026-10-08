@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -453,6 +455,434 @@ func TestHandoverPauseDrainsAcceptedStorageTaskAndSnapshotsLatestMedia(t *testin
 	current, err := manager.Get(recording.ID)
 	if err != nil || current.State != domain.StateRecording || current.SegmentCount() != 1 || len(current.Gaps) != 0 {
 		t.Fatalf("pause did not drain accepted canonical write cleanly: recording=%#v err=%v", current, err)
+	}
+}
+
+func TestHandoverWaitsForBlockedSegmentBodyThenTargetContinues(t *testing.T) {
+	store, owners, _ := newHandoverStores(t)
+	fixture := newBlockedSegmentHandoverHTTPFixture(1)
+	var releaseSegmentOnce sync.Once
+	releaseSegment := func() { releaseSegmentOnce.Do(func() { close(fixture.releaseSegmentOne) }) }
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	resolver := &handoverMetadataResolver{fixture: &handoverFixture{metadata: "title"}}
+	source, err := NewManagerWithMode(store, server.Client(), resolver, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ConfigureCanonicalCommitFence(owners); err != nil {
+		t.Fatal(err)
+	}
+	source.metadataPollInterval = 8 * time.Millisecond
+	ownerTransferred, sourceDetached := false, false
+	var oldOwner OwnershipToken
+	t.Cleanup(func() {
+		if ownerTransferred && !sourceDetached {
+			if err := source.CompleteHandover(handoverRecordingID, oldOwner); err != nil && !errors.Is(err, storage.ErrNotFound) {
+				t.Errorf("detach source manager during cleanup: %v", err)
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := source.Close(ctx); err != nil {
+			t.Errorf("close source manager: %v", err)
+		}
+	})
+	t.Cleanup(releaseSegment)
+
+	oldOwner = claimHandoverOwner(t, owners, handoverGenA, handoverWorkerA)
+	recording, err := source.StartResolvedWithIDOwned(context.Background(), oldOwner, handoverRecordingID, "fixture", adapterproto.MediaSource{
+		Type: "hls", ManifestURL: server.URL + "/live.m3u8",
+	}, nil, "handover fixture", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fixture.segmentOneStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("old Engine did not start segment 1 response")
+	}
+	drainWaiting := observeHandoverDrainWait(t, source, recording.ID)
+	if current, err := store.LoadRecordingReadOnly(recording.ID); err != nil || current.SegmentCount() != 0 || len(current.Gaps) != 0 {
+		t.Fatalf("partial segment body changed canonical archive: recording=%#v err=%v", current, err)
+	}
+
+	type pauseResult struct {
+		snapshot HandoverSnapshot
+		err      error
+	}
+	paused := make(chan pauseResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		snapshot, pauseErr := source.PauseForHandover(ctx, recording.ID, oldOwner)
+		paused <- pauseResult{snapshot: snapshot, err: pauseErr}
+	}()
+	e, _ := source.entry(recording.ID)
+	waitHandoverState(t, e, handoverDraining)
+	select {
+	case <-drainWaiting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handover did not enter scheduler drain with the accepted segment pending")
+	}
+	select {
+	case result := <-paused:
+		t.Fatalf("handover completed while segment HTTP body remained blocked: err=%v", result.err)
+	default:
+	}
+	assertHandoverStillDraining(t, e)
+	if current, err := store.LoadRecordingReadOnly(recording.ID); err != nil || current.SegmentCount() != 0 || len(current.Gaps) != 0 {
+		t.Fatalf("archive changed before blocked body completed: recording=%#v err=%v", current, err)
+	}
+
+	releaseSegment()
+	select {
+	case <-fixture.segmentOneFinished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("segment 1 HTTP body did not finish after release")
+	}
+	var sourceSnapshot HandoverSnapshot
+	select {
+	case result := <-paused:
+		if result.err != nil {
+			t.Fatalf("PauseForHandover: %v", result.err)
+		}
+		sourceSnapshot = result.snapshot
+	case <-time.After(3 * time.Second):
+		t.Fatal("handover did not finish after segment body and commit drained")
+	}
+	current, err := store.LoadRecordingReadOnly(recording.ID)
+	if err != nil || current.State != domain.StateRecording || current.SegmentCount() != 1 || len(current.Gaps) != 0 {
+		t.Fatalf("handover snapshot preceded complete segment commit: recording=%#v err=%v", current, err)
+	}
+	oldLiveView, err := source.LivePlaybackSnapshot(context.Background(), recording.ID)
+	if err != nil || len(oldLiveView.Segments) != 1 || oldLiveView.Segments[0].LivePresentationOrdinal == 0 {
+		t.Fatalf("old Engine live identity unavailable at segment boundary: view=%#v err=%v", oldLiveView, err)
+	}
+	oldLiveIdentity := map[string]uint64{oldLiveView.Segments[0].ID: oldLiveView.Segments[0].LivePresentationOrdinal}
+
+	fixture.setMax(3)
+	rootBeforeTarget := recordingRootBytes(t, store, recording.ID)
+	target, err := NewManagerWithMode(store, server.Client(), resolver, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ConfigureCanonicalCommitFence(owners); err != nil {
+		t.Fatal(err)
+	}
+	target.metadataPollInterval = 8 * time.Millisecond
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := target.Close(ctx); err != nil {
+			t.Errorf("close target manager: %v", err)
+		}
+	})
+	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
+	if err := target.PrepareHandoverTarget(context.Background(), sourceSnapshot, identity); err != nil {
+		t.Fatalf("prepare target: %v", err)
+	}
+	if !bytes.Equal(rootBeforeTarget, recordingRootBytes(t, store, recording.ID)) {
+		t.Fatal("target preparation rewrote source canonical root")
+	}
+	newOwner, err := owners.Transfer(oldOwner, handoverGenB, handoverWorkerB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerTransferred = true
+	if err := target.ActivatePreparedHandover(newOwner); err != nil {
+		t.Fatalf("activate target: %v", err)
+	}
+	if err := source.CompleteHandover(recording.ID, oldOwner); err != nil {
+		t.Fatalf("complete source handover: %v", err)
+	}
+	sourceDetached = true
+	waitHandover(t, func() bool {
+		current, err := target.Get(recording.ID)
+		return err == nil && current.SegmentCount() == 3
+	}, "target captures after transferred segment")
+	newLiveView, err := target.LivePlaybackSnapshot(context.Background(), recording.ID)
+	if err != nil {
+		t.Fatalf("target live playback snapshot: %v", err)
+	}
+	for _, segment := range newLiveView.Segments {
+		if previous, existed := oldLiveIdentity[segment.ID]; existed && segment.LivePresentationOrdinal != previous {
+			t.Fatalf("handover renumbered existing live URI %s: %d -> %d", segment.ID, previous, segment.LivePresentationOrdinal)
+		}
+	}
+	if len(newLiveView.Segments) != 3 || newLiveView.Segments[2].LivePresentationOrdinal != oldLiveView.Segments[0].LivePresentationOrdinal+2 {
+		t.Fatalf("new Engine did not continue presentation sequence: %#v", newLiveView.Segments)
+	}
+	current, err = store.LoadRecordingReadOnly(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHandoverFixtureArchive(t, store, current, 3)
+}
+
+func TestHandoverWaitsForCanonicalCommitBarrier(t *testing.T) {
+	store, owners, _ := newHandoverStores(t)
+	fixture := &handoverFixture{max: 1, metadata: "title"}
+	manager := newHandoverManager(t, store, owners, fixture, false)
+	oldOwner := claimHandoverOwner(t, owners, handoverGenA, handoverWorkerA)
+	writeStarted, releaseWrite := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseWrite) }) }
+	t.Cleanup(release)
+	manager.storageWriteHook = func() {
+		once.Do(func() { close(writeStarted) })
+		<-releaseWrite
+	}
+	recording := startHandoverRecording(t, manager, oldOwner)
+	select {
+	case <-writeStarted:
+	case <-time.After(3 * time.Second):
+		release()
+		t.Fatal("accepted media commit did not reach canonical barrier")
+	}
+	drainWaiting := observeHandoverDrainWait(t, manager, recording.ID)
+
+	type pauseResult struct {
+		snapshot HandoverSnapshot
+		err      error
+	}
+	paused := make(chan pauseResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		snapshot, err := manager.PauseForHandover(ctx, recording.ID, oldOwner)
+		paused <- pauseResult{snapshot: snapshot, err: err}
+	}()
+	e, _ := manager.entry(recording.ID)
+	waitHandoverState(t, e, handoverDraining)
+	select {
+	case <-drainWaiting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handover did not enter scheduler drain with the canonical commit pending")
+	}
+	select {
+	case result := <-paused:
+		t.Fatalf("handover completed while canonical commit was blocked: err=%v", result.err)
+	default:
+	}
+	assertHandoverStillDraining(t, e)
+	if current, err := store.LoadRecordingReadOnly(recording.ID); err != nil || current.SegmentCount() != 0 || len(current.Gaps) != 0 {
+		t.Fatalf("canonical root changed before commit barrier release: recording=%#v err=%v", current, err)
+	}
+	release()
+	var snapshot HandoverSnapshot
+	select {
+	case result := <-paused:
+		if result.err != nil {
+			t.Fatalf("PauseForHandover: %v", result.err)
+		}
+		snapshot = result.snapshot
+	case <-time.After(3 * time.Second):
+		t.Fatal("handover did not finish after canonical commit")
+	}
+	current, err := store.LoadRecordingReadOnly(recording.ID)
+	if err != nil || current.State != domain.StateRecording || current.SegmentCount() != 1 || len(current.Gaps) != 0 {
+		t.Fatalf("handover completed before canonical commit became visible: recording=%#v err=%v", current, err)
+	}
+	if snapshot.RecordingID != recording.ID || snapshot.Owner != oldOwner {
+		t.Fatalf("handover snapshot identity/owner = %#v", snapshot)
+	}
+	fixture.mu.Lock()
+	fixture.max = 3
+	fixture.mu.Unlock()
+	target, err := NewManagerWithMode(store, &http.Client{Transport: fixture}, &handoverMetadataResolver{fixture: fixture}, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ConfigureCanonicalCommitFence(owners); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if closeErr := target.Close(ctx); closeErr != nil {
+			t.Errorf("close target manager: %v", closeErr)
+		}
+	})
+	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
+	if err := target.PrepareHandoverTarget(context.Background(), snapshot, identity); err != nil {
+		t.Fatalf("prepare target after canonical commit: %v", err)
+	}
+	newOwner, err := owners.Transfer(oldOwner, handoverGenB, handoverWorkerB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ActivatePreparedHandover(newOwner); err != nil {
+		t.Fatalf("activate target after canonical commit: %v", err)
+	}
+	if err := manager.CompleteHandover(recording.ID, oldOwner); err != nil {
+		t.Fatalf("complete source handover after canonical commit: %v", err)
+	}
+	waitHandover(t, func() bool {
+		current, getErr := target.Get(recording.ID)
+		return getErr == nil && current.SegmentCount() == 3
+	}, "target continuation after canonical commit")
+	continued, err := store.LoadRecordingReadOnly(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHandoverFixtureArchive(t, store, continued, 3)
+}
+
+type blockedSegmentHandoverHTTPFixture struct {
+	mu                 sync.Mutex
+	max                int
+	segmentOneStarted  chan struct{}
+	releaseSegmentOne  chan struct{}
+	segmentOneFinished chan struct{}
+	segmentOneOnce     sync.Once
+}
+
+func newBlockedSegmentHandoverHTTPFixture(max int) *blockedSegmentHandoverHTTPFixture {
+	return &blockedSegmentHandoverHTTPFixture{
+		max: max, segmentOneStarted: make(chan struct{}),
+		releaseSegmentOne: make(chan struct{}), segmentOneFinished: make(chan struct{}),
+	}
+}
+
+func (f *blockedSegmentHandoverHTTPFixture) setMax(max int) {
+	f.mu.Lock()
+	f.max = max
+	f.mu.Unlock()
+}
+
+func (f *blockedSegmentHandoverHTTPFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.URL.Path == "/live.m3u8":
+		f.mu.Lock()
+		max := f.max
+		f.mu.Unlock()
+		manifest := "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n"
+		for sequence := 1; sequence <= max; sequence++ {
+			manifest += fmt.Sprintf("#EXTINF:1.0,\nsegment-%06d.ts\n", sequence)
+		}
+		_, _ = io.WriteString(w, manifest)
+	case strings.HasPrefix(r.URL.Path, "/segment-"):
+		var sequence int
+		if _, err := fmt.Sscanf(r.URL.Path, "/segment-%06d.ts", &sequence); err != nil {
+			http.Error(w, "invalid segment path", http.StatusBadRequest)
+			return
+		}
+		payload := []byte(fmt.Sprintf("source-segment-%06d", sequence))
+		w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.WriteHeader(http.StatusOK)
+		if sequence == 1 {
+			f.segmentOneOnce.Do(func() {
+				_, _ = w.Write(payload[:len(payload)/2])
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				close(f.segmentOneStarted)
+				select {
+				case <-f.releaseSegmentOne:
+				case <-r.Context().Done():
+				}
+				_, _ = w.Write(payload[len(payload)/2:])
+				close(f.segmentOneFinished)
+			})
+			return
+		}
+		_, _ = w.Write(payload)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func waitHandoverState(t *testing.T, e *entry, wanted handoverOperationState) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for {
+		e.mu.Lock()
+		state := handoverOperationState(0)
+		if e.handover != nil {
+			state = e.handover.state
+		}
+		e.mu.Unlock()
+		if state == wanted {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for handover state %v; got %v", wanted, state)
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
+func observeHandoverDrainWait(t *testing.T, manager *Manager, recordingID string) <-chan struct{} {
+	t.Helper()
+	e, ok := manager.entry(recordingID)
+	if !ok {
+		t.Fatalf("recording entry %s is missing", recordingID)
+	}
+	e.mu.Lock()
+	scheduler := e.scheduler
+	e.mu.Unlock()
+	if scheduler == nil {
+		t.Fatal("recording scheduler is missing")
+	}
+	waiting := make(chan struct{}, 1)
+	scheduler.mu.Lock()
+	scheduler.drainWaitHook = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+	scheduler.mu.Unlock()
+	return waiting
+}
+
+func assertHandoverStillDraining(t *testing.T, e *entry) {
+	t.Helper()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.handover == nil || e.handover.state != handoverDraining {
+		t.Fatalf("handover advanced before accepted work drained: %#v", e.handover)
+	}
+}
+
+func assertHandoverFixtureArchive(t *testing.T, store *storage.Store, recording *domain.Recording, count int) {
+	t.Helper()
+	if recording.ID != handoverRecordingID || recording.State != domain.StateRecording || recording.SegmentCount() != count || len(recording.Gaps) != 0 {
+		t.Fatalf("recording continuity failed: %#v", recording)
+	}
+	track := recording.Tracks["main"]
+	if track == nil {
+		t.Fatal("main track is missing")
+	}
+	if len(track.Segments) != count {
+		t.Fatalf("main track segment count=%d, want %d", len(track.Segments), count)
+	}
+	seen := make(map[uint64]struct{}, count)
+	for index, segment := range track.Segments {
+		wantSequence := uint64(index + 1)
+		if segment.Sequence != wantSequence || segment.ArchiveOrdinal != wantSequence {
+			t.Fatalf("segment %d identity/ordinal=%d/%d, want %d/%d", index, segment.Sequence, segment.ArchiveOrdinal, wantSequence, wantSequence)
+		}
+		if _, duplicate := seen[segment.Sequence]; duplicate {
+			t.Fatalf("duplicate segment sequence %d", segment.Sequence)
+		}
+		seen[segment.Sequence] = struct{}{}
+		payload, err := store.OpenPayloadReader(recording.ID, segment.StoragePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, readErr := io.ReadAll(payload)
+		_ = payload.Close()
+		if readErr != nil || string(data) != fmt.Sprintf("source-segment-%06d", wantSequence) {
+			t.Fatalf("segment %d payload=%q err=%v", wantSequence, data, readErr)
+		}
 	}
 }
 

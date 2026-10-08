@@ -19,7 +19,7 @@ type Recording struct {
 	// from ID, which identifies this one recording execution. It is a bounded,
 	// opaque Core-generated fingerprint; raw adapter session references are not
 	// stored in this field.
-	SourceSessionID string `json:"source_session_id,omitempty"`
+	SourceSessionID         string             `json:"source_session_id,omitempty"`
 	Title                   string             `json:"title,omitempty"`
 	AdapterID               string             `json:"adapter_id,omitempty"`
 	Adapter                 *AdapterProvenance `json:"adapter,omitempty"`
@@ -57,13 +57,17 @@ type MetadataRevision struct {
 }
 
 type Track struct {
-	ID                      string `json:"id"`
-	SourcePlaylistURL       string `json:"source_playlist_url"`
-	Bandwidth               int64  `json:"bandwidth,omitempty"`
-	SourceEpoch             uint64 `json:"source_epoch,omitempty"`
-	NextArchiveOrdinal      uint64 `json:"next_archive_ordinal,omitempty"`
-	HasLastObservedSequence bool   `json:"has_last_observed_sequence,omitempty"`
-	LastObservedSequence    uint64 `json:"last_observed_sequence,omitempty"`
+	ID                 string `json:"id"`
+	SourcePlaylistURL  string `json:"source_playlist_url"`
+	Bandwidth          int64  `json:"bandwidth,omitempty"`
+	SourceEpoch        uint64 `json:"source_epoch,omitempty"`
+	NextArchiveOrdinal uint64 `json:"next_archive_ordinal,omitempty"`
+	// LivePresentation stores the append-only identity cursor used only by the
+	// active browser-facing live HLS projection. It is independent of both
+	// ArchiveOrdinal and the revisionable VOD TimelineOrdinal.
+	LivePresentation        *LivePresentationState `json:"live_presentation,omitempty"`
+	HasLastObservedSequence bool                   `json:"has_last_observed_sequence,omitempty"`
+	LastObservedSequence    uint64                 `json:"last_observed_sequence,omitempty"`
 	// PendingSequences is retained for legacy recordings where source epoch was
 	// implicitly zero. Newer recordings use PendingSegments.
 	PendingSequences []uint64          `json:"pending_sequences,omitempty"`
@@ -72,10 +76,36 @@ type Track struct {
 	Segments         []Segment         `json:"segments"`
 }
 
+// LivePresentationState is persisted with the recording root so an Engine
+// handover or restart cannot renumber already published live media.
+type LivePresentationState struct {
+	NextOrdinal               uint64 `json:"next_ordinal,omitempty"`
+	DiscontinuitySequence     uint64 `json:"discontinuity_sequence,omitempty"`
+	HasLastCoordinate         bool   `json:"has_last_coordinate,omitempty"`
+	LastSourceEpoch           uint64 `json:"last_source_epoch,omitempty"`
+	LastDiscontinuitySequence uint64 `json:"last_discontinuity_sequence,omitempty"`
+	LastSequence              uint64 `json:"last_sequence,omitempty"`
+	HasEpochMapping           bool   `json:"has_epoch_mapping,omitempty"`
+	MappedSourceEpoch         uint64 `json:"mapped_source_epoch,omitempty"`
+	SourceSequenceBase        uint64 `json:"source_sequence_base,omitempty"`
+	PresentationOrdinalBase   uint64 `json:"presentation_ordinal_base,omitempty"`
+	MaxSourceSequence         uint64 `json:"max_source_sequence,omitempty"`
+	SourceDiscontinuityBase   uint64 `json:"source_discontinuity_base,omitempty"`
+	PresentationDiscBase      uint64 `json:"presentation_disc_base,omitempty"`
+	EpochBoundary             bool   `json:"epoch_boundary,omitempty"`
+	FirstPresentationOrdinal  uint64 `json:"first_presentation_ordinal,omitempty"`
+}
+
 type PendingSequence struct {
-	SourceEpoch           uint64 `json:"source_epoch,omitempty"`
-	DiscontinuitySequence uint64 `json:"discontinuity_sequence,omitempty"`
-	Sequence              uint64 `json:"sequence"`
+	SourceEpoch               uint64     `json:"source_epoch,omitempty"`
+	DiscontinuitySequence     uint64     `json:"discontinuity_sequence,omitempty"`
+	Sequence                  uint64     `json:"sequence"`
+	LivePresentationOrdinal   uint64     `json:"live_presentation_ordinal,omitempty"`
+	LiveDiscontinuity         bool       `json:"live_discontinuity,omitempty"`
+	LiveDiscontinuitySequence uint64     `json:"live_discontinuity_sequence,omitempty"`
+	Duration                  float64    `json:"duration,omitempty"`
+	ProgramDateTime           *time.Time `json:"program_date_time,omitempty"`
+	InitSegmentID             string     `json:"init_segment_id,omitempty"`
 }
 
 // ResourceReference is the stable archive representation of an opaque
@@ -109,17 +139,26 @@ type Segment struct {
 	// TimelineOrdinal is a revisionable playback position. Unlike
 	// ArchiveOrdinal, it can change when a late prefix or repaired segment is
 	// inserted into the timeline.
-	TimelineOrdinal uint64     `json:"timeline_ordinal,omitempty"`
-	SourceURI       string     `json:"source_uri"`
-	Duration        float64    `json:"duration,omitempty"`
-	ProgramDateTime *time.Time `json:"program_date_time,omitempty"`
-	InitSegmentID   string     `json:"init_segment_id,omitempty"`
-	ByteRange       *ByteRange `json:"byte_range,omitempty"`
-	Discontinuity   bool       `json:"discontinuity,omitempty"`
-	StoragePath     string     `json:"storage_path"`
-	PayloadSize     int64      `json:"payload_size"`
-	SHA256          string     `json:"sha256"`
-	IsInit          bool       `json:"is_init,omitempty"`
+	TimelineOrdinal uint64 `json:"timeline_ordinal,omitempty"`
+	// LivePresentationOrdinal is immutable once a media object enters an active
+	// live playlist. It is not the archive storage ordinal or VOD timeline slot.
+	LivePresentationOrdinal uint64 `json:"live_presentation_ordinal,omitempty"`
+	// LiveDiscontinuity records a boundary in the immutable live presentation.
+	// LiveDiscontinuitySequence counts discontinuities before this segment's
+	// boundary, as required by EXT-X-DISCONTINUITY-SEQUENCE. It lets a sliding
+	// playlist avoid scanning older recording history.
+	LiveDiscontinuity         bool       `json:"live_discontinuity,omitempty"`
+	LiveDiscontinuitySequence uint64     `json:"live_discontinuity_sequence,omitempty"`
+	SourceURI                 string     `json:"source_uri"`
+	Duration                  float64    `json:"duration,omitempty"`
+	ProgramDateTime           *time.Time `json:"program_date_time,omitempty"`
+	InitSegmentID             string     `json:"init_segment_id,omitempty"`
+	ByteRange                 *ByteRange `json:"byte_range,omitempty"`
+	Discontinuity             bool       `json:"discontinuity,omitempty"`
+	StoragePath               string     `json:"storage_path"`
+	PayloadSize               int64      `json:"payload_size"`
+	SHA256                    string     `json:"sha256"`
+	IsInit                    bool       `json:"is_init,omitempty"`
 }
 
 type ByteRange struct {
@@ -128,13 +167,18 @@ type ByteRange struct {
 }
 
 type Gap struct {
-	TrackID               string    `json:"track_id"`
-	SourceEpoch           uint64    `json:"source_epoch,omitempty"`
-	DiscontinuitySequence uint64    `json:"discontinuity_sequence,omitempty"`
-	FromSequence          uint64    `json:"from_sequence"`
-	ToSequence            uint64    `json:"to_sequence"`
-	DetectedAt            time.Time `json:"detected_at"`
-	Reason                string    `json:"reason"`
+	TrackID                   string     `json:"track_id"`
+	SourceEpoch               uint64     `json:"source_epoch,omitempty"`
+	DiscontinuitySequence     uint64     `json:"discontinuity_sequence,omitempty"`
+	FromSequence              uint64     `json:"from_sequence"`
+	ToSequence                uint64     `json:"to_sequence"`
+	DetectedAt                time.Time  `json:"detected_at"`
+	Reason                    string     `json:"reason"`
+	LivePresentationOrdinal   uint64     `json:"live_presentation_ordinal,omitempty"`
+	LiveDiscontinuity         bool       `json:"live_discontinuity,omitempty"`
+	LiveDiscontinuitySequence uint64     `json:"live_discontinuity_sequence,omitempty"`
+	LiveDuration              float64    `json:"live_duration,omitempty"`
+	ProgramDateTime           *time.Time `json:"program_date_time,omitempty"`
 }
 
 type ManifestSnapshot struct {

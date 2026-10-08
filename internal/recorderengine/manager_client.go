@@ -255,6 +255,36 @@ func (m *ManagerClient) GetContext(ctx context.Context, id string) (*domain.Reco
 	return &recording, nil
 }
 
+// LivePlaybackSnapshot reads only the bounded active live tail from this
+// generation. The Engine IPC operation avoids transferring a full recording
+// root for browser playlist reloads.
+func (m *ManagerClient) LivePlaybackSnapshot(ctx context.Context, id string) (acquire.LivePlaybackView, error) {
+	var view acquire.LivePlaybackView
+	if err := m.client.Call(ctx, OperationLivePlaybackSnapshot, RecordingIDRequest{RecordingID: id}, &view); err != nil {
+		return acquire.LivePlaybackView{}, normalizeEngineError(err)
+	}
+	if view.RecordingID != id || len(view.Segments) > acquire.LivePlaybackWindowSize ||
+		len(view.Slots) > acquire.LivePlaybackWindowSize || len(view.InitSegments) > acquire.LivePlaybackWindowSize {
+		return acquire.LivePlaybackView{}, errors.New("recorder engine live playback snapshot is invalid")
+	}
+	for _, segment := range view.Segments {
+		if segment.SourceURI != "" {
+			return acquire.LivePlaybackView{}, errors.New("recorder engine live playback snapshot contains source URI material")
+		}
+	}
+	for _, slot := range view.Slots {
+		if slot.Segment != nil && slot.Segment.SourceURI != "" {
+			return acquire.LivePlaybackView{}, errors.New("recorder engine live playback slot contains source URI material")
+		}
+	}
+	for _, segment := range view.InitSegments {
+		if segment.SourceURI != "" {
+			return acquire.LivePlaybackView{}, errors.New("recorder engine live playback init contains source URI material")
+		}
+	}
+	return view, nil
+}
+
 // Inventory returns the active recordings owned by this exact Engine process.
 // The transport envelope pins the generation; the result is checked as well
 // so callers do not accidentally associate another Engine's inventory.

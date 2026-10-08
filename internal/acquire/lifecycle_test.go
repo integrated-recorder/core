@@ -145,10 +145,10 @@ func TestSequenceResetUsesArchiveOrdinalAndDoesNotRedownloadLaterDuplicate(t *te
 	if len(segments) != 2 {
 		t.Fatalf("segments = %#v", segments)
 	}
-	if segments[0].SourceEpoch != 0 || segments[0].Sequence != 100 || segments[0].ArchiveOrdinal != 1 || segments[0].Discontinuity {
+	if segments[0].SourceEpoch != 0 || segments[0].Sequence != 100 || segments[0].ArchiveOrdinal != 1 || segments[0].Discontinuity || segments[0].LivePresentationOrdinal != 1 {
 		t.Fatalf("first segment = %#v", segments[0])
 	}
-	if segments[1].SourceEpoch != 1 || segments[1].Sequence != 0 || segments[1].ArchiveOrdinal != 2 || !segments[1].Discontinuity {
+	if segments[1].SourceEpoch != 1 || segments[1].Sequence != 0 || segments[1].ArchiveOrdinal != 2 || !segments[1].Discontinuity || segments[1].LivePresentationOrdinal != 2 || !segments[1].LiveDiscontinuity {
 		t.Fatalf("reset segment = %#v", segments[1])
 	}
 	wantBytes := [][]byte{{0x00, 0x10, 0xff}, {0x80, 0x20, 0x01, 0xfe}}
@@ -175,6 +175,80 @@ func TestSequenceResetUsesArchiveOrdinalAndDoesNotRedownloadLaterDuplicate(t *te
 	}
 	if got := again.Tracks["main"].Segments; len(got) != 2 || got[0].ArchiveOrdinal != 1 || got[1].ArchiveOrdinal != 2 || got[1].SourceEpoch != 1 {
 		t.Fatalf("reload order = %#v", got)
+	}
+}
+
+func TestChangedSourceIdentityAtSameSequenceStartsStablePresentationEpoch(t *testing.T) {
+	firstCaptured, secondCaptured := make(chan struct{}), make(chan struct{})
+	var firstOnce, secondOnce sync.Once
+	var manifestMu sync.Mutex
+	manifest := "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:1,old\nold.ts\n"
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/live.m3u8":
+			manifestMu.Lock()
+			body := manifest
+			manifestMu.Unlock()
+			_, _ = fmt.Fprint(w, body)
+		case "/old.ts":
+			_, _ = w.Write([]byte("old-source-object"))
+			firstOnce.Do(func() { close(firstCaptured) })
+		case "/new.ts":
+			_, _ = w.Write([]byte("new-source-object"))
+			secondOnce.Do(func() { close(secondCaptured) })
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, server.Client(), nil, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if closeErr := manager.Close(ctx); closeErr != nil {
+			t.Errorf("close manager: %v", closeErr)
+		}
+	})
+	recording, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/live.m3u8"}, nil, "identity reset fixture", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, firstCaptured, "first source identity")
+	waitForSegmentCount(t, manager, recording.ID, 1)
+	manifestMu.Lock()
+	manifest = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:1,new\nnew.ts\n"
+	manifestMu.Unlock()
+	waitSignal(t, secondCaptured, "changed source identity")
+	waitForSegmentCount(t, manager, recording.ID, 2)
+	beforeStop, getErr := manager.Get(recording.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	stopped, err := manager.Stop(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stopped.Tracks["main"].Segments) != 2 {
+		t.Fatalf("same-sequence source identity change produced %d objects, want 2; before stop=%#v state=%s error=%s: %#v", len(stopped.Tracks["main"].Segments), beforeStop.Tracks["main"].Segments, stopped.State, stopped.LastError, stopped.Tracks["main"].Segments)
+	}
+	byEpoch := make(map[uint64]domain.Segment, 2)
+	for _, segment := range stopped.Tracks["main"].Segments {
+		byEpoch[segment.SourceEpoch] = segment
+	}
+	first, firstOK := byEpoch[0]
+	second, secondOK := byEpoch[1]
+	if !firstOK || !secondOK || first.Sequence != 7 || second.Sequence != 7 || first.SourceURI == second.SourceURI {
+		t.Fatalf("source identity change was not recorded as a new epoch: %#v", stopped.Tracks["main"].Segments)
+	}
+	if first.LivePresentationOrdinal != 1 || second.LivePresentationOrdinal != 2 || !second.LiveDiscontinuity {
+		t.Fatalf("source identity change regressed live presentation sequence: first=%#v second=%#v", first, second)
 	}
 }
 

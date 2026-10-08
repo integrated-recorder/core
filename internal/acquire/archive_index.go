@@ -649,7 +649,7 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			if source != archiveindex.ClaimLiveOrigin || exists && existing.SHA256 != result.SHA256 {
 				return ErrArchiveIndexLimit
 			}
-			if exists {
+			if exists && existing.LivePresentationOrdinal != 0 {
 				return nil
 			} // Root already durably selects these exact bytes.
 			inventory = archiveindex.Inventory{}
@@ -678,6 +678,32 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 					return err
 				}
 			}
+			if source == archiveindex.ClaimLiveOrigin && existing.LivePresentationOrdinal == 0 {
+				assigned, assignErr := assignLivePresentationIdentity(rootSnapshot, &existing)
+				if assignErr != nil {
+					return assignErr
+				}
+				if assigned {
+					state := *rootSnapshot.Tracks[existing.TrackID].LivePresentation
+					if err := m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
+						track := recording.Tracks[existing.TrackID]
+						if track == nil {
+							return errors.New("main track is missing")
+						}
+						for i := range track.Segments {
+							if track.Segments[i].ID == existing.ID {
+								copyLivePresentationFields(&track.Segments[i], existing)
+								track.LivePresentation = &state
+								return nil
+							}
+						}
+						return errors.New("selected live segment is missing")
+					}); err != nil {
+						return newStorageStageError("persist live presentation identity", err)
+					}
+					m.updateLivePlaybackProjection(e, existing)
+				}
+			}
 			return nil
 		}
 		if exists && disposition == archiveindex.DispositionConflict {
@@ -697,6 +723,14 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			return errors.New("main track is missing")
 		}
 		if !segment.IsInit {
+			if gap, ok := findRootGapForCoordinate(rootSnapshot, coordinate); ok && gap.LivePresentationOrdinal != 0 {
+				offset := segment.Sequence - gap.FromSequence
+				if gap.LivePresentationOrdinal <= ^uint64(0)-offset {
+					segment.LivePresentationOrdinal = gap.LivePresentationOrdinal + offset
+					segment.LiveDiscontinuity = gap.LiveDiscontinuity && offset == 0
+					segment.LiveDiscontinuitySequence = gap.LiveDiscontinuitySequence + offset
+				}
+			}
 			ordinalCollision := false
 			for _, current := range trackForOrdinal.Segments {
 				if current.ArchiveOrdinal == segment.ArchiveOrdinal &&
@@ -717,10 +751,6 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			}
 			segment.ID = fmt.Sprintf("seg-%020d", segment.ArchiveOrdinal)
 		}
-		if err := m.saveImmutablePayload(rootSnapshot.ID, segment.StoragePath, data, result); err != nil {
-			return newStorageStageError("persist immutable archive payload", err)
-		}
-
 		sourceDiscontinuity := segment.Discontinuity
 		var previousUpdate *domain.Segment
 		if !segment.IsInit && segment.SourceEpoch > 0 {
@@ -765,6 +795,14 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 				plannedMarker = &planned
 			}
 		}
+		if !segment.IsInit && source == archiveindex.ClaimLiveOrigin {
+			if _, err := assignLivePresentationIdentity(rootSnapshot, &segment); err != nil {
+				return err
+			}
+		}
+		if err := m.saveImmutablePayload(rootSnapshot.ID, segment.StoragePath, data, result); err != nil {
+			return newStorageStageError("persist immutable archive payload", err)
+		}
 		if previousUpdate != nil {
 			if err := m.store.SaveSidecar(rootSnapshot.ID, previousUpdate.StoragePath, *previousUpdate); err != nil {
 				return newStorageStageError("persist prior segment sidecar", err)
@@ -784,6 +822,10 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			track := recording.Tracks[segment.TrackID]
 			if track == nil {
 				return errors.New("main track is missing")
+			}
+			if trackForSnapshot := rootSnapshot.Tracks[segment.TrackID]; trackForSnapshot != nil && trackForSnapshot.LivePresentation != nil {
+				state := *trackForSnapshot.LivePresentation
+				track.LivePresentation = &state
 			}
 			segments := &track.Segments
 			if segment.IsInit {
@@ -832,6 +874,9 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 		}); err != nil {
 			return newStorageStageError("persist recording root", err)
 		}
+		if segment.LivePresentationOrdinal != 0 {
+			m.updateLivePlaybackProjection(e, segment)
+		}
 		return nil
 	})
 	if commitErr != nil {
@@ -848,6 +893,29 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 		m.signalAutomaticArchiveRecovery(recordingID(e))
 	}
 	return result, plannedMarker, nil
+}
+
+func copyLivePresentationFields(destination *domain.Segment, source domain.Segment) {
+	if destination == nil {
+		return
+	}
+	destination.LivePresentationOrdinal = source.LivePresentationOrdinal
+	destination.LiveDiscontinuity = source.LiveDiscontinuity
+	destination.LiveDiscontinuitySequence = source.LiveDiscontinuitySequence
+}
+
+func findRootGapForCoordinate(recording *domain.Recording, coordinate archiveindex.Coordinate) (domain.Gap, bool) {
+	if recording == nil {
+		return domain.Gap{}, false
+	}
+	for _, gap := range recording.Gaps {
+		if gap.TrackID == coordinate.TrackID && gap.SourceEpoch == coordinate.SourceEpoch &&
+			gap.DiscontinuitySequence == coordinate.DiscontinuitySequence &&
+			coordinate.Sequence >= gap.FromSequence && coordinate.Sequence <= gap.ToSequence {
+			return gap, true
+		}
+	}
+	return domain.Gap{}, false
 }
 
 func (m *Manager) recordingSnapshotForArchive(e *entry) *domain.Recording {

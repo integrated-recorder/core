@@ -193,6 +193,13 @@ func TestManagerRouterGenerationRoutingAndDetachAfterInventoryDrains(t *testing.
 		t.Fatalf("start on initial generation: recording=%#v err=%v", recordingA, err)
 	}
 	waitForSegment(t, router, recordingAID)
+	liveView, err := router.LivePlaybackSnapshot(context.Background(), recordingAID)
+	if err != nil || len(liveView.Segments) != 1 || liveView.Segments[0].SourceURI != "" {
+		t.Fatalf("live playback snapshot=%#v err=%v", liveView, err)
+	}
+	if engineA.count.count(recorderengine.OperationLivePlaybackSnapshot) != 1 || engineB.count.count(recorderengine.OperationLivePlaybackSnapshot) != 0 {
+		t.Fatalf("live snapshot did not route to the owning generation: A=%d B=%d", engineA.count.count(recorderengine.OperationLivePlaybackSnapshot), engineB.count.count(recorderengine.OperationLivePlaybackSnapshot))
+	}
 	if err := router.SetActive("engine-b"); err != nil {
 		t.Fatal(err)
 	}

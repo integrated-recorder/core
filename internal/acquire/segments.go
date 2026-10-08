@@ -209,6 +209,8 @@ type segmentScheduler struct {
 	next                     uint64
 	epochMarkers             map[uint64]epochMarker
 	manifestWake             chan struct{}
+	// drainWaitHook is an observation seam for deterministic drain tests.
+	drainWaitHook func()
 }
 
 func newSegmentScheduler(parent context.Context, manager *Manager, e *entry) (*segmentScheduler, error) {
@@ -1545,7 +1547,11 @@ func (s *segmentScheduler) drain(ctx context.Context) error {
 			return nil
 		}
 		changed := s.changed
+		drainWaitHook := s.drainWaitHook
 		s.mu.Unlock()
+		if drainWaitHook != nil {
+			drainWaitHook()
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

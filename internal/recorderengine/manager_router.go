@@ -266,6 +266,60 @@ func (r *ManagerRouter) GetContext(ctx context.Context, id string) (*domain.Reco
 	return nil, storage.ErrNotFound
 }
 
+// LivePlaybackSnapshot routes to the generation that owns the live worker and
+// returns only its bounded live-tail projection. Terminal recordings have no
+// active owner; in that case return only state so the HTTP layer can preserve
+// its existing conflict response without cloning a terminal archive root.
+func (r *ManagerRouter) LivePlaybackSnapshot(ctx context.Context, id string) (acquire.LivePlaybackView, error) {
+	r.mutation.RLock()
+	defer r.mutation.RUnlock()
+	clients, activeID := r.clientsAndActive()
+	inventories := make([]GenerationInventory, 0, len(clients))
+	for _, attached := range clients {
+		inventory, err := attached.client.Inventory(ctx)
+		if err != nil {
+			return acquire.LivePlaybackView{}, fmt.Errorf("engine inventory is required to identify the live recording owner: %w", err)
+		}
+		if inventory.GenerationID != attached.generationID {
+			return acquire.LivePlaybackView{}, errors.New("engine inventory generation identity mismatch")
+		}
+		inventories = append(inventories, inventory)
+	}
+	owners, err := ownerMap(inventories)
+	if err != nil {
+		return acquire.LivePlaybackView{}, err
+	}
+	if ownerID := owners[id]; ownerID != "" {
+		owner := findAttached(clients, ownerID)
+		if owner == nil {
+			return acquire.LivePlaybackView{}, ErrGenerationNotAttached
+		}
+		return owner.client.LivePlaybackSnapshot(ctx, id)
+	}
+	active := findAttached(clients, activeID)
+	if active == nil {
+		return acquire.LivePlaybackView{}, ErrGenerationNotAttached
+	}
+	recording, err := active.client.GetContext(ctx, id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			for _, attached := range clients {
+				recording, err = attached.client.GetContext(ctx, id)
+				if err == nil {
+					break
+				}
+				if !errors.Is(err, storage.ErrNotFound) {
+					return acquire.LivePlaybackView{}, err
+				}
+			}
+		}
+		if err != nil {
+			return acquire.LivePlaybackView{}, err
+		}
+	}
+	return acquire.LivePlaybackView{RecordingID: id, State: recording.State}, nil
+}
+
 func (r *ManagerRouter) List() []*domain.Recording {
 	rows, err := r.ListForManagement(context.Background(), DefaultListLimit)
 	if err != nil {

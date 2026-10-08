@@ -40,11 +40,13 @@ mutation. If the owner record or lock cannot be validated, the mutation fails
 closed.
 
 For a normal handover, the source scheduler stops new manifest admissions and
-waits for admitted fetch tasks, metadata work, queued payloads, storage retries,
-and writer callbacks to finish. The owner transfer cannot begin until this
-boundary succeeds. A timeout or drain error resumes the source under its
-current epoch. The target never writes the canonical archive before the Host
-has transferred ownership.
+waits for admitted segment HTTP bodies, metadata work, queued payloads, storage
+retries, and writer callbacks to finish. The owner transfer cannot begin until
+this segment boundary succeeds. A segment body already in progress is allowed
+to complete; Core does not cancel or splice a partial response across Engines.
+The handover does not wait for the broadcast to end. A timeout or drain error
+resumes the source under its current epoch. The target never writes the
+canonical archive before the Host has transferred ownership.
 
 ## Target continuation preflight
 

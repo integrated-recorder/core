@@ -2,7 +2,6 @@ package bootstrap
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,11 +60,7 @@ func TestColdRecoveryLeaseClearFailurePropagates(t *testing.T) {
 }
 
 func TestStartupIPCRendezvousPathsAreScopedToHostBoot(t *testing.T) {
-	root, err := os.MkdirTemp("/private/tmp", "runtime-host-ipc-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := bootstrapTestDir(t, "runtime-host-ipc-")
 	if err := makePrivateRuntimeDirs(root); err != nil {
 		t.Fatal(err)
 	}

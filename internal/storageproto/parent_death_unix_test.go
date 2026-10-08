@@ -32,7 +32,12 @@ func TestProviderParentDeathHelper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start provider: %v", err)
 	}
-	if err = os.WriteFile(filepath.Join(dir, "provider.pid"), []byte(strconv.Itoa(client.cmd.Process.Pid)), 0600); err != nil {
+	pidPath := filepath.Join(dir, "provider.pid")
+	tmpPIDPath := pidPath + ".tmp"
+	if err = os.WriteFile(tmpPIDPath, []byte(strconv.Itoa(client.cmd.Process.Pid)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(tmpPIDPath, pidPath); err != nil {
 		t.Fatal(err)
 	}
 	select {}

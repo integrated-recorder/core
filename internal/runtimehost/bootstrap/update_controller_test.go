@@ -52,14 +52,7 @@ type controllerFixture struct {
 
 func newControllerFixture(t *testing.T, badSignature bool) *controllerFixture {
 	t.Helper()
-	tempRoot := "/tmp"
-	if runtime.GOOS == "darwin" {
-		tempRoot = "/private/tmp"
-	}
-	root, err := os.MkdirTemp(tempRoot, "ir-update-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	root := bootstrapTestDir(t, "ir-update-")
 	t.Cleanup(func() {
 		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {
@@ -149,7 +142,7 @@ func newControllerFixture(t *testing.T, badSignature bool) *controllerFixture {
 	sup.events = events
 	initialSocket := filepath.Join(root, "engine.sock")
 	initialToken := filepath.Join(root, "engine.token")
-	resourceSocket := "/tmp/ir-resource.sock"
+	resourceSocket := filepath.Join(root, "resource.sock")
 	resourceToken := filepath.Join(root, "resources.token")
 	if err := os.WriteFile(initialToken, bytes.Repeat([]byte{'x'}, 32), 0600); err != nil {
 		t.Fatal(err)

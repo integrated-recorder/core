@@ -203,8 +203,7 @@ func TestInitialEngineRecoveryIsGatedByInstallationReadiness(t *testing.T) {
 }
 
 func TestPrivateRuntimeFilesAndDirectories(t *testing.T) {
-	root := filepath.Join("/private", "tmp", fmt.Sprintf("runtime-host-private-%d", time.Now().UnixNano()))
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := bootstrapTestDir(t, "runtime-host-private-")
 	if err := makePrivateRuntimeDirs(root); err != nil {
 		t.Fatal(err)
 	}
@@ -234,16 +233,38 @@ func TestPrivateRuntimeFilesAndDirectories(t *testing.T) {
 
 func bootstrapTestDir(t *testing.T, prefix string) string {
 	t.Helper()
-	base := os.TempDir()
-	if resolved, err := filepath.EvalSymlinks(base); err == nil {
-		base = resolved
-	}
+	base := resolvedBootstrapTempDir(t)
 	root, err := os.MkdirTemp(base, prefix)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	return root
+}
+
+func resolvedBootstrapTempDir(t *testing.T) string {
+	t.Helper()
+	// Prefer shortest canonical system temp root. On macOS, os.TempDir() often
+	// resolves into a long per-user path that exceeds Unix socket path limits.
+	candidates := []string{os.TempDir(), filepath.Join(string(filepath.Separator), "tmp")}
+	base := ""
+	for _, candidate := range candidates {
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if base == "" || len(resolved) < len(base) {
+			base = resolved
+		}
+	}
+	if base == "" {
+		t.Fatalf("could not resolve an accessible OS temporary directory from %q", candidates)
+	}
+	return base
 }
 
 func TestPrintSetupCodeOnlyReadsExistingOneTimeToken(t *testing.T) {
@@ -569,7 +590,11 @@ func TestBootstrapSupervisorRealProcessSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("process-boundary smoke test")
 	}
-	work := t.TempDir()
+	work := bootstrapTestDir(t, "runtime-host-process-")
+	home := filepath.Join(work, "home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
 	controlAddr := reserveControlAddress(t)
 	target, err := url.Parse("http://" + controlAddr)
 	if err != nil {
@@ -583,7 +608,7 @@ func TestBootstrapSupervisorRealProcessSmoke(t *testing.T) {
 	engineMarker := filepath.Join(work, "engine.started")
 	controlMarker := filepath.Join(work, "control.started")
 	makeProcess := func(role supervisor.Role, marker string, extra ...string) supervisor.ProcessSpec {
-		env := []string{"PATH=/usr/bin:/bin", "HOME=/private/tmp", "BOOTSTRAP_HELPER=1", "BOOTSTRAP_ROLE=" + string(role), "BOOTSTRAP_MARKER=" + marker}
+		env := []string{"PATH=/usr/bin:/bin", "HOME=" + home, "BOOTSTRAP_HELPER=1", "BOOTSTRAP_ROLE=" + string(role), "BOOTSTRAP_MARKER=" + marker}
 		env = append(env, extra...)
 		return supervisor.ProcessSpec{
 			GenerationID: id, Role: role, Executable: executable,

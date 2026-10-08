@@ -288,7 +288,7 @@ func newRuntimeE2ETempDir(t *testing.T) string {
 	t.Helper()
 	// Keep the path short enough for the Runtime Host's bounded Unix socket
 	// path while retaining a private, symlink-free temporary root.
-	root, err := os.MkdirTemp("/private/tmp", "ir-e2e-")
+	root, err := os.MkdirTemp(resolvedBootstrapTempDir(t), "ir-e2e-")
 	if err != nil {
 		t.Fatalf("create symlink-free runtime E2E directory: %v", err)
 	}

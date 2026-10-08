@@ -149,6 +149,26 @@ func waitCommit(t *testing.T, service *IngestService, coordinator *leaseFaultCoo
 	}
 }
 
+func waitForActiveWriters(t *testing.T, service *IngestService, want int) {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		service.mu.Lock()
+		if service.activeWriters == want {
+			service.mu.Unlock()
+			return
+		}
+		changed := service.changed
+		service.mu.Unlock()
+		select {
+		case <-changed:
+		case <-timer.C:
+			t.Fatalf("active writers did not reach %d: %#v", want, service.Snapshot())
+		}
+	}
+}
+
 func TestCoordinatorAcquireRetriesSameIDAndDoesNotPoisonRecording(t *testing.T) {
 	t.Run("queue request failed before host", func(t *testing.T) {
 		coordinator := newLeaseFaultCoordinator()
@@ -294,6 +314,10 @@ func TestAcceptedPayloadRetriesTransientWriterAcquire(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("accepted payload did not survive coordinator recovery")
 	}
+	// Completion reports persistence outcome before writer-loop accounting
+	// decrements ActiveWriters. Wait for that explicit state transition before
+	// asserting the final snapshot.
+	waitForActiveWriters(t, service, 0)
 	assertSameLeaseID(t, coordinator.callIDs("acquire_writer"), runtimeResourceOperationAttempts+2)
 	if persistCalls != 1 {
 		t.Fatalf("persistence callback calls=%d, want one", persistCalls)

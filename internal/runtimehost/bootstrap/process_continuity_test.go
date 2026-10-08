@@ -40,12 +40,8 @@ func TestRuntimeGenerationProcessBoundaryContinuity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires separate Runtime Host, Control, and Engine processes")
 	}
-	root, err := os.MkdirTemp("/private/tmp", "ir-gen-e2e-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	for _, dir := range []string{"ipc", "tokens", "markers", "data"} {
+	root := bootstrapTestDir(t, "ir-gen-e2e-")
+	for _, dir := range []string{"ipc", "tokens", "markers", "data", "home"} {
 		if err := os.Mkdir(filepath.Join(root, dir), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -330,14 +326,14 @@ func runProcessHostHelper(t *testing.T) {
 	}()
 	makeEngine := func(id string) supervisor.ProcessSpec {
 		return supervisor.ProcessSpec{GenerationID: id, Role: supervisor.RoleEngine, Executable: executable, Args: []string{"-test.run=^TestRuntimeGenerationProcessHelper$"}, Env: []string{
-			"PATH=/usr/bin:/bin", "HOME=/private/tmp", "IR_PROCESS_HELPER=engine", "IR_PROCESS_GENERATION=" + id,
+			"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(root, "home"), "IR_PROCESS_HELPER=engine", "IR_PROCESS_GENERATION=" + id,
 			"IR_PROCESS_ROOT=" + root, "IR_PROCESS_DATA=" + dataDir,
 			"IR_PROCESS_MARKER=" + filepath.Join(root, "markers", "engine-"+id[:1]+".json"),
 		}}
 	}
 	makeControl := func(id, addr, label string) supervisor.ProcessSpec {
 		return supervisor.ProcessSpec{GenerationID: id, Role: supervisor.RoleControl, Executable: executable, Endpoint: "http://" + addr + "/ready", Args: []string{"-test.run=^TestRuntimeGenerationProcessHelper$"}, Env: []string{
-			"PATH=/usr/bin:/bin", "HOME=/private/tmp", "IR_PROCESS_HELPER=control", "IR_PROCESS_LABEL=" + label,
+			"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(root, "home"), "IR_PROCESS_HELPER=control", "IR_PROCESS_LABEL=" + label,
 			"IR_PROCESS_ADDR=" + addr, "IR_PROCESS_MARKER=" + filepath.Join(root, "markers", "control-"+label+".json"),
 		}}
 	}

@@ -319,7 +319,14 @@ func TestManagerClientHandoverUDSRoundTripWhenUnixSocketsAreAvailable(t *testing
 	if len(claims) != 1 {
 		t.Fatalf("Host claims = %d; want 1", len(claims))
 	}
-	root, err := os.MkdirTemp("/private/tmp", "ir-handover-ipc-")
+	// Resolve the platform temp directory before creating the socket so the
+	// Unix-domain path does not inherit symlink components (for example /tmp
+	// on macOS), while still respecting the host's configured temp location.
+	tempBase, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temporary directory: %v", err)
+	}
+	root, err := os.MkdirTemp(tempBase, "ir-handover-ipc-")
 	if err != nil {
 		t.Fatal(err)
 	}

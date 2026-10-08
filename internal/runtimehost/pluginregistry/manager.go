@@ -516,6 +516,13 @@ func (m *Manager) downloadAndVerify(ctx context.Context, plugin registryPlugin, 
 		return ErrDownloadFailed
 	}
 	defer response.Body.Close()
+	// A transport may return a response concurrently with cancellation (for
+	// example, an empty implicit response after a test/server handler exits).
+	// Cancellation is an acquisition failure, not evidence that the Registry
+	// pinned size or digest was incorrect.
+	if requestCtx.Err() != nil {
+		return ErrDownloadFailed
+	}
 	if response.StatusCode != http.StatusOK || response.Request != nil && (response.Request.URL.Scheme != "https" || response.Request.URL.User != nil) {
 		return ErrDownloadFailed
 	}

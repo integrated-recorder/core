@@ -152,6 +152,18 @@ func (s *LocalFilesystemBackend) ArchiveIndex(recording *domain.Recording) ([]Ar
 // exist, so management queries can still report a degraded archive's size.
 // Symlinks and non-regular objects fail closed instead of being followed.
 func (s *LocalFilesystemBackend) RecordingDirectoryBytes(recordingID string) (int64, error) {
+	return s.RecordingDirectoryBytesContext(context.Background(), recordingID)
+}
+
+// RecordingDirectoryBytesContext returns physical bytes below one recording
+// and stops walking when ctx is canceled.
+func (s *LocalFilesystemBackend) RecordingDirectoryBytesContext(ctx context.Context, recordingID string) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if !recordingIDPattern.MatchString(recordingID) {
 		return 0, errors.New("invalid recording id")
 	}
@@ -162,6 +174,9 @@ func (s *LocalFilesystemBackend) RecordingDirectoryBytes(recordingID string) (in
 	}
 	var total int64
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return errors.New("recording directory could not be read")
 		}
@@ -178,8 +193,11 @@ func (s *LocalFilesystemBackend) RecordingDirectoryBytes(recordingID string) (in
 		if metadata.IsDir() {
 			return nil
 		}
-		if !metadata.Mode().IsRegular() || metadata.Size() < 0 || total > math.MaxInt64-metadata.Size() {
+		if !metadata.Mode().IsRegular() || metadata.Size() < 0 {
 			return errors.New("recording directory contains invalid files")
+		}
+		if total > math.MaxInt64-metadata.Size() {
+			return ErrArchiveSizeOverflow
 		}
 		total += metadata.Size()
 		return nil

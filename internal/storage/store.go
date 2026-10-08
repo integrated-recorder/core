@@ -33,6 +33,10 @@ const maxSidecarReadBytes int64 = 16 << 20
 // ordinary local I/O errors remain distinguishable and are not retried.
 var ErrPayloadSizeMismatch = errors.New("payload size mismatch")
 
+// ErrArchiveSizeOverflow marks a physical archive size that cannot be
+// represented by the API's signed byte count.
+var ErrArchiveSizeOverflow = errors.New("recording archive size overflow")
+
 // ErrReadOnlyListLimit marks a read-only archive snapshot that exceeds its
 // caller's count bound.
 var ErrReadOnlyListLimit = errors.New("read-only recording list exceeds limit")
@@ -108,6 +112,28 @@ func (s *Store) LoadSidecar(id, relativePath string, maxBytes int64, output any)
 		return ErrSidecarReadUnsupported
 	}
 	return reader.LoadSidecar(id, relativePath, maxBytes, output)
+}
+
+// RecordingDirectoryBytesContext returns the physical bytes below one
+// recording while allowing providers with context-aware enumeration to stop
+// work when the caller no longer needs the read-model result. The optional
+// capability keeps existing StorageBackend implementations source-compatible.
+func (s *Store) RecordingDirectoryBytesContext(ctx context.Context, recordingID string) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if s == nil || s.StorageBackend == nil {
+		return 0, errors.New("storage backend is unavailable")
+	}
+	if backend, ok := s.StorageBackend.(interface {
+		RecordingDirectoryBytesContext(context.Context, string) (int64, error)
+	}); ok {
+		return backend.RecordingDirectoryBytesContext(ctx, recordingID)
+	}
+	return s.StorageBackend.RecordingDirectoryBytes(recordingID)
 }
 
 // CreateRecordingWithSidecar atomically initializes one recording with a

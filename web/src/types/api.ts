@@ -68,10 +68,11 @@ export type RecordingSummary = {
 export type RecordingListItem = {
   id: string; title?: string; adapter_id: string; adapter_name?: string; state: RecordingState;
   resource_type?: string; resource_id?: string; tags: string[]; created_at: string; started_at: string;
-  duration_seconds: number; archive_size_bytes: number; media_payload_size_bytes: number;
+  duration_seconds: number; archive_size_bytes: number | null; media_payload_size_bytes: number;
   manifest_size_bytes: number; init_payload_size_bytes: number; segment_count: number;
   init_segment_count: number; manifest_snapshot_count: number; gap_count: number;
-  gap_segment_count: number; gap_duration_seconds: number | null; integrity: IntegrityStatus; preview?: PreviewSummary
+  gap_segment_count: number; gap_duration_seconds: number | null; integrity: IntegrityStatus; preview?: PreviewSummary;
+  statistics_status?: 'complete' | 'partial'; unavailable_fields?: string[]
 }
 export type RecordingDetail = {
   format_version?: number; id: string; title?: string; adapter_id?: string;
@@ -86,10 +87,11 @@ export type SourceMetadataRevision = { observed_at: string; source_updated_at?: 
 export type RecordingMetadata = { current?: SourceMetadataRevision; items: SourceMetadataRevision[]; truncated: boolean }
 export type IntegrityStatus = 'unknown' | 'verifying' | 'verified' | 'degraded' | 'failed'
 export type RecordingStatistics = {
-  duration_seconds?: number; archive_size_bytes?: number; media_payload_size_bytes?: number;
+  duration_seconds?: number; archive_size_bytes?: number | null; media_payload_size_bytes?: number;
   manifest_size_bytes?: number; init_payload_size_bytes?: number; segment_count?: number;
   init_segment_count?: number; manifest_snapshot_count?: number; gap_count?: number;
-  gap_segment_count?: number; gap_duration_seconds?: number | null; integrity?: IntegrityStatus
+  gap_segment_count?: number; gap_duration_seconds?: number | null; integrity?: IntegrityStatus;
+  status?: 'complete' | 'partial'; unavailable_fields?: string[]
 }
 export type RecordingPage = { items: RecordingListItem[]; next_cursor?: string; total: number }
 export type IntegrityResult = { status: IntegrityStatus; last_verified_at?: string; objects_total?: number; objects_verified?: number; objects_missing?: number; objects_corrupt?: number; issues?: { code: string; path?: string }[] }

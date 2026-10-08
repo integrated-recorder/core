@@ -35,7 +35,7 @@ func TestRecordingDetailIncludesDerivedArchiveStatistics(t *testing.T) {
 		t.Fatal(err)
 	}
 	stats := result.Statistics
-	if stats.ArchiveSizeBytes <= 0 || stats.MediaPayloadSizeBytes != int64(len("original-media-payload")) ||
+	if stats.ArchiveSizeBytes == nil || *stats.ArchiveSizeBytes <= 0 || stats.Status != "complete" || stats.UnavailableFields == nil || len(stats.UnavailableFields) != 0 || stats.MediaPayloadSizeBytes != int64(len("original-media-payload")) ||
 		stats.InitPayloadSizeBytes != int64(len("original-init-payload")) || stats.ManifestSizeBytes != int64(len("#EXTM3U\n")) ||
 		stats.SegmentCount != 1 || stats.InitSegmentCount != 1 || stats.ManifestSnapshotCount != 1 ||
 		stats.GapCount != 1 || stats.GapSegmentCount != 2 || stats.GapDurationSeconds != nil {

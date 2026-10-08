@@ -1064,17 +1064,26 @@ func (b *ObjectStoreArchiveBackend) ArchiveIndex(recording *domain.Recording) ([
 }
 
 func (b *ObjectStoreArchiveBackend) RecordingDirectoryBytes(id string) (int64, error) {
+	return b.RecordingDirectoryBytesContext(context.Background(), id)
+}
+
+// RecordingDirectoryBytesContext returns physical bytes under one recording
+// using the caller's cancellation context for provider listing.
+func (b *ObjectStoreArchiveBackend) RecordingDirectoryBytesContext(ctx context.Context, id string) (int64, error) {
 	if !recordingIDPattern.MatchString(id) {
 		return 0, errors.New("invalid recording id")
 	}
-	items, err := b.listAll(context.Background(), "recordings/"+id+"/", maxObjectEnumeration)
+	items, err := b.listAll(ctx, "recordings/"+id+"/", maxObjectEnumeration)
 	if err != nil {
 		return 0, errors.New("recording archive listing is unavailable")
 	}
 	var total int64
 	for _, item := range items {
-		if item.Size < 0 || total > math.MaxInt64-item.Size {
-			return 0, errors.New("recording archive size overflow")
+		if item.Size < 0 {
+			return 0, errors.New("recording archive contains an invalid object size")
+		}
+		if total > math.MaxInt64-item.Size {
+			return 0, ErrArchiveSizeOverflow
 		}
 		total += item.Size
 	}

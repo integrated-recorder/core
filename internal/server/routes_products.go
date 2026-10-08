@@ -40,6 +40,11 @@ const (
 	globalSearchTimeout      = 2 * time.Second
 )
 
+var (
+	errInvalidRecordingReadModel  = errors.New("recording read-model metadata is invalid")
+	errRecordingReadModelOverflow = errors.New("recording read-model value overflow")
+)
+
 func (s *Server) registerProductRoutes() {
 	s.registerDerivativeRoutes()
 	s.mux.HandleFunc("GET /api/v2/recordings", s.recordingsQuery)
@@ -81,15 +86,24 @@ func recordLockIndex(id string) uint32 {
 	return h.Sum32() % 64
 }
 
-// recordingQueryItem is a read-model projection. All payload sizes come from
-// canonical files referenced by recording metadata; no source URI is returned.
-func (s *Server) recordingQueryItem(recording *domain.Recording) (recordquery.Item, error) {
+// recordingQueryItem builds one list item. Canonical metadata errors remain
+// authoritative; provider and management projections degrade per item.
+func (s *Server) recordingQueryItem(ctx context.Context, recording *domain.Recording) (recordquery.Item, error) {
+	statistics, err := s.deriveRecordingStatistics(ctx, recording)
+	if err != nil {
+		return recordquery.Item{}, err
+	}
 	item := recordquery.Item{
 		ID: recording.ID, Title: recording.Title, AdapterID: recording.AdapterID,
 		State: string(recording.State), StartedAt: recording.StartedAt, CreatedAt: recording.CreatedAt,
-		DurationSeconds: recording.Duration(), SegmentCount: recording.SegmentCount(),
-		InitSegmentCount: 0, ManifestSnapshotCount: len(recording.Snapshots), GapCount: len(recording.Gaps),
-		GapDurationSeconds: nil, Integrity: string(storage.IntegrityUnknown), Tags: []string{},
+		DurationSeconds: statistics.DurationSeconds, ArchiveSizeBytes: statistics.ArchiveSizeBytes,
+		MediaPayloadSizeBytes: statistics.MediaPayloadSizeBytes, ManifestSizeBytes: statistics.ManifestSizeBytes,
+		InitPayloadSizeBytes: statistics.InitPayloadSizeBytes, SegmentCount: statistics.SegmentCount,
+		InitSegmentCount: statistics.InitSegmentCount, ManifestSnapshotCount: statistics.ManifestSnapshotCount,
+		GapCount: statistics.GapCount, GapSegmentCount: statistics.GapSegmentCount,
+		GapDurationSeconds: statistics.GapDurationSeconds, Integrity: string(statistics.Integrity),
+		StatisticsStatus: statistics.Status, UnavailableFields: append([]string{}, statistics.UnavailableFields...),
+		Tags: []string{},
 	}
 	if s.previews != nil {
 		previewSummary := s.previews.Summary(recording)
@@ -109,52 +123,13 @@ func (s *Server) recordingQueryItem(recording *domain.Recording) (recordquery.It
 	if s.products != nil {
 		tags, err := s.products.Tags(recording.ID)
 		if err != nil {
-			return recordquery.Item{}, err
-		}
-		item.Tags = tags
-	}
-	for _, track := range recording.Tracks {
-		if track == nil {
-			return recordquery.Item{}, errors.New("invalid recording track")
-		}
-		for _, segment := range track.Segments {
-			if segment.PayloadSize < 0 || !addInt64(&item.MediaPayloadSizeBytes, segment.PayloadSize) {
-				return recordquery.Item{}, errors.New("recording payload size overflow")
-			}
-		}
-		for _, segment := range track.InitSegments {
-			if segment.PayloadSize < 0 || !addInt64(&item.InitPayloadSizeBytes, segment.PayloadSize) {
-				return recordquery.Item{}, errors.New("recording init size overflow")
-			}
-		}
-		item.InitSegmentCount += len(track.InitSegments)
-	}
-	for _, snapshot := range recording.Snapshots {
-		if snapshot.Size < 0 || !addInt64(&item.ManifestSizeBytes, snapshot.Size) {
-			return recordquery.Item{}, errors.New("recording manifest size overflow")
+			item.StatisticsStatus = "partial"
+			item.UnavailableFields = append(item.UnavailableFields, "tags")
+			s.reportReadModelFailure(recording.ID, "tags", "management_unavailable")
+		} else {
+			item.Tags = tags
 		}
 	}
-	for _, gap := range recording.Gaps {
-		if gap.ToSequence < gap.FromSequence {
-			return recordquery.Item{}, errors.New("invalid gap metadata")
-		}
-		n := gap.ToSequence - gap.FromSequence + 1
-		maxInt := int(^uint(0) >> 1)
-		if n == 0 || item.GapSegmentCount < 0 || n > uint64(maxInt-item.GapSegmentCount) {
-			return recordquery.Item{}, errors.New("gap count overflow")
-		}
-		item.GapSegmentCount += int(n)
-	}
-	if s.integrity != nil {
-		if result, ok := s.integrity.Status(recording.ID); ok {
-			item.Integrity = string(result.Status)
-		}
-	}
-	archiveBytes, err := s.storage.RecordingDirectoryBytes(recording.ID)
-	if err != nil {
-		return recordquery.Item{}, err
-	}
-	item.ArchiveSizeBytes = archiveBytes
 	return item, nil
 }
 
@@ -166,20 +141,155 @@ func addInt64(target *int64, amount int64) bool {
 	return true
 }
 
-func (s *Server) recordingDetail(recording *domain.Recording) (recordingDetail, error) {
-	item, err := s.recordingQueryItem(recording)
+func (s *Server) deriveRecordingStatistics(ctx context.Context, recording *domain.Recording) (recordingStatistics, error) {
+	statistics, err := s.projectRecordingStatistics(ctx, recording)
+	if err != nil {
+		category := "invalid_metadata"
+		if errors.Is(err, errRecordingReadModelOverflow) {
+			category = "overflow"
+		}
+		recordingID := ""
+		if recording != nil {
+			recordingID = recording.ID
+		}
+		s.reportReadModelFailure(recordingID, "statistics_projection", category)
+	}
+	return statistics, err
+}
+
+func (s *Server) projectRecordingStatistics(ctx context.Context, recording *domain.Recording) (recordingStatistics, error) {
+	if recording == nil {
+		return recordingStatistics{}, errInvalidRecordingReadModel
+	}
+	statistics := recordingStatistics{
+		MediaPayloadSizeBytes: 0, ManifestSizeBytes: 0, InitPayloadSizeBytes: 0,
+		SegmentCount: 0, InitSegmentCount: 0,
+		ManifestSnapshotCount: len(recording.Snapshots), DurationSeconds: 0,
+		GapCount: len(recording.Gaps), GapDurationSeconds: nil, Integrity: storage.IntegrityUnknown,
+		Status: "complete", UnavailableFields: []string{},
+	}
+	for _, track := range recording.Tracks {
+		if track == nil {
+			return recordingStatistics{}, errInvalidRecordingReadModel
+		}
+		if len(track.Segments) > int(^uint(0)>>1)-statistics.SegmentCount {
+			return recordingStatistics{}, errRecordingReadModelOverflow
+		}
+		statistics.SegmentCount += len(track.Segments)
+		for _, segment := range track.Segments {
+			if math.IsNaN(segment.Duration) || math.IsInf(segment.Duration, 0) || segment.Duration < 0 {
+				return recordingStatistics{}, errInvalidRecordingReadModel
+			}
+			statistics.DurationSeconds += segment.Duration
+			if math.IsInf(statistics.DurationSeconds, 0) {
+				return recordingStatistics{}, errRecordingReadModelOverflow
+			}
+			if segment.PayloadSize < 0 || !addInt64(&statistics.MediaPayloadSizeBytes, segment.PayloadSize) {
+				if segment.PayloadSize < 0 {
+					return recordingStatistics{}, errInvalidRecordingReadModel
+				}
+				return recordingStatistics{}, errRecordingReadModelOverflow
+			}
+		}
+		for _, segment := range track.InitSegments {
+			if segment.PayloadSize < 0 {
+				return recordingStatistics{}, errInvalidRecordingReadModel
+			}
+			if !addInt64(&statistics.InitPayloadSizeBytes, segment.PayloadSize) {
+				return recordingStatistics{}, errRecordingReadModelOverflow
+			}
+		}
+		if len(track.InitSegments) > int(^uint(0)>>1)-statistics.InitSegmentCount {
+			return recordingStatistics{}, errRecordingReadModelOverflow
+		}
+		statistics.InitSegmentCount += len(track.InitSegments)
+	}
+	for _, snapshot := range recording.Snapshots {
+		if snapshot.Size < 0 {
+			return recordingStatistics{}, errInvalidRecordingReadModel
+		}
+		if !addInt64(&statistics.ManifestSizeBytes, snapshot.Size) {
+			return recordingStatistics{}, errRecordingReadModelOverflow
+		}
+	}
+	for _, gap := range recording.Gaps {
+		if gap.ToSequence < gap.FromSequence {
+			return recordingStatistics{}, errInvalidRecordingReadModel
+		}
+		n := gap.ToSequence - gap.FromSequence + 1
+		maxInt := int(^uint(0) >> 1)
+		if n == 0 || statistics.GapSegmentCount < 0 || n > uint64(maxInt-statistics.GapSegmentCount) {
+			return recordingStatistics{}, errRecordingReadModelOverflow
+		}
+		statistics.GapSegmentCount += int(n)
+	}
+	if s.integrity != nil {
+		if result, ok := s.integrity.Status(recording.ID); ok {
+			statistics.Integrity = result.Status
+		}
+	}
+	var archiveBytes int64
+	var archiveErr error
+	if s.storage == nil {
+		archiveErr = errors.New("storage backend is unavailable")
+	} else {
+		archiveBytes, archiveErr = s.storage.RecordingDirectoryBytesContext(ctx, recording.ID)
+	}
+	if archiveErr != nil {
+		statistics.Status = "partial"
+		statistics.UnavailableFields = append(statistics.UnavailableFields, "archive_size_bytes")
+		category := "provider_list_unavailable"
+		if errors.Is(archiveErr, storage.ErrArchiveSizeOverflow) {
+			category = "overflow"
+		}
+		if ctx != nil && ctx.Err() != nil {
+			archiveErr = ctx.Err()
+		}
+		if !errors.Is(archiveErr, context.Canceled) && !errors.Is(archiveErr, context.DeadlineExceeded) {
+			s.reportReadModelFailure(recording.ID, "archive_size", category)
+		}
+	} else {
+		statistics.ArchiveSizeBytes = &archiveBytes
+	}
+	return statistics, nil
+}
+
+func (s *Server) reportReadModelFailure(recordingID, component, category string) {
+	if s.logs == nil {
+		return
+	}
+	if len(recordingID) != 32 {
+		recordingID = "invalid"
+	} else {
+		for _, character := range recordingID {
+			if character < '0' || character > '9' {
+				if character < 'a' || character > 'f' {
+					recordingID = "invalid"
+					break
+				}
+			}
+		}
+	}
+	switch component {
+	case "archive_size", "tags", "statistics_projection":
+	default:
+		component = "other"
+	}
+	switch category {
+	case "provider_list_unavailable", "invalid_metadata", "overflow", "management_unavailable":
+	default:
+		category = "other"
+	}
+	s.logs.Add("warn", "recording-read-model", fmt.Sprintf("recording=%s component=%s category=%s", recordingID, component, category))
+}
+
+func (s *Server) recordingDetail(ctx context.Context, recording *domain.Recording) (recordingDetail, error) {
+	statistics, err := s.deriveRecordingStatistics(ctx, recording)
 	if err != nil {
 		return recordingDetail{}, err
 	}
 	response := detail(recording)
-	response.Statistics = &recordingStatistics{
-		ArchiveSizeBytes: item.ArchiveSizeBytes, MediaPayloadSizeBytes: item.MediaPayloadSizeBytes,
-		ManifestSizeBytes: item.ManifestSizeBytes, InitPayloadSizeBytes: item.InitPayloadSizeBytes,
-		SegmentCount: item.SegmentCount, InitSegmentCount: item.InitSegmentCount,
-		ManifestSnapshotCount: item.ManifestSnapshotCount, DurationSeconds: item.DurationSeconds,
-		GapCount: item.GapCount, GapSegmentCount: item.GapSegmentCount,
-		GapDurationSeconds: item.GapDurationSeconds, Integrity: storage.IntegrityStatus(item.Integrity),
-	}
+	response.Statistics = &statistics
 	if s.previews != nil {
 		previewSummary := s.previews.Summary(recording)
 		response.Preview = &previewSummary
@@ -213,7 +323,7 @@ func (s *Server) recordingsQuery(w http.ResponseWriter, r *http.Request) {
 			writeStorageError(w, getErr)
 			return
 		}
-		item, itemErr := s.recordingQueryItem(recording)
+		item, itemErr := s.recordingQueryItem(r.Context(), recording)
 		lock.RUnlock()
 		if itemErr != nil {
 			writeError(w, http.StatusServiceUnavailable, "recording statistics are temporarily unavailable")

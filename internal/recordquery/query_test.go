@@ -13,14 +13,16 @@ import (
 func fixtureItems() []Item {
 	base := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	return []Item{
-		{ID: "z", Title: "Evening", AdapterID: "owncast", AdapterName: "Owncast", State: "completed", ResourceType: "alpha", ResourceID: "res-z", Tags: []string{"concert"}, StartedAt: base.Add(24 * time.Hour), CreatedAt: base, DurationSeconds: 10, ArchiveSizeBytes: 100, GapDurationSeconds: ptr(0.5), GapCount: 1, Integrity: "verified"},
-		{ID: "b", Title: "Morning", AdapterID: "other", AdapterName: "Other Adapter", State: "stopped", ResourceType: "beta", ResourceID: "stable-b", Tags: []string{"important"}, StartedAt: base.Add(24 * time.Hour), CreatedAt: base.Add(48 * time.Hour), DurationSeconds: 30, ArchiveSizeBytes: 200, GapSegmentCount: 2, Integrity: "degraded"},
-		{ID: "a", Title: "Concert Live", AdapterID: "other", AdapterName: "Other Adapter", State: "completed", ResourceType: "alpha", ResourceID: "stable-a", Tags: []string{"archive"}, StartedAt: base, CreatedAt: base.Add(24 * time.Hour), DurationSeconds: 20, ArchiveSizeBytes: 300, GapDurationSeconds: nil, Integrity: "unknown"},
-		{ID: "c", Title: "Late Show", AdapterID: "third", AdapterName: "Third", State: "interrupted", ResourceType: "gamma", ResourceID: "stable-c", Tags: []string{"concert", "important"}, StartedAt: base.Add(48 * time.Hour), CreatedAt: base.Add(72 * time.Hour), DurationSeconds: 40, ArchiveSizeBytes: 50, GapCount: 1, Integrity: "failed"},
+		{ID: "z", Title: "Evening", AdapterID: "owncast", AdapterName: "Owncast", State: "completed", ResourceType: "alpha", ResourceID: "res-z", Tags: []string{"concert"}, StartedAt: base.Add(24 * time.Hour), CreatedAt: base, DurationSeconds: 10, ArchiveSizeBytes: ptrInt64(100), GapDurationSeconds: ptr(0.5), GapCount: 1, Integrity: "verified"},
+		{ID: "b", Title: "Morning", AdapterID: "other", AdapterName: "Other Adapter", State: "stopped", ResourceType: "beta", ResourceID: "stable-b", Tags: []string{"important"}, StartedAt: base.Add(24 * time.Hour), CreatedAt: base.Add(48 * time.Hour), DurationSeconds: 30, ArchiveSizeBytes: ptrInt64(200), GapSegmentCount: 2, Integrity: "degraded"},
+		{ID: "a", Title: "Concert Live", AdapterID: "other", AdapterName: "Other Adapter", State: "completed", ResourceType: "alpha", ResourceID: "stable-a", Tags: []string{"archive"}, StartedAt: base, CreatedAt: base.Add(24 * time.Hour), DurationSeconds: 20, ArchiveSizeBytes: ptrInt64(300), GapDurationSeconds: nil, Integrity: "unknown"},
+		{ID: "c", Title: "Late Show", AdapterID: "third", AdapterName: "Third", State: "interrupted", ResourceType: "gamma", ResourceID: "stable-c", Tags: []string{"concert", "important"}, StartedAt: base.Add(48 * time.Hour), CreatedAt: base.Add(72 * time.Hour), DurationSeconds: 40, ArchiveSizeBytes: ptrInt64(50), GapCount: 1, Integrity: "failed"},
 	}
 }
 
 func ptr(v float64) *float64 { return &v }
+
+func ptrInt64(v int64) *int64 { return &v }
 
 func TestParseQueryDatesAndLimits(t *testing.T) {
 	values := url.Values{

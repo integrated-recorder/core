@@ -47,7 +47,7 @@ type Item struct {
 	StartedAt             time.Time        `json:"started_at"`
 	CreatedAt             time.Time        `json:"created_at"`
 	DurationSeconds       float64          `json:"duration_seconds"`
-	ArchiveSizeBytes      int64            `json:"archive_size_bytes"`
+	ArchiveSizeBytes      *int64           `json:"archive_size_bytes"`
 	MediaPayloadSizeBytes int64            `json:"media_payload_size_bytes"`
 	ManifestSizeBytes     int64            `json:"manifest_size_bytes"`
 	InitPayloadSizeBytes  int64            `json:"init_payload_size_bytes"`
@@ -59,6 +59,8 @@ type Item struct {
 	GapDurationSeconds    *float64         `json:"gap_duration_seconds"`
 	Integrity             string           `json:"integrity"`
 	Preview               *preview.Summary `json:"preview,omitempty"`
+	StatisticsStatus      string           `json:"statistics_status"`
+	UnavailableFields     []string         `json:"unavailable_fields"`
 }
 
 // Query contains the normalized recording-list filters. StartedAfter and
@@ -329,7 +331,7 @@ func validateItem(item Item) error {
 	if math.IsNaN(item.DurationSeconds) || math.IsInf(item.DurationSeconds, 0) || item.DurationSeconds < 0 {
 		return fmt.Errorf("%w: invalid duration summary", errInvalidQuery)
 	}
-	if item.ArchiveSizeBytes < 0 || item.MediaPayloadSizeBytes < 0 || item.ManifestSizeBytes < 0 || item.InitPayloadSizeBytes < 0 || item.SegmentCount < 0 || item.InitSegmentCount < 0 || item.ManifestSnapshotCount < 0 || item.GapCount < 0 || item.GapSegmentCount < 0 {
+	if item.ArchiveSizeBytes != nil && *item.ArchiveSizeBytes < 0 || item.MediaPayloadSizeBytes < 0 || item.ManifestSizeBytes < 0 || item.InitPayloadSizeBytes < 0 || item.SegmentCount < 0 || item.InitSegmentCount < 0 || item.ManifestSnapshotCount < 0 || item.GapCount < 0 || item.GapSegmentCount < 0 {
 		return fmt.Errorf("%w: invalid statistics summary", errInvalidQuery)
 	}
 	if item.GapDurationSeconds != nil && (math.IsNaN(*item.GapDurationSeconds) || math.IsInf(*item.GapDurationSeconds, 0) || *item.GapDurationSeconds < 0) {
@@ -415,7 +417,7 @@ func compare(a, b Item, sortKey string) int {
 	case "duration":
 		primary = compareFloat(a.DurationSeconds, b.DurationSeconds)
 	case "size":
-		primary = compareInt64(a.ArchiveSizeBytes, b.ArchiveSizeBytes)
+		primary = compareInt64(archiveSizeValue(a.ArchiveSizeBytes), archiveSizeValue(b.ArchiveSizeBytes))
 	}
 	if desc {
 		primary = -primary
@@ -424,6 +426,13 @@ func compare(a, b Item, sortKey string) int {
 		return primary
 	}
 	return strings.Compare(a.ID, b.ID)
+}
+
+func archiveSizeValue(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func compareTime(a, b time.Time) int {
@@ -517,7 +526,7 @@ func cursorItem(cursor cursorData, sortKey string) (Item, error) {
 		if err != nil {
 			return Item{}, fmt.Errorf("%w: malformed cursor value", errInvalidQuery)
 		}
-		item.ArchiveSizeBytes = value
+		item.ArchiveSizeBytes = &value
 	default:
 		return Item{}, fmt.Errorf("%w: malformed cursor key", errInvalidQuery)
 	}
@@ -533,7 +542,7 @@ func sortValue(item Item, key string) (string, error) {
 	case "duration":
 		return strconv.FormatFloat(item.DurationSeconds, 'g', -1, 64), nil
 	case "size":
-		return strconv.FormatInt(item.ArchiveSizeBytes, 10), nil
+		return strconv.FormatInt(archiveSizeValue(item.ArchiveSizeBytes), 10), nil
 	default:
 		return "", fmt.Errorf("%w: unsupported cursor key", errInvalidQuery)
 	}

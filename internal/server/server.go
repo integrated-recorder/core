@@ -334,7 +334,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	s.applyPreviewPolicy(recording.ID, previewMode)
 	s.appendRecordingEvent(recording.ID, "recording_started", recording.StartedAt, 0, "")
-	response, responseErr := s.recordingDetail(recording)
+	response, responseErr := s.recordingDetail(r.Context(), recording)
 	if responseErr != nil {
 		writeJSON(w, http.StatusCreated, detail(recording))
 		return
@@ -461,7 +461,7 @@ func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
 	}
 	s.applyPreviewPolicy(recording.ID, workflow.previewMode)
 	s.appendRecordingEvent(recording.ID, "recording_started", recording.StartedAt, 0, "")
-	response, responseErr := s.recordingDetail(recording)
+	response, responseErr := s.recordingDetail(r.Context(), recording)
 	if responseErr != nil {
 		writeJSON(w, http.StatusCreated, detail(recording))
 		return
@@ -770,7 +770,7 @@ type recordingDetail struct {
 }
 
 type recordingStatistics struct {
-	ArchiveSizeBytes      int64                   `json:"archive_size_bytes"`
+	ArchiveSizeBytes      *int64                  `json:"archive_size_bytes"`
 	MediaPayloadSizeBytes int64                   `json:"media_payload_size_bytes"`
 	ManifestSizeBytes     int64                   `json:"manifest_size_bytes"`
 	InitPayloadSizeBytes  int64                   `json:"init_payload_size_bytes"`
@@ -782,6 +782,8 @@ type recordingStatistics struct {
 	GapSegmentCount       int                     `json:"gap_segment_count"`
 	GapDurationSeconds    *float64                `json:"gap_duration_seconds"`
 	Integrity             storage.IntegrityStatus `json:"integrity"`
+	Status                string                  `json:"status"`
+	UnavailableFields     []string                `json:"unavailable_fields"`
 }
 
 func detail(r *domain.Recording) recordingDetail {
@@ -831,7 +833,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, err)
 		return
 	}
-	response, err := s.recordingDetail(recording)
+	response, err := s.recordingDetail(r.Context(), recording)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "recording statistics are temporarily unavailable")
 		return

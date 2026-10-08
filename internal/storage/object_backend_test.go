@@ -41,6 +41,24 @@ type identifiedMemoryPhysicalObjects struct {
 	name string
 }
 
+type blockingListPhysicalObjects struct {
+	*memoryPhysicalObjects
+	listStarted chan context.Context
+	releaseList chan struct{}
+}
+
+func (m *blockingListPhysicalObjects) List(ctx context.Context, prefix, cursor string, limit int) (PhysicalObjectPage, error) {
+	m.listStarted <- ctx
+	select {
+	case <-ctx.Done():
+		return PhysicalObjectPage{}, ctx.Err()
+	case <-m.releaseList:
+		return PhysicalObjectPage{}, errors.New("test list released")
+	}
+}
+
+type recordingDirectoryRequestContextKey struct{}
+
 func (m identifiedMemoryPhysicalObjects) StorageProviderIdentity() (string, string) {
 	return m.id, m.name
 }
@@ -658,6 +676,71 @@ func TestObjectStoreContextCancellationAndDeadline(t *testing.T) {
 	stop()
 	if _, err := store.StorageBackend.(*ObjectStoreArchiveBackend).SavePayloadContext(canceled, id, "tracks/main/canceled.m4s", bytes.NewReader([]byte("x")), 100); err == nil {
 		t.Fatal("canceled call succeeded")
+	}
+}
+
+func TestObjectStoreRecordingDirectoryBytesContextPropagatesCancellation(t *testing.T) {
+	objects := &blockingListPhysicalObjects{
+		memoryPhysicalObjects: newMemoryPhysicalObjects(),
+		listStarted:           make(chan context.Context, 1),
+		releaseList:           make(chan struct{}, 1),
+	}
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := store.StorageBackend.(*ObjectStoreArchiveBackend)
+	const id = "55555555555555555555555555555555"
+	marker := new(int)
+	requestCtx, cancel := context.WithCancel(context.WithValue(context.Background(), recordingDirectoryRequestContextKey{}, marker))
+	defer cancel()
+	type result struct {
+		bytes int64
+		err   error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		byteCount, err := backend.RecordingDirectoryBytesContext(requestCtx, id)
+		resultCh <- result{bytes: byteCount, err: err}
+	}()
+	completed := false
+	defer func() {
+		cancel()
+		if completed {
+			return
+		}
+		select {
+		case objects.releaseList <- struct{}{}:
+		default:
+		}
+		select {
+		case <-resultCh:
+		case <-time.After(time.Second):
+			t.Error("recording byte listing did not exit")
+		}
+	}()
+
+	var providerCtx context.Context
+	select {
+	case providerCtx = <-objects.listStarted:
+	case <-time.After(time.Second):
+		t.Fatal("provider List was not called")
+	}
+	if providerCtx.Value(recordingDirectoryRequestContextKey{}) != marker {
+		t.Fatal("provider List did not receive request context")
+	}
+	cancel()
+	if !errors.Is(providerCtx.Err(), context.Canceled) {
+		t.Fatalf("provider context error = %v, want context.Canceled", providerCtx.Err())
+	}
+	select {
+	case got := <-resultCh:
+		completed = true
+		if got.bytes != 0 || got.err == nil {
+			t.Fatalf("canceled listing = %d, %v; want 0 bytes and error", got.bytes, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled recording byte listing did not exit")
 	}
 }
 

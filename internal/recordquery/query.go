@@ -417,15 +417,34 @@ func compare(a, b Item, sortKey string) int {
 	case "duration":
 		primary = compareFloat(a.DurationSeconds, b.DurationSeconds)
 	case "size":
-		primary = compareInt64(archiveSizeValue(a.ArchiveSizeBytes), archiveSizeValue(b.ArchiveSizeBytes))
+		primary = compareArchiveSize(a.ArchiveSizeBytes, b.ArchiveSizeBytes, desc)
 	}
-	if desc {
+	if desc && key != "size" {
 		primary = -primary
 	}
 	if primary != 0 {
 		return primary
 	}
 	return strings.Compare(a.ID, b.ID)
+}
+
+// compareArchiveSize keeps unknown sizes last in either direction. Direction
+// applies only when both values are known.
+func compareArchiveSize(a, b *int64, desc bool) int {
+	if a == nil {
+		if b == nil {
+			return 0
+		}
+		return 1
+	}
+	if b == nil {
+		return -1
+	}
+	result := compareInt64(*a, *b)
+	if desc {
+		return -result
+	}
+	return result
 }
 
 func archiveSizeValue(value *int64) int64 {
@@ -471,6 +490,7 @@ type cursorData struct {
 	Value       string `json:"x"`
 	ID          string `json:"i"`
 	Fingerprint string `json:"f"`
+	Missing     bool   `json:"m,omitempty"`
 }
 
 func encodeCursor(item Item, sortKey, fingerprint string) (string, error) {
@@ -479,7 +499,8 @@ func encodeCursor(item Item, sortKey, fingerprint string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	data, err := json.Marshal(cursorData{Version: 1, Key: key, Value: value, ID: item.ID, Fingerprint: fingerprint})
+	missing := key == "size" && item.ArchiveSizeBytes == nil
+	data, err := json.Marshal(cursorData{Version: 1, Key: key, Value: value, ID: item.ID, Fingerprint: fingerprint, Missing: missing})
 	if err != nil {
 		return "", fmt.Errorf("encode cursor: %w", err)
 	}
@@ -504,6 +525,9 @@ func decodeCursor(raw string) (*cursorData, error) {
 func cursorItem(cursor cursorData, sortKey string) (Item, error) {
 	item := Item{ID: cursor.ID}
 	key := validSorts[sortKey]
+	if cursor.Missing && key != "size" {
+		return Item{}, fmt.Errorf("%w: malformed cursor value", errInvalidQuery)
+	}
 	switch key {
 	case "started_at", "created_at":
 		value, err := time.Parse(time.RFC3339Nano, cursor.Value)
@@ -522,6 +546,13 @@ func cursorItem(cursor cursorData, sortKey string) (Item, error) {
 		}
 		item.DurationSeconds = value
 	case "size":
+		if cursor.Missing {
+			if cursor.Value != "0" {
+				return Item{}, fmt.Errorf("%w: malformed cursor value", errInvalidQuery)
+			}
+			item.ArchiveSizeBytes = nil
+			break
+		}
 		value, err := strconv.ParseInt(cursor.Value, 10, 64)
 		if err != nil {
 			return Item{}, fmt.Errorf("%w: malformed cursor value", errInvalidQuery)

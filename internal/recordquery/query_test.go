@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,123 @@ func TestPageSupportsAllSortDirectionsAndIDTieBreak(t *testing.T) {
 				t.Fatalf("got %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func archiveSizeItems() []Item {
+	return []Item{
+		{ID: "unknown-b", ArchiveSizeBytes: nil},
+		{ID: "known-20", ArchiveSizeBytes: ptrInt64(20)},
+		{ID: "unknown-a", ArchiveSizeBytes: nil},
+		{ID: "known-0", ArchiveSizeBytes: ptrInt64(0)},
+		{ID: "known-10", ArchiveSizeBytes: ptrInt64(10)},
+	}
+}
+
+func TestSizeSortKeepsUnknownLastInBothDirections(t *testing.T) {
+	tests := []struct {
+		sort string
+		want []string
+	}{
+		{"size", []string{"known-0", "known-10", "known-20", "unknown-a", "unknown-b"}},
+		{"-size", []string{"known-20", "known-10", "known-0", "unknown-a", "unknown-b"}},
+	}
+	for _, test := range tests {
+		t.Run(test.sort, func(t *testing.T) {
+			result, err := Page(archiveSizeItems(), Query{Sort: test.sort})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := ids(result.Items); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got IDs %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSizeCursorDistinguishesKnownZeroFromUnknown(t *testing.T) {
+	query, err := normalize(Query{Sort: "size", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := filterFingerprint(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	legacyJSON := `{"v":1,"k":"size","x":"0","i":"known-0","f":"` + fingerprint + `"}`
+	legacyCursor := base64.RawURLEncoding.EncodeToString([]byte(legacyJSON))
+	result, err := Page(archiveSizeItems(), Query{Sort: "size", Limit: 1, Cursor: legacyCursor})
+	if err != nil {
+		t.Fatalf("legacy known-size cursor rejected: %v", err)
+	}
+	if got := ids(result.Items); !reflect.DeepEqual(got, []string{"known-10"}) {
+		t.Fatalf("legacy zero cursor was treated as unknown: got %v", got)
+	}
+
+	unknown := Item{ID: "unknown-a"}
+	encoded, err := encodeCursor(unknown, "size", fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cursor cursorData
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Value != "0" || !cursor.Missing {
+		t.Fatalf("unknown cursor must mark missing zero distinctly: %+v", cursor)
+	}
+
+	known, err := encodeCursor(Item{ID: "known-0", ArchiveSizeBytes: ptrInt64(0)}, "size", fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	knownData, err := base64.RawURLEncoding.DecodeString(known)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(knownData), `"m"`) {
+		t.Fatalf("known-size cursor changed legacy representation: %s", knownData)
+	}
+}
+
+func TestSizeCursorPaginationHasNoDuplicatesOrSkips(t *testing.T) {
+	items := archiveSizeItems()
+	for _, sortKey := range []string{"size", "-size"} {
+		sortKey := sortKey
+		full, err := Page(items, Query{Sort: sortKey, Limit: maximumLimit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := ids(full.Items)
+		for _, limit := range []int{1, 2} {
+			limit := limit
+			t.Run(sortKey+"/limit="+strconv.Itoa(limit), func(t *testing.T) {
+				query := Query{Sort: sortKey, Limit: limit}
+				var got []string
+				for pageCount := 0; ; pageCount++ {
+					if pageCount > len(items) {
+						t.Fatal("cursor pagination did not terminate")
+					}
+					page, err := Page(items, query)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got = append(got, ids(page.Items)...)
+					if page.NextCursor == "" {
+						break
+					}
+					query.Cursor = page.NextCursor
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("paged IDs %v, want %v", got, want)
+				}
+			})
+		}
 	}
 }
 

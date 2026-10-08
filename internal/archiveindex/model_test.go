@@ -278,6 +278,37 @@ func TestLegacyAdoptionPreservesIDsPathsHashesAndDoesNotMutateInput(t *testing.T
 	}
 }
 
+func TestFromRecordingAllowsRepeatedInitObjectIDAtDistinctCoordinates(t *testing.T) {
+	initBytes := []byte("identical init bytes")
+	digest := sha256.Sum256(initBytes)
+	recording := &domain.Recording{
+		ID: "late-history-recording", AdapterID: "fixture", SourceSessionID: "session-" + strings.Repeat("b", 64),
+		State: domain.StateRecording, StartedAt: testTime,
+		Tracks: map[string]*domain.Track{"main": {
+			ID: "main",
+			InitSegments: []domain.Segment{
+				{ID: "init-shared-map", TrackID: "main", Sequence: 100, SourceURI: "https://media.example/init.mp4", StoragePath: "tracks/main/init-a.mp4", PayloadSize: int64(len(initBytes)), SHA256: hex.EncodeToString(digest[:]), IsInit: true},
+				{ID: "init-shared-map", TrackID: "main", Sequence: 101, SourceURI: "https://media.example/init.mp4", StoragePath: "tracks/main/init-b.mp4", PayloadSize: int64(len(initBytes)), SHA256: hex.EncodeToString(digest[:]), IsInit: true},
+			},
+		}},
+	}
+	inventory, err := FromRecording(recording, false)
+	if err != nil {
+		t.Fatalf("reconstruct repeated init reference: %v", err)
+	}
+	if len(inventory.Segments) != 2 {
+		t.Fatalf("init coordinates = %d, want 2", len(inventory.Segments))
+	}
+	if inventory.Segments[0].ID == inventory.Segments[1].ID || inventory.Segments[0].Claims[0].ID == inventory.Segments[1].Claims[0].ID {
+		t.Fatal("distinct init coordinates must have distinct inventory and claim identities")
+	}
+	for _, segment := range inventory.Segments {
+		if segment.Coordinate.Kind != ObjectInit || segment.Claims[0].LegacySegmentID != "init-shared-map" {
+			t.Fatalf("legacy init identity was not preserved: %#v", segment)
+		}
+	}
+}
+
 func TestSessionIdentityRequiresExplicitSessionReferenceToCrossRecordings(t *testing.T) {
 	resource := &domain.ResourceReference{Type: "channel", ID: "channel-1"}
 	first, err := NewSessionIdentity("recording-a", "fixture", resource, "")

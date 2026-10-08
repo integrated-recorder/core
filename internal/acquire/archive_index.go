@@ -449,7 +449,7 @@ func archiveClaimShardForInventory(inventory archiveindex.Inventory, segmentID s
 			continue
 		}
 		for _, claim := range segment.Claims {
-			if claim.ID == "legacy-media:"+rootSegmentID || claim.ID == "legacy-init:"+rootSegmentID {
+			if isLegacyRootAdoptionClaim(claim, rootSegmentID) {
 				continue
 			}
 			// The root-selected claim is reconstructed from recording.json. Store
@@ -471,6 +471,11 @@ func archiveClaimShardForInventory(inventory archiveindex.Inventory, segmentID s
 		return archiveClaimShard{}, nil, ErrArchiveIndexLimit
 	}
 	return shard, encoded, nil
+}
+
+func isLegacyRootAdoptionClaim(claim archiveindex.Claim, rootSegmentID string) bool {
+	return rootSegmentID != "" && claim.Source == archiveindex.ClaimUnknown &&
+		claim.Evidence == "legacy archive adoption" && claim.LegacySegmentID == rootSegmentID
 }
 
 func preferPersistedSelectedClaim(inventory *archiveindex.Inventory, coordinate archiveindex.Coordinate, persisted archiveindex.Claim) {
@@ -589,7 +594,7 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 		e.mu.Unlock()
 		identity, err := archiveSessionIdentity(rootSnapshot, adapterID, sessionRef)
 		if err != nil {
-			return err
+			return newStorageStageError("reconstruct archive inventory", err)
 		}
 		rootSnapshot.SourceSessionID = identity.ID
 		segment.TrackID = "main"

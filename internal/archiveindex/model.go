@@ -804,10 +804,15 @@ func appendLegacySegment(inventory *Inventory, legacy domain.Segment, fallbackTr
 	if err != nil {
 		return err
 	}
-	claimID := "legacy-" + string(kind) + ":" + legacy.ID
 	if legacy.ID == "" {
 		return fmt.Errorf("%w: legacy segment has no ID", ErrInvalidInventory)
 	}
+	// Domain IDs are not guaranteed to be unique across archive coordinates.
+	// HLS init-map IDs intentionally repeat when the same map is observed at
+	// multiple media sequences, so derive the synthetic adoption claim from
+	// the coordinate identity instead. Keep LegacySegmentID as the original
+	// root reference for provenance and reconciliation.
+	claimID := "legacy-" + string(kind) + ":" + segmentID
 	segment := Segment{
 		ID: segmentID, Coordinate: coordinate, Duration: legacy.Duration,
 		ProgramDateTime: cloneTime(legacy.ProgramDateTime), InitIdentity: legacy.InitSegmentID,

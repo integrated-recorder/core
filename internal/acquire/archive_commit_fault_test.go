@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
@@ -171,6 +172,33 @@ func TestCanonicalCommitFaultPointsRemainRetryableAndRootSafe(t *testing.T) {
 					assertStoredPayload(t, store, root.ID, selected.StoragePath, payload)
 				})
 			}
+		}
+	}
+}
+
+func TestRepeatedLegacyInitIdentityIsNotPersistedAsSupplementalClaim(t *testing.T) {
+	recording := &domain.Recording{
+		ID: "legacy-init-repeat", AdapterID: "fixture", SourceSessionID: "session-" + strings.Repeat("c", 64),
+		State: domain.StateRecording, StartedAt: time.Now().UTC(),
+		Tracks: map[string]*domain.Track{"main": {
+			ID: "main",
+			InitSegments: []domain.Segment{
+				{ID: "init-shared", TrackID: "main", Sequence: 10, StoragePath: "tracks/main/init-a.mp4", PayloadSize: 4, SHA256: strings.Repeat("a", 64), IsInit: true},
+				{ID: "init-shared", TrackID: "main", Sequence: 11, StoragePath: "tracks/main/init-b.mp4", PayloadSize: 4, SHA256: strings.Repeat("a", 64), IsInit: true},
+			},
+		}},
+	}
+	inventory, err := archiveindex.FromRecording(recording, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, segment := range inventory.Segments {
+		_, encoded, err := archiveClaimShardForInventory(inventory, segment.ID, segment.Coordinate, "init-shared")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(encoded) != 0 {
+			t.Fatal("synthetic root-adoption claim was persisted as source provenance")
 		}
 	}
 }

@@ -1,8 +1,9 @@
 export class APIError extends Error {
   readonly status: number
   readonly requestID?: string
-  constructor(status: number, message: string, requestID?: string) {
-    super(message); this.name = 'APIError'; this.status = status; this.requestID = requestID
+  readonly errorCode?: string
+  constructor(status: number, message: string, requestID?: string, errorCode?: string) {
+    super(message); this.name = 'APIError'; this.status = status; this.requestID = requestID; this.errorCode = errorCode
   }
 }
 
@@ -36,9 +37,12 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
       window.dispatchEvent(new CustomEvent('ir:unauthorized'))
     }
     const payloadError = typeof data === 'object' && data !== null && 'error' in data ? (data as { error: unknown }).error : undefined
+    const payloadCode = typeof data === 'object' && data !== null
+      ? ('error_code' in data ? (data as { error_code: unknown }).error_code : 'code' in data ? (data as { code: unknown }).code : undefined)
+      : undefined
     const payloadMessage = typeof data === 'object' && data !== null && 'message' in data ? (data as { message: unknown }).message : undefined
     const detail = typeof payloadMessage === 'string' && payloadMessage.trim() ? payloadMessage : typeof payloadError === 'string' && payloadError.trim() ? payloadError : `요청 실패 (${response.status})`
-    throw new APIError(response.status, detail, response.headers.get('X-Request-ID') ?? undefined)
+    throw new APIError(response.status, detail, response.headers.get('X-Request-ID') ?? undefined, typeof payloadCode === 'string' ? payloadCode : undefined)
   }
   if (typeof data === 'object' && data !== null && 'csrf_token' in data) {
     const token = (data as { csrf_token?: unknown }).csrf_token

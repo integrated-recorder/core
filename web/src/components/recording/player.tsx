@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type Hls from 'hls.js'
 import { CircleAlert, Film } from 'lucide-react'
+import { useI18n } from '@/i18n/provider'
 
 type PlaylistSegment = { identity: string; duration: number; start: number; programDateTime?: number }
 type PlaybackAnchor = { identity: string; offset: number; index: number; programDateTime?: number; playlist: PlaylistSegment[]; currentTime: number }
@@ -111,21 +112,38 @@ function trackPlaylistURL(recordingId: string, timelineRevision?: number): strin
 }
 
 export function RecordingPlayer({ recordingId, active = false, hasCommittedSegments = true, timelineRevision, onVideoRef }: { recordingId: string; active?: boolean; hasCommittedSegments?: boolean; timelineRevision?: number; onVideoRef?: (video: HTMLVideoElement | null) => void }) {
+  const { locale, t } = useI18n()
   const videoRef = useRef<HTMLVideoElement>(null)
   const restoreRef = useRef<RestorePosition | undefined>(undefined)
   const vodPlaylistRef = useRef<{ recordingId: string; segments: PlaylistSegment[] } | undefined>(undefined)
-  const [error, setError] = useState('')
+  const [error, setError] = useState<'hlsUnsupported' | 'playbackFailed' | 'hlsModuleFailed' | undefined>()
+  const [buffering, setBuffering] = useState(false)
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
     let hls: Hls | undefined
     let mounted = true
-    setError('')
+    setError(undefined)
+    setBuffering(false)
+    const onWaiting = () => setBuffering(true)
+    const onPlayable = () => setBuffering(false)
+    video.addEventListener('waiting', onWaiting)
+    video.addEventListener('playing', onPlayable)
+    video.addEventListener('canplay', onPlayable)
+    video.addEventListener('pause', onPlayable)
+    video.addEventListener('ended', onPlayable)
+    const removeBufferingListeners = () => {
+      video.removeEventListener('waiting', onWaiting)
+      video.removeEventListener('playing', onPlayable)
+      video.removeEventListener('canplay', onPlayable)
+      video.removeEventListener('pause', onPlayable)
+      video.removeEventListener('ended', onPlayable)
+    }
     if (active && !hasCommittedSegments) {
       video.pause()
       video.removeAttribute('src')
       video.load()
-      return () => { mounted = false }
+      return () => { mounted = false; removeBufferingListeners() }
     }
     const baseSource = active
       ? `/api/recordings/${encodeURIComponent(recordingId)}/play/live/master.m3u8`
@@ -177,12 +195,12 @@ export function RecordingPlayer({ recordingId, active = false, hasCommittedSegme
     } else {
       void import('hls.js').then(({ default: HlsModule }) => {
         if (!mounted) return
-        if (!HlsModule.isSupported()) { setError('이 브라우저에서 HLS 재생을 지원하지 않습니다.'); return }
+        if (!HlsModule.isSupported()) { setError('hlsUnsupported'); return }
         hls = new HlsModule({ enableWorker: true, lowLatencyMode: false })
         hls.loadSource(source)
         hls.attachMedia(video)
-        hls.on(HlsModule.Events.ERROR, (_event, data) => { if (data.fatal && mounted) setError('재생을 시작하지 못했습니다. 보관 데이터 상태 또는 네트워크를 확인하세요.') })
-      }).catch(() => { if (mounted) setError('HLS 재생 모듈을 불러오지 못했습니다.') })
+        hls.on(HlsModule.Events.ERROR, (_event, data) => { if (data.fatal && mounted) setError('playbackFailed') })
+      }).catch(() => { if (mounted) setError('hlsModuleFailed') })
     }
     return () => {
       if (!active) {
@@ -196,11 +214,16 @@ export function RecordingPlayer({ recordingId, active = false, hasCommittedSegme
         }
       }
       mounted = false
+      removeBufferingListeners()
       video.removeEventListener('loadedmetadata', restorePosition)
       hls?.destroy(); video.pause(); video.removeAttribute('src'); video.load()
     }
   }, [recordingId, active, hasCommittedSegments, timelineRevision])
 
-  if (active && !hasCommittedSegments) return <div className="mx-auto grid aspect-video max-h-[360px] place-items-center rounded-md bg-muted p-6 text-center" role="status"><div><CircleAlert className="mx-auto h-6 w-6 text-muted-foreground" /><p className="mt-2 text-sm font-medium">첫 세그먼트를 기다리는 중입니다.</p><p className="mt-1 text-xs text-muted-foreground">세그먼트가 보관되면 실시간 HLS 재생이 시작됩니다.</p></div></div>
-  return <div className="overflow-hidden rounded-lg border border-border bg-black"><div className="relative mx-auto aspect-video max-h-[360px] w-full"><video ref={node => { videoRef.current = node; onVideoRef?.(node) }} className="h-full w-full object-contain" controls playsInline preload="metadata" aria-label={active ? '녹화 중 실시간 HLS 재생' : '녹화 VOD 재생'} />{error && <div className="absolute inset-0 grid place-items-center bg-black/80 p-6 text-center text-white"><div><CircleAlert className="mx-auto h-6 w-6 text-amber-300" /><p className="mt-2 text-sm font-medium">재생할 수 없습니다</p><p className="mt-1 max-w-sm text-xs text-white/70">{error}</p></div></div>}{!error && <div className="pointer-events-none absolute left-3 top-3 inline-flex items-center gap-1.5 rounded bg-black/55 px-2 py-1 text-[10px] font-medium text-white"><Film className="h-3 w-3" />{active ? '보관 세그먼트' : '원본 세그먼트'}</div>}</div></div>
+  const errorMessage = error === 'hlsUnsupported' ? t('detail.player.hlsUnsupported')
+    : error === 'playbackFailed' ? t('detail.player.playbackFailed')
+      : error === 'hlsModuleFailed' ? t('detail.player.hlsModuleFailed') : undefined
+  const videoLabel = t(active ? 'detail.player.liveAriaLabel' : 'detail.player.vodAriaLabel')
+  if (active && !hasCommittedSegments) return <div className="mx-auto grid aspect-video max-h-[360px] place-items-center rounded-md bg-muted p-6 text-center" role="status"><div><CircleAlert className="mx-auto h-6 w-6 text-muted-foreground" /><p className="mt-2 text-sm font-medium">{t('detail.player.waitingFirstSegment')}</p><p className="mt-1 text-xs text-muted-foreground">{t('detail.player.waitingFirstSegmentHelp')}</p></div></div>
+  return <div className="overflow-hidden rounded-lg border border-border bg-black"><div className="relative mx-auto aspect-video max-h-[360px] w-full"><video ref={node => { videoRef.current = node; onVideoRef?.(node) }} className="h-full w-full object-contain" controls playsInline preload="metadata" lang={locale} aria-label={buffering ? `${videoLabel} · ${t('detail.player.buffering')}` : videoLabel} />{errorMessage && <div className="absolute inset-0 grid place-items-center bg-black/80 p-6 text-center text-white"><div><CircleAlert className="mx-auto h-6 w-6 text-amber-300" /><p className="mt-2 text-sm font-medium">{t('detail.player.playbackUnavailable')}</p><p className="mt-1 max-w-sm text-xs text-white/70">{errorMessage}</p></div></div>}{!error && <div className="pointer-events-none absolute left-3 top-3 inline-flex items-center gap-1.5 rounded bg-black/55 px-2 py-1 text-[10px] font-medium text-white"><Film className="h-3 w-3" />{t(active ? 'detail.player.archivedSegments' : 'detail.player.originalSegments')}</div>}</div></div>
 }

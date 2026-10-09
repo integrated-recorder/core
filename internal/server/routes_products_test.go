@@ -85,7 +85,7 @@ func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
 
 	index := httptest.NewRecorder()
 	handler.ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recording.ID+"/archive/index", nil))
-	if index.Code != http.StatusOK || strings.Contains(index.Body.String(), "private.invalid") || strings.Contains(index.Body.String(), root) || !strings.Contains(index.Body.String(), "tracks/main/00000001.ts") {
+	if index.Code != http.StatusConflict || !strings.Contains(index.Body.String(), `"error_code":"archive_index_unsupported_format"`) || strings.Contains(index.Body.String(), root) {
 		t.Fatalf("archive index=%d %s", index.Code, index.Body.String())
 	}
 	metadata := httptest.NewRecorder()

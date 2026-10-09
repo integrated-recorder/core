@@ -1,5 +1,5 @@
 import { queryOptions } from '@tanstack/react-query'
-import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, pluginsAPI, productAPI, recordingsAPI, runtimeUpdateAPI, setupAPI, storageAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery, type StorageMetricWindow } from './index'
+import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, pluginsAPI, productAPI, recordingsAPI, runtimeUpdateAPI, setupAPI, storageAPI, userPreferencesAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery, type StorageMetricWindow } from './index'
 
 export const qk = {
   session: ['auth', 'session'] as const, installation: ['installation', 'status'] as const, dashboard: ['dashboard'] as const, storage: ['system', 'storage'] as const, info: ['system', 'info'] as const,
@@ -16,8 +16,10 @@ export const qk = {
   watches: ['watches'] as const, watch: (id: string) => ['watch', id] as const,
   watchRecordings: (id: string) => ['watch', id, 'recordings'] as const, watchEvents: (id: string) => ['watch', id, 'events'] as const,
   notifications: ['notifications'] as const, audit: ['audit'] as const, logs: (query: unknown) => ['logs', query] as const,
+  userPreferences: ['user', 'preferences'] as const,
 }
 export const sessionQuery = queryOptions({ queryKey: qk.session, queryFn: authAPI.session, retry: false, staleTime: 10_000 })
+export const userPreferencesQuery = queryOptions({ queryKey: qk.userPreferences, queryFn: () => userPreferencesAPI.get(), staleTime: 60_000, retry: false })
 export const installationQuery = queryOptions({
   queryKey: qk.installation, queryFn: setupAPI.status, retry: false, staleTime: 0,
   refetchInterval: query => query.state.data?.state === 'ready' ? false : 5_000,

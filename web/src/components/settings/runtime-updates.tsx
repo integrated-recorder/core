@@ -3,6 +3,9 @@ import { Check, Download, RotateCcw, Search, Sparkles } from 'lucide-react'
 import { runtimeUpdateAPI } from '@/api'
 import { qk, runtimeUpdateQuery } from '@/api/queries'
 import { errorMessage } from '@/lib/errors'
+import { formatDateTime } from '@/lib/formatting'
+import { useI18n } from '@/i18n/provider'
+import type { TranslationKey } from '@/i18n/catalog'
 import type { RuntimeGenerationSummary, RuntimeReleaseSummary, RuntimeUpdateStatus } from '@/types/api'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -11,31 +14,25 @@ import { ErrorState, LoadingState } from '@/components/query-state'
 
 type RuntimeUpdateAction = 'check' | 'stage' | 'activate' | 'rollback'
 
-const verificationLabels: Record<RuntimeUpdateStatus['verification_state'], string> = {
-  unknown: '상태 알 수 없음', not_checked: '아직 확인하지 않음', checking: '확인 중', verified: '검증 완료', failed: '검증 실패',
+const verificationKeys: Record<RuntimeUpdateStatus['verification_state'], TranslationKey> = {
+  unknown: 'runtime.verification.unknown', not_checked: 'runtime.verification.not_checked', checking: 'runtime.verification.checking', verified: 'runtime.verification.verified', failed: 'runtime.verification.failed',
 }
-const generationStateLabels: Record<string, string> = {
-  staging: '준비 중', verified: '검증 완료', ready: '활성화 준비 완료', active: '활성', draining: '정리 중', retired: '종료', failed: '실패',
+const generationKeys: Record<string, TranslationKey> = {
+  staging: 'runtime.generation.staging', verified: 'runtime.generation.verified', ready: 'runtime.generation.ready', active: 'runtime.generation.active', draining: 'runtime.generation.draining', retired: 'runtime.generation.retired', failed: 'runtime.generation.failed',
 }
-const releaseChannelLabels: Record<string, string> = { stable: '안정판', prerelease: '사전 공개', development: '개발' }
-const unavailableMessages: Record<string, string> = {
-  development_build: '개발 빌드에서는 애플리케이션 업데이트를 사용할 수 없습니다.',
-  source_unavailable: '업데이트 제공처를 사용할 수 없습니다.',
-  unsupported_platform: '현재 플랫폼용 업데이트를 제공하지 않습니다.',
-  trust_key_unavailable: '릴리스 검증 키를 사용할 수 없어 업데이트를 진행할 수 없습니다.',
-  updates_disabled: '이 환경에서는 업데이트가 비활성화되어 있습니다.',
-  host_update_required: '애플리케이션 업데이트 전에 Runtime Host 업데이트가 필요합니다.',
+const channelKeys: Record<string, TranslationKey> = { stable: 'runtime.channel.stable', prerelease: 'runtime.channel.prerelease', development: 'runtime.channel.development' }
+const unavailableKeys: Record<string, TranslationKey> = {
+  development_build: 'runtime.unavailable.development_build', source_unavailable: 'runtime.unavailable.source_unavailable', unsupported_platform: 'runtime.unavailable.unsupported_platform',
+  trust_key_unavailable: 'runtime.unavailable.trust_key_unavailable', updates_disabled: 'runtime.unavailable.updates_disabled', host_update_required: 'runtime.unavailable.host_update_required',
 }
-const failureMessages: Record<string, string> = {
-  update_unavailable: '업데이트 기능을 사용할 수 없습니다.', update_check_failed: '업데이트 확인에 실패했습니다.',
-  no_update_available: '사용 가능한 업데이트가 없습니다.', operation_conflict: '다른 업데이트 작업이 진행 중입니다.',
-  verification_failed: '릴리스 검증에 실패했습니다.', candidate_not_ready: '활성화할 후보 릴리스가 준비되지 않았습니다.',
-  release_incompatible: '현재 실행 환경과 호환되지 않는 릴리스입니다.', stage_failed: '릴리스를 준비하지 못했습니다.',
-  activation_failed: '릴리스를 활성화하지 못했습니다.', rollback_unavailable: '롤백할 이전 릴리스가 없습니다.',
-  rollback_failed: '이전 릴리스로 롤백하지 못했습니다.', internal_error: '업데이트 요청을 처리하지 못했습니다.',
+const failureKeys: Record<string, TranslationKey> = {
+  update_unavailable: 'runtime.failure.update_unavailable', update_check_failed: 'runtime.failure.update_check_failed', no_update_available: 'runtime.failure.no_update_available', operation_conflict: 'runtime.failure.operation_conflict',
+  verification_failed: 'runtime.failure.verification_failed', candidate_not_ready: 'runtime.failure.candidate_not_ready', release_incompatible: 'runtime.failure.release_incompatible', stage_failed: 'runtime.failure.stage_failed',
+  activation_failed: 'runtime.failure.activation_failed', rollback_unavailable: 'runtime.failure.rollback_unavailable', rollback_failed: 'runtime.failure.rollback_failed', internal_error: 'runtime.failure.internal_error',
 }
 
 export function RuntimeUpdates() {
+  const { t } = useI18n()
   const client = useQueryClient()
   const status = useQuery({ ...runtimeUpdateQuery, enabled: true })
   const action = useMutation({
@@ -44,7 +41,7 @@ export function RuntimeUpdates() {
   })
   const value = status.data
   const unavailableReason = value?.update_unavailable_reason
-  const unavailable = unavailableReason ? unavailableMessages[unavailableReason] ?? '이 환경에서는 업데이트를 사용할 수 없습니다.' : undefined
+  const unavailable = unavailableReason ? t(unavailableKeys[unavailableReason] ?? 'runtime.unavailable.unknown') : undefined
   const developmentBuild = value?.application.version === 'dev'
   const canUpdate = Boolean(value && !unavailable && !developmentBuild)
   const pending = action.isPending
@@ -52,65 +49,105 @@ export function RuntimeUpdates() {
 
   return <div role="tabpanel" id="settings-panel-updates" aria-labelledby="settings-tab-updates" tabIndex={0} className="space-y-4">
     <Card>
-      <CardHeader><CardTitle className="flex items-center gap-2"><Sparkles className="h-4 w-4 text-primary" />애플리케이션 업데이트</CardTitle><p className="text-xs leading-5 text-muted-foreground">새 버전을 검증하고 활성화합니다. 진행 중인 녹화는 시작 당시의 엔진 세대에서 계속됩니다.</p></CardHeader>
+      <CardHeader><CardTitle className="flex items-center gap-2"><Sparkles className="h-4 w-4 text-primary" />{t('runtime.title')}</CardTitle><p className="text-xs leading-5 text-muted-foreground">{t('runtime.description')}</p></CardHeader>
       <CardContent>
-        {status.isLoading ? <LoadingState /> : status.error || !value ? <ErrorState message={status.error ? errorMessage(status.error) : '업데이트 상태를 불러올 수 없습니다.'} retry={() => void status.refetch()} /> : <div className="space-y-5">
+        {status.isLoading ? <LoadingState /> : status.error || !value ? <ErrorState message={status.error ? errorMessage(status.error) : t('runtime.statusUnavailable')} retry={() => void status.refetch()} /> : <div className="space-y-5">
           <div className="grid gap-3 sm:grid-cols-2">
-            <IdentityCard title="현재 애플리케이션" identity={value.application} />
-            <IdentityCard title="Runtime Host" identity={value.host} />
+            <IdentityCard title={t('runtime.currentApplication')} identity={value.application} />
+            <IdentityCard title={t('runtime.host')} identity={value.host} />
           </div>
 
           <div className="grid gap-3 lg:grid-cols-3">
-            <ReleaseCard title="사용 가능한 버전" release={value.available_release} empty="새 버전을 확인하지 않았습니다." />
-            <ReleaseCard title="준비된 버전" release={value.staged_release} empty="다운로드한 후보가 없습니다." />
-            <ReleaseCard title="롤백 버전" release={value.previous_release} empty="이전 버전이 없습니다." />
+            <ReleaseCard title={t('runtime.availableVersion')} release={value.available_release} empty={t('runtime.noReleaseChecked')} />
+            <ReleaseCard title={t('runtime.stagedVersion')} release={value.staged_release} empty={t('runtime.noCandidate')} />
+            <ReleaseCard title={t('runtime.rollbackVersion')} release={value.previous_release} empty={t('runtime.noPrevious')} />
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <Badge tone={value.verification_state === 'verified' ? 'green' : value.verification_state === 'failed' ? 'red' : value.verification_state === 'checking' ? 'amber' : 'neutral'}>검증 상태 · {verificationLabels[value.verification_state]}</Badge>
-            {value.updates_available && <Badge tone="blue">새 버전 있음</Badge>}
-            {value.last_failure_code && <span className="text-xs text-destructive">{failureMessages[value.last_failure_code] ?? '마지막 업데이트 작업에 실패했습니다.'}</span>}
+            <Badge tone={value.verification_state === 'verified' ? 'green' : value.verification_state === 'failed' ? 'red' : value.verification_state === 'checking' ? 'amber' : 'neutral'}>{t('runtime.verificationLabel')} · {t(verificationKeys[value.verification_state])}</Badge>
+            {value.updates_available && <Badge tone="blue">{t('runtime.updatesAvailable')}</Badge>}
+            {value.last_failure_code && <span className="text-xs text-destructive">{t(failureKeys[value.last_failure_code] ?? 'runtime.failure.unknown')}</span>}
           </div>
 
           {unavailable && <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-5 text-amber-800 dark:text-amber-200">{unavailable}</p>}
-          {!unavailable && developmentBuild && <p className="rounded-md border border-muted bg-muted/40 p-3 text-xs leading-5 text-muted-foreground">개발 빌드에서는 애플리케이션 업데이트를 사용할 수 없습니다.</p>}
+          {!unavailable && developmentBuild && <p className="rounded-md border border-muted bg-muted/40 p-3 text-xs leading-5 text-muted-foreground">{t('runtime.unavailable.development_build')}</p>}
           {action.error && <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs leading-5 text-destructive">{errorMessage(action.error)}</p>}
 
           <div className="flex flex-wrap gap-2">
-            <Button variant="outline" size="sm" onClick={() => perform('check')} disabled={!canUpdate || pending}><Search className="h-3.5 w-3.5" />업데이트 확인</Button>
-            <Button variant="outline" size="sm" onClick={() => perform('stage')} disabled={!canUpdate || !value.available_release || pending}><Download className="h-3.5 w-3.5" />다운로드 및 검증</Button>
-            <Button size="sm" onClick={() => perform('activate')} disabled={!canUpdate || !value.staged_release || value.verification_state !== 'verified' || pending}><Check className="h-3.5 w-3.5" />활성화</Button>
-            <Button variant="outline" size="sm" onClick={() => perform('rollback')} disabled={!canUpdate || !value.previous_release || pending}><RotateCcw className="h-3.5 w-3.5" />이전 버전으로 롤백</Button>
+            <Button variant="outline" size="sm" onClick={() => perform('check')} disabled={!canUpdate || pending}><Search className="h-3.5 w-3.5" />{t('runtime.check')}</Button>
+            <Button variant="outline" size="sm" onClick={() => perform('stage')} disabled={!canUpdate || !value.available_release || pending}><Download className="h-3.5 w-3.5" />{t('runtime.stage')}</Button>
+            <Button size="sm" onClick={() => perform('activate')} disabled={!canUpdate || !value.staged_release || value.verification_state !== 'verified' || pending}><Check className="h-3.5 w-3.5" />{t('runtime.activate')}</Button>
+            <Button variant="outline" size="sm" onClick={() => perform('rollback')} disabled={!canUpdate || !value.previous_release || pending}><RotateCcw className="h-3.5 w-3.5" />{t('runtime.rollback')}</Button>
           </div>
-          {pending && <p role="status" className="text-xs text-muted-foreground">업데이트 작업을 진행하고 있습니다…</p>}
-          <p className="text-xs leading-5 text-muted-foreground">활성화해도 진행 중인 녹화는 중단되지 않습니다. 기존 녹화는 현재 엔진 세대에서 마칠 때까지 유지되고, 새 녹화부터 새 기본 엔진을 사용합니다.</p>
+          {pending && <p role="status" className="text-xs text-muted-foreground">{t('runtime.pending')}</p>}
+          <p className="text-xs leading-5 text-muted-foreground">{t('runtime.continuity')}</p>
         </div>}
       </CardContent>
     </Card>
 
     {value && <Card>
-      <CardHeader><CardTitle>실행 중인 세대</CardTitle><p className="text-xs text-muted-foreground">각 세대에 고정된 녹화는 해당 세대가 종료될 때까지 계속됩니다.</p></CardHeader>
+      <CardHeader><CardTitle>{t('runtime.runningGenerations')}</CardTitle><p className="text-xs text-muted-foreground">{t('runtime.runningGenerationsHelp')}</p></CardHeader>
       <CardContent><GenerationList active={value.active_generations ?? []} draining={value.draining_generations ?? []} activeControl={value.active_control} defaultEngine={value.default_engine} /></CardContent>
     </Card>}
+    {value?.handover_diagnostic && <HandoverDiagnostic diagnostic={value.handover_diagnostic} />}
   </div>
 }
 
+const knownDiagnosticPhases = new Set(['prepare_target', 'handover'])
+const knownDiagnosticReasons = new Set(['target_start_timeout', 'target_not_ready', 'capability_mismatch', 'ipc_unavailable', 'process_exit', 'storage_binding_failed', 'unknown'])
+
+function HandoverDiagnostic({ diagnostic }: { diagnostic: NonNullable<RuntimeUpdateStatus['handover_diagnostic']> }) {
+  const { t } = useI18n()
+  const phaseKey: TranslationKey = knownDiagnosticPhases.has(diagnostic.phase) ? `diagnostic.phase.${diagnostic.phase}` as TranslationKey : 'diagnostic.phase.prepare_target'
+  const knownReason = knownDiagnosticReasons.has(diagnostic.reason_code) ? diagnostic.reason_code : 'unknown'
+  const reasonKey: TranslationKey = `diagnostic.reason.${knownReason}` as TranslationKey
+  const safeIdentifier = (value: string) => /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : '—'
+  const safeVersion = /^[A-Za-z0-9.+_-]{1,80}$/.test(diagnostic.target_version) ? diagnostic.target_version : '—'
+  return <Card>
+    <CardHeader><CardTitle>{t('diagnostic.title')}</CardTitle></CardHeader>
+    <CardContent>
+      <dl className="grid gap-x-5 gap-y-3 text-xs sm:grid-cols-2 lg:grid-cols-3">
+        <DiagnosticField label={t('diagnostic.phase')} value={t(phaseKey)} />
+        <DiagnosticField label={t('diagnostic.reason')} value={`${t(reasonKey)} · ${knownReason}`} />
+        <DiagnosticField label={t('diagnostic.targetVersion')} value={safeVersion} />
+        <DiagnosticField label={t('diagnostic.occurredAt')} value={formatDateTime(diagnostic.occurred_at)} />
+        <DiagnosticField label={t('diagnostic.sourceGeneration')} value={safeIdentifier(diagnostic.source_generation_id)} />
+        <DiagnosticField label={t('diagnostic.targetGeneration')} value={safeIdentifier(diagnostic.target_generation_id)} />
+        <DiagnosticField label={t('diagnostic.recording')} value={safeIdentifier(diagnostic.recording_id)} />
+        <DiagnosticField label={t('diagnostic.reconcileState')} value={t(diagnostic.reconcile_state === 'pending' ? 'diagnostic.reconcile.pending' : 'diagnostic.reconcile.succeeded')} />
+        <DiagnosticField label={t('diagnostic.retryable')} value={diagnostic.retryable ? t('diagnostic.yes') : t('diagnostic.no')} />
+        <DiagnosticField label={t('diagnostic.recoverable')} value={diagnostic.recoverable ? t('diagnostic.yes') : t('diagnostic.no')} />
+        <DiagnosticField label={t('diagnostic.ownership')} value={diagnostic.ownership_retained ? t('diagnostic.ownerRetained') : t('diagnostic.no')} />
+        {diagnostic.resolved_at && <DiagnosticField label={t('diagnostic.resolvedAt')} value={formatDateTime(diagnostic.resolved_at)} />}
+      </dl>
+    </CardContent>
+  </Card>
+}
+
+function DiagnosticField({ label, value }: { label: string; value: string }) {
+  return <div className="min-w-0"><dt className="text-muted-foreground">{label}</dt><dd className="mt-1 break-all font-medium">{value}</dd></div>
+}
+
 function IdentityCard({ title, identity }: { title: string; identity: RuntimeUpdateStatus['application'] }) {
-  return <div className="min-w-0 rounded-md border border-border p-3"><p className="text-xs text-muted-foreground">{title}</p><p className="mt-1 truncate text-base font-semibold" title={identity.version}>{identity.version}</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{identity.commit}</p><p className="mt-1 text-xs text-muted-foreground">채널 {releaseChannelLabels[identity.release_channel] ?? '기타'} · 프로토콜 {identity.runtime_protocol_version}</p></div>
+  const { t } = useI18n()
+  return <div className="min-w-0 rounded-md border border-border p-3"><p className="text-xs text-muted-foreground">{title}</p><p className="mt-1 truncate text-base font-semibold" title={identity.version}>{identity.version}</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{identity.commit}</p><p className="mt-1 text-xs text-muted-foreground">{t('runtime.channelProtocol', { channel: t(channelKeys[identity.release_channel] ?? 'runtime.channel.other'), version: identity.runtime_protocol_version })}</p></div>
 }
 
 function ReleaseCard({ title, release, empty }: { title: string; release?: RuntimeReleaseSummary; empty: string }) {
-	return <div className="min-w-0 rounded-md border border-border p-3"><p className="text-xs text-muted-foreground">{title}</p>{release ? <><p className="mt-1 truncate text-sm font-semibold" title={release.version}>{release.version}</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{release.commit}</p><p className="mt-1 text-xs text-muted-foreground">채널 {releaseChannelLabels[release.release_channel] ?? '기타'} · 빌드 {release.build_time}</p>{release.notes_summary && <div className="mt-2 border-t border-border pt-2"><p className="text-[11px] font-medium text-muted-foreground">릴리스 요약</p><p className="mt-1 line-clamp-3 whitespace-normal text-xs leading-5 text-foreground">{release.notes_summary}</p></div>}</> : <p className="mt-2 text-xs text-muted-foreground">{empty}</p>}</div>
+	const { t } = useI18n()
+	return <div className="min-w-0 rounded-md border border-border p-3"><p className="text-xs text-muted-foreground">{title}</p>{release ? <><p className="mt-1 truncate text-sm font-semibold" title={release.version}>{release.version}</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{release.commit}</p><p className="mt-1 text-xs text-muted-foreground">{t('runtime.channelBuild', { channel: t(channelKeys[release.release_channel] ?? 'runtime.channel.other'), time: release.build_time })}</p>{release.notes_summary && <div className="mt-2 border-t border-border pt-2"><p className="text-[11px] font-medium text-muted-foreground">{t('runtime.releaseNotes')}</p><p className="mt-1 line-clamp-3 whitespace-normal text-xs leading-5 text-foreground">{release.notes_summary}</p></div>}</> : <p className="mt-2 text-xs text-muted-foreground">{empty}</p>}</div>
 }
 
 function GenerationList({ active, draining, activeControl, defaultEngine }: {
   active: RuntimeGenerationSummary[]; draining: RuntimeGenerationSummary[]
   activeControl?: RuntimeGenerationSummary; defaultEngine?: RuntimeGenerationSummary
 }) {
-  const rows = [...active.map(item => ({ ...item, displayState: generationStateLabels[item.state] ?? '상태 알 수 없음' })), ...draining.map(item => ({ ...item, displayState: generationStateLabels[item.state] ?? '상태 알 수 없음' }))]
+  const { t } = useI18n()
+  const stateName = (state: string) => t(generationKeys[state] ?? 'runtime.generation.unknown')
+  const rows = [...active.map(item => ({ ...item, displayState: stateName(item.state) })), ...draining.map(item => ({ ...item, displayState: stateName(item.state) }))]
   for (const item of [activeControl, defaultEngine]) {
-    if (item && !rows.some(row => row.id === item.id)) rows.push({ ...item, displayState: generationStateLabels[item.state] ?? '상태 알 수 없음' })
+    if (item && !rows.some(row => row.id === item.id)) rows.push({ ...item, displayState: stateName(item.state) })
   }
-  if (!rows.length) return <p className="text-sm text-muted-foreground">실행 중인 세대가 없습니다.</p>
-  return <div className="divide-y divide-border">{rows.map(item => <div key={item.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2.5 text-xs"><span className="min-w-0 flex-1 truncate font-medium">{item.version} <span className="font-normal text-muted-foreground">· {item.displayState}</span></span><span className="text-muted-foreground">녹화 {item.active_recordings}개</span><Badge tone={item.id === defaultEngine?.id ? 'blue' : item.state === 'draining' ? 'amber' : 'neutral'}>{item.id === defaultEngine?.id ? '기본 엔진' : generationStateLabels[item.state] ?? '상태 알 수 없음'}</Badge></div>)}</div>
+  if (!rows.length) return <p className="text-sm text-muted-foreground">{t('runtime.noGenerations')}</p>
+  return <div className="divide-y divide-border">{rows.map(item => <div key={item.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2.5 text-xs"><span className="min-w-0 flex-1 truncate font-medium">{item.version} <span className="font-normal text-muted-foreground">· {item.displayState}</span></span><span className="text-muted-foreground">{t('runtime.recordings', { count: item.active_recordings })}</span><Badge tone={item.id === defaultEngine?.id ? 'blue' : item.state === 'draining' ? 'amber' : 'neutral'}>{item.id === defaultEngine?.id ? t('runtime.defaultEngine') : stateName(item.state)}</Badge></div>)}</div>
 }

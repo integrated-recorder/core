@@ -8,8 +8,6 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -166,97 +164,6 @@ func (s *Server) recordingSnapshot(ctx context.Context, id string) (*domain.Reco
 		return nil, storage.ErrNotFound
 	}
 	return s.manager.Get(id)
-}
-
-// shardedArchiveIndex preserves the archive-index response for v2 recordings
-// while reading canonical references incrementally from bounded shards.
-func (s *Server) shardedArchiveIndex(ctx context.Context, header *domain.Recording) ([]storage.ArchiveEntry, error) {
-	if s.storage == nil || header == nil || header.FormatVersion != storage.ShardedArchiveFormatVersion {
-		return nil, storage.ErrShardedArchiveUnavailable
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	rootInfo, err := s.storage.StatPayload(header.ID, "recording.json")
-	if err != nil || !rootInfo.Regular {
-		return nil, errors.New("recording metadata is unavailable")
-	}
-	entries := []storage.ArchiveEntry{{Path: "recording.json", Kind: "recording", Size: rootInfo.Size}}
-	seen := map[string]struct{}{"recording.json": {}}
-	add := func(relative, kind, prefix, digest string) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if !validShardedArchivePath(relative, prefix) {
-			return errors.New("invalid canonical archive reference")
-		}
-		if _, exists := seen[relative]; exists {
-			return errors.New("duplicate canonical archive reference")
-		}
-		info, statErr := s.storage.StatPayload(header.ID, relative)
-		if statErr != nil || !info.Regular {
-			return errors.New("canonical archive payload is unavailable")
-		}
-		seen[relative] = struct{}{}
-		entries = append(entries, storage.ArchiveEntry{Path: relative, Kind: kind, Size: info.Size, SHA256: digest})
-
-		sidecar := relative + ".json"
-		if _, exists := seen[sidecar]; exists {
-			return errors.New("duplicate canonical archive reference")
-		}
-		sidecarInfo, sidecarErr := s.storage.StatPayload(header.ID, sidecar)
-		if isMissingArchiveObject(sidecarErr) {
-			return nil
-		}
-		if sidecarErr != nil || !sidecarInfo.Regular {
-			return errors.New("canonical archive sidecar is unavailable")
-		}
-		seen[sidecar] = struct{}{}
-		entries = append(entries, storage.ArchiveEntry{Path: sidecar, Kind: kind + "_sidecar", Size: sidecarInfo.Size})
-		return nil
-	}
-
-	if err := s.storage.IterateShardedManifests(ctx, header.ID, func(snapshot domain.ManifestSnapshot) error {
-		return add(snapshot.StoragePath, "manifest", "manifests/", snapshot.SHA256)
-	}); err != nil {
-		return nil, err
-	}
-	trackIDs := make([]string, 0, len(header.Tracks))
-	for trackID := range header.Tracks {
-		trackIDs = append(trackIDs, trackID)
-	}
-	sort.Strings(trackIDs)
-	for _, trackID := range trackIDs {
-		if err := s.storage.IterateShardedMedia(ctx, header.ID, trackID, func(record storage.V2MediaRecord) error {
-			return add(record.Segment.StoragePath, "segment", "tracks/", record.Segment.SHA256)
-		}); err != nil {
-			return nil, err
-		}
-		if err := s.storage.IterateShardedInitSegments(ctx, header.ID, trackID, func(record storage.V2MediaRecord) error {
-			return add(record.Segment.StoragePath, "init_segment", "tracks/", record.Segment.SHA256)
-		}); err != nil {
-			return nil, err
-		}
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	return entries, nil
-}
-
-func validShardedArchivePath(relative, prefix string) bool {
-	if !strings.HasPrefix(relative, prefix) || len(relative) <= len(prefix) || strings.ContainsAny(relative, "\\\x00") ||
-		filepath.IsAbs(relative) || filepath.VolumeName(relative) != "" || filepath.ToSlash(filepath.Clean(filepath.FromSlash(relative))) != relative {
-		return false
-	}
-	for _, component := range strings.Split(relative, "/") {
-		if component == "" || component == "." || component == ".." {
-			return false
-		}
-	}
-	return true
-}
-
-func isMissingArchiveObject(err error) bool {
-	return errors.Is(err, storage.ErrNotFound) || errors.Is(err, storage.ErrObjectNotFound) || errors.Is(err, os.ErrNotExist)
 }
 
 func (s *Server) serveShardedVODMasterPlaylist(w http.ResponseWriter, r *http.Request) bool {

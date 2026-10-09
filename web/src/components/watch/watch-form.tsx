@@ -10,6 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { supportsCapability } from '@/lib/capabilities'
 import { resourceLabel } from '@/lib/utils'
+import { useI18n } from '@/i18n/provider'
 import type { Adapter, ResourceRef, Schema, WatchView } from '@/types/api'
 
 export type WatchFormValue = {
@@ -34,9 +35,10 @@ type Props = {
 }
 
 export function WatchForm({ adapter, schema, watch, busy, submitLabel, onSubmit }: Props) {
+  const { t } = useI18n()
   const [title, setTitle] = useState(watch?.title ?? '')
   const [interval, setInterval] = useState(watch?.check_interval_seconds ?? 10)
-  const [previewMode, setPreviewMode] = useState<'disabled' | 'segment'>(watch?.preview_mode ?? 'disabled')
+  const [previewMode, setPreviewMode] = useState<'disabled' | 'segment'>(watch?.preview_mode ?? 'segment')
   const [resource, setResource] = useState<ResourceRef | undefined>(watch?.resource)
   const [browseParent, setBrowseParent] = useState<ResourceRef | undefined>()
   const [browseOpen, setBrowseOpen] = useState(false)
@@ -92,7 +94,7 @@ export function WatchForm({ adapter, schema, watch, busy, submitLabel, onSubmit 
       <CardContent className="grid gap-4 sm:grid-cols-2">
         <label className="space-y-2"><span className="text-sm font-medium">녹화 제목 <span className="text-xs text-muted-foreground">(선택)</span></span><Input value={title} onChange={event => setTitle(event.target.value)} maxLength={256} placeholder="자동 녹화로 생성된 녹화의 제목" /></label>
         <label className="space-y-2"><span className="text-sm font-medium">방송 확인 주기 (초)</span><Input type="number" min={2} max={3600} step={1} value={interval} onChange={event => { setInterval(event.target.value === '' ? 0 : Number(event.target.value)); setIntervalError('') }} aria-invalid={Boolean(intervalError)} aria-describedby={intervalError ? 'watch-interval-error' : undefined} />{intervalError && <span id="watch-interval-error" className="block text-xs text-destructive" role="alert">{intervalError}</span>}</label>
-        <label className="flex cursor-pointer items-start gap-3 rounded-md border border-border p-3 sm:col-span-2"><input type="checkbox" className="mt-0.5 h-4 w-4 accent-primary" checked={previewMode === 'segment'} onChange={event => setPreviewMode(event.target.checked ? 'segment' : 'disabled')} /><span><span className="block text-sm font-medium">장면 미리보기 생성</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">녹화마다 보관 세그먼트에서 미리보기 프레임을 생성합니다. 기본값은 사용 안 함입니다.</span></span></label>
+        <label className="flex cursor-pointer items-start gap-3 rounded-md border border-border p-3 sm:col-span-2"><input type="checkbox" className="mt-0.5 h-4 w-4 accent-primary" checked={previewMode === 'segment'} onChange={event => setPreviewMode(event.target.checked ? 'segment' : 'disabled')} /><span><span className="block text-sm font-medium">{t('watch.form.previewTitle')}</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">{t('watch.form.previewHelp')}</span></span></label>
         {canBrowse && <div className="space-y-3 sm:col-span-2"><div className="flex flex-wrap items-center justify-between gap-2"><div><p className="text-sm font-medium">리소스 선택 <span className="text-xs text-muted-foreground">(선택)</span></p><p className="mt-1 text-xs text-muted-foreground">어댑터가 리소스 탐색을 지원합니다.</p></div><Button type="button" variant="outline" size="sm" onClick={() => setBrowseOpen(open => !open)} aria-expanded={browseOpen}>{browseOpen ? '탐색 닫기' : '리소스 찾아보기'}<ChevronDown className="h-3.5 w-3.5" /></Button></div>
           {resource && <p className="text-xs text-muted-foreground">선택한 리소스: <span className="font-medium text-foreground">{resourceLabel(resource)}</span><Button type="button" variant="link" size="sm" className="ml-1 h-auto p-0" onClick={() => setResource(undefined)}>해제</Button></p>}
           {browseOpen && <div className="rounded-md border border-border p-3"><ResourceBreadcrumbs resource={browseParent} onNavigate={setBrowseParent} /><div className="mt-3 grid gap-2 sm:grid-cols-[1fr_180px_auto]"><Input value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') runResourceSearch() }} placeholder="리소스 검색 (비우면 목록)" aria-label="리소스 검색" /><Input value={resourceType} onChange={event => setResourceType(event.target.value)} placeholder="리소스 유형" aria-label="리소스 유형" /><Button type="button" variant="outline" onClick={runResourceSearch}><Search className="h-4 w-4" />검색</Button></div>

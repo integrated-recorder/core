@@ -84,6 +84,118 @@ func TestLoginAcceptsOptionalIdentityAndPersistsBoundSession(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedUserPreferencesAreSessionScopedAndDurable(t *testing.T) {
+	root := t.TempDir()
+	service, err := authn.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenBytes, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Bootstrap(strings.TrimSpace(string(tokenBytes)), "prefs-owner-password"); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := service.FindByLogin("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := service.CreateUser("prefs-other", "prefs-other-password", authn.RoleOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerSession, err := service.Login("prefs-owner-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherSession, err := service.LoginAs("prefs-other", "prefs-other-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(nil, nil, nil, Options{Auth: service})
+
+	get := func(token string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodGet, "/api/user/preferences", nil)
+		request.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: token})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	put := func(token, csrf, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPut, "/api/user/preferences", strings.NewReader(body))
+		request.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: token})
+		request.Header.Set("X-CSRF-Token", csrf)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	ownerDefault := get(ownerSession.Token)
+	if ownerDefault.Code != http.StatusOK || ownerDefault.Body.String() != "{\"locale\":\"system\",\"theme\":\"system\",\"timezone\":\"system\"}\n" {
+		t.Fatalf("owner default preferences status=%d body=%s", ownerDefault.Code, ownerDefault.Body.String())
+	}
+	ownerPrefsBody := `{"locale":"ko-KR","theme":"dark","timezone":"Asia/Seoul"}`
+	if response := put(ownerSession.Token, ownerSession.CSRFToken, ownerPrefsBody); response.Code != http.StatusOK {
+		t.Fatalf("owner preference update status=%d body=%s", response.Code, response.Body.String())
+	}
+	otherPrefsBody := `{"locale":"en-US","theme":"light","timezone":"America/Los_Angeles"}`
+	if response := put(otherSession.Token, otherSession.CSRFToken, otherPrefsBody); response.Code != http.StatusOK {
+		t.Fatalf("other preference update status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response := put(ownerSession.Token, ownerSession.CSRFToken, `{"user_id":"`+other.ID+`","locale":"en-US","theme":"dark","timezone":"system"}`); response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"error_code":"preferences_invalid"`) {
+		t.Fatalf("forged target preference update status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := get(otherSession.Token); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"locale":"en-US"`) || !strings.Contains(got.Body.String(), `"theme":"light"`) {
+		t.Fatalf("other user's preferences crossed session boundary: status=%d body=%s", got.Code, got.Body.String())
+	}
+	if got := get(ownerSession.Token); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"locale":"ko-KR"`) || strings.Contains(got.Body.String(), "user_id") {
+		t.Fatalf("owner preference response=%d %s", got.Code, got.Body.String())
+	}
+	targetedRead := httptest.NewRecorder()
+	targetedRequest := httptest.NewRequest(http.MethodGet, "/api/user/preferences?user_id="+other.ID, nil)
+	targetedRequest.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: ownerSession.Token})
+	handler.ServeHTTP(targetedRead, targetedRequest)
+	if targetedRead.Code != http.StatusOK || !strings.Contains(targetedRead.Body.String(), `"locale":"ko-KR"`) {
+		t.Fatalf("user_id query altered self preference read: status=%d body=%s", targetedRead.Code, targetedRead.Body.String())
+	}
+
+	unauthenticated := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/api/user/preferences", nil))
+	if unauthenticated.Code != http.StatusUnauthorized || !strings.Contains(unauthenticated.Body.String(), `"error_code":"authentication_required"`) {
+		t.Fatalf("unauthenticated preference read status=%d body=%s", unauthenticated.Code, unauthenticated.Body.String())
+	}
+	noCSRF := httptest.NewRecorder()
+	noCSRFRequest := httptest.NewRequest(http.MethodPut, "/api/user/preferences", strings.NewReader(ownerPrefsBody))
+	noCSRFRequest.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: ownerSession.Token})
+	handler.ServeHTTP(noCSRF, noCSRFRequest)
+	if noCSRF.Code != http.StatusForbidden {
+		t.Fatalf("preference update without CSRF status=%d body=%s", noCSRF.Code, noCSRF.Body.String())
+	}
+
+	reopened, err := authn.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedHandler := NewWithOptions(nil, nil, nil, Options{Auth: reopened})
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  string
+	}{{"owner", ownerSession.Token, `"locale":"ko-KR"`}, {"other", otherSession.Token, `"locale":"en-US"`}} {
+		request := httptest.NewRequest(http.MethodGet, "/api/user/preferences", nil)
+		request.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: tc.token})
+		response := httptest.NewRecorder()
+		reopenedHandler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), tc.want) {
+			t.Errorf("reopened %s preferences status=%d body=%s", tc.name, response.Code, response.Body.String())
+		}
+	}
+	if owner.ID == other.ID {
+		t.Fatal("fixture users must have independent identities")
+	}
+}
+
 func TestLogoutRevokesSessionAndClearsCookies(t *testing.T) {
 	root := t.TempDir()
 	service, err := authn.Open(root)
@@ -126,6 +238,7 @@ func TestLogoutRevokesSessionAndClearsCookies(t *testing.T) {
 
 func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
 	owner := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	member := authn.Principal{UserID: "usr-1123456789abcdef0123456789abcdef", Login: "member", Role: "member"}
 	for _, tc := range []struct {
 		method string
 		path   string
@@ -137,6 +250,8 @@ func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
 		{http.MethodPost, "/api/retention/run", authn.PermissionRecordingDelete},
 		{http.MethodPost, "/api/recordings", authn.PermissionRecordingControl},
 		{http.MethodDelete, "/api/recordings/0123456789abcdef0123456789abcdef", authn.PermissionRecordingDelete},
+		{http.MethodGet, "/api/user/preferences", authn.PermissionUserPreferences},
+		{http.MethodPut, "/api/user/preferences", authn.PermissionUserPreferences},
 	} {
 		got := permissionForRequest(httptest.NewRequest(tc.method, tc.path, nil))
 		if got != tc.want || !authn.HasPermission(owner, got) {
@@ -176,6 +291,9 @@ func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
 	}
 	if got := permissionForRequest(httptest.NewRequest(http.MethodHead, "/api/audit", nil)); got != authn.PermissionAuditRead {
 		t.Fatalf("HEAD audit permission=%q, want audit.read", got)
+	}
+	if !authn.HasPermission(member, authn.PermissionUserPreferences) || authn.HasPermission(member, authn.PermissionSettingsManage) {
+		t.Fatal("self preference permission should be available to an authenticated non-owner without granting system settings")
 	}
 }
 

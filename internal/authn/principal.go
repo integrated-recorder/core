@@ -16,6 +16,7 @@ const (
 	PermissionSettingsManage   Permission = "settings.manage"
 	PermissionAuditRead        Permission = "audit.read"
 	PermissionUpdateManage     Permission = "update.manage"
+	PermissionUserPreferences  Permission = "user.preferences.self"
 )
 
 // Principal binds request identity to server-validated session state.
@@ -41,7 +42,15 @@ func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 }
 
 func HasPermission(principal Principal, permission Permission) bool {
-	if !validUserID(principal.UserID) || principal.Role != RoleOwner {
+	if !validUserID(principal.UserID) || principal.Role == "" {
+		return false
+	}
+	// A user may manage only their own preferences; this is identity-scoped and
+	// does not require owner-level control-plane permissions.
+	if permission == PermissionUserPreferences {
+		return true
+	}
+	if principal.Role != RoleOwner {
 		return false
 	}
 	switch permission {

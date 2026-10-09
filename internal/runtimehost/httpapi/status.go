@@ -94,14 +94,36 @@ type Status struct {
 	AvailableRelease        *ReleaseSummary     `json:"available_release,omitempty"`
 	VerificationState       string              `json:"verification_state"`
 	LastFailureCode         string              `json:"last_failure_code,omitempty"`
+	HandoverDiagnostic      *HandoverDiagnostic `json:"handover_diagnostic,omitempty"`
 	UpdatesAvailable        bool                `json:"updates_available"`
 	UpdateUnavailableReason string              `json:"update_unavailable_reason,omitempty"`
 }
 
+// HandoverDiagnostic is a sanitized operational summary for the latest
+// active-recording generation handover failure. It contains allowlisted phase
+// and reason values only. Raw process, adapter, IPC, and storage errors never
+// cross the Runtime Host status boundary.
+type HandoverDiagnostic struct {
+	RecordingID        string     `json:"recording_id"`
+	Phase              string     `json:"phase"`
+	ReasonCode         string     `json:"reason_code"`
+	SourceGenerationID string     `json:"source_generation_id"`
+	TargetGenerationID string     `json:"target_generation_id"`
+	TargetVersion      string     `json:"target_version"`
+	OccurredAt         time.Time  `json:"occurred_at"`
+	ReconcileState     string     `json:"reconcile_state"`
+	Retryable          bool       `json:"retryable"`
+	Recoverable        bool       `json:"recoverable"`
+	OwnershipRetained  bool       `json:"ownership_retained"`
+	ReconcileAttempt   uint32     `json:"reconcile_attempt"`
+	ResolvedAt         *time.Time `json:"resolved_at,omitempty"`
+}
+
 var (
-	versionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$`)
-	commitPattern  = regexp.MustCompile(`^(?:unknown|[0-9a-fA-F]{7,64})$`)
-	genIDPattern   = regexp.MustCompile(`^(?:[0-9a-fA-F]{32,64}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})$`)
+	versionPattern               = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$`)
+	commitPattern                = regexp.MustCompile(`^(?:unknown|[0-9a-fA-F]{7,64})$`)
+	genIDPattern                 = regexp.MustCompile(`^(?:[0-9a-fA-F]{32,64}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})$`)
+	recordingDiagnosticIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 )
 
 var (
@@ -124,6 +146,14 @@ var (
 		"development_build": {}, "source_unavailable": {}, "unsupported_platform": {},
 		"trust_key_unavailable": {}, "updates_disabled": {}, "host_update_required": {},
 	}
+	handoverDiagnosticPhases = map[string]struct{}{
+		"prepare_target": {}, "prepare_drained_target": {},
+	}
+	handoverDiagnosticReasons = map[string]struct{}{
+		"target_start_timeout": {}, "target_not_ready": {}, "capability_mismatch": {},
+		"ipc_unavailable": {}, "process_exit": {}, "storage_binding_failed": {}, "unknown": {},
+	}
+	handoverReconcileStates = map[string]struct{}{"pending": {}, "succeeded": {}}
 )
 
 // Validate checks public status values before they cross the HTTP boundary.
@@ -141,6 +171,20 @@ func (s Status) Validate() error {
 	}
 	if s.UpdateUnavailableReason != "" && !enumContains(unavailableReasons, s.UpdateUnavailableReason) {
 		return fmt.Errorf("runtime update unavailable reason is invalid")
+	}
+	if s.HandoverDiagnostic != nil {
+		diagnostic := s.HandoverDiagnostic
+		if !recordingDiagnosticIDPattern.MatchString(diagnostic.RecordingID) ||
+			!enumContains(handoverDiagnosticPhases, diagnostic.Phase) || !enumContains(handoverDiagnosticReasons, diagnostic.ReasonCode) ||
+			len(diagnostic.SourceGenerationID) > maxGenerationName || !genIDPattern.MatchString(diagnostic.SourceGenerationID) ||
+			len(diagnostic.TargetGenerationID) > maxGenerationName || !genIDPattern.MatchString(diagnostic.TargetGenerationID) ||
+			!validVersion(diagnostic.TargetVersion) || diagnostic.OccurredAt.IsZero() || diagnostic.ReconcileAttempt == 0 || !enumContains(handoverReconcileStates, diagnostic.ReconcileState) {
+			return fmt.Errorf("runtime handover diagnostic is invalid")
+		}
+		if diagnostic.ReconcileState == "pending" && (!diagnostic.Retryable || diagnostic.ResolvedAt != nil) ||
+			diagnostic.ReconcileState == "succeeded" && (diagnostic.Retryable || diagnostic.ResolvedAt == nil || diagnostic.ResolvedAt.IsZero()) || !diagnostic.Recoverable || !diagnostic.OwnershipRetained {
+			return fmt.Errorf("runtime handover diagnostic state is invalid")
+		}
 	}
 	if len(s.ActiveGenerations) > maxGenerations || len(s.DrainingGenerations) > maxGenerations {
 		return fmt.Errorf("runtime generation summary count exceeds limit")

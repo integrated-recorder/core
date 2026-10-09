@@ -189,16 +189,30 @@ func TestShardedArchiveIndexUsesBoundedHeaderAndIterators(t *testing.T) {
 	var result struct {
 		RecordingID string                 `json:"recording_id"`
 		Entries     []storage.ArchiveEntry `json:"entries"`
+		NextCursor  string                 `json:"next_cursor"`
+		HasMore     bool                   `json:"has_more"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.RecordingID != id || len(result.Entries) != 8 {
+	if result.RecordingID != id || len(result.Entries) != 8 || result.HasMore || result.NextCursor != "" {
 		t.Fatalf("archive index recording=%q entries=%d: %+v", result.RecordingID, len(result.Entries), result.Entries)
 	}
+	var terminalPayload map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &terminalPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := terminalPayload["next_cursor"]; exists {
+		t.Fatalf("terminal archive index page must omit next_cursor: %s", response.Body.String())
+	}
+	wantPaths := []string{
+		"recording.json", snapshot.StoragePath, snapshot.StoragePath + ".json",
+		"tracks/main/init-vod-a.mp4", "tracks/main/init-vod-b.mp4",
+		"tracks/main/segment-00000000000000000001.ts", "tracks/main/segment-00000000000000000002.ts", "tracks/main/segment-00000000000000000003.ts",
+	}
 	for i, entry := range result.Entries {
-		if i > 0 && result.Entries[i-1].Path >= entry.Path {
-			t.Fatalf("archive index is not path-sorted: %+v", result.Entries)
+		if entry.Path != wantPaths[i] {
+			t.Fatalf("archive index order[%d]=%q want=%q: %+v", i, entry.Path, wantPaths[i], result.Entries)
 		}
 		if strings.HasPrefix(entry.Path, "tracks/") && strings.HasSuffix(entry.Path, ".json") {
 			t.Fatalf("v2 media sidecar unexpectedly visible: %+v", entry)
@@ -206,6 +220,72 @@ func TestShardedArchiveIndexUsesBoundedHeaderAndIterators(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"kind":"manifest_sidecar"`) || strings.Contains(response.Body.String(), "private-manifest") {
 		t.Fatalf("archive index omitted visible manifest sidecar or leaked source URI: %s", response.Body.String())
+	}
+
+	var pagedPaths []string
+	cursor := ""
+	for {
+		request := httptest.NewRequest(http.MethodGet, "/api/recordings/"+id+"/archive/index?limit=3&cursor="+cursor, nil)
+		if cursor == "" {
+			request = httptest.NewRequest(http.MethodGet, "/api/recordings/"+id+"/archive/index?limit=3", nil)
+		}
+		pageResponse := httptest.NewRecorder()
+		handler.ServeHTTP(pageResponse, request)
+		if pageResponse.Code != http.StatusOK {
+			t.Fatalf("archive index page status=%d body=%s", pageResponse.Code, pageResponse.Body.String())
+		}
+		var page struct {
+			Entries    []storage.ArchiveEntry `json:"entries"`
+			NextCursor string                 `json:"next_cursor"`
+			HasMore    bool                   `json:"has_more"`
+		}
+		if err := json.Unmarshal(pageResponse.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range page.Entries {
+			pagedPaths = append(pagedPaths, entry.Path)
+		}
+		if !page.HasMore {
+			if page.NextCursor != "" {
+				t.Fatalf("terminal archive index page cursor=%q", page.NextCursor)
+			}
+			break
+		}
+		if page.NextCursor == "" {
+			t.Fatal("non-terminal archive index page omitted cursor")
+		}
+		cursor = page.NextCursor
+	}
+	if len(pagedPaths) != len(wantPaths) {
+		t.Fatalf("paged archive index paths=%v want=%v", pagedPaths, wantPaths)
+	}
+	for index, want := range wantPaths {
+		if pagedPaths[index] != want {
+			t.Fatalf("paged archive index[%d]=%q want=%q", index, pagedPaths[index], want)
+		}
+	}
+	invalidLimit := httptest.NewRecorder()
+	handler.ServeHTTP(invalidLimit, httptest.NewRequest(http.MethodGet, "/api/recordings/"+id+"/archive/index?limit=101", nil))
+	if invalidLimit.Code != http.StatusBadRequest || !strings.Contains(invalidLimit.Body.String(), `"error_code":"archive_index_invalid_pagination"`) {
+		t.Fatalf("invalid archive index limit status=%d body=%s", invalidLimit.Code, invalidLimit.Body.String())
+	}
+	firstPage := httptest.NewRecorder()
+	handler.ServeHTTP(firstPage, httptest.NewRequest(http.MethodGet, "/api/recordings/"+id+"/archive/index?limit=1", nil))
+	var firstPageResult struct {
+		NextCursor string `json:"next_cursor"`
+	}
+	if firstPage.Code != http.StatusOK || json.Unmarshal(firstPage.Body.Bytes(), &firstPageResult) != nil || firstPageResult.NextCursor == "" {
+		t.Fatalf("archive index first page status=%d body=%s", firstPage.Code, firstPage.Body.String())
+	}
+	changedTitle := "revision changed after page one"
+	if err := store.AppendShardedMetadata(context.Background(), id, domain.MetadataRevision{ObservedAt: at.Add(time.Minute), Title: &changedTitle}); err != nil {
+		t.Fatal(err)
+	}
+	stalePage := httptest.NewRecorder()
+	staleRequest := httptest.NewRequest(http.MethodGet, "/api/recordings/"+id+"/archive/index?limit=1&cursor="+firstPageResult.NextCursor, nil)
+	handler.ServeHTTP(stalePage, staleRequest)
+	if stalePage.Code != http.StatusConflict || !strings.Contains(stalePage.Body.String(), `"error_code":"archive_index_stale_cursor"`) {
+		t.Fatalf("stale archive index cursor status=%d body=%s", stalePage.Code, stalePage.Body.String())
 	}
 }
 

@@ -75,7 +75,7 @@ func runServerTestAdapter() int {
 	}
 }
 
-func TestDirectRecordingCreatePersistsOptionalPreviewPolicyOutsideArchive(t *testing.T) {
+func TestDirectRecordingCreateDefaultsPreviewOnAndKeepsItBestEffort(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.New(root)
 	if err != nil {
@@ -106,16 +106,14 @@ func TestDirectRecordingCreatePersistsOptionalPreviewPolicyOutsideArchive(t *tes
 		t.Fatal(err)
 	}
 	defer previews.Close(context.Background())
-	api := NewWithOptions(manager, host, configs, Options{Previews: previews})
+	// A missing optional preview service must not block canonical recording.
+	api := NewWithOptions(manager, host, configs, Options{})
 	response := httptest.NewRecorder()
-	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(`{"adapter_id":"schema-test","input":{},"title":"preview opt-in","preview_mode":"segment"}`)))
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(`{"adapter_id":"schema-test","input":{},"title":"preview default"}`)))
 	if response.Code != http.StatusCreated {
 		t.Fatalf("recording create status=%d body=%s", response.Code, response.Body.String())
 	}
 	id := extractJSONID(t, response.Body.Bytes())
-	if mode := previews.Policy(id).Mode; mode != preview.ModeSegment {
-		t.Fatalf("direct create lost preview policy: mode=%q", mode)
-	}
 	archive, err := manager.Get(id)
 	if err != nil {
 		t.Fatal(err)
@@ -129,6 +127,45 @@ func TestDirectRecordingCreatePersistsOptionalPreviewPolicyOutsideArchive(t *tes
 	}
 	if _, err := manager.Stop(id); err != nil {
 		t.Fatal(err)
+	}
+
+	api = NewWithOptions(manager, host, configs, Options{Previews: previews})
+	response = httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(`{"adapter_id":"schema-test","input":{},"title":"preview default with service"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("default-on preview recording create status=%d body=%s", response.Code, response.Body.String())
+	}
+	id = extractJSONID(t, response.Body.Bytes())
+	if mode := previews.Policy(id).Mode; mode != preview.ModeSegment {
+		t.Fatalf("missing preview mode did not persist default-on policy: mode=%q", mode)
+	}
+	if _, err := manager.Stop(id); err != nil {
+		t.Fatal(err)
+	}
+
+	// The explicit opt-out must survive the default-on policy.
+	response = httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(`{"adapter_id":"schema-test","input":{},"title":"preview off","preview_mode":"disabled"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("explicit preview-off recording create status=%d body=%s", response.Code, response.Body.String())
+	}
+	id = extractJSONID(t, response.Body.Bytes())
+	if mode := previews.Policy(id).Mode; mode != preview.ModeDisabled {
+		t.Fatalf("explicit preview-off choice was not preserved: mode=%q", mode)
+	}
+	if _, err := manager.Stop(id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNormalizePreviewModeDefaultsOnAndHonorsExplicitOff(t *testing.T) {
+	mode, err := normalizePreviewMode("")
+	if err != nil || mode != preview.ModeSegment {
+		t.Fatalf("missing mode should default to segment previews: mode=%q err=%v", mode, err)
+	}
+	mode, err = normalizePreviewMode(preview.ModeDisabled)
+	if err != nil || mode != preview.ModeDisabled {
+		t.Fatalf("explicit disabled mode was not honored: mode=%q err=%v", mode, err)
 	}
 }
 

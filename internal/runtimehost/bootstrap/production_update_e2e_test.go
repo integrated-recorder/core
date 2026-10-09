@@ -1952,6 +1952,14 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if err != nil || durableOwnerAfterTargetFailure != ownerBeforeTargetFailure || durableOwnerAfterTargetFailure.EngineGeneration != leaseA.EngineGeneration {
 		t.Fatalf("unavailable target changed durable R ownership: before=%+v after=%+v err=%v; host=%s", ownerBeforeTargetFailure, durableOwnerAfterTargetFailure, err, process.output.String())
 	}
+	failureStatus := waitRuntimeStatus(t, ctx, client, baseURL, func(status httpapi.Status) bool {
+		diagnostic := status.HandoverDiagnostic
+		return diagnostic != nil && diagnostic.RecordingID == recordingR.ID && diagnostic.ReconcileState == "pending"
+	})
+	failureDiagnostic := failureStatus.HandoverDiagnostic
+	if failureDiagnostic.Phase != "prepare_drained_target" || failureDiagnostic.ReasonCode != "target_start_timeout" || !failureDiagnostic.Retryable || !failureDiagnostic.Recoverable || !failureDiagnostic.OwnershipRetained || failureDiagnostic.ReconcileAttempt < 1 {
+		t.Fatalf("failed target preparation diagnostic=%+v; owner=%+v", failureDiagnostic, durableOwnerAfterTargetFailure)
+	}
 	resumeTargetEngine()
 	if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR.ID, 2, 30*time.Second); err != nil {
 		t.Fatalf("%v; host output=%s", err, process.output.String())
@@ -1971,6 +1979,12 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	// a safe rollback cannot satisfy the continuity assertion.
 	if err := waitHostHandoverLogEvent(process, "recording handover_committed", recordingR.ID, 1, 40*time.Second); err != nil {
 		t.Fatalf("lease moved to B without a completed handover: lease=%+v; fixture=%s; host=%s; child diagnostics=%s", leaseAfterHandover, fixture.describe(streamR), process.output.String(), readRuntimeE2EChildDiagnostics(process.diagnosticDir))
+	}
+	resolvedStatus := waitRuntimeStatus(t, ctx, client, baseURL, func(status httpapi.Status) bool {
+		return status.HandoverDiagnostic != nil && status.HandoverDiagnostic.RecordingID == recordingR.ID && status.HandoverDiagnostic.ReconcileState == "succeeded"
+	})
+	if resolvedStatus.HandoverDiagnostic.Retryable || resolvedStatus.HandoverDiagnostic.ResolvedAt == nil {
+		t.Fatalf("successful reconcile left stale handover diagnostic: %+v", resolvedStatus.HandoverDiagnostic)
 	}
 	if leaseAfterHandover.EngineGeneration == leaseA.EngineGeneration {
 		t.Fatalf("eligible R was not handed from Engine A to active Engine B: lease=%+v", leaseAfterHandover)

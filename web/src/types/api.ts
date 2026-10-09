@@ -100,9 +100,19 @@ export type RecordingStatistics = {
 }
 export type RecordingPage = { items: RecordingListItem[]; next_cursor?: string; total: number; total_is_partial?: boolean; partial_errors?: string[] }
 export type RevisionFreshness = 'unknown' | 'current' | 'stale'
-export type IntegrityResult = { status: IntegrityStatus; last_verified_at?: string; objects_total?: number; objects_verified?: number; objects_missing?: number; objects_corrupt?: number; issues?: { code: string; path?: string }[]; freshness?: RevisionFreshness; revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number }
-export type IntegrityJob = { id: string; recording_id: string; state: 'queued' | 'running' | 'completed' | 'failed' | 'canceled'; created_at: string; started_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness; result?: IntegrityResult }
-export type ExportJob = { id: string; recording_id: string; state: string; format?: string; output_name?: string; created_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness }
+export type JobProgress = {
+  current: number
+  total?: number
+  percent?: number
+  indeterminate: boolean
+  phase: string
+  unit: string
+  updated_at?: string
+}
+export type IntegrityJobState = 'queued' | 'running' | 'completed' | 'failed' | 'interrupted' | 'canceled' | 'cancelled'
+export type IntegrityResult = { status: IntegrityStatus; last_verified_at?: string; objects_total?: number; objects_verified?: number; objects_missing?: number; objects_corrupt?: number; issues?: { code: string; path?: string }[]; freshness?: RevisionFreshness; revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; active_job?: Pick<IntegrityJob, 'id' | 'state' | 'progress' | 'freshness' | 'error_code'> }
+export type IntegrityJob = { id: string; recording_id: string; state: IntegrityJobState; created_at: string; started_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness; progress?: JobProgress; result?: IntegrityResult }
+export type ExportJob = { id: string; recording_id: string; state: string; format?: string; output_name?: string; created_at?: string; started_at?: string; updated_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness; progress?: JobProgress }
 export type Notification = { id: string; type: string; at: string; read: boolean; object_id?: string }
 export type WorkflowProgress = {
   workflow_id: string; adapter_id: string; state: string; resource?: ResourceRef;
@@ -169,6 +179,20 @@ export type RuntimeUpdateStatus = {
   last_failure_code?: string
   updates_available: boolean
   update_unavailable_reason?: string
+  handover_diagnostic?: {
+    recording_id: string
+    phase: string
+    reason_code: string
+    source_generation_id: string
+    target_generation_id: string
+    target_version: string
+    occurred_at: string
+    reconcile_state: 'pending' | 'succeeded'
+    retryable: boolean
+    recoverable: boolean
+    ownership_retained: boolean
+    resolved_at?: string
+  }
 }
 export type StorageSettings = {
   ingest_memory: { global_buffer_bytes: number; per_recording_buffer_bytes: number; max_payload_bytes: number }
@@ -188,10 +212,12 @@ export type SystemSettings = {
 }
 export type SearchResult = { type: 'recording' | 'adapter' | 'resource' | 'workflow'; id?: string; workflow_id?: string; adapter_id?: string; resource_type?: string; resource_id?: string; title?: string; name?: string; display_name?: string; state?: string; resource?: ResourceRef }
 export type ArchiveEntry = { kind: string; path: string; size: number; sha256?: string }
+export type ArchiveIndexPage = { recording_id: string; entries: ArchiveEntry[]; next_cursor?: string; has_more: boolean }
 export type RecordingEvent = { id: string; recording_id: string; type: string; at: string; count?: number; message?: string }
 export type LogEntry = { at: string; level: string; component: string; message: string }
 export type AuditEvent = { id: string; type: string; at: string; object_id?: string }
 export type ApiSession = { auth_enabled: boolean; authenticated: boolean; needs_bootstrap: boolean; csrf_token?: string; expires_at?: string }
+export type UserPreferences = { locale: 'system' | 'ko-KR' | 'en-US'; theme: 'system' | 'light' | 'dark'; timezone: string }
 export type InstallationState = 'uninitialized' | 'setup_in_progress' | 'ready' | 'recovery_required'
 export type InstallationStatus = {
   state: InstallationState

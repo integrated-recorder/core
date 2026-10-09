@@ -1,5 +1,8 @@
-import { act, render, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { authAPI, userPreferencesAPI } from '@/api'
+import { I18nProvider } from '@/i18n/provider'
 import { RecordingPlayer } from './player'
 
 const hlsState = vi.hoisted(() => ({ destroy: vi.fn(), loadSource: vi.fn(), attachMedia: vi.fn(), on: vi.fn() }))
@@ -13,7 +16,7 @@ vi.mock('hls.js', () => ({ default: class HlsMock {
   destroy() { hlsState.destroy() }
 } }))
 
-afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks() })
+afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); document.documentElement.lang = 'ko-KR' })
 
 function playlist(...segments: Array<[string, number]>): string {
   return `#EXTM3U\n#EXT-X-VERSION:7\n${segments.map(([uri, duration]) => `#EXTINF:${duration},\n${uri}`).join('\n')}\n#EXT-X-ENDLIST\n`
@@ -50,6 +53,26 @@ function setVideoState(video: HTMLVideoElement, currentTime: number, playing: bo
 }
 
 describe('RecordingPlayer lifecycle', () => {
+  it.each([
+    { locale: 'ko-KR' as const, ariaLabel: '녹화 VOD 재생', bufferingLabel: '녹화 VOD 재생 · 버퍼링', badge: '원본 세그먼트' },
+    { locale: 'en-US' as const, ariaLabel: 'Recording VOD playback', bufferingLabel: 'Recording VOD playback · Buffering', badge: 'Original segments' },
+  ])('localizes VOD accessible labels for $locale', async ({ locale, ariaLabel, bufferingLabel, badge }) => {
+    vi.spyOn(authAPI, 'session').mockResolvedValue({ auth_enabled: true, authenticated: true, needs_bootstrap: false })
+    vi.spyOn(userPreferencesAPI, 'get').mockResolvedValue({ locale, theme: 'system', timezone: 'system' })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const view = render(<QueryClientProvider client={queryClient}><I18nProvider><RecordingPlayer recordingId="rec-locale" /></I18nProvider></QueryClientProvider>)
+
+    const video = await screen.findByLabelText(ariaLabel) as HTMLVideoElement
+    vi.spyOn(video, 'pause').mockImplementation(() => undefined)
+    vi.spyOn(video, 'load').mockImplementation(() => undefined)
+    expect(screen.getByText(badge)).toBeInTheDocument()
+    await waitFor(() => expect(document.documentElement.lang).toBe(locale))
+    expect(video).toHaveAttribute('lang', locale)
+    act(() => { video.dispatchEvent(new Event('waiting')) })
+    expect(video).toHaveAttribute('aria-label', bufferingLabel)
+    view.unmount()
+  })
+
   it('waits for the first committed segment without requesting a manifest', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     const view = render(<RecordingPlayer recordingId="rec-live" active hasCommittedSegments={false} />)

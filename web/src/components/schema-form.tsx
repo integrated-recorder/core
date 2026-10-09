@@ -7,6 +7,7 @@ import { Input, Textarea } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectItem } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
+import { useI18n } from '@/i18n/provider'
 
 type Props = {
   schema: Schema
@@ -21,6 +22,7 @@ type Props = {
   busy?: boolean
 }
 export function SchemaForm({ schema, initialValues, storedValues, initialSecrets, valueSources, secretSources, mode = 'input', submitLabel = '저장', onSubmit, busy }: Props) {
+  const { t } = useI18n()
   const initial = useMemo(() => ({ ...defaultValues(schema), ...(initialValues ?? {}) }), [schema, initialValues])
   const [values, setValues] = useState<Record<string, unknown>>(initial)
   const [secrets, setSecrets] = useState<Record<string, string>>({})
@@ -74,7 +76,7 @@ export function SchemaForm({ schema, initialValues, storedValues, initialSecrets
       const describedBy = [descriptionId, errorId].filter(Boolean).join(' ') || undefined
       return <div key={field.key} className="space-y-2 rounded-md">
         {field.control === 'action' ? <ActionField field={field} /> : field.control === 'status' ? <StatusField field={field} /> : <>
-          <div className="flex items-center justify-between gap-3"><Label htmlFor={inputId}>{fieldLabel(field)}{field.required && <span className="ml-1 text-destructive" aria-label="필수">*</span>}</Label>
+          <div className="flex items-center justify-between gap-3"><Label htmlFor={inputId}>{fieldLabel(field)}{field.required && <span className="ml-1 text-destructive" aria-label={t('schema.required')}>*</span>}</Label>
             {mode === 'config' && source && !localValue && <Badge tone="blue">상속 · {source}</Badge>}
           </div>
           {field.description && <p id={descriptionId} className="-mt-1 text-xs leading-5 text-muted-foreground">{field.description}</p>}

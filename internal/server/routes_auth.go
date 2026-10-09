@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -16,6 +17,47 @@ func (s *Server) registerAuthRoutes() {
 	s.mux.HandleFunc("POST /api/auth/bootstrap", s.authBootstrap)
 	s.mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	s.mux.HandleFunc("POST /api/auth/logout", s.authLogout)
+	s.mux.HandleFunc("GET /api/user/preferences", s.userPreferencesGet)
+	s.mux.HandleFunc("PUT /api/user/preferences", s.userPreferencesPut)
+}
+
+func (s *Server) userPreferencesGet(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authn.PrincipalFromContext(r.Context())
+	if !ok || s.auth == nil {
+		writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
+		return
+	}
+	preferences, err := s.auth.GetUserPreferences(principal.UserID)
+	if err != nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "preferences_unavailable", "Preferences could not be loaded.")
+		return
+	}
+	writeJSON(w, http.StatusOK, preferences)
+}
+
+func (s *Server) userPreferencesPut(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authn.PrincipalFromContext(r.Context())
+	if !ok || s.auth == nil {
+		writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
+		return
+	}
+	var preferences authn.UserPreferences
+	if err := decodeJSONBody(w, r, 4<<10, &preferences); err != nil {
+		writeCodedError(w, http.StatusBadRequest, "preferences_invalid", "Preferences are invalid.")
+		return
+	}
+	if err := s.auth.SetUserPreferences(principal.UserID, preferences); err != nil {
+		switch {
+		case errors.Is(err, authn.ErrInvalidPreferences):
+			writeCodedError(w, http.StatusBadRequest, "preferences_invalid", "Preferences are invalid.")
+		case errors.Is(err, authn.ErrUnsupportedPreferencesVersion):
+			writeCodedError(w, http.StatusServiceUnavailable, "preferences_unavailable", "Preferences could not be updated.")
+		default:
+			writeCodedError(w, http.StatusServiceUnavailable, "preferences_unavailable", "Preferences could not be updated.")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, preferences)
 }
 
 func (s *Server) authSession(w http.ResponseWriter, r *http.Request) {
@@ -140,13 +182,13 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		token := authn.SessionToken(r)
 		session, err := s.auth.Authenticate(token)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, "authentication required")
+			writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
 			csrf := r.Header.Get("X-CSRF-Token")
 			if csrf == "" || !s.auth.ValidCSRF(token, csrf) {
-				writeError(w, http.StatusForbidden, "CSRF validation failed")
+				writeCodedError(w, http.StatusForbidden, "csrf_invalid", "Request validation failed.")
 				return
 			}
 		}
@@ -167,6 +209,9 @@ func permissionForRequest(r *http.Request) authn.Permission {
 	unclassified := authn.Permission("permission.unclassified")
 	if path == "/api/auth/logout" && r.Method == http.MethodPost {
 		return authn.PermissionSettingsManage
+	}
+	if path == "/api/user/preferences" && (method == http.MethodGet || method == http.MethodPut) {
+		return authn.PermissionUserPreferences
 	}
 	if path == "/api/audit" && method == http.MethodGet {
 		return authn.PermissionAuditRead

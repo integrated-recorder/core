@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api, setCSRFToken } from './client'
-import { recordingsAPI } from './index'
+import { recordingsAPI, userPreferencesAPI } from './index'
 
 afterEach(() => { vi.unstubAllGlobals(); setCSRFToken(undefined) })
 
@@ -23,6 +23,26 @@ describe('typed API client', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toContain('/api/v2/recordings?q=live+show&state=completed&tag=important&sort=-started_at&limit=25&cursor=next-page')
   })
 
+  it('requests archive index pages with bounded limit and cursor', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ recording_id: 'rec-1', entries: [], next_cursor: 'cursor-2', has_more: true }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const page = await recordingsAPI.archive('rec-1', { limit: 20, cursor: 'cursor-1' })
+    expect(page.has_more).toBe(true)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/recordings/rec-1/archive/index?limit=20&cursor=cursor-1')
+  })
+
+  it('uses current-user preference endpoints without accepting a user ID', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ locale: 'ko-KR', theme: 'dark', timezone: 'Asia/Seoul' }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ locale: 'en-US', theme: 'light', timezone: 'America/New_York' }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    await userPreferencesAPI.get()
+    await userPreferencesAPI.update({ locale: 'en-US', theme: 'light', timezone: 'America/New_York' })
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/user/preferences')
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/user/preferences')
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({ locale: 'en-US', theme: 'light', timezone: 'America/New_York' })
+  })
+
   it('sends preview policy only as management-level recording creation input and uses the frame-index API', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'rec-1' }), { status: 200, headers: { 'content-type': 'application/json' } }))
@@ -40,8 +60,8 @@ describe('typed API client', () => {
   })
 
   it('returns structured API errors with request identifiers', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: 'conflict' }), { status: 409, headers: { 'content-type': 'application/json', 'X-Request-ID': 'req-1' } })))
-    await expect(api('/api/example')).rejects.toMatchObject({ status: 409, message: 'conflict', requestID: 'req-1' })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error_code: 'archive_conflict', error: 'conflict' }), { status: 409, headers: { 'content-type': 'application/json', 'X-Request-ID': 'req-1' } })))
+    await expect(api('/api/example')).rejects.toMatchObject({ status: 409, message: 'conflict', errorCode: 'archive_conflict', requestID: 'req-1' })
   })
 
   it('uses a CSRF token returned by bootstrap or login for the next mutation', async () => {

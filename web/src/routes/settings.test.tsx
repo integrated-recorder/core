@@ -1,11 +1,13 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { dashboardAPI, productAPI, runtimeUpdateAPI } from '@/api'
+import { authAPI, dashboardAPI, productAPI, runtimeUpdateAPI, userPreferencesAPI } from '@/api'
 import { ToastProvider } from '@/components/ui/toast'
 import { APIError } from '@/api/client'
 import type { RuntimeUpdateStatus, StorageSettings, SystemSettings } from '@/types/api'
+import type { UserPreferences } from '@/types/api'
 import { SettingsPage } from './settings'
+import { I18nProvider } from '@/i18n/provider'
 
 const storageDefaults: StorageSettings = {
   ingest_memory: { global_buffer_bytes: 1024 ** 3, per_recording_buffer_bytes: 768 * 1024 ** 2, max_payload_bytes: 512 * 1024 ** 2 },
@@ -37,11 +39,17 @@ function renderSettings() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   return render(<QueryClientProvider client={client}><ToastProvider><SettingsPage /></ToastProvider></QueryClientProvider>)
 }
+function renderLocalizedSettings() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  return render(<QueryClientProvider client={client}><I18nProvider><ToastProvider><SettingsPage /></ToastProvider></I18nProvider></QueryClientProvider>)
+}
 function openStorageTab() { fireEvent.click(screen.getByRole('tab', { name: '저장소' })) }
 
 beforeEach(() => {
   vi.spyOn(productAPI, 'settings').mockResolvedValue(structuredClone(settingsDefaults))
   vi.spyOn(productAPI, 'saveSettings').mockResolvedValue(structuredClone(settingsDefaults))
+  vi.spyOn(userPreferencesAPI, 'get').mockResolvedValue({ locale: 'system', theme: 'system', timezone: 'system' })
+  vi.spyOn(userPreferencesAPI, 'update').mockImplementation(async preferences => preferences)
   vi.spyOn(productAPI, 'retentionCandidates').mockResolvedValue({ enabled: false, candidate_count: 0, candidates: [] })
   vi.spyOn(dashboardAPI, 'storage').mockResolvedValue(storageInfo)
   vi.spyOn(dashboardAPI, 'info').mockResolvedValue(systemInfo)
@@ -97,18 +105,36 @@ describe('storage ingest settings UI', () => {
   })
 
   it('shows an authoritative server validation error for invalid related limits', async () => {
-    vi.mocked(productAPI.saveSettings).mockRejectedValue(new APIError(400, '녹화별 버퍼 한도는 전체 버퍼 한도보다 클 수 없습니다.'))
+    vi.mocked(productAPI.saveSettings).mockRejectedValue(new APIError(400, 'untrusted backend detail', undefined, 'invalid_argument'))
     renderSettings()
     openStorageTab()
     await screen.findByRole('heading', { name: '고급 수집·저장 설정' })
     fireEvent.change(screen.getByLabelText('녹화별 버퍼 한도'), { target: { value: '1100' } })
     fireEvent.click(screen.getByRole('button', { name: '수집·저장 설정 저장' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('녹화별 버퍼 한도는 전체 버퍼 한도보다 클 수 없습니다.')
+    expect(await screen.findByRole('alert')).toHaveTextContent('입력 값을 확인한 뒤 다시 시도하세요.')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('untrusted backend detail')
   })
 })
 
 describe('runtime update settings UI', () => {
   function openUpdatesTab() { fireEvent.click(screen.getByRole('tab', { name: '업데이트' })) }
+
+  it('renders only stable, sanitized handover diagnostics', async () => {
+    const diagnostic = {
+      recording_id: 'recording-123', phase: 'prepare_target', reason_code: 'target_start_timeout',
+      source_generation_id: 'generation-old', target_generation_id: 'generation-new', target_version: '1.2.3',
+      occurred_at: '2026-10-10T01:02:03Z', reconcile_state: 'pending' as const, retryable: true, recoverable: true,
+      ownership_retained: true, raw_error: 'token=super-secret private-path=/srv/archive',
+    } as NonNullable<RuntimeUpdateStatus['handover_diagnostic']>
+    vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({ ...structuredClone(updateStatus), handover_diagnostic: diagnostic })
+    renderSettings()
+    openUpdatesTab()
+    expect(await screen.findByRole('heading', { name: '최근 세대 전환 진단' })).toBeInTheDocument()
+    expect(screen.getByText('대상 시작 시간 초과 · target_start_timeout')).toBeInTheDocument()
+    expect(screen.getByText('generation-old')).toBeInTheDocument()
+    expect(screen.getByText('generation-new')).toBeInTheDocument()
+    expect(screen.queryByText(/super-secret|private-path/)).not.toBeInTheDocument()
+  })
 
   it('loads release state, runs update actions and refreshes the displayed status', async () => {
     const { container } = renderSettings()
@@ -117,7 +143,7 @@ describe('runtime update settings UI', () => {
     await waitFor(() => expect(runtimeUpdateAPI.status).toHaveBeenCalledTimes(1))
     expect(screen.getAllByText('1.0.0').length).toBeGreaterThan(0)
     expect(screen.getByText('1.1.0')).toBeInTheDocument()
-    expect(screen.getByText('녹화 2개')).toBeInTheDocument()
+    expect(screen.getByText('2개 녹화')).toBeInTheDocument()
     expect(screen.getByText('변경 사항 <img src=x onerror=alert(1)>')).toBeInTheDocument()
     expect(container.querySelector('img[src="x"]')).toBeNull()
 
@@ -138,12 +164,13 @@ describe('runtime update settings UI', () => {
   })
 
   it('shows update action errors', async () => {
-    vi.mocked(runtimeUpdateAPI.check).mockRejectedValue(new APIError(502, '업데이트 확인에 실패했습니다.'))
+    vi.mocked(runtimeUpdateAPI.check).mockRejectedValue(new APIError(502, 'private backend details'))
     renderSettings()
     openUpdatesTab()
     await screen.findByText('1.1.0')
     fireEvent.click(screen.getByRole('button', { name: '업데이트 확인' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('업데이트 확인에 실패했습니다.')
+    expect(await screen.findByRole('alert')).toHaveTextContent('서버가 요청을 처리하지 못했습니다.')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('private backend details')
   })
 
   it('shows unavailable reason and disables update operations for a development build', async () => {
@@ -155,5 +182,44 @@ describe('runtime update settings UI', () => {
     expect(screen.getByRole('button', { name: '다운로드 및 검증' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '활성화' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '이전 버전으로 롤백' })).toBeDisabled()
+  })
+})
+
+describe('per-user preferences', () => {
+  it('switches settings UI and save toast to the saved locale', async () => {
+    vi.spyOn(authAPI, 'session').mockResolvedValue({ auth_enabled: true, authenticated: true, needs_bootstrap: false })
+    vi.mocked(userPreferencesAPI.get).mockResolvedValue({ locale: 'en-US', theme: 'system', timezone: 'system' })
+    renderLocalizedSettings()
+    expect(await screen.findByRole('heading', { name: 'User preferences' })).toBeInTheDocument()
+    const locale = await screen.findByRole('combobox', { name: 'Language' })
+    fireEvent.change(locale, { target: { value: 'ko-KR' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save preferences' }))
+    expect(await screen.findByText('환경 설정을 저장했습니다.')).toBeInTheDocument()
+    await waitFor(() => expect(document.documentElement.lang).toBe('ko-KR'))
+    expect(screen.getByRole('heading', { name: '사용자 환경' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '환경 설정 저장' })).toBeInTheDocument()
+  })
+
+  it('loads and persists locale, theme, and time zone together', async () => {
+    const saved: UserPreferences = { locale: 'ko-KR', theme: 'dark', timezone: 'Asia/Seoul' }
+    vi.mocked(userPreferencesAPI.update).mockResolvedValue(saved)
+    renderSettings()
+    expect(await screen.findByRole('heading', { name: '사용자 환경' })).toBeInTheDocument()
+    fireEvent.change(await screen.findByRole('combobox', { name: '언어' }), { target: { value: 'ko-KR' } })
+    fireEvent.change(await screen.findByRole('combobox', { name: '테마' }), { target: { value: 'dark' } })
+    fireEvent.change(await screen.findByLabelText('시간대'), { target: { value: 'Asia/Seoul' } })
+    fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
+    await waitFor(() => expect(userPreferencesAPI.update).toHaveBeenCalledWith(saved, expect.objectContaining({ client: expect.anything() })))
+    expect(await screen.findByText('환경 설정을 저장했습니다.')).toBeInTheDocument()
+    expect(productAPI.saveSettings).not.toHaveBeenCalledWith(expect.objectContaining({ ui: expect.anything() }))
+  })
+
+  it('rejects invalid IANA time zones before sending the update', async () => {
+    renderSettings()
+    await screen.findByRole('heading', { name: '사용자 환경' })
+    fireEvent.change(await screen.findByLabelText('시간대'), { target: { value: 'Mars/Olympus' } })
+    fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('환경 설정 값을 확인하세요.')
+    expect(userPreferencesAPI.update).not.toHaveBeenCalled()
   })
 })

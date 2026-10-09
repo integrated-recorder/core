@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { StorageMetricSample, StoragePool } from '@/types/api'
 import { MetricChart } from '@/components/storage/metric-chart'
 import { StoragePoolCard, StoragePoolDetailPage, StoragePoolList } from './storage'
+import { configureFormatPreferences, formatDateTime } from '@/lib/formatting'
 
 const pool: StoragePool = {
   id: 'local-primary', display_name: '기본 보관 저장소', kind: 'local', role: 'primary', health: 'healthy',
@@ -62,7 +63,7 @@ describe('storage observability UI', () => {
     const router = createRouter({ routeTree: root.addChildren([cardRoute, detailRoute]), history: createMemoryHistory({ initialEntries: ['/'] }), scrollRestoration: false })
     await router.load()
     const { container } = render(<RouterProvider router={router} />)
-    expect(screen.getByText('용량 알 수 없음')).toBeInTheDocument()
+    expect(screen.getByText('용량을 알 수 없음')).toBeInTheDocument()
     expect(container.querySelector('progress')).not.toBeInTheDocument()
     expect(screen.queryByText('0 B / 0 B')).not.toBeInTheDocument()
   })
@@ -79,7 +80,7 @@ describe('storage observability UI', () => {
     const router = createRouter({ routeTree: root.addChildren([detailRoute, listRoute]), history: createMemoryHistory({ initialEntries: [`/storage/${unknownPool.id}`] }), scrollRestoration: false })
     await router.load()
     const { container } = render(<QueryClientProvider client={client}><RouterProvider router={router} /></QueryClientProvider>)
-    expect(await screen.findByText('파일 시스템 용량: 용량 알 수 없음')).toBeInTheDocument()
+    expect(await screen.findByText('파일 시스템 용량: 용량을 알 수 없음')).toBeInTheDocument()
     expect(container.querySelector('progress')).not.toBeInTheDocument()
     expect(screen.queryByText('0 B / 0 B')).not.toBeInTheDocument()
   })
@@ -92,5 +93,15 @@ describe('storage observability UI', () => {
     expect(container.querySelector('svg polyline')).toBeInTheDocument()
     expect(container.querySelector('line[stroke-dasharray="7 5"]')).not.toBeInTheDocument()
     expect(container.querySelectorAll('circle')).toHaveLength(4)
+  })
+
+  it('formats metric timestamps with the saved locale and timezone', () => {
+    const locale = 'en-US'
+    const timezone = 'America/Los_Angeles'
+    configureFormatPreferences(locale, timezone)
+    const { container } = render(<MetricChart title="Read and write" samples={samples} kind="throughput" pool={pool} />)
+    const expected = formatDateTime(samples[0]!.at, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }, locale, timezone)
+    expect(container.querySelector('svg')?.textContent).toContain(expected)
+    configureFormatPreferences('ko-KR', 'system')
   })
 })

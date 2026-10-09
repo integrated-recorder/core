@@ -352,10 +352,6 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid preview mode")
 		return
 	}
-	if previewMode == preview.ModeSegment && s.previews == nil {
-		writeError(w, http.StatusNotImplemented, "preview generation is unavailable")
-		return
-	}
 	if s.adapters == nil {
 		writeError(w, http.StatusServiceUnavailable, "adapter resolver is unavailable")
 		return
@@ -526,7 +522,7 @@ func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
 
 func normalizePreviewMode(mode preview.Mode) (preview.Mode, error) {
 	if mode == "" {
-		return preview.ModeDisabled, nil
+		return preview.ModeSegment, nil
 	}
 	if mode != preview.ModeDisabled && mode != preview.ModeSegment {
 		return "", preview.ErrInvalid
@@ -535,16 +531,24 @@ func normalizePreviewMode(mode preview.Mode) (preview.Mode, error) {
 }
 
 func (s *Server) applyPreviewPolicy(recordingID string, mode preview.Mode) {
-	if mode != preview.ModeSegment || s.previews == nil {
+	if mode != preview.ModeSegment {
+		return
+	}
+	if s.previews == nil {
+		if s.logs != nil {
+			s.logs.Add("warn", "preview", "preview generation is unavailable; canonical recording continues without previews")
+		}
 		return
 	}
 	if _, err := s.previews.SetMode(recordingID, mode); err != nil {
 		if s.logs != nil {
-			s.logs.Add("error", "preview", "preview policy could not be persisted after recording start")
+			s.logs.Add("warn", "preview", "preview policy could not be persisted after recording start; canonical recording continues")
 		}
 		return
 	}
-	_ = s.previews.Reconcile()
+	if err := s.previews.Reconcile(); err != nil && s.logs != nil {
+		s.logs.Add("warn", "preview", "preview work could not be queued after recording start; canonical recording continues")
+	}
 }
 
 func (s *Server) adapterList(w http.ResponseWriter, r *http.Request) {
@@ -1570,6 +1574,13 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+func writeCodedError(w http.ResponseWriter, status int, code, safeMessage string) {
+	if strings.TrimSpace(code) == "" {
+		writeError(w, status, safeMessage)
+		return
+	}
+	writeJSON(w, status, map[string]string{"error_code": code, "error": safeMessage})
 }
 func writeStorageError(w http.ResponseWriter, err error) {
 	if errors.Is(err, storage.ErrNotFound) {

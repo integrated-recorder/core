@@ -152,17 +152,18 @@ type updateController struct {
 	gate chan struct{}
 	mu   sync.RWMutex
 
-	engines         map[string]engineAttachment
-	manifests       map[string]release.Manifest
-	releaseNotes    map[string]string
-	buildIdentities map[string]buildinfo.Info
-	bundleBuild     buildinfo.Info
-	inventorySource leases.InventorySource
-	available       *release.Manifest
-	availableSource install.Source
-	availableNotes  string
-	verification    string
-	lastFailureCode string
+	engines            map[string]engineAttachment
+	manifests          map[string]release.Manifest
+	releaseNotes       map[string]string
+	buildIdentities    map[string]buildinfo.Info
+	bundleBuild        buildinfo.Info
+	inventorySource    leases.InventorySource
+	available          *release.Manifest
+	availableSource    install.Source
+	availableNotes     string
+	verification       string
+	lastFailureCode    string
+	handoverDiagnostic *httpapi.HandoverDiagnostic
 }
 
 var _ httpapi.Controller = (*updateController)(nil)
@@ -917,14 +918,17 @@ func (c *updateController) handoverOneDrainingRecording(ctx context.Context, rea
 	return nil
 }
 
-func (c *updateController) handoverRecording(ctx context.Context, source, target engineAttachment, lease generation.Lease, owner recordingowner.Owner) error {
+func (c *updateController) handoverRecording(ctx context.Context, source, target engineAttachment, lease generation.Lease, owner recordingowner.Owner) (returnErr error) {
 	started := time.Now()
 	stage := "inventory"
 	defer func() {
 		// Error details can contain adapter-controlled strings, so this event
 		// records only bounded identities and a stable safe code.
-		if stage != "complete" && stage != "aborted" {
-			slog.Warn("recording handover_failed", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch, "stage", stage, "code", "handover_failed", "duration_ms", time.Since(started).Milliseconds())
+		if returnErr != nil && stage != "complete" && stage != "aborted" {
+			if stage == "prepare_target" || stage == "prepare_drained_target" {
+				c.recordHandoverDiagnostic(stage, returnErr, source.generationID, target.generationID, lease.RecordingID)
+			}
+			slog.Warn("recording handover_failed", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch, "stage", stage, "code", "handover_failed", "reason_code", handoverDiagnosticReason(returnErr), "retryable", stage == "prepare_target" || stage == "prepare_drained_target", "recoverable", stage == "prepare_target" || stage == "prepare_drained_target", "duration_ms", time.Since(started).Milliseconds())
 		}
 	}()
 	sourceManager, err := c.engineManagerClient(source)
@@ -1088,8 +1092,59 @@ func (c *updateController) handoverRecording(ctx context.Context, source, target
 	}
 	committed = true
 	stage = "complete"
+	c.resolveHandoverDiagnostic(lease.RecordingID)
 	slog.Info("recording handover_committed", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", targetOwner.Epoch, "duration_ms", time.Since(started).Milliseconds())
 	return nil
+}
+
+func handoverDiagnosticReason(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "target_start_timeout"
+	case errors.Is(err, recorderengine.ErrHandoverIdentity):
+		return "target_not_ready"
+	default:
+		return "unknown"
+	}
+}
+
+func (c *updateController) recordHandoverDiagnostic(phase string, err error, sourceGenerationID, targetGenerationID, recordingID string) {
+	if c == nil || (phase != "prepare_target" && phase != "prepare_drained_target") {
+		return
+	}
+	version := "unknown"
+	if c.registry != nil {
+		if state := c.registry.Snapshot(); state.Generations != nil {
+			if target, ok := state.Generations[targetGenerationID]; ok && target.Version != "" {
+				version = target.Version
+			}
+		}
+	}
+	diagnostic := httpapi.HandoverDiagnostic{
+		RecordingID: recordingID, Phase: phase, ReasonCode: handoverDiagnosticReason(err),
+		SourceGenerationID: sourceGenerationID,
+		TargetGenerationID: targetGenerationID, TargetVersion: version,
+		OccurredAt: time.Now().UTC(), ReconcileState: "pending", Retryable: true, Recoverable: true, OwnershipRetained: true,
+		ReconcileAttempt: 1,
+	}
+	c.mu.Lock()
+	if previous := c.handoverDiagnostic; previous != nil && previous.RecordingID == recordingID && previous.ReconcileAttempt < ^uint32(0) {
+		diagnostic.ReconcileAttempt = previous.ReconcileAttempt + 1
+	}
+	c.handoverDiagnostic = &diagnostic
+	c.mu.Unlock()
+}
+
+func (c *updateController) resolveHandoverDiagnostic(recordingID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.handoverDiagnostic == nil || c.handoverDiagnostic.RecordingID != recordingID || c.handoverDiagnostic.ReconcileState == "succeeded" {
+		return
+	}
+	resolvedAt := time.Now().UTC()
+	c.handoverDiagnostic.ReconcileState = "succeeded"
+	c.handoverDiagnostic.Retryable = false
+	c.handoverDiagnostic.ResolvedAt = &resolvedAt
 }
 
 func (c *updateController) engineManagerClient(attachment engineAttachment) (*recorderengine.ManagerClient, error) {
@@ -1952,6 +2007,15 @@ func (c *updateController) status() httpapi.Status {
 	appBuild := c.applicationBuild
 	verification := c.verification
 	lastFailure := c.lastFailureCode
+	var handoverDiagnostic *httpapi.HandoverDiagnostic
+	if c.handoverDiagnostic != nil {
+		copy := *c.handoverDiagnostic
+		if c.handoverDiagnostic.ResolvedAt != nil {
+			resolvedAt := *c.handoverDiagnostic.ResolvedAt
+			copy.ResolvedAt = &resolvedAt
+		}
+		handoverDiagnostic = &copy
+	}
 	unavailable := c.unavailableReason
 	available := c.available
 	availableNotes := c.availableNotes
@@ -1983,6 +2047,7 @@ func (c *updateController) status() httpapi.Status {
 		Host: toAPIIdentity(hostBuild), Application: toAPIIdentity(appBuild),
 		ActiveGenerations: []httpapi.GenerationSummary{}, DrainingGenerations: []httpapi.GenerationSummary{},
 		VerificationState: verification, LastFailureCode: lastFailure,
+		HandoverDiagnostic:      handoverDiagnostic,
 		UpdateUnavailableReason: unavailable,
 	}
 	leaseCount := make(map[string]int, len(registryState.Leases))

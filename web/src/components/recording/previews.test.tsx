@@ -2,6 +2,8 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { LivePreviewViewport, PreviewFrameGrid, PreviewThumbnail } from './previews'
 import { formatPreviewClock, seekToPreview, uniquePreviewFrames } from '@/lib/previews'
+import { formatDuration } from '@/lib/utils'
+import { translate } from '@/i18n/catalog'
 import type { PreviewFrame, PreviewSummary } from '@/types/api'
 
 const frame = (ordinal: number, time: number, state?: PreviewFrame['state']): PreviewFrame => ({
@@ -15,14 +17,14 @@ describe('Preview Frame Index presentation', () => {
     expect(uniquePreviewFrames([frame(3, 12), frame(1, 3), frame(1, 4), frame(2, 6, 'failed')]).map(item => item.archive_ordinal)).toEqual([1, 3])
     const view = render(<PreviewFrameGrid recordingId="rec-1" items={[frame(3, 12), frame(1, 3), frame(1, 4)]} onSeek={() => undefined} />)
     expect(screen.getAllByRole('button')).toHaveLength(2)
-    expect(screen.getByRole('button', { name: '0m 03s 위치로 이동' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: translate('ko-KR', 'preview.seek', { time: formatDuration(3) }) })).toBeInTheDocument()
     expect(view.container.querySelector('[aria-label="장면 미리보기"]')).toHaveClass('grid-cols-3', 'md:grid-cols-6', 'xl:grid-cols-8')
   })
 
   it('seeks to the selected frame when its storyboard button is activated', () => {
     const onSeek = vi.fn()
     render(<PreviewFrameGrid recordingId="rec-1" items={[frame(7, 30)]} onSeek={onSeek} />)
-    fireEvent.click(screen.getByRole('button', { name: '0m 30s 위치로 이동' }))
+    fireEvent.click(screen.getByRole('button', { name: translate('ko-KR', 'preview.seek', { time: formatDuration(30) }) }))
     expect(onSeek).toHaveBeenCalledWith(30)
   })
 

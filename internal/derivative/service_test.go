@@ -108,6 +108,9 @@ func TestExportHappyPathIsProjectionAndDownloadable(t *testing.T) {
 	if job.State != StateCompleted || job.Size != int64(len("matroska-fixture")) || job.OutputName != "recording-"+recording.ID+".mkv" {
 		t.Fatalf("unexpected completed job: %+v", job)
 	}
+	if job.Progress.Phase != "completed" || job.Progress.Indeterminate || job.Progress.Total == nil || job.Progress.Current != *job.Progress.Total || job.Progress.Percent == nil || *job.Progress.Percent != 100 {
+		t.Fatalf("completed export progress=%+v, want measured terminal completion", job.Progress)
+	}
 	if job.SourceRevisionKnown || ProjectJob(job, recording).Freshness != FreshnessUnknown {
 		t.Fatalf("legacy revision-zero export must have unknown freshness: job=%+v projection=%+v", job, ProjectJob(job, recording))
 	}
@@ -491,12 +494,20 @@ func TestDuplicateExportCoalescesAndCancelCleansPartial(t *testing.T) {
 		t.Fatal("job was not marked active")
 	}
 	waitFile(t, marker)
+	progressing, err := service.Get(first.ID)
+	if err != nil || progressing.State != StateRunning || progressing.Progress.Phase != "remuxing" || !progressing.Progress.Indeterminate || progressing.Progress.Percent != nil || progressing.Progress.Total == nil || progressing.Progress.Current != *progressing.Progress.Total {
+		t.Fatalf("remux progress=%+v err=%v, want indeterminate after measured input preparation", progressing.Progress, err)
+	}
+	encoded, err := json.Marshal(progressing.Progress)
+	if err != nil || strings.Contains(string(encoded), `"percent"`) {
+		t.Fatalf("indeterminate progress must omit percent: %s err=%v", encoded, err)
+	}
 	if _, err := service.Cancel(first.ID); err != nil {
 		t.Fatal(err)
 	}
 	job := waitTerminal(t, service, first.ID)
-	if job.State != StateCanceled {
-		t.Fatalf("state=%s", job.State)
+	if job.State != StateCanceled || job.Progress.Phase != "canceled" {
+		t.Fatalf("job=%+v, want canceled state and phase", job)
 	}
 	if _, err := os.Stat(filepath.Join(root, "exports", first.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("partial output remains: %v", err)
@@ -527,6 +538,9 @@ func TestWaitForIdleDrainsQueuedAndRunningExportsWithoutClosingService(t *testin
 	}
 	if second.State != StateQueued {
 		t.Fatalf("second job state=%s, want queued behind blocked worker", second.State)
+	}
+	if second.Progress.Phase != "queued" || second.Progress.Current != 0 || second.Progress.Total == nil || second.Progress.Percent == nil || *second.Progress.Percent != 0 {
+		t.Fatalf("queued progress=%+v, want zero percent with known total", second.Progress)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
@@ -570,8 +584,47 @@ func TestFailedFFmpegDoesNotRetainPartialArtifact(t *testing.T) {
 	if job.State != StateFailed || job.ErrorCode != "ffmpeg_failed" {
 		t.Fatalf("job=%+v", job)
 	}
+	if job.Progress.Phase != "failed" || job.Progress.Percent != nil || !job.Progress.Indeterminate {
+		t.Fatalf("failed remux progress=%+v, want indeterminate failed phase", job.Progress)
+	}
 	if _, err := os.Stat(filepath.Join(root, "exports", job.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failure staging remains: %v", err)
+	}
+}
+
+func TestProgressStateReflectsTerminalPersistenceFailure(t *testing.T) {
+	root, store, recording := fixtureRecording(t)
+	ffmpeg := fakeFFmpeg(t)
+	started := filepath.Join(t.TempDir(), "started")
+	release := filepath.Join(t.TempDir(), "release")
+	t.Setenv("DERIVATIVE_FAKE_FFMPEG", "wait-release")
+	t.Setenv("DERIVATIVE_FAKE_STARTED", started)
+	t.Setenv("DERIVATIVE_FAKE_RELEASE", release)
+	service := openService(t, root, store, ffmpeg, 1)
+	job, err := service.Start(context.Background(), recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFile(t, started)
+
+	service.mu.Lock()
+	statePath := service.statePath
+	service.statePath = service.jobsDir // Rename onto this existing directory must fail.
+	service.mu.Unlock()
+	if err := os.WriteFile(release, []byte("release"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	failed := waitTerminal(t, service, job.ID)
+	if failed.State != StateFailed || failed.ErrorCode != "state_persistence_failed" || failed.Progress.Phase != "failed" {
+		t.Fatalf("job after final-state persistence failure=%+v, want failed state and progress", failed)
+	}
+
+	service.mu.Lock()
+	service.statePath = statePath
+	persistErr := service.persistLocked()
+	service.mu.Unlock()
+	if persistErr != nil {
+		t.Fatalf("persist recovered failure summary: %v", persistErr)
 	}
 }
 
@@ -595,6 +648,9 @@ func TestRestartMarksQueuedAndRunningJobsInterrupted(t *testing.T) {
 	for _, job := range service.List("") {
 		if job.State != StateFailed || job.ErrorCode != "interrupted_by_restart" {
 			t.Fatalf("job=%+v", job)
+		}
+		if job.Progress.Phase != "interrupted" {
+			t.Fatalf("restarted active job progress=%+v, want interrupted phase", job.Progress)
 		}
 	}
 	if err := service.Delete("../" + id); !errors.Is(err, ErrNotFound) {

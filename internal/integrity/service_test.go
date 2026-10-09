@@ -38,6 +38,9 @@ func TestVerificationCompletesPersistsAndReloads(t *testing.T) {
 	if completed.Result == nil || completed.Result.Status != storage.IntegrityVerified || completed.Result.ObjectsTotal != 1 || completed.Result.ObjectsVerified != 1 {
 		t.Fatalf("unexpected completed verification: %#v", completed)
 	}
+	if completed.Progress.Phase != "completed" || completed.Progress.Current != 1 || completed.Progress.Total == nil || *completed.Progress.Total != 1 || completed.Progress.Percent == nil || *completed.Progress.Percent != 100 || completed.Progress.Indeterminate {
+		t.Fatalf("completed integrity progress=%+v, want one verified object and 100%%", completed.Progress)
+	}
 	if !completed.SourceRevisionKnown || completed.SourceArchiveRevision != 7 || completed.SourceTimelineRevision != 3 {
 		t.Fatalf("job did not retain source revisions: %+v", completed)
 	}
@@ -78,7 +81,7 @@ func TestVerificationCompletesPersistsAndReloads(t *testing.T) {
 		t.Fatalf("archive revision change should preserve verified result but mark it stale: %+v present=%t", stale, ok)
 	}
 	projected := ProjectJob(reloadedJob, &changed)
-	if projected.Freshness != FreshnessStale || projected.State != StateCompleted {
+	if projected.Freshness != FreshnessStale || projected.State != StateCompleted || projected.Progress.Phase != "completed" || projected.Progress.Percent == nil || *projected.Progress.Percent != 100 {
 		t.Fatalf("job projection after archive revision change=%+v, want stale completed job", projected)
 	}
 	timelineOnly := *recording
@@ -135,6 +138,10 @@ func TestActiveVerificationProjectsItsCapturedArchiveRevision(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("second verification did not start")
 	}
+	activeJob, err := service.Get(active.ID)
+	if err != nil || activeJob.Progress.Phase != "checking_objects" || !activeJob.Progress.Indeterminate || activeJob.Progress.Percent != nil {
+		t.Fatalf("uninstrumented integrity progress=%+v err=%v, want indeterminate without percentage", activeJob.Progress, err)
+	}
 
 	projection, ok := service.StatusFor(recording)
 	if !ok || projection.Status != storage.IntegrityVerifying || projection.Freshness != FreshnessCurrent || !projection.RevisionKnown || projection.SourceArchiveRevision != 8 || projection.SourceTimelineRevision != 4 {
@@ -151,6 +158,132 @@ func TestActiveVerificationProjectsItsCapturedArchiveRevision(t *testing.T) {
 	completed := waitJobState(t, service, active.ID, StateCompleted)
 	if completed.SourceArchiveRevision != 8 || completed.SourceTimelineRevision != 4 {
 		t.Fatalf("completed active job lost captured revisions: %+v", completed)
+	}
+}
+
+func TestIntegrityProgressAndActiveSummaryAreBounded(t *testing.T) {
+	root := t.TempDir()
+	store, recording := makeIntegrityArchive(t, root, "edededededededededededededededed", []byte("original"))
+	recording.ArchiveRevision = 7
+	recording.TimelineRevision = 3
+	service, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeService(t, service)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	service.verifyWithProgress = func(ctx context.Context, _ *domain.Recording, report verificationProgress) storage.IntegrityResult {
+		report(1)
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return storage.IntegrityResult{Status: storage.IntegrityVerified, ObjectsTotal: 1, ObjectsVerified: 1, Issues: []storage.IntegrityIssue{}}
+	}
+	job, err := service.Start(context.Background(), recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("verification did not reach progress barrier")
+	}
+	active, found := service.ActiveForRecording(recording.ID)
+	if !found || active.ID != job.ID || active.State != StateRunning || active.Progress.Current != 1 || active.Progress.Total == nil || *active.Progress.Total != 1 || active.Progress.Percent == nil || *active.Progress.Percent != 100 || active.Progress.Indeterminate {
+		t.Fatalf("active summary=%+v found=%t, want bounded measured progress", active, found)
+	}
+	close(release)
+	completed := waitJobState(t, service, job.ID, StateCompleted)
+	if completed.Progress.Phase != "completed" || completed.Progress.Percent == nil || *completed.Progress.Percent != 100 {
+		t.Fatalf("terminal progress=%+v, want completed", completed.Progress)
+	}
+	staleRecording := *recording
+	staleRecording.ArchiveRevision++
+	projection := ProjectJob(completed, &staleRecording)
+	if projection.Freshness != FreshnessStale || projection.State != StateCompleted || projection.Progress.Phase != "completed" {
+		t.Fatalf("freshness changed progress state: %+v", projection)
+	}
+	if _, found := service.ActiveForRecording(recording.ID); found {
+		t.Fatal("terminal job remained in active lookup")
+	}
+}
+
+func TestVerificationFailureHasTerminalProgressState(t *testing.T) {
+	root := t.TempDir()
+	store, recording := makeIntegrityArchive(t, root, "abababababababababababababababac", []byte("original"))
+	service, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeService(t, service)
+	service.verify = func(context.Context, *domain.Recording) storage.IntegrityResult {
+		panic("sensitive verifier detail")
+	}
+	job, err := service.Start(context.Background(), recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := waitJobState(t, service, job.ID, StateFailed)
+	if failed.ErrorCode != ErrorVerificationFailed || failed.Progress.Phase != "failed" || failed.Progress.Percent != nil || !failed.Progress.Indeterminate {
+		t.Fatalf("failed verification job=%+v, want safe error and indeterminate failed progress", failed)
+	}
+	encoded, err := json.Marshal(failed)
+	if err != nil || strings.Contains(string(encoded), "sensitive verifier detail") {
+		t.Fatalf("job exposed raw verifier detail: %s err=%v", encoded, err)
+	}
+}
+
+func TestProgressStateReflectsResultPersistenceFailure(t *testing.T) {
+	root := t.TempDir()
+	store, recording := makeIntegrityArchive(t, root, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc", []byte("original"))
+	service, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeService(t, service)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	service.verifyWithProgress = func(ctx context.Context, _ *domain.Recording, report verificationProgress) storage.IntegrityResult {
+		report(1)
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return storage.IntegrityResult{Status: storage.IntegrityVerified, ObjectsTotal: 1, ObjectsVerified: 1, Issues: []storage.IntegrityIssue{}}
+	}
+	job, err := service.Start(context.Background(), recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("verification did not reach progress barrier")
+	}
+
+	service.mu.Lock()
+	statePath := service.statePath
+	service.statePath = service.dir // Rename onto this existing directory must fail.
+	service.mu.Unlock()
+	close(release)
+	failed := waitJobState(t, service, job.ID, StateFailed)
+	if failed.ErrorCode != ErrorPersistenceFailed || failed.Progress.Phase != "failed" {
+		t.Fatalf("job after result persistence failure=%+v, want failed state and progress", failed)
+	}
+
+	service.mu.Lock()
+	service.statePath = statePath
+	persistErr := service.persistLocked()
+	service.lastErr = nil // The injected persistence failure was repaired above.
+	service.mu.Unlock()
+	if persistErr != nil {
+		t.Fatalf("persist recovered failure summary: %v", persistErr)
 	}
 }
 
@@ -359,6 +492,10 @@ func TestWaitForIdleDrainsQueuedAndRunningVerificationsWithoutClosingService(t *
 	if job, err := service.Get(second.ID); err != nil || job.State != StateQueued {
 		t.Fatalf("second job=%+v err=%v, want queued behind blocked worker", job, err)
 	}
+	queuedSummary, found := service.ActiveForRecording(second.RecordingID)
+	if !found || queuedSummary.ID != second.ID || queuedSummary.Progress.Phase != "queued" || queuedSummary.Progress.Current != 0 || queuedSummary.Progress.Percent != nil {
+		t.Fatalf("queued active summary=%+v found=%t, want bounded indeterminate zero-work snapshot", queuedSummary, found)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	err = service.WaitForIdle(ctx)
@@ -483,9 +620,13 @@ func TestContextCancellationCancelsQueuedAndRunningJobs(t *testing.T) {
 	cancelQueued()
 	if got := waitJobState(t, service, running.ID, StateCanceled); got.ErrorCode != ErrorCanceled {
 		t.Fatalf("running cancellation result: %#v", got)
+	} else if got.Progress.Phase != "canceled" {
+		t.Fatalf("running cancellation progress=%+v, want canceled", got.Progress)
 	}
 	if got := waitJobState(t, service, queued.ID, StateCanceled); got.ErrorCode != ErrorCanceled {
 		t.Fatalf("queued cancellation result: %#v", got)
+	} else if got.Progress.Phase != "canceled" {
+		t.Fatalf("queued cancellation progress=%+v, want canceled", got.Progress)
 	}
 	if err = service.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -576,6 +717,9 @@ func TestRestartRecoveryFailsPersistedActiveJobs(t *testing.T) {
 	}
 	if recovered.State != StateFailed || recovered.ErrorCode != ErrorInterruptedByRestart || recovered.FinishedAt == nil {
 		t.Fatalf("stuck job was not recovered: %#v", recovered)
+	}
+	if recovered.Progress.Phase != "interrupted" {
+		t.Fatalf("recovered progress=%+v, want interrupted phase", recovered.Progress)
 	}
 	status, ok := service.Status(job.RecordingID)
 	if !ok || status.Status != storage.IntegrityUnknown {

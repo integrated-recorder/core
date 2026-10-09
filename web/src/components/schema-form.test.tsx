@@ -13,6 +13,7 @@ describe('SchemaForm', () => {
   it('renders conditional fields and submits generic schema values', async () => {
     const onSubmit = vi.fn()
     render(<SchemaForm schema={schema} onSubmit={onSubmit} submitLabel="Continue" />)
+    expect(document.querySelector('[aria-label="필수"]')).toBeInTheDocument()
     expect(screen.queryByLabelText('Detail')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('checkbox', { name: /Enabled/ }))
     fireEvent.change(screen.getByLabelText('Detail'), { target: { value: 'opaque' } })

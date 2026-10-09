@@ -1,4 +1,6 @@
 import { humanize } from '@/lib/utils'
+import { getFormatPreferences } from '@/lib/formatting'
+import { translate, type TranslationKey } from '@/i18n/catalog'
 
 export const commonLabels = {
   adapter: '어댑터',
@@ -68,23 +70,38 @@ const auditEventLabels: Record<string, string> = {
   config_changed: '설정 변경', recording_tags_updated: '녹화 태그 변경', recording_deleted: '녹화 삭제',
   integrity_verification_requested: '무결성 검사 요청', export_requested: '내보내기 요청',
 }
-const recordingEventMessages: Record<string, string> = {
-  'recording started': '녹화를 시작했습니다.', 'manifest observed': '매니페스트를 확인했습니다.',
-  'gap detected': '수집 누락을 감지했습니다.', 'recording stopped': '녹화를 중지했습니다.',
-  'recording completed': '녹화를 완료했습니다.', 'recording interrupted': '녹화가 중단되었습니다.',
+
+function labelFrom(map: Record<string, string>, value?: string, locale = getFormatPreferences().locale): string {
+  if (!value) return map.unknown ?? '미확인'
+  const key = stateTranslationKeys[value.toLowerCase()]
+  return key ? translate(locale, key) : map[value.toLowerCase()] ?? humanize(value)
 }
 
-function labelFrom(map: Record<string, string>, value?: string): string {
-  if (!value) return map.unknown ?? '미확인'
-  return map[value.toLowerCase()] ?? humanize(value)
+const stateTranslationKeys: Record<string, TranslationKey> = {
+  recording: 'state.recording', stopped: 'state.stopped', completed: 'state.completed', interrupted: 'state.interrupted', unknown: 'state.unknown',
+  queued: 'state.queued', running: 'state.running', failed: 'state.failed', canceled: 'state.cancelled', cancelled: 'state.cancelled',
+  verified: 'state.verified', verifying: 'state.verifying', degraded: 'state.degraded', ready: 'state.ready', disabled: 'state.disabled', unavailable: 'state.unavailable',
+  rejected: 'state.rejected', restarting: 'state.restarting', starting: 'state.starting', offline: 'state.offline', checking: 'state.checking', backoff: 'state.backoff',
+  attention_required: 'state.attention_required', suppressed: 'state.suppressed', started: 'state.started', resource_discovered: 'state.resource_discovered',
+  configuration_required: 'state.configuration_required', interaction_required: 'state.interaction_required', challenge_required: 'state.challenge_required',
+  resolving: 'state.resolving', resolved: 'state.resolved', expired: 'state.expired',
 }
 
 export const recordingStateLabel = (value?: string) => labelFrom(recordingLabels, value)
 export const integrityStatusLabel = (value?: string) => labelFrom(integrityLabels, value)
 export const adapterStateLabel = (value?: string) => labelFrom(adapterLabels, value)
 export const workflowStateLabel = (value?: string) => labelFrom(workflowLabels, value)
-export const watchStateLabel = (value?: string) => labelFrom(watchLabels, value)
-export const statusLabel = (value?: string) => labelFrom(genericLabels, value)
-export const recordingEventLabel = (value?: string) => labelFrom(recordingEventLabels, value)
+export const watchStateLabel = (value?: string) => value?.toLowerCase() === 'starting'
+  ? translate(getFormatPreferences().locale, 'watch.starting')
+  : labelFrom(watchLabels, value)
+export const statusLabel = (value?: string, locale?: Parameters<typeof translate>[0]) => labelFrom(genericLabels, value, locale)
+const eventTranslationKeys: Record<string, TranslationKey> = {
+  recording_started: 'event.recording_started', manifest_observed: 'event.manifest_observed', source_refreshed: 'event.source_refreshed', segment_retry: 'event.segment_retry',
+  gap_detected: 'event.gap_detected', gap_committed: 'event.gap_committed', recording_completed: 'event.recording_completed', recording_stopped: 'event.recording_stopped',
+  recording_interrupted: 'event.recording_interrupted', integrity_started: 'event.integrity_started', integrity_completed: 'event.integrity_completed', export_started: 'event.export_started', export_completed: 'event.export_completed',
+}
+export const recordingEventLabel = (value?: string, locale = getFormatPreferences().locale) => {
+  const key = value ? eventTranslationKeys[value.toLowerCase()] : undefined
+  return key ? translate(locale, key) : labelFrom(recordingEventLabels, value, locale)
+}
 export const auditEventLabel = (value?: string) => labelFrom(auditEventLabels, value)
-export const recordingEventMessageLabel = (value?: string) => value ? recordingEventMessages[value.toLowerCase()] ?? value : ''

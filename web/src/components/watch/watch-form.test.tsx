@@ -20,12 +20,12 @@ function wrapper(children: React.ReactNode) {
 }
 
 describe('Watch form', () => {
-  it('defaults to a 10 second interval and preview disabled, then submits secrets separately', async () => {
+  it('defaults new watches to preview enabled and submits secrets separately', async () => {
     const user = userEvent.setup()
     const onSubmit = vi.fn()
     render(wrapper(<WatchForm adapter={adapter} schema={schema} submitLabel="Watch 등록" onSubmit={onSubmit} />))
     expect(screen.getByLabelText('방송 확인 주기 (초)')).toHaveValue(10)
-    expect(screen.getByRole('checkbox', { name: /장면 미리보기 생성/ })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: /장면 미리보기 생성/ })).toBeChecked()
     await user.type(screen.getByLabelText(/방송 주소/), 'https://stream.example/live')
     await user.type(screen.getByLabelText('접근 토큰'), 'private-token-value')
     await user.click(screen.getByRole('button', { name: 'Watch 등록' }))
@@ -34,7 +34,7 @@ describe('Watch form', () => {
       input: { source_url: 'https://stream.example/live' },
       input_secrets: { access_token: 'private-token-value' },
       check_interval_seconds: 10,
-      preview_mode: 'disabled',
+      preview_mode: 'segment',
     }))
     expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty('clear_resource')
     expect(screen.queryByText('private-token-value')).not.toBeInTheDocument()
@@ -66,6 +66,20 @@ describe('Watch form', () => {
     expect(screen.queryByDisplayValue('must-not-render')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '저장' }))
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ input: { source_url: 'https://stream.example/live' }, input_secrets: {} })))
+  })
+
+  it('preserves an existing explicit preview opt-out', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    const watch: WatchView = {
+      id: 'watch-preview-off', adapter_id: 'owncast', input: { source_url: 'https://stream.example/live' },
+      enabled: true, preview_mode: 'disabled', check_interval_seconds: 10, state: 'offline',
+      created_at: '2026-09-28T00:00:00Z', updated_at: '2026-09-28T00:00:00Z', input_secret_configured: {},
+    }
+    render(wrapper(<WatchForm adapter={adapter} schema={schema} watch={watch} submitLabel="저장" onSubmit={onSubmit} />))
+    expect(screen.getByRole('checkbox', { name: /장면 미리보기 생성/ })).not.toBeChecked()
+    await user.click(screen.getByRole('button', { name: '저장' }))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ preview_mode: 'disabled' })))
   })
 
   it('sends clear_resource only when an existing resource is explicitly cleared', async () => {

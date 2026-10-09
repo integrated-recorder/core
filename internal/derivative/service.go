@@ -30,13 +30,15 @@ import (
 )
 
 const (
-	maxWorkers       = 4
-	maxActiveJobs    = 64
-	maxHistory       = 5000
-	maxInputBytes    = int64(512 << 30)
-	defaultTimeout   = 30 * time.Minute
-	jobKindExport    = "export"
-	defaultFFmpegBin = "ffmpeg"
+	maxWorkers              = 4
+	maxActiveJobs           = 64
+	maxHistory              = 5000
+	maxInputBytes           = int64(512 << 30)
+	defaultTimeout          = 30 * time.Minute
+	progressPersistStep     = uint64(32)
+	progressPersistInterval = 250 * time.Millisecond
+	jobKindExport           = "export"
+	defaultFFmpegBin        = "ffmpeg"
 )
 
 var (
@@ -63,6 +65,18 @@ const (
 	StateCanceled  State = "canceled"
 )
 
+// Progress is a safe, durable snapshot of export work. Percent is present
+// only while the current phase has a known total.
+type Progress struct {
+	Current       uint64    `json:"current"`
+	Total         *uint64   `json:"total,omitempty"`
+	Percent       *int      `json:"percent,omitempty"`
+	Indeterminate bool      `json:"indeterminate"`
+	Phase         string    `json:"phase"`
+	Unit          string    `json:"unit"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
 // Job is safe to return from the management API. It contains no paths,
 // commands, source URIs, adapter state, or process output.
 type Job struct {
@@ -70,6 +84,7 @@ type Job struct {
 	RecordingID            string     `json:"recording_id"`
 	Kind                   string     `json:"kind"`
 	State                  State      `json:"state"`
+	Progress               Progress   `json:"progress"`
 	CreatedAt              time.Time  `json:"created_at"`
 	StartedAt              *time.Time `json:"started_at,omitempty"`
 	FinishedAt             *time.Time `json:"finished_at,omitempty"`
@@ -108,25 +123,33 @@ type queuedJob struct {
 	recording *domain.Recording
 }
 
+type progressReporter func(current uint64, phase, unit string, indeterminate bool)
+
+type progressCheckpoint struct {
+	current uint64
+	at      time.Time
+}
+
 type Service struct {
-	mu           sync.Mutex
-	root         string
-	jobsDir      string
-	thumbnailDir string
-	statePath    string
-	store        *storage.Store
-	ffmpegPath   string
-	timeout      time.Duration
-	queue        chan queuedJob
-	ctx          context.Context
-	cancel       context.CancelFunc
-	workers      sync.WaitGroup
-	closed       bool
-	jobs         map[string]Job
-	activeByRec  map[string]string
-	cancelByID   map[string]context.CancelFunc
-	running      int
-	changed      chan struct{}
+	mu              sync.Mutex
+	root            string
+	jobsDir         string
+	thumbnailDir    string
+	statePath       string
+	store           *storage.Store
+	ffmpegPath      string
+	timeout         time.Duration
+	queue           chan queuedJob
+	ctx             context.Context
+	cancel          context.CancelFunc
+	workers         sync.WaitGroup
+	closed          bool
+	jobs            map[string]Job
+	activeByRec     map[string]string
+	cancelByID      map[string]context.CancelFunc
+	running         int
+	changed         chan struct{}
+	progressPersist map[string]progressCheckpoint
 }
 
 // Open initializes an optional remux-only service. Missing FFmpeg is not a
@@ -193,7 +216,7 @@ func Open(root string, store *storage.Store, ffmpegPath string, concurrency int)
 		store: store, ffmpegPath: resolved, timeout: defaultTimeout,
 		queue: make(chan queuedJob, maxActiveJobs), ctx: ctx, cancel: cancel,
 		jobs: make(map[string]Job), activeByRec: make(map[string]string), cancelByID: make(map[string]context.CancelFunc),
-		changed: make(chan struct{}),
+		changed: make(chan struct{}), progressPersist: make(map[string]progressCheckpoint),
 	}
 	if err := s.load(); err != nil {
 		cancel()
@@ -248,6 +271,7 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 	if err != nil {
 		return Job{}, ErrInvalid
 	}
+	legacyObjectCount := uint64(0)
 	if copyRecording.FormatVersion == storage.ShardedArchiveFormatVersion {
 		if err := s.validateShardedSource(ctx, copyRecording); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -255,8 +279,12 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 			}
 			return Job{}, fmt.Errorf("%w: canonical source is unavailable", ErrUnsupported)
 		}
-	} else if _, err := s.sourceObjects(copyRecording); err != nil {
-		return Job{}, fmt.Errorf("%w: canonical source is unavailable", ErrUnsupported)
+	} else {
+		objects, objectErr := s.sourceObjects(copyRecording)
+		if objectErr != nil {
+			return Job{}, fmt.Errorf("%w: canonical source is unavailable", ErrUnsupported)
+		}
+		legacyObjectCount = uint64(len(objects))
 	}
 
 	s.mu.Lock()
@@ -284,6 +312,19 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 		SourceTimelineRevision: copyRecording.TimelineRevision,
 		SourceRevisionKnown:    copyRecording.ArchiveRevision != 0,
 	}
+	progressTotal := uint64(copyRecording.SegmentCount())
+	progressUnit := "segments"
+	if copyRecording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		_, track, trackErr := primaryTrackHeader(copyRecording)
+		if trackErr != nil {
+			return Job{}, fmt.Errorf("%w: canonical source is unavailable", ErrUnsupported)
+		}
+		progressTotal = track.MediaCount
+	} else {
+		progressTotal = legacyObjectCount
+		progressUnit = "objects"
+	}
+	job.Progress = makeProgress(0, &progressTotal, "queued", progressUnit, false, job.CreatedAt)
 	s.jobs[id] = job
 	s.activeByRec[recording.ID] = id
 	s.notifyLocked()
@@ -394,6 +435,7 @@ func (s *Service) Cancel(id string) (Job, error) {
 	}
 	now := time.Now().UTC()
 	job.State, job.FinishedAt, job.ErrorCode = StateCanceled, &now, "canceled"
+	job.Progress = terminalProgress(job.Progress, "canceled", now)
 	s.jobs[id] = job
 	delete(s.activeByRec, job.RecordingID)
 	s.notifyLocked()
@@ -498,6 +540,48 @@ func (s *Service) notifyLocked() {
 	s.changed = make(chan struct{})
 }
 
+func (s *Service) updateProgress(id string, current uint64, phase, unit string, indeterminate bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok || job.State != StateRunning {
+		return
+	}
+	var total *uint64
+	if job.Progress.Total != nil {
+		value := *job.Progress.Total
+		total = &value
+	}
+	now := time.Now().UTC()
+	job.Progress = makeProgress(current, total, phase, unit, indeterminate, now)
+	s.jobs[id] = job
+	s.notifyLocked()
+	last := s.progressPersist[id]
+	if current == 0 || current-last.current >= progressPersistStep || now.Sub(last.at) >= progressPersistInterval {
+		if err := s.persistLocked(); err != nil {
+			// Progress persistence is secondary to the export result. The next
+			// bounded checkpoint or terminal transition will retry persistence.
+			s.progressPersist[id] = progressCheckpoint{current: current, at: now}
+			return
+		}
+		s.progressPersist[id] = progressCheckpoint{current: current, at: now}
+	}
+}
+
+func (s *Service) updatePhase(id, phase string, indeterminate bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok || job.State != StateRunning {
+		return
+	}
+	now := time.Now().UTC()
+	job.Progress = makeProgress(job.Progress.Current, job.Progress.Total, phase, job.Progress.Unit, indeterminate, now)
+	s.jobs[id] = job
+	s.notifyLocked()
+	_ = s.persistLocked()
+}
+
 func (s *Service) finishRunning() {
 	s.mu.Lock()
 	if s.running > 0 {
@@ -555,16 +639,19 @@ func (s *Service) run(task queuedJob) {
 	}
 	now := time.Now().UTC()
 	job.State, job.StartedAt = StateRunning, &now
+	job.Progress = makeProgress(job.Progress.Current, job.Progress.Total, "preparing_inputs", job.Progress.Unit, job.Progress.Indeterminate, now)
 	s.jobs[job.ID] = job
 	s.running++
 	s.notifyLocked()
 	defer s.finishRunning()
 	jobCtx, cancel := context.WithTimeout(s.ctx, s.timeout)
 	s.cancelByID[job.ID] = cancel
+	s.progressPersist[job.ID] = progressCheckpoint{current: job.Progress.Current, at: now}
 	if err := s.persistLocked(); err != nil {
 		cancel()
 		delete(s.cancelByID, job.ID)
 		job.State, job.FinishedAt, job.ErrorCode = StateFailed, timePtr(time.Now().UTC()), "state_persistence_failed"
+		job.Progress = terminalProgress(job.Progress, "failed", *job.FinishedAt)
 		s.jobs[job.ID] = job
 		delete(s.activeByRec, job.RecordingID)
 		_ = s.persistLocked()
@@ -573,11 +660,15 @@ func (s *Service) run(task queuedJob) {
 	}
 	s.mu.Unlock()
 
-	errCode, size := s.export(jobCtx, task.id, task.recording)
+	report := func(current uint64, phase, unit string, indeterminate bool) {
+		s.updateProgress(task.id, current, phase, unit, indeterminate)
+	}
+	errCode, size := s.export(jobCtx, task.id, task.recording, report)
 	if errCode == "" {
 		if workErr := jobCtx.Err(); workErr != nil {
 			errCode = contextErrorCode(workErr)
 		} else {
+			s.updatePhase(task.id, "publishing", true)
 			errCode = s.publish(task.id)
 		}
 	}
@@ -595,15 +686,20 @@ func (s *Service) run(task queuedJob) {
 		if errCode == "" {
 			current.State, current.Size = StateCompleted, size
 			current.ErrorCode = ""
+			current.Progress = completedProgress(current.Progress, finished)
 		} else if errCode == "canceled" {
 			current.State, current.ErrorCode = StateCanceled, errCode
+			current.Progress = terminalProgress(current.Progress, "canceled", finished)
 		} else {
 			current.State, current.ErrorCode = StateFailed, errCode
+			current.Progress = terminalProgress(current.Progress, "failed", finished)
 		}
+		delete(s.progressPersist, job.ID)
 		s.jobs[job.ID] = current
 		delete(s.activeByRec, job.RecordingID)
 		if persistErr := s.persistLocked(); persistErr != nil {
 			current.State, current.ErrorCode = StateFailed, "state_persistence_failed"
+			current.Progress = terminalProgress(current.Progress, "failed", finished)
 			s.jobs[job.ID] = current
 			_ = s.persistLocked()
 			errCode = "state_persistence_failed"
@@ -624,9 +720,9 @@ func contextErrorCode(err error) string {
 	return "canceled"
 }
 
-func (s *Service) export(ctx context.Context, id string, recording *domain.Recording) (string, int64) {
+func (s *Service) export(ctx context.Context, id string, recording *domain.Recording, report progressReporter) (string, int64) {
 	if recording != nil && recording.FormatVersion == storage.ShardedArchiveFormatVersion {
-		return s.exportSharded(ctx, id, recording)
+		return s.exportSharded(ctx, id, recording, report)
 	}
 	if err := ctx.Err(); err != nil {
 		return "canceled", 0
@@ -644,7 +740,7 @@ func (s *Service) export(ctx context.Context, id string, recording *domain.Recor
 		_ = os.RemoveAll(jobDir)
 		return "staging_failed", 0
 	}
-	localNames, err := s.prepareInputs(ctx, recording, objects, workDir)
+	localNames, err := s.prepareInputs(ctx, recording, objects, workDir, report)
 	if err != nil {
 		_ = os.RemoveAll(jobDir)
 		if errors.Is(err, context.Canceled) {
@@ -665,6 +761,7 @@ func (s *Service) export(ctx context.Context, id string, recording *domain.Recor
 		_ = os.RemoveAll(jobDir)
 		return "staging_failed", 0
 	}
+	report(uint64(len(objects)), "remuxing", taskUnit(recording), true)
 	command := exec.CommandContext(ctx, s.ffmpegPath,
 		"-nostdin", "-hide_banner", "-loglevel", "error",
 		"-protocol_whitelist", "file", "-i", "input.m3u8",
@@ -708,11 +805,11 @@ func (s *Service) export(ctx context.Context, id string, recording *domain.Recor
 
 // exportSharded traverses the revisionable v2 playback projection directly.
 // It keeps segment metadata on disk in the temporary playlist body.
-func (s *Service) exportSharded(ctx context.Context, id string, recording *domain.Recording) (string, int64) {
+func (s *Service) exportSharded(ctx context.Context, id string, recording *domain.Recording, report progressReporter) (string, int64) {
 	if err := ctx.Err(); err != nil {
 		return contextErrorCode(err), 0
 	}
-	trackID, _, err := primaryTrackHeader(recording)
+	trackID, track, err := primaryTrackHeader(recording)
 	if err != nil {
 		return "unsupported_media", 0
 	}
@@ -725,7 +822,7 @@ func (s *Service) exportSharded(ctx context.Context, id string, recording *domai
 		_ = os.RemoveAll(jobDir)
 		return "staging_failed", 0
 	}
-	if err := s.prepareShardedInputs(ctx, recording, trackID, workDir); err != nil {
+	if err := s.prepareShardedInputs(ctx, recording, trackID, workDir, report); err != nil {
 		_ = os.RemoveAll(jobDir)
 		if errors.Is(err, context.Canceled) {
 			return "canceled", 0
@@ -738,6 +835,7 @@ func (s *Service) exportSharded(ctx context.Context, id string, recording *domai
 		}
 		return "source_unavailable", 0
 	}
+	report(track.MediaCount, "remuxing", "segments", true)
 	command := exec.CommandContext(ctx, s.ffmpegPath,
 		"-nostdin", "-hide_banner", "-loglevel", "error",
 		"-protocol_whitelist", "file", "-i", "input.m3u8",
@@ -924,7 +1022,7 @@ func (s *diskStringSet) SeenOrAdd(value string) (bool, error) {
 	}
 }
 
-func (s *Service) prepareShardedInputs(ctx context.Context, recording *domain.Recording, trackID, workDir string) error {
+func (s *Service) prepareShardedInputs(ctx context.Context, recording *domain.Recording, trackID, workDir string, report progressReporter) error {
 	bodyPath := filepath.Join(workDir, "playlist-body.tmp")
 	body, err := os.OpenFile(bodyPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -996,6 +1094,7 @@ func (s *Service) prepareShardedInputs(ctx context.Context, recording *domain.Re
 			return err
 		}
 		count++
+		report(uint64(count), "preparing_inputs", "segments", false)
 		return nil
 	})
 	flushErr := bodyWriter.Flush()
@@ -1234,7 +1333,7 @@ func (s *Service) sourceObjects(recording *domain.Recording) ([]storage.ArchiveE
 	return objects, nil
 }
 
-func (s *Service) prepareInputs(ctx context.Context, recording *domain.Recording, objects []storage.ArchiveEntry, workDir string) (map[string]string, error) {
+func (s *Service) prepareInputs(ctx context.Context, recording *domain.Recording, objects []storage.ArchiveEntry, workDir string, report progressReporter) (map[string]string, error) {
 	localNames := make(map[string]string, len(objects))
 	extensions := sourceExtensions(recording)
 	for index, object := range objects {
@@ -1270,6 +1369,7 @@ func (s *Service) prepareInputs(ctx context.Context, recording *domain.Recording
 			return nil, errors.New("source integrity mismatch")
 		}
 		localNames[object.Path] = name
+		report(uint64(index+1), "preparing_inputs", "objects", false)
 	}
 	return localNames, nil
 }
@@ -1334,10 +1434,17 @@ func (s *Service) load() error {
 		if job.OutputName != "recording-"+job.RecordingID+".mkv" {
 			job.OutputName = "recording-" + job.RecordingID + ".mkv"
 		}
+		if job.Progress.Phase == "" {
+			job.Progress = defaultProgress(job, "objects", time.Now().UTC())
+		} else if !validProgress(job.Progress) {
+			return errors.New("export state invalid")
+		}
 		if active(job.State) {
 			job.State, job.FinishedAt, job.ErrorCode = StateFailed, timePtr(time.Now().UTC()), "interrupted_by_restart"
+			job.Progress = terminalProgress(job.Progress, "interrupted", *job.FinishedAt)
 		} else if job.State == StateCompleted && !s.validArtifact(job) {
 			job.State, job.ErrorCode = StateFailed, "artifact_unavailable"
+			job.Progress = terminalProgress(job.Progress, "failed", time.Now().UTC())
 		} else if job.State != StateCompleted && job.State != StateFailed && job.State != StateCanceled {
 			job.State, job.FinishedAt, job.ErrorCode = StateFailed, timePtr(time.Now().UTC()), "invalid_persisted_state"
 		}
@@ -1449,7 +1556,106 @@ func cloneJob(job Job) Job {
 		value := *job.FinishedAt
 		job.FinishedAt = &value
 	}
+	job.Progress = cloneProgress(job.Progress)
 	return job
+}
+
+func makeProgress(current uint64, total *uint64, phase, unit string, indeterminate bool, updatedAt time.Time) Progress {
+	progress := Progress{Current: current, Phase: phase, Unit: unit, Indeterminate: indeterminate, UpdatedAt: updatedAt.UTC()}
+	if total != nil {
+		value := *total
+		progress.Total = &value
+		if progress.Current > value {
+			progress.Current = value
+		}
+		if !indeterminate && value > 0 {
+			percent := int(float64(progress.Current) * 100 / float64(value))
+			if progress.Current < value && percent >= 100 {
+				percent = 99
+			}
+			progress.Percent = &percent
+		}
+	}
+	return progress
+}
+
+func completedProgress(progress Progress, at time.Time) Progress {
+	if progress.Total == nil {
+		total := progress.Current
+		progress.Total = &total
+	}
+	progress.Current = *progress.Total
+	progress.Indeterminate = false
+	progress.Phase = "completed"
+	progress.UpdatedAt = at.UTC()
+	percent := 100
+	progress.Percent = &percent
+	return cloneProgress(progress)
+}
+
+func terminalProgress(progress Progress, phase string, at time.Time) Progress {
+	progress.Phase = phase
+	progress.UpdatedAt = at.UTC()
+	progress.Percent = nil
+	if !progress.Indeterminate && progress.Total != nil && *progress.Total > 0 {
+		percent := int(float64(progress.Current) * 100 / float64(*progress.Total))
+		if progress.Current < *progress.Total && percent >= 100 {
+			percent = 99
+		}
+		progress.Percent = &percent
+	}
+	return cloneProgress(progress)
+}
+
+func cloneProgress(progress Progress) Progress {
+	if progress.Total != nil {
+		value := *progress.Total
+		progress.Total = &value
+	}
+	if progress.Percent != nil {
+		value := *progress.Percent
+		progress.Percent = &value
+	}
+	return progress
+}
+
+func taskUnit(recording *domain.Recording) string {
+	if recording != nil && recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		return "segments"
+	}
+	return "objects"
+}
+
+func defaultProgress(job Job, unit string, at time.Time) Progress {
+	phase := string(job.State)
+	if job.State == StateQueued || job.State == StateRunning {
+		return makeProgress(0, nil, phase, unit, true, at)
+	}
+	if job.State == StateCompleted {
+		return completedProgress(makeProgress(0, nil, phase, unit, true, at), at)
+	}
+	return terminalProgress(makeProgress(0, nil, phase, unit, true, at), phase, at)
+}
+
+func validProgress(progress Progress) bool {
+	switch progress.Phase {
+	case "queued", "preparing_inputs", "remuxing", "publishing", "completed", "failed", "canceled", "interrupted":
+	default:
+		return false
+	}
+	if progress.Unit != "objects" && progress.Unit != "segments" && progress.Unit != "bytes" {
+		return false
+	}
+	if progress.Total == nil && progress.Percent != nil {
+		return false
+	}
+	if progress.Total != nil && progress.Current > *progress.Total {
+		return false
+	}
+	if progress.Percent != nil && (*progress.Percent < 0 || *progress.Percent > 100 || progress.Indeterminate) {
+		return false
+	}
+	return true
 }
 
 func cloneRecording(recording *domain.Recording) (*domain.Recording, error) {

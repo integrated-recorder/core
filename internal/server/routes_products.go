@@ -13,6 +13,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
 	"runtime"
 	"sort"
 	"strconv"
@@ -781,32 +782,77 @@ func validRecordingPathID(id string) bool {
 
 func (s *Server) archiveIndex(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !validRecordingPathID(id) {
+		writeCodedError(w, http.StatusNotFound, "recording_not_found", "recording not found")
+		return
+	}
+	if s.storage == nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "archive_index_unavailable", "archive index is unavailable")
+		return
+	}
+	limit := 50
+	if values, exists := r.URL.Query()["limit"]; exists {
+		if len(values) != 1 {
+			writeCodedError(w, http.StatusBadRequest, "archive_index_invalid_pagination", "archive index pagination is invalid")
+			return
+		}
+		parsed, err := strconv.Atoi(values[0])
+		if err != nil || parsed < 1 || parsed > storage.ArchiveIndexPageMax {
+			writeCodedError(w, http.StatusBadRequest, "archive_index_invalid_pagination", "archive index pagination is invalid")
+			return
+		}
+		limit = parsed
+	}
+	cursor := ""
+	if values, exists := r.URL.Query()["cursor"]; exists {
+		if len(values) != 1 {
+			writeCodedError(w, http.StatusBadRequest, "archive_index_invalid_cursor", "archive index cursor is invalid")
+			return
+		}
+		cursor = values[0]
+	}
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
 	if r.Context().Err() != nil {
 		return
 	}
-	recording, err := s.recordingSnapshot(r.Context(), id)
+	version, err := s.storage.RecordingFormatVersion(r.Context(), id)
 	if err != nil {
-		writeStorageError(w, err)
-		return
-	}
-	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
-		entries, err := s.shardedArchiveIndex(r.Context(), recording)
-		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "archive index is unavailable")
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, storage.ErrObjectNotFound) || errors.Is(err, os.ErrNotExist) {
+			writeCodedError(w, http.StatusNotFound, "recording_not_found", "recording not found")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"recording_id": id, "entries": entries})
+		writeCodedError(w, http.StatusServiceUnavailable, "archive_index_unavailable", "archive index is unavailable")
 		return
 	}
-	entries, err := s.storage.ArchiveIndex(recording)
+	if version != storage.ShardedArchiveFormatVersion {
+		// V1 roots have no bounded seekable object index. Do not call Manager.Get
+		// and materialize an unbounded legacy recording for this browse endpoint.
+		writeCodedError(w, http.StatusConflict, "archive_index_unsupported_format", "archive index is unavailable for this archive format")
+		return
+	}
+	page, err := s.storage.ShardedArchiveIndexPage(r.Context(), id, cursor, limit)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "archive index is unavailable")
+		switch {
+		case errors.Is(err, storage.ErrNotFound) || errors.Is(err, storage.ErrObjectNotFound) || errors.Is(err, os.ErrNotExist):
+			writeCodedError(w, http.StatusNotFound, "recording_not_found", "recording not found")
+		case errors.Is(err, storage.ErrArchiveIndexInvalidCursor):
+			writeCodedError(w, http.StatusBadRequest, "archive_index_invalid_cursor", "archive index cursor is invalid")
+		case errors.Is(err, storage.ErrArchiveIndexStaleCursor):
+			writeCodedError(w, http.StatusConflict, "archive_index_stale_cursor", "archive changed; restart archive index pagination")
+		default:
+			writeCodedError(w, http.StatusServiceUnavailable, "archive_index_unavailable", "archive index is unavailable")
+		}
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"recording_id": id, "entries": entries})
+	response := struct {
+		RecordingID string                 `json:"recording_id"`
+		Entries     []storage.ArchiveEntry `json:"entries"`
+		NextCursor  string                 `json:"next_cursor,omitempty"`
+		HasMore     bool                   `json:"has_more"`
+	}{RecordingID: id, Entries: page.Entries, NextCursor: page.NextCursor, HasMore: page.HasMore}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) integrityGet(w http.ResponseWriter, r *http.Request) {
@@ -817,7 +863,7 @@ func (s *Server) integrityGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.integrity == nil {
-		writeError(w, http.StatusServiceUnavailable, "integrity verification is unavailable")
+		writeCodedError(w, http.StatusServiceUnavailable, "integrity_unavailable", "Integrity verification is unavailable.")
 		return
 	}
 	result, ok := s.integrity.StatusFor(recording)
@@ -827,12 +873,20 @@ func (s *Server) integrityGet(w http.ResponseWriter, r *http.Request) {
 			Freshness:       integrity.FreshnessUnknown,
 		}
 	}
-	writeJSON(w, http.StatusOK, result)
+	response := struct {
+		integrity.ResultProjection
+		ActiveJob *integrity.JobProjection `json:"active_job,omitempty"`
+	}{ResultProjection: result}
+	if job, active := s.integrity.ActiveForRecording(id); active {
+		projection := integrity.ProjectJob(job, recording)
+		response.ActiveJob = &projection
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) integrityStart(w http.ResponseWriter, r *http.Request) {
 	if s.integrity == nil {
-		writeError(w, http.StatusServiceUnavailable, "integrity verification is unavailable")
+		writeCodedError(w, http.StatusServiceUnavailable, "integrity_unavailable", "Integrity verification is unavailable.")
 		return
 	}
 	id := r.PathValue("id")
@@ -847,7 +901,11 @@ func (s *Server) integrityStart(w http.ResponseWriter, r *http.Request) {
 		job, err = s.integrity.Start(context.Background(), recording)
 		lock.RUnlock()
 		if err != nil {
-			writeError(w, http.StatusConflict, "integrity job could not be started")
+			if errors.Is(err, integrity.ErrCapacity) {
+				writeCodedError(w, http.StatusTooManyRequests, "integrity_capacity", "Integrity verification capacity is full.")
+			} else {
+				writeCodedError(w, http.StatusConflict, "integrity_job_conflict", "Integrity verification could not be started in the current state.")
+			}
 			return
 		}
 		if s.products != nil {
@@ -859,7 +917,7 @@ func (s *Server) integrityStart(w http.ResponseWriter, r *http.Request) {
 	}
 	lock.RUnlock()
 	if errors.Is(err, acquire.ErrActiveRecording) {
-		writeError(w, http.StatusConflict, "active recordings cannot be verified")
+		writeCodedError(w, http.StatusConflict, "integrity_active_recording", "Active recordings cannot be verified.")
 		return
 	}
 	writeStorageError(w, err)
@@ -867,12 +925,12 @@ func (s *Server) integrityStart(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) integrityJobGet(w http.ResponseWriter, r *http.Request) {
 	if s.integrity == nil {
-		writeError(w, http.StatusServiceUnavailable, "integrity jobs are unavailable")
+		writeCodedError(w, http.StatusServiceUnavailable, "integrity_unavailable", "Integrity jobs are unavailable.")
 		return
 	}
 	job, err := s.integrity.Get(r.PathValue("job_id"))
 	if err != nil {
-		writeError(w, http.StatusNotFound, "integrity job not found")
+		writeCodedError(w, http.StatusNotFound, "integrity_job_not_found", "Integrity job not found.")
 		return
 	}
 	recording, err := s.recordingSnapshot(r.Context(), job.RecordingID)
@@ -885,20 +943,20 @@ func (s *Server) integrityJobGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) integrityJobCancel(w http.ResponseWriter, r *http.Request) {
 	if s.integrity == nil {
-		writeError(w, http.StatusServiceUnavailable, "integrity jobs are unavailable")
+		writeCodedError(w, http.StatusServiceUnavailable, "integrity_unavailable", "Integrity jobs are unavailable.")
 		return
 	}
 	var request struct{}
 	if err := decodeJSONBody(w, r, 1024, &request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid integrity cancellation request")
+		writeCodedError(w, http.StatusBadRequest, "integrity_cancel_invalid_request", "Integrity cancellation request is invalid.")
 		return
 	}
 	job, err := s.integrity.Cancel(r.PathValue("job_id"))
 	if err != nil {
 		if errors.Is(err, integrity.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "integrity job not found")
+			writeCodedError(w, http.StatusNotFound, "integrity_job_not_found", "Integrity job not found.")
 		} else {
-			writeError(w, http.StatusServiceUnavailable, "integrity job cancellation could not be saved")
+			writeCodedError(w, http.StatusServiceUnavailable, "integrity_cancel_failed", "Integrity job cancellation could not be saved.")
 		}
 		return
 	}

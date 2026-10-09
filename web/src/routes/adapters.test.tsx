@@ -34,11 +34,11 @@ describe('adapter discovery controls', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await renderAdapters()
-    fireEvent.click(await screen.findByRole('button', { name: '어댑터 다시 검색' }))
+    fireEvent.click(await screen.findByRole('button', { name: '플러그인 다시 검색' }))
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/adapters/reconcile' && init?.method === 'POST')).toBe(true))
-    expect(await screen.findByText('새 어댑터 세대를 활성화했습니다.')).toBeInTheDocument()
-    expect(screen.getByText(/공식 Plugin Registry에서 source plugin을 찾아 설치하세요/)).toBeInTheDocument()
+    expect(await screen.findByText('새 플러그인 세대를 활성화했습니다.')).toBeInTheDocument()
+    expect(screen.getByText(/공식 Plugin Registry에서 Source Plugin을 찾아 설치하세요/)).toBeInTheDocument()
     expect(screen.getByText(/운영자 executable 가져오기는 기본적으로 비활성화되어 있습니다/)).toBeInTheDocument()
     expect(screen.queryByText(/어댑터 디렉터리에 넣으면/)).not.toBeInTheDocument()
   })
@@ -57,7 +57,7 @@ describe('adapter discovery controls', () => {
 
     expect(await screen.findByRole('status')).toHaveTextContent(/Plugin Registry가 비활성화되었거나 URL이 구성되지 않았습니다/)
     expect(screen.getByRole('button', { name: 'Registry 새로고침' })).toBeDisabled()
-    expect(screen.getByText(/Registry가 비활성화되어 새 source adapter 목록을 표시하지 못했습니다/)).toBeInTheDocument()
+    expect(screen.getByText(/Registry가 비활성화되어 새 Source Plugin 목록을 표시하지 못했습니다/)).toBeInTheDocument()
     expect(screen.queryByText(/아래 공식 Plugin Registry에서 source plugin을 찾아 설치하세요/)).not.toBeInTheDocument()
   })
 
@@ -82,7 +82,7 @@ describe('adapter discovery controls', () => {
     fireEvent.click(screen.getByRole('button', { name: '설치' }))
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/plugins/demo/install' && init?.method === 'POST')).toBe(true))
-    expect(await screen.findByText('플러그인을 설치하고 새 어댑터 세대를 활성화했습니다.')).toBeInTheDocument()
+    expect(await screen.findByText('플러그인을 설치하고 새 plugin generation을 활성화했습니다.')).toBeInTheDocument()
   })
 
   it('separates typed source and storage registry entries and does not activate storage on install', async () => {
@@ -100,10 +100,10 @@ describe('adapter discovery controls', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await renderAdapters()
-    expect(await screen.findByRole('region', { name: 'Source adapters' })).toHaveTextContent('Sample Source')
-    expect(screen.getByRole('region', { name: 'Storage providers' })).toHaveTextContent('Sample Storage')
-    expect(screen.getByText(/기본 저장소를 바꾸지 않습니다/)).toBeInTheDocument()
-    const storageSection = screen.getByRole('region', { name: 'Storage providers' })
+    expect(await screen.findByRole('region', { name: 'Source Plugin' })).toHaveTextContent('Sample Source')
+    expect(screen.getByRole('region', { name: 'Storage Provider' })).toHaveTextContent('Sample Storage')
+    expect(screen.getByText(/기본 저장소는 바뀌지 않으며/)).toBeInTheDocument()
+    const storageSection = screen.getByRole('region', { name: 'Storage Provider' })
     fireEvent.click(within(storageSection).getByRole('button', { name: '설치' }))
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/plugins/storage-sample/install' && init?.method === 'POST')).toBe(true))
     expect(await screen.findByText('Storage provider 실행 파일을 설치했습니다.')).toBeInTheDocument()
@@ -123,8 +123,8 @@ describe('adapter discovery controls', () => {
 
     await renderAdapters()
 
-    expect(await screen.findByText(/Registry에 연결할 수 없습니다\. 이미 설치된 어댑터는 계속 사용할 수 있습니다\./)).toBeInTheDocument()
-    expect(screen.getByText(/설치 1\.0\.0/)).toBeInTheDocument()
+    expect(await screen.findByText(/Registry에 연결할 수 없습니다\. 이미 설치된 Source Plugin과 storage provider는 계속 사용할 수 있습니다\./)).toBeInTheDocument()
+    expect(screen.getByText(/설치됨 1\.0\.0/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Registry 새로고침' })).toBeEnabled()
   })
 
@@ -141,8 +141,9 @@ describe('adapter discovery controls', () => {
 
     await renderAdapters()
     fireEvent.click(await screen.findByRole('button', { name: '설치' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/plugins/demo/install' && init?.method === 'POST')).toBe(true))
 
-    expect(await screen.findByText('다운로드한 플러그인을 검증하지 못했습니다.')).toBeInTheDocument()
+    expect(await screen.findByText('입력 값을 확인한 뒤 다시 시도하세요.')).toBeInTheDocument()
     expect(screen.queryByText(/Registry에 연결할 수 없습니다/)).not.toBeInTheDocument()
   })
 })

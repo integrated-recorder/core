@@ -2,6 +2,7 @@ import { useId } from 'react'
 import type { StorageMetricSample, StoragePool } from '@/types/api'
 import { EmptyState } from '@/components/query-state'
 import { formatBytes } from '@/lib/utils'
+import { formatDateTime } from '@/lib/formatting'
 
 type ChartKind = 'throughput' | 'backlog'
 type Series = { key: keyof StorageMetricSample; label: string; color: string; format: (value: number) => string }
@@ -95,5 +96,5 @@ function formatRate(value: number) { return `${formatBytes(value)}/s` }
 function formatSampleTime(value: string) {
   const date = new Date(value)
   if (!Number.isFinite(date.getTime())) return value
-  return new Intl.DateTimeFormat('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(date)
+  return formatDateTime(date, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
 }

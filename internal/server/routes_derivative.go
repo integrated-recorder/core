@@ -118,16 +118,16 @@ func (s *Server) exportStart(w http.ResponseWriter, r *http.Request) {
 		Format string `json:"format,omitempty"`
 	}
 	if err := decodeJSONBody(w, r, 8<<10, &request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid export request")
+		writeCodedError(w, http.StatusBadRequest, "export_invalid_request", "Invalid export request.")
 		return
 	}
 	if request.Format != "" && request.Format != "mkv" {
-		writeError(w, http.StatusBadRequest, "unsupported export format")
+		writeCodedError(w, http.StatusBadRequest, "export_unsupported_format", "The requested export format is not supported.")
 		return
 	}
 	id := r.PathValue("id")
 	if !validRecordingPathID(id) {
-		writeError(w, http.StatusNotFound, "recording not found")
+		writeCodedError(w, http.StatusNotFound, "recording_not_found", "Recording not found.")
 		return
 	}
 	lock := s.productLock(id)
@@ -160,7 +160,7 @@ func (s *Server) exportList(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if !validRecordingPathID(id) {
-		writeError(w, http.StatusNotFound, "recording not found")
+		writeCodedError(w, http.StatusNotFound, "recording_not_found", "Recording not found.")
 		return
 	}
 	lock := s.productLock(id)
@@ -238,11 +238,11 @@ func (s *Server) exportDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) exportAvailable(w http.ResponseWriter) bool {
 	if s.derivatives == nil || !s.derivatives.Available() {
-		writeError(w, http.StatusNotImplemented, "remux export is unavailable")
+		writeCodedError(w, http.StatusNotImplemented, "export_unavailable", "Export is unavailable.")
 		return false
 	}
 	if s.manager == nil && s.storage == nil {
-		writeError(w, http.StatusServiceUnavailable, "recording manager is unavailable")
+		writeCodedError(w, http.StatusServiceUnavailable, "recording_manager_unavailable", "Recording management is unavailable.")
 		return false
 	}
 	return true
@@ -253,18 +253,18 @@ func writeDerivativeError(w http.ResponseWriter, err error) {
 	case err == nil:
 		return
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		writeError(w, http.StatusRequestTimeout, "export request was canceled")
+		writeCodedError(w, http.StatusRequestTimeout, "export_timeout", "The export request was interrupted.")
 	case errors.Is(err, derivative.ErrNotFound):
-		writeError(w, http.StatusNotFound, "export job not found")
+		writeCodedError(w, http.StatusNotFound, "export_not_found", "Export job not found.")
 	case errors.Is(err, derivative.ErrActive), errors.Is(err, derivative.ErrConflict):
-		writeError(w, http.StatusConflict, "export is not available in the current state")
+		writeCodedError(w, http.StatusConflict, "export_state_conflict", "Export is not available in the current state.")
 	case errors.Is(err, derivative.ErrCapacity):
-		writeError(w, http.StatusTooManyRequests, "export capacity is full")
+		writeCodedError(w, http.StatusTooManyRequests, "export_capacity", "Export capacity is full.")
 	case errors.Is(err, derivative.ErrUnsupported):
-		writeError(w, http.StatusUnprocessableEntity, "recording cannot be remuxed")
+		writeCodedError(w, http.StatusUnprocessableEntity, "export_unsupported", "This recording cannot be exported.")
 	case errors.Is(err, derivative.ErrUnavailable):
-		writeError(w, http.StatusNotImplemented, "remux export is unavailable")
+		writeCodedError(w, http.StatusNotImplemented, "export_unavailable", "Export is unavailable.")
 	default:
-		writeError(w, http.StatusInternalServerError, "export operation failed")
+		writeCodedError(w, http.StatusInternalServerError, "export_failed", "Export could not be completed.")
 	}
 }

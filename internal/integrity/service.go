@@ -23,10 +23,12 @@ import (
 )
 
 const (
-	maxActiveJobs = 64
-	maxJobHistory = 5000
-	maxWorkers    = 4
-	defaultWorker = 1
+	maxActiveJobs           = 64
+	maxJobHistory           = 5000
+	maxWorkers              = 4
+	defaultWorker           = 1
+	progressPersistStep     = uint64(32)
+	progressPersistInterval = 250 * time.Millisecond
 )
 
 var (
@@ -48,6 +50,18 @@ const (
 	StateCanceled  State = "canceled"
 )
 
+// Progress is a safe, durable snapshot of verification work. Percent is
+// present only when the object total is known and the current phase is measured.
+type Progress struct {
+	Current       uint64    `json:"current"`
+	Total         *uint64   `json:"total,omitempty"`
+	Percent       *int      `json:"percent,omitempty"`
+	Indeterminate bool      `json:"indeterminate"`
+	Phase         string    `json:"phase"`
+	Unit          string    `json:"unit"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
 const (
 	ErrorCanceled             = "canceled"
 	ErrorInterruptedByRestart = "interrupted_by_restart"
@@ -61,6 +75,7 @@ type Job struct {
 	ID                     string                   `json:"id"`
 	RecordingID            string                   `json:"recording_id"`
 	State                  State                    `json:"state"`
+	Progress               Progress                 `json:"progress"`
 	CreatedAt              time.Time                `json:"created_at"`
 	StartedAt              *time.Time               `json:"started_at,omitempty"`
 	FinishedAt             *time.Time               `json:"finished_at,omitempty"`
@@ -141,31 +156,40 @@ type jobControl struct {
 	previousRevision *sourceRevision
 }
 
+type verificationProgress func(checked uint64)
+
+type progressCheckpoint struct {
+	current uint64
+	at      time.Time
+}
+
 // Service owns a fixed worker set and a bounded queue. State transitions and
 // persistence are serialized by mu; verification itself always runs unlocked.
 type Service struct {
-	mu              sync.Mutex
-	dir             string
-	statePath       string
-	store           *storage.Store
-	verify          func(context.Context, *domain.Recording) storage.IntegrityResult
-	jobs            map[string]Job
-	order           []string
-	results         map[string]storage.IntegrityResult
-	resultRevisions map[string]sourceRevision
-	active          map[string]string // recording ID -> queued/running job ID
-	controls        map[string]*jobControl
-	queue           chan string
-	ctx             context.Context
-	cancel          context.CancelFunc
-	workers         sync.WaitGroup
-	done            chan struct{}
-	closed          bool
-	closeOnce       sync.Once
-	closeErr        error
-	lastErr         error
-	running         int
-	changed         chan struct{}
+	mu                 sync.Mutex
+	dir                string
+	statePath          string
+	store              *storage.Store
+	verify             func(context.Context, *domain.Recording) storage.IntegrityResult
+	verifyWithProgress func(context.Context, *domain.Recording, verificationProgress) storage.IntegrityResult
+	jobs               map[string]Job
+	order              []string
+	results            map[string]storage.IntegrityResult
+	resultRevisions    map[string]sourceRevision
+	active             map[string]string // recording ID -> queued/running job ID
+	controls           map[string]*jobControl
+	queue              chan string
+	ctx                context.Context
+	cancel             context.CancelFunc
+	workers            sync.WaitGroup
+	done               chan struct{}
+	closed             bool
+	closeOnce          sync.Once
+	closeErr           error
+	lastErr            error
+	progressPersist    map[string]progressCheckpoint
+	running            int
+	changed            chan struct{}
 }
 
 // Open loads persisted history, marks work left by a prior process as failed,
@@ -205,8 +229,8 @@ func Open(root string, store *storage.Store, concurrency int) (*Service, error) 
 		dir:       jobDir,
 		statePath: filepath.Join(jobDir, "state.json"),
 		store:     store,
-		verify: func(ctx context.Context, recording *domain.Recording) storage.IntegrityResult {
-			return verifyRecording(ctx, store, recording)
+		verifyWithProgress: func(ctx context.Context, recording *domain.Recording, progress verificationProgress) storage.IntegrityResult {
+			return verifyRecordingWithProgress(ctx, store, recording, progress)
 		},
 		jobs:            make(map[string]Job),
 		results:         make(map[string]storage.IntegrityResult),
@@ -215,6 +239,7 @@ func Open(root string, store *storage.Store, concurrency int) (*Service, error) 
 		controls:        make(map[string]*jobControl),
 		queue:           make(chan string, maxActiveJobs),
 		changed:         make(chan struct{}),
+		progressPersist: make(map[string]progressCheckpoint),
 		ctx:             ctx,
 		cancel:          cancel,
 		done:            make(chan struct{}),
@@ -276,6 +301,12 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 		SourceArchiveRevision:  snapshot.ArchiveRevision,
 		SourceTimelineRevision: snapshot.TimelineRevision,
 		SourceRevisionKnown:    snapshot.ArchiveRevision != 0,
+	}
+	if total, known := integrityObjectTotal(snapshot); known {
+		indeterminate := snapshot.FormatVersion != storage.ShardedArchiveFormatVersion
+		job.Progress = makeProgress(0, &total, "queued", "objects", indeterminate, now)
+	} else {
+		job.Progress = makeProgress(0, nil, "queued", "objects", true, now)
 	}
 
 	s.mu.Lock()
@@ -494,6 +525,25 @@ func (s *Service) InProgress(recordingID string) bool {
 	return s.active[recordingID] != ""
 }
 
+// ActiveForRecording returns the queued or running summary for one recording.
+// It reads only the in-memory active index and never loads archive metadata.
+func (s *Service) ActiveForRecording(recordingID string) (Job, bool) {
+	if !recordingIDRE.MatchString(recordingID) {
+		return Job{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.active[recordingID]
+	if id == "" {
+		return Job{}, false
+	}
+	job, ok := s.jobs[id]
+	if !ok || !activeState(job.State) {
+		return Job{}, false
+	}
+	return cloneJob(job), true
+}
+
 // WaitForIdle waits until every accepted queued or running verification has
 // stopped mutating job state. It does not close the service or block later
 // Start calls after idle has been observed.
@@ -526,6 +576,27 @@ func (s *Service) WaitForIdle(ctx context.Context) error {
 func (s *Service) notifyLocked() {
 	close(s.changed)
 	s.changed = make(chan struct{})
+}
+
+func (s *Service) updateProgress(id string, checked uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok || job.State != StateRunning {
+		return
+	}
+	now := time.Now().UTC()
+	job.Progress = makeProgress(checked, job.Progress.Total, "checking_objects", "objects", job.Progress.Total == nil, now)
+	s.jobs[id] = job
+	s.notifyLocked()
+	last := s.progressPersist[id]
+	if checked == 0 || checked >= last.current && checked-last.current >= progressPersistStep || now.Sub(last.at) >= progressPersistInterval {
+		if err := s.persistLocked(); err != nil {
+			s.lastErr = errors.New("integrity job state could not be saved")
+			return
+		}
+		s.progressPersist[id] = progressCheckpoint{current: checked, at: now}
+	}
 }
 
 func (s *Service) finishRunning() {
@@ -596,6 +667,7 @@ func (s *Service) run(id string) {
 	now := time.Now().UTC()
 	job.State = StateRunning
 	job.StartedAt = timePointer(now)
+	job.Progress = makeProgress(job.Progress.Current, job.Progress.Total, "checking_objects", job.Progress.Unit, job.Progress.Indeterminate, now)
 	s.jobs[id] = job
 	s.running++
 	s.notifyLocked()
@@ -621,9 +693,17 @@ func (s *Service) run(id string) {
 	}
 	snapshot := control.snapshot
 	jobCtx := control.ctx
+	s.progressPersist[id] = progressCheckpoint{current: job.Progress.Current, at: now}
 	s.mu.Unlock()
 
-	result, panicked := safeVerify(s.verify, jobCtx, snapshot)
+	reportProgress := func(checked uint64) { s.updateProgress(id, checked) }
+	var result storage.IntegrityResult
+	var panicked bool
+	if s.verify != nil {
+		result, panicked = safeVerify(s.verify, jobCtx, snapshot)
+	} else {
+		result, panicked = safeVerifyWithProgress(s.verifyWithProgress, jobCtx, snapshot, reportProgress)
+	}
 
 	s.mu.Lock()
 	job, ok = s.jobs[id]
@@ -649,6 +729,7 @@ func (s *Service) run(id string) {
 	job.FinishedAt = timePointer(time.Now().UTC())
 	job.ErrorCode = ""
 	job.Result = resultPointer(result)
+	job.Progress = completedProgress(job.Progress, nonNegativeCount(result.ObjectsTotal), *job.FinishedAt)
 	s.jobs[id] = job
 	s.results[job.RecordingID] = cloneResult(result)
 	s.resultRevisions[job.RecordingID] = sourceRevision{
@@ -657,6 +738,7 @@ func (s *Service) run(id string) {
 		Known:    job.SourceRevisionKnown,
 	}
 	s.finishLocked(id)
+	delete(s.progressPersist, id)
 	if err := s.persistLocked(); err != nil {
 		// Do not report an unpersisted result as durable. Restore the prior
 		// result and record only a fixed failure code in memory if possible.
@@ -674,10 +756,12 @@ func (s *Service) run(id string) {
 		job.State = StateFailed
 		job.ErrorCode = ErrorPersistenceFailed
 		job.Result = nil
+		job.Progress = terminalProgress(job.Progress, "failed", *job.FinishedAt)
 		s.jobs[id] = job
 		s.lastErr = errors.New("integrity job state could not be saved")
 		_ = s.persistLocked()
 	}
+	delete(s.progressPersist, id)
 	s.mu.Unlock()
 }
 
@@ -707,6 +791,7 @@ func (s *Service) cancelJobLocked(id string, at time.Time) bool {
 	job.State = StateCanceled
 	job.FinishedAt = timePointer(at)
 	job.ErrorCode = ErrorCanceled
+	job.Progress = terminalProgress(job.Progress, "canceled", at)
 	job.Result = nil
 	s.jobs[id] = job
 	s.finishLocked(id)
@@ -726,6 +811,7 @@ func (s *Service) failLocked(id, code string, previous *storage.IntegrityResult)
 	job.State = StateFailed
 	job.FinishedAt = timePointer(time.Now().UTC())
 	job.ErrorCode = code
+	job.Progress = terminalProgress(job.Progress, "failed", *job.FinishedAt)
 	job.Result = nil
 	s.jobs[id] = job
 	s.finishLocked(id)
@@ -733,6 +819,7 @@ func (s *Service) failLocked(id, code string, previous *storage.IntegrityResult)
 
 func (s *Service) finishLocked(id string) {
 	job := s.jobs[id]
+	delete(s.progressPersist, id)
 	if s.active[job.RecordingID] == id {
 		delete(s.active, job.RecordingID)
 	}
@@ -777,6 +864,9 @@ func (s *Service) load() error {
 		disk.ResultRevisions = make(map[string]sourceRevision)
 	}
 	for _, job := range disk.Jobs {
+		if job.Progress.Phase == "" {
+			job.Progress = defaultProgress(job, time.Now().UTC())
+		}
 		if !validJob(job) {
 			return errors.New("integrity job state is invalid")
 		}
@@ -815,12 +905,16 @@ func (s *Service) recoverInterrupted() error {
 	now := time.Now().UTC()
 	changed := false
 	for id, job := range s.jobs {
+		if job.Progress.Phase == "" {
+			job.Progress = defaultProgress(job, time.Now().UTC())
+		}
 		if !activeState(job.State) {
 			continue
 		}
 		job.State = StateFailed
 		job.ErrorCode = ErrorInterruptedByRestart
 		job.FinishedAt = timePointer(now)
+		job.Progress = terminalProgress(job.Progress, "interrupted", now)
 		job.Result = nil
 		s.jobs[id] = job
 		if result, ok := s.results[job.RecordingID]; ok && result.Status == storage.IntegrityVerifying {
@@ -980,18 +1074,43 @@ func safeVerify(verify func(context.Context, *domain.Recording) storage.Integrit
 	return cloneResult(result), false
 }
 
+func safeVerifyWithProgress(verify func(context.Context, *domain.Recording, verificationProgress) storage.IntegrityResult, ctx context.Context, recording *domain.Recording, progress verificationProgress) (result storage.IntegrityResult, panicked bool) {
+	defer func() {
+		if recover() != nil {
+			result = storage.IntegrityResult{}
+			panicked = true
+		}
+	}()
+	result = verify(ctx, recording, progress)
+	if !validResult(result) {
+		return storage.IntegrityResult{}, true
+	}
+	return cloneResult(result), false
+}
+
 func verifyRecording(ctx context.Context, store *storage.Store, recording *domain.Recording) storage.IntegrityResult {
 	if recording != nil && recording.FormatVersion == storage.ShardedArchiveFormatVersion {
-		return verifyShardedRecording(ctx, store, recording)
+		return verifyShardedRecording(ctx, store, recording, nil)
 	}
 	return store.VerifyRecordingContext(ctx, recording)
+}
+
+func verifyRecordingWithProgress(ctx context.Context, store *storage.Store, recording *domain.Recording, progress verificationProgress) storage.IntegrityResult {
+	if recording != nil && recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		return verifyShardedRecording(ctx, store, recording, progress)
+	}
+	result := store.VerifyRecordingContext(ctx, recording)
+	if progress != nil && result.ObjectsTotal > 0 {
+		progress(uint64(result.ObjectsTotal))
+	}
+	return result
 }
 
 var errVerificationCanceled = errors.New("integrity verification canceled")
 
 // verifyShardedRecording walks bounded v2 metadata records and streams each
 // payload through SHA-256. It retains no archive-sized object list.
-func verifyShardedRecording(ctx context.Context, store *storage.Store, recording *domain.Recording) storage.IntegrityResult {
+func verifyShardedRecording(ctx context.Context, store *storage.Store, recording *domain.Recording, progress verificationProgress) storage.IntegrityResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1009,6 +1128,12 @@ func verifyShardedRecording(ctx context.Context, store *storage.Store, recording
 			return
 		}
 		result.ObjectsTotal++
+		checked := true
+		defer func() {
+			if checked && progress != nil {
+				progress(uint64(result.ObjectsTotal))
+			}
+		}()
 		issuePath := ""
 		if validIntegrityReference(path, expectedPrefix) {
 			issuePath = path
@@ -1050,6 +1175,7 @@ func verifyShardedRecording(ctx context.Context, store *storage.Store, recording
 		closeErr := reader.Close()
 		if ctx.Err() != nil || errors.Is(copyErr, context.Canceled) || errors.Is(copyErr, context.DeadlineExceeded) {
 			canceled = true
+			checked = false
 			return
 		}
 		if copyErr != nil || closeErr != nil || size != expectedSize || !equalIntegrityDigest(hash.Sum(nil), digest) {
@@ -1169,6 +1295,9 @@ func validJob(job Job) bool {
 	if job.Result != nil && !validResult(*job.Result) {
 		return false
 	}
+	if !validProgress(job.Progress) {
+		return false
+	}
 	return true
 }
 
@@ -1223,7 +1352,160 @@ func cloneJob(job Job) Job {
 	if job.Result != nil {
 		job.Result = resultPointer(*job.Result)
 	}
+	job.Progress = cloneProgress(job.Progress)
 	return job
+}
+
+func integrityObjectTotal(recording *domain.Recording) (uint64, bool) {
+	if recording == nil {
+		return 0, false
+	}
+	var total uint64
+	add := func(value uint64) bool {
+		if ^uint64(0)-total < value {
+			return false
+		}
+		total += value
+		return true
+	}
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		if recording.ShardedArchive == nil || !add(recording.ShardedArchive.ManifestSnapshotCount) {
+			return 0, false
+		}
+		for _, track := range recording.Tracks {
+			if track == nil || !add(track.MediaCount) || !add(track.InitCount) {
+				return 0, false
+			}
+		}
+		return total, true
+	}
+	if !add(uint64(len(recording.Snapshots))) {
+		return 0, false
+	}
+	for _, track := range recording.Tracks {
+		if track == nil || !add(uint64(len(track.Segments))) || !add(uint64(len(track.InitSegments))) {
+			return 0, false
+		}
+	}
+	return total, true
+}
+
+func makeProgress(current uint64, total *uint64, phase, unit string, indeterminate bool, updatedAt time.Time) Progress {
+	progress := Progress{Current: current, Phase: phase, Unit: unit, Indeterminate: indeterminate, UpdatedAt: updatedAt.UTC()}
+	if total != nil {
+		value := *total
+		progress.Total = &value
+		if progress.Current > value {
+			progress.Current = value
+		}
+		if !indeterminate && value > 0 {
+			percent := int(float64(progress.Current) * 100 / float64(value))
+			if progress.Current < value && percent >= 100 {
+				percent = 99
+			}
+			progress.Percent = &percent
+		}
+	}
+	return progress
+}
+
+func completedProgress(progress Progress, current uint64, at time.Time) Progress {
+	if progress.Total == nil {
+		total := current
+		progress.Total = &total
+	}
+	if current > *progress.Total {
+		current = *progress.Total
+	}
+	progress.Current = current
+	progress.Indeterminate = false
+	progress.Phase = "completed"
+	progress.UpdatedAt = at.UTC()
+	progress.Percent = nil
+	if *progress.Total == 0 || progress.Current == *progress.Total {
+		percent := 100
+		progress.Percent = &percent
+	} else {
+		percent := int(float64(progress.Current) * 100 / float64(*progress.Total))
+		if progress.Current < *progress.Total && percent >= 100 {
+			percent = 99
+		}
+		progress.Percent = &percent
+	}
+	return cloneProgress(progress)
+}
+
+func terminalProgress(progress Progress, phase string, at time.Time) Progress {
+	progress.Phase = phase
+	progress.UpdatedAt = at.UTC()
+	progress.Percent = nil
+	if !progress.Indeterminate && progress.Total != nil {
+		if *progress.Total == 0 {
+			percent := 0
+			progress.Percent = &percent
+		} else {
+			percent := int(float64(progress.Current) * 100 / float64(*progress.Total))
+			if progress.Current < *progress.Total && percent >= 100 {
+				percent = 99
+			}
+			progress.Percent = &percent
+		}
+	}
+	return cloneProgress(progress)
+}
+
+func defaultProgress(job Job, at time.Time) Progress {
+	if job.State == StateCompleted {
+		current := uint64(0)
+		if job.Result != nil && job.Result.ObjectsTotal > 0 {
+			current = uint64(job.Result.ObjectsTotal)
+		}
+		return completedProgress(makeProgress(0, nil, "completed", "objects", true, at), current, at)
+	}
+	if job.State == StateFailed || job.State == StateCanceled {
+		return terminalProgress(makeProgress(0, nil, string(job.State), "objects", true, at), string(job.State), at)
+	}
+	if job.State == StateRunning {
+		return makeProgress(0, nil, "checking_objects", "objects", true, at)
+	}
+	return makeProgress(0, nil, "queued", "objects", true, at)
+}
+
+func cloneProgress(progress Progress) Progress {
+	if progress.Total != nil {
+		value := *progress.Total
+		progress.Total = &value
+	}
+	if progress.Percent != nil {
+		value := *progress.Percent
+		progress.Percent = &value
+	}
+	return progress
+}
+
+func validProgress(progress Progress) bool {
+	switch progress.Phase {
+	case "queued", "checking_objects", "completed", "failed", "canceled", "interrupted":
+	default:
+		return false
+	}
+	if progress.Unit != "objects" || progress.Total == nil && progress.Percent != nil {
+		return false
+	}
+	if progress.Total != nil && progress.Current > *progress.Total {
+		return false
+	}
+	if progress.Percent != nil && (*progress.Percent < 0 || *progress.Percent > 100 || progress.Indeterminate) {
+		return false
+	}
+	return true
+}
+
+func nonNegativeCount(value int) uint64 {
+	if value <= 0 {
+		return 0
+	}
+	return uint64(value)
 }
 
 func cloneResult(result storage.IntegrityResult) storage.IntegrityResult {

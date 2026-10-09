@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, UserPreferences, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -48,7 +48,7 @@ export const recordingsAPI = {
   remove: (id: string) => api<void>(`/api/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   tags: (id: string) => api<{ tags: string[] }>(`/api/recordings/${encodeURIComponent(id)}/tags`),
   setTags: (id: string, tags: string[]) => api<{ tags: string[] }>(`/api/recordings/${encodeURIComponent(id)}/tags`, { method: 'PUT', body: { tags } }),
-  archive: (id: string) => api<{ recording_id: string; entries: ArchiveEntry[] }>(`/api/recordings/${encodeURIComponent(id)}/archive/index`),
+  archive: (id: string, query: { limit?: number; cursor?: string } = {}) => api<ArchiveIndexPage>(`/api/recordings/${encodeURIComponent(id)}/archive/index${queryString(query)}`),
   events: (id: string) => api<{ items: RecordingEvent[] }>(`/api/recordings/${encodeURIComponent(id)}/events`),
   metadata: (id: string) => api<RecordingMetadata>(`/api/recordings/${encodeURIComponent(id)}/metadata`),
   previews: (id: string, query: PreviewQuery) => api<PreviewFramesResponse>(`/api/recordings/${encodeURIComponent(id)}/previews${queryString(query)}`),
@@ -117,6 +117,10 @@ export const productAPI = {
   saveSettings: (body: { ui?: { theme: 'system' | 'light' | 'dark' }; integrity?: { concurrency: number }; retention?: { enabled?: boolean; completed_after_days?: number }; storage?: StorageSettings }) => api<SystemSettings>('/api/settings', { method: 'PUT', body }),
   retentionCandidates: () => api<{ enabled: boolean; candidate_count: number; candidates: { id: string; stopped_at: string }[] }>('/api/retention/candidates'),
   runRetention: () => api<{ candidate_count: number; deleted_count: number; deleted_ids: string[] }>('/api/retention/run', { method: 'POST', body: {} }),
+}
+export const userPreferencesAPI = {
+  get: () => api<UserPreferences>('/api/user/preferences'),
+  update: (preferences: UserPreferences) => api<UserPreferences>('/api/user/preferences', { method: 'PUT', body: preferences }),
 }
 export const runtimeUpdateAPI = {
   status: () => api<RuntimeUpdateStatus>('/api/runtime/update'),

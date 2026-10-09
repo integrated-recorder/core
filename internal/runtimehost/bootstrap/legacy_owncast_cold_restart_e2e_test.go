@@ -151,7 +151,7 @@ func TestLegacyBundledOwncastColdRestartE2E(t *testing.T) {
 	}
 	stopRecording(t, client, baseURL, recording.ID)
 	waitRuntimeRecordingState(t, client, baseURL, recording.ID, domain.StateStopped, 25*time.Second)
-	completedBefore := getRecording(t, client, baseURL, recording.ID)
+	completedBefore := getRecording(t, dataDir, client, baseURL, recording.ID)
 	assertLegacyOwncastRecording(t, completedBefore, true)
 	oldRecordingIdentity := legacyRecordingIdentity(completedBefore)
 	verifyLegacyOwncastVOD(t, client, baseURL, completedBefore, false)
@@ -222,7 +222,7 @@ func TestLegacyBundledOwncastColdRestartE2E(t *testing.T) {
 	if info, err := os.Stat(oldImmutableAdapter); err != nil || info.Mode().Perm()&0222 != 0 {
 		t.Fatalf("retained historical adapter is missing or writable: mode=%v err=%v", modeOrZero(info), err)
 	}
-	currentOldRecording := getRecording(t, client, baseURL, recording.ID)
+	currentOldRecording := getRecording(t, dataDir, client, baseURL, recording.ID)
 	assertLegacyOwncastRecording(t, currentOldRecording, true)
 	if !bytes.Equal(oldRecordingIdentity, legacyRecordingIdentity(currentOldRecording)) {
 		t.Fatal("completed archive identity, source sequences, ordinals, or hashes changed across Core cold restart")

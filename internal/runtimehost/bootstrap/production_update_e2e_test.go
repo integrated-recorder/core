@@ -876,7 +876,7 @@ func runTargetRefreshPreflightScenario(t *testing.T, artifacts runtimeUpdateArti
 	}
 	fixture.advance(stream, 3)
 	waitRecordingSequenceCount(t, client, baseURL, recording.ID, 3, 20*time.Second)
-	baseline := getRecording(t, client, baseURL, recording.ID)
+	baseline := getRecording(t, dataDir, client, baseURL, recording.ID)
 	if baseline.State != domain.StateRecording || len(baseline.Gaps) != 0 || !equalSequenceRange(recordingSequences(baseline), 1, 3) {
 		t.Fatalf("preflight baseline is not a live contiguous archive: state=%s sequences=%v gaps=%+v", baseline.State, recordingSequences(baseline), baseline.Gaps)
 	}
@@ -1359,7 +1359,7 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 	}
 	fixture.advance(stream, 5)
 	waitRecordingSequenceCount(t, client, baseURL, recording.ID, 5, 25*time.Second)
-	baseline := getRecording(t, client, baseURL, recording.ID)
+	baseline := getRecording(t, dataDir, client, baseURL, recording.ID)
 	if !equalSequenceRange(recordingSequences(baseline), 1, 5) || len(baseline.Gaps) != 0 {
 		t.Fatalf("pre-crash archive is not contiguous through sequence 5: sequences=%v gaps=%+v", recordingSequences(baseline), baseline.Gaps)
 	}
@@ -1465,14 +1465,7 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 				t.Fatalf("materialize canonical archive while source retirement is held: %v", err)
 			}
 		} else {
-			preCrashArchive = getRecording(t, client, baseURL, recording.ID)
-			store, err := storage.New(dataDir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := materializeShardedRecordingForTest(store, preCrashArchive); err != nil {
-				t.Fatalf("materialize canonical archive before cold recovery: %v", err)
-			}
+			preCrashArchive = getRecording(t, dataDir, client, baseURL, recording.ID)
 		}
 		objectsAfterRead, err := snapshotRecordingObjects(archiveDir)
 		if err != nil {
@@ -1532,7 +1525,7 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 	if _, err := os.Stat(archiveDir); err != nil {
 		t.Fatalf("cold recovery changed/removed canonical Recording directory: %v", err)
 	}
-	postCrash := getRecording(t, client, baseURL, recording.ID)
+	postCrash := getRecording(t, dataDir, client, baseURL, recording.ID)
 	if postCrash.ID != recording.ID || postCrash.State != domain.StateInterrupted || len(postCrash.Gaps) != 0 || !equalSequenceRange(recordingSequences(postCrash), 1, lastBeforeCrash) {
 		t.Fatalf("cold recovery must preserve the same archive and make its active state explicitly interrupted: id=%s state=%s seq=%v gaps=%+v", postCrash.ID, postCrash.State, recordingSequences(postCrash), postCrash.Gaps)
 	}
@@ -1647,7 +1640,7 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 		if (!errors.Is(staleCommitErr, recordingowner.ErrNotFound) && !errors.Is(staleCommitErr, recordingowner.ErrStaleOwner)) || staleCommitCalled {
 			t.Fatalf("released orphan owner token could still reach canonical commit: err=%v callback=%v", staleCommitErr, staleCommitCalled)
 		}
-		afterStaleAttempt := getRecording(t, client, baseURL, recording.ID)
+		afterStaleAttempt := getRecording(t, dataDir, client, baseURL, recording.ID)
 		if afterStaleAttempt.State != domain.StateInterrupted || !equalSequenceRange(recordingSequences(afterStaleAttempt), 1, lastBeforeCrash) || len(afterStaleAttempt.Gaps) != 0 {
 			t.Fatalf("cold recovery or orphan polling changed the canonical archive after fencing: state=%s sequences=%v gaps=%+v", afterStaleAttempt.State, recordingSequences(afterStaleAttempt), afterStaleAttempt.Gaps)
 		}
@@ -1788,7 +1781,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		storageDiagnostic, _ := os.ReadFile(filepath.Join(dataDir, "management", "diagnostics", "recordings", recordingR.ID+".json"))
 		t.Fatalf("wait for initial live archive: %v; canonical=%s; durable storage diagnostic=%s; fixture=%s; host=%s; child diagnostics=%s", err, archiveSummary, storageDiagnostic, fixture.describe(streamR), process.output.String(), childDiagnostics)
 	}
-	baseline := getRecording(t, client, baseURL, recordingR.ID)
+	baseline := getRecording(t, dataDir, client, baseURL, recordingR.ID)
 	verifyRuntimeRecordingSegments(t, dataDir, baseline, streamR, 1, 20)
 	baselineSequences := recordingSequences(baseline)
 	if !equalSequenceRange(baselineSequences, 1, 20) {
@@ -2020,7 +2013,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if err := waitShardedHeaderMediaCount(t, dataDir, recordingR.ID, 60, 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	finalR := getRecording(t, client, baseURL, recordingR.ID)
+	finalR := getRecording(t, dataDir, client, baseURL, recordingR.ID)
 	if finalR.ID != recordingR.ID || finalR.Title != "Recording R" || finalR.State != domain.StateRecording || len(finalR.Gaps) != 0 {
 		t.Fatalf("R identity/title/state/gaps changed during application update: id=%s title=%q state=%s gaps=%+v", finalR.ID, finalR.Title, finalR.State, finalR.Gaps)
 	}
@@ -2399,13 +2392,60 @@ func waitShardedHeaderMediaCount(t *testing.T, dataDir, id string, minimum int, 
 	}
 }
 
-func getRecording(t *testing.T, client *http.Client, baseURL, id string) *domain.Recording {
+type runtimeRecordingDetail struct {
+	domain.Recording
+	APIError        string  `json:"error"`
+	TrackCount      int     `json:"track_count"`
+	SegmentCount    int     `json:"segment_count"`
+	DurationSeconds float64 `json:"duration_seconds"`
+	Statistics      *struct {
+		SegmentCount int `json:"segment_count"`
+	} `json:"statistics"`
+}
+
+func getRuntimeRecordingDetail(client *http.Client, baseURL, id string) (runtimeRecordingDetail, int, error) {
+	var detail runtimeRecordingDetail
+	code, err := requestRuntimeJSON(client, baseURL, http.MethodGet, "/api/recordings/"+id, nil, &detail)
+	return detail, code, err
+}
+
+// getRecording checks the bounded HTTP detail contract, then reads V2 timeline
+// entries from the canonical archive index for assertions that need identities.
+func getRecording(t *testing.T, dataDir string, client *http.Client, baseURL, id string) *domain.Recording {
 	t.Helper()
-	recording, code := getRuntimeJSON[domain.Recording](t, client, baseURL, http.MethodGet, "/api/recordings/"+id, nil)
-	if code != http.StatusOK {
-		t.Fatalf("get recording %s returned %d", id, code)
+	detail, code, err := getRuntimeRecordingDetail(client, baseURL, id)
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("get recording %s returned code=%d api_error=%q err=%v", id, code, detail.APIError, err)
 	}
-	return &recording
+	recording := &detail.Recording
+	if recording.FormatVersion != storage.ShardedArchiveFormatVersion {
+		return recording
+	}
+	if detail.SegmentCount != recording.SegmentCount() || detail.Statistics == nil || detail.Statistics.SegmentCount != detail.SegmentCount {
+		t.Fatalf("bounded V2 detail count disagrees with root summary: api=%d statistics=%+v root=%d", detail.SegmentCount, detail.Statistics, recording.SegmentCount())
+	}
+	for trackID, track := range recording.Tracks {
+		if track != nil && (len(track.Segments) != 0 || len(track.InitSegments) != 0) {
+			t.Fatalf("V2 detail materialized timeline for track %s; canonical assertions must use archive index", trackID)
+		}
+	}
+	store, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatalf("open canonical archive for V2 read assertions: %v", err)
+	}
+	if err := materializeShardedRecordingForTest(store, recording); err != nil {
+		t.Fatalf("read canonical V2 archive index for Recording %s: %v", id, err)
+	}
+	var canonicalTimelineCount int
+	for _, track := range recording.Tracks {
+		if track != nil {
+			canonicalTimelineCount += len(track.Segments)
+		}
+	}
+	if canonicalTimelineCount != detail.SegmentCount {
+		t.Fatalf("canonical V2 timeline count=%d, bounded API summary=%d", canonicalTimelineCount, detail.SegmentCount)
+	}
+	return recording
 }
 
 func waitRecordingSequenceCount(t *testing.T, client *http.Client, baseURL, id string, minimum int, timeout time.Duration) {
@@ -2417,13 +2457,12 @@ func waitRecordingSequenceCount(t *testing.T, client *http.Client, baseURL, id s
 
 func waitRuntimeRecordingSequenceCount(client *http.Client, baseURL, id string, minimum int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	var latest *domain.Recording
+	var latest *runtimeRecordingDetail
 	for time.Now().Before(deadline) {
-		var recording domain.Recording
-		code, err := requestRuntimeJSON(client, baseURL, http.MethodGet, "/api/recordings/"+id, nil, &recording)
+		detail, code, err := getRuntimeRecordingDetail(client, baseURL, id)
 		if err == nil && code == http.StatusOK {
-			latest = &recording
-			if recording.Tracks["main"] != nil && len(recording.Tracks["main"].Segments) >= minimum {
+			latest = &detail
+			if detail.SegmentCount >= minimum {
 				return nil
 			}
 		}
@@ -2432,13 +2471,7 @@ func waitRuntimeRecordingSequenceCount(client *http.Client, baseURL, id string, 
 	if latest == nil {
 		return fmt.Errorf("recording %s could not be read while waiting for %d segments", id, minimum)
 	}
-	var count int
-	var sequences []uint64
-	if track := latest.Tracks["main"]; track != nil {
-		count = len(track.Segments)
-		sequences = recordingSequences(latest)
-	}
-	return fmt.Errorf("recording %s did not reach %d segments (state=%s count=%d sequences=%v gaps=%+v error=%q)", id, minimum, latest.State, count, sequences, latest.Gaps, latest.LastError)
+	return fmt.Errorf("recording %s did not reach %d segments (state=%s bounded_count=%d root_tracks=%+v error=%q)", id, minimum, latest.State, latest.SegmentCount, latest.Tracks, latest.LastError)
 }
 
 func (f *runtimeUpdateFixture) describe(stream string) string {
@@ -2735,8 +2768,8 @@ func waitRuntimeRecordingState(t *testing.T, client *http.Client, baseURL, recor
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		current := getRecording(t, client, baseURL, recordingID)
-		if current.State == expected {
+		current, code, err := getRuntimeRecordingDetail(client, baseURL, recordingID)
+		if err == nil && code == http.StatusOK && current.State == expected {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)

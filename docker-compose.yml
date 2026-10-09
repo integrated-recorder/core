@@ -8,7 +8,7 @@ services:
       DATA_DIR: /data
       ADAPTER_DIR: /external-adapters
       IR_ALLOW_OPERATOR_PLUGINS: ${IR_ALLOW_OPERATOR_PLUGINS:-0}
-      IR_PLUGIN_REGISTRY_URL: ${IR_PLUGIN_REGISTRY_URL:-}
+      IR_PLUGIN_REGISTRY_URL: ${IR_PLUGIN_REGISTRY_URL:-https://integrated-recorder.github.io/plugin-registry/catalog-v3.json}
       IR_RELEASE_TRUSTED_KEYS_JSON: ${IR_RELEASE_TRUSTED_KEYS_JSON:-}
     volumes:
       - recording-data:/data

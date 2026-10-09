@@ -2,9 +2,11 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +16,31 @@ import (
 
 	"github.com/integrated-recorder/core/internal/domain"
 )
+
+func TestLocalLoadAllReadOnlyLimitPropagatesUnreadableRootAndCancellation(t *testing.T) {
+	root := t.TempDir()
+	store, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "6123456789abcdef0123456789abcdef"
+	if err := store.CreateRecording(stoppedRecording(id)); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "recordings", id, "recording.json")
+	if err := os.WriteFile(path, []byte("not-json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := store.LoadAllReadOnlyLimit(10); err == nil || rows != nil {
+		t.Fatalf("unreadable canonical root was silently omitted: rows=%#v err=%v", rows, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if rows, err := store.LoadAllReadOnlyLimitContext(ctx, 10); !errors.Is(err, context.Canceled) || rows != nil {
+		t.Fatalf("canceled local snapshot rows=%#v err=%v, want no rows and context.Canceled", rows, err)
+	}
+}
 
 func TestLoadAllMarksStaleRecordingInterrupted(t *testing.T) {
 	dir := t.TempDir()

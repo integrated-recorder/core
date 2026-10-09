@@ -503,8 +503,11 @@ func TestStorageProviderSetIdentityPersistsAcrossActivationAndRollback(t *testin
 
 	firstStorageSet := strings.Repeat("a", 64)
 	secondStorageSet := strings.Repeat("b", 64)
+	firstInstance := "si_" + strings.Repeat("1", 32)
+	secondInstance := "si_" + strings.Repeat("2", 32)
 	first := testGeneration(generationTwo, StateStaging)
 	first.StorageProviderSetID = firstStorageSet
+	first.StorageInstanceID = firstInstance
 	stageGenerationReady(t, r, first)
 	if err := r.Activate(generationTwo); err != nil {
 		t.Fatal(err)
@@ -515,6 +518,7 @@ func TestStorageProviderSetIdentityPersistsAcrossActivationAndRollback(t *testin
 
 	second := testGeneration(generationThree, StateStaging)
 	second.StorageProviderSetID = secondStorageSet
+	second.StorageInstanceID = secondInstance
 	stageGenerationReady(t, r, second)
 	if err := r.Activate(generationThree); err != nil {
 		t.Fatal(err)
@@ -531,13 +535,13 @@ func TestStorageProviderSetIdentityPersistsAcrossActivationAndRollback(t *testin
 		t.Fatalf("reload generation storage identities: %v", err)
 	}
 	state := reloaded.Snapshot()
-	if got := state.Generations[generationTwo].StorageProviderSetID; got != firstStorageSet {
-		t.Fatalf("old generation storage set after activation/reload = %q, want %q", got, firstStorageSet)
+	if got := state.Generations[generationTwo]; got.StorageProviderSetID != firstStorageSet || got.StorageInstanceID != firstInstance {
+		t.Fatalf("old generation storage pin after activation/reload = %+v", got)
 	}
-	if got := state.Generations[generationThree].StorageProviderSetID; got != secondStorageSet {
-		t.Fatalf("active generation storage set after reload = %q, want %q", got, secondStorageSet)
+	if got := state.Generations[generationThree]; got.StorageProviderSetID != secondStorageSet || got.StorageInstanceID != secondInstance {
+		t.Fatalf("active generation storage pin after reload = %+v", got)
 	}
-	if got := state.Generations[generationTwo]; !got.EngineDormant || got.StorageProviderSetID != firstStorageSet {
+	if got := state.Generations[generationTwo]; !got.EngineDormant || got.StorageProviderSetID != firstStorageSet || got.StorageInstanceID != firstInstance {
 		t.Fatalf("dormant generation did not retain its storage set: %+v", got)
 	}
 
@@ -545,14 +549,14 @@ func TestStorageProviderSetIdentityPersistsAcrossActivationAndRollback(t *testin
 		t.Fatalf("rollback: %v", err)
 	}
 	state = reloaded.Snapshot()
-	if got := state.Generations[generationTwo].StorageProviderSetID; got != firstStorageSet {
-		t.Fatalf("rollback target storage set = %q, want %q", got, firstStorageSet)
+	if got := state.Generations[generationTwo]; got.StorageProviderSetID != firstStorageSet || got.StorageInstanceID != firstInstance {
+		t.Fatalf("rollback target storage pin = %+v", got)
 	}
 	if got := state.Generations[generationTwo].EngineDormant; got {
 		t.Fatal("rollback left reactivated Engine dormant")
 	}
-	if got := state.Generations[generationThree].StorageProviderSetID; got != secondStorageSet {
-		t.Fatalf("draining generation storage set = %q, want %q", got, secondStorageSet)
+	if got := state.Generations[generationThree]; got.StorageProviderSetID != secondStorageSet || got.StorageInstanceID != secondInstance {
+		t.Fatalf("draining generation storage pin = %+v", got)
 	}
 }
 

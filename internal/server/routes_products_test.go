@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/applog"
 	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/buildinfo"
 	"github.com/integrated-recorder/core/internal/derivative"
@@ -66,7 +68,7 @@ func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
 	if err := json.Unmarshal(query.Body.Bytes(), &page); err != nil || page.Total != 1 || len(page.Items) != 1 {
 		t.Fatalf("recording query response=%s err=%v", query.Body.String(), err)
 	}
-	if page.Items[0]["archive_size_bytes"].(float64) <= 0 || page.Items[0]["gap_duration_seconds"] != nil || page.Items[0]["resource_id"] != "resource-stable" {
+	if page.Items[0]["archive_size_bytes"] != nil || page.Items[0]["statistics_status"] != "partial" || page.Items[0]["gap_duration_seconds"] != nil || page.Items[0]["resource_id"] != "resource-stable" {
 		t.Fatalf("recording query statistics=%v", page.Items[0])
 	}
 
@@ -297,6 +299,90 @@ func TestGlobalSearchRejectsRepeatedAndUnknownParameters(t *testing.T) {
 	}
 }
 
+func TestTagLookupFailureMarksRecordingQueriesAndSearchPartial(t *testing.T) {
+	_, fixtureManager, recording := readModelFixture(t, strings.Repeat("8", 32), domain.StateCompleted)
+	t.Cleanup(func() {
+		if err := fixtureManager.Close(context.Background()); err != nil {
+			t.Errorf("close fixture manager: %v", err)
+		}
+	})
+	// Keep canonical fields usable while making the management tag lookup fail.
+	// A hidden tag could have matched these filters, so the API must mark its
+	// results/totals partial instead of presenting the visible subset as exact.
+	recording.ID = "invalid/id"
+	recording.Title = "visible title"
+	manager := &fixedRecordingManager{recording: recording}
+	products, err := management.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := applog.NewStore()
+	handler := NewWithOptions(manager, nil, nil, Options{Management: products, Logs: logs})
+
+	for _, target := range []string{
+		"/api/v2/recordings?q=hidden-tag-match",
+		"/api/v2/recordings?tag=hidden-tag-match",
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d body=%s", target, response.Code, response.Body.String())
+		}
+		var page struct {
+			Items          []map[string]any `json:"items"`
+			Total          int              `json:"total"`
+			PartialErrors  []string         `json:"partial_errors"`
+			TotalIsPartial bool             `json:"total_is_partial"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+			t.Fatalf("decode GET %s: %v", target, err)
+		}
+		if response.Code != http.StatusOK || page.Total != 0 || len(page.Items) != 0 ||
+			!page.TotalIsPartial || len(page.PartialErrors) != 1 || page.PartialErrors[0] != "tags" {
+			t.Fatalf("GET %s did not identify an incomplete tag-filter result: %s", target, response.Body.String())
+		}
+	}
+
+	// A result matched by canonical text remains visible, with the per-item tag
+	// availability signal retained alongside the query-level partial marker.
+	visible := httptest.NewRecorder()
+	handler.ServeHTTP(visible, httptest.NewRequest(http.MethodGet, "/api/v2/recordings?q=visible", nil))
+	var visiblePage struct {
+		Items []struct {
+			UnavailableFields []string `json:"unavailable_fields"`
+		} `json:"items"`
+		PartialErrors  []string `json:"partial_errors"`
+		TotalIsPartial bool     `json:"total_is_partial"`
+	}
+	if visible.Code != http.StatusOK || json.Unmarshal(visible.Body.Bytes(), &visiblePage) != nil ||
+		len(visiblePage.Items) != 1 || !containsString(visiblePage.Items[0].UnavailableFields, "tags") ||
+		!visiblePage.TotalIsPartial || len(visiblePage.PartialErrors) != 1 || visiblePage.PartialErrors[0] != "tags" {
+		t.Fatalf("visible recording lost per-item/query partial state: status=%d body=%s", visible.Code, visible.Body.String())
+	}
+
+	search := httptest.NewRecorder()
+	handler.ServeHTTP(search, httptest.NewRequest(http.MethodGet, "/api/search?q=hidden-tag-match", nil))
+	var searchResult struct {
+		Results       []map[string]any `json:"results"`
+		PartialErrors []string         `json:"partial_errors"`
+	}
+	if search.Code != http.StatusOK || json.Unmarshal(search.Body.Bytes(), &searchResult) != nil ||
+		len(searchResult.Results) != 0 || len(searchResult.PartialErrors) != 1 || searchResult.PartialErrors[0] != "tags" {
+		t.Fatalf("global search did not return a partial marker: status=%d body=%s", search.Code, search.Body.String())
+	}
+
+	entries, err := logs.Query(applog.Query{Component: "recording-read-model", Limit: 10})
+	if err != nil || len(entries.Items) == 0 {
+		t.Fatalf("tag failure diagnostic missing: entries=%+v err=%v", entries.Items, err)
+	}
+	for _, entry := range entries.Items {
+		if !strings.Contains(entry.Message, "component=tags") || !strings.Contains(entry.Message, "category=management_unavailable") ||
+			strings.Contains(entry.Message, "invalid/id") {
+			t.Fatalf("tag failure diagnostic unsafe or incomplete: %+v", entry)
+		}
+	}
+}
+
 func TestGlobalSearchCancellationReturnsNoPartialResults(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.New(root)
@@ -518,6 +604,52 @@ func TestRecordingDeleteRejectsActiveAndDeletesWholeArchiveIdempotently(t *testi
 	handler.ServeHTTP(again, httptest.NewRequest(http.MethodDelete, "/api/recordings/"+completed.ID, nil))
 	if again.Code != http.StatusNoContent {
 		t.Fatalf("idempotent delete=%d %s", again.Code, again.Body.String())
+	}
+}
+
+func TestRecordingDeleteAuditsBeforeManagementCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording := writeProductRecording(t, store, strings.Repeat("c", 32), domain.StateCompleted)
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := products.SetTags(recording.ID, []string{"cleanup-failure"}); err != nil {
+		t.Fatal(err)
+	}
+	projectionPath := filepath.Join(root, "management", "recordings", recording.ID+".json")
+	if err := os.Remove(projectionPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(projectionPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectionPath, "unsafe-entry"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(manager, nil, nil, Options{Management: products})
+	principal := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	request := httptest.NewRequest(http.MethodDelete, "/api/recordings/"+recording.ID, nil)
+	request = request.WithContext(authn.WithPrincipal(request.Context(), principal))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError || response.Header().Get("X-Audit-Status") != "recorded" || !strings.Contains(response.Body.String(), "recording was deleted but management metadata cleanup is pending") {
+		t.Fatalf("delete cleanup failure response=%d audit=%q body=%s", response.Code, response.Header().Get("X-Audit-Status"), response.Body.String())
+	}
+	if _, err := manager.Get(recording.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("canonical recording survived deletion: %v", err)
+	}
+	events := products.Audit(10)
+	if len(events) != 1 || events[0].Type != "recording_deleted" || events[0].ObjectID != recording.ID || events[0].Actor == nil || events[0].Actor.Type != management.AuditActorUser || events[0].Actor.UserID != principal.UserID {
+		t.Fatalf("canonical deletion audit=%+v", events)
 	}
 }
 

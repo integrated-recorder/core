@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, ArrowRight, Check, Database, Gauge, HardDrive, Layers3, RefreshCw, Server, ShieldCheck, Timer, TriangleAlert, Waves } from 'lucide-react'
 import { storageMetricsQuery, storagePoolsQuery } from '@/api/queries'
 import { storageProvidersAPI, type StorageMetricWindow } from '@/api'
-import type { StoragePool, StorageProviderConfigBody, StorageProviderSummary, StorageProviderStatus } from '@/types/api'
+import type { Schema, StorageInstanceCreateBody, StorageInstanceSummary, StoragePool, StorageProviderConfigBody, StorageProviderSummary, StorageProviderStatus } from '@/types/api'
 import { MetricChart } from '@/components/storage/metric-chart'
 import { EmptyState, ErrorState, LoadingState } from '@/components/query-state'
 import { PageHeading } from '@/components/page-heading'
@@ -17,6 +17,7 @@ import { formatBytes } from '@/lib/utils'
 import { SchemaForm } from '@/components/schema-form'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/use-toast'
+import { Input } from '@/components/ui/input'
 
 export function StoragePage() {
   const pools = useQuery(storagePoolsQuery)
@@ -46,7 +47,65 @@ function StorageProviderManagement() {
       <div><h2 className="text-base font-semibold">설치된 Storage Provider</h2><p className="mt-1 text-xs text-muted-foreground">설정, 연결 검사, 기본 저장소 활성화는 각각 별도 단계입니다. 저장소 전환은 기존 archive를 이동하지 않으며 archive가 비어 있지 않으면 거부될 수 있습니다.</p></div>
       {query.data.providers.length ? <div className="grid min-w-0 gap-4 xl:grid-cols-2">{query.data.providers.map(provider => <StorageProviderCard key={provider.id} provider={provider} />)}</div> : <EmptyState title="설치된 storage provider가 없습니다." description="Plugin Registry에서 provider를 설치할 수 있습니다. 설치만으로는 기본 저장소가 바뀌지 않습니다." />}
     </div>}
+    {query.data && <StorageInstanceManagement providers={query.data.providers} />}
   </section>
+}
+
+const localInstanceSchema: Schema = { fields: [{ key: 'root', control: 'text', label: 'Archive root', required: true, constraints: { max_length: 4096 } }] }
+
+function StorageInstanceManagement({ providers }: { providers: StorageProviderSummary[] }) {
+  const client = useQueryClient()
+  const { toast } = useToast()
+  const queryKey = ['storage-instances'] as const
+  const instances = useQuery({ queryKey, queryFn: storageProvidersAPI.instances, staleTime: 5_000 })
+  const [creating, setCreating] = useState(false)
+  const [displayName, setDisplayName] = useState('')
+  const [providerID, setProviderID] = useState(providers[0]?.id ?? '')
+  const provider = providers.find(item => item.id === providerID)
+  const schema = provider?.id === 'local' ? localInstanceSchema : provider?.configuration_schema
+  const invalidate = async () => Promise.all([
+    client.invalidateQueries({ queryKey }),
+    client.invalidateQueries({ queryKey: ['runtime-storage-provider'] }),
+    client.invalidateQueries({ queryKey: ['storage', 'pools'] }),
+  ])
+  const create = useMutation({
+    mutationFn: (body: StorageInstanceCreateBody) => storageProvidersAPI.createInstance(body),
+    onSuccess: async () => { setCreating(false); setDisplayName(''); toast('저장소 인스턴스를 만들었습니다.'); await invalidate() },
+  })
+  return <section aria-labelledby="storage-instances-title" className="space-y-3">
+    <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 id="storage-instances-title" className="text-base font-semibold">저장소 인스턴스</h2><p className="mt-1 text-xs text-muted-foreground">같은 provider로 여러 설정을 저장합니다. 활성화한 세대는 선택한 immutable 설정을 고정합니다.</p></div><Button variant="outline" onClick={() => setCreating(value => !value)}>{creating ? '만들기 닫기' : '인스턴스 추가'}</Button></div>
+    {creating && <Card><CardHeader><CardTitle className="text-base">저장소 인스턴스 만들기</CardTitle><p className="text-xs text-muted-foreground">자격 증명은 쓰기 전용으로 저장합니다. 새 인스턴스는 별도 활성화 전까지 기본 저장소를 바꾸지 않습니다.</p></CardHeader><CardContent className="space-y-4">
+      <label className="block space-y-2"><span className="text-sm font-medium">표시 이름</span><Input value={displayName} onChange={event => setDisplayName(event.target.value)} maxLength={128} placeholder="예: SSD archive" /></label>
+      <label className="block space-y-2"><span className="text-sm font-medium">Storage Provider</span><select className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm" value={providerID} onChange={event => setProviderID(event.target.value)} aria-label="Storage Provider">{providers.map(item => <option key={item.id} value={item.id}>{item.name} · {item.id}</option>)}</select></label>
+      {schema?.fields.length ? <SchemaForm key={`instance-create-${providerID}`} schema={schema} mode="input" submitLabel="인스턴스 만들기" busy={create.isPending} onSubmit={({ values, secrets }) => create.mutate({ display_name: displayName, provider_id: providerID, values, secrets })} /> : <p className="text-sm text-muted-foreground">선택한 provider에 설정 항목이 없습니다.</p>}
+      {create.error && <p role="alert" className="text-sm text-destructive">{storageActionError(create.error)}</p>}
+    </CardContent></Card>}
+    {instances.isLoading ? <LoadingState label="저장소 인스턴스를 불러오는 중입니다" /> : instances.error ? <div role="alert" className="space-y-2"><p className="text-sm text-muted-foreground">저장소 인스턴스를 불러오지 못했습니다.</p><Button variant="outline" onClick={() => void instances.refetch()}>다시 시도</Button></div> : instances.data?.length ? <div className="grid min-w-0 gap-4 xl:grid-cols-2">{instances.data.map(instance => <StorageInstanceCard key={instance.id} instance={instance} provider={providers.find(item => item.id === instance.provider_id)} active={instance.active} onChanged={invalidate} />)}</div> : <EmptyState title="저장소 인스턴스가 없습니다." description="Provider 설정마다 이름이 있는 인스턴스를 만들 수 있습니다." />}
+  </section>
+}
+
+function StorageInstanceCard({ instance, provider, active, onChanged }: { instance: StorageInstanceSummary; provider?: StorageProviderSummary; active: boolean; onChanged: () => Promise<unknown> }) {
+  const client = useQueryClient()
+  const { toast } = useToast()
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [message, setMessage] = useState('')
+  const configKey = ['storage-instance-config', instance.id] as const
+  const config = useQuery({ queryKey: configKey, queryFn: () => storageProvidersAPI.instanceConfig(instance.id), staleTime: 10_000 })
+  const schema = instance.provider_id === 'local' ? localInstanceSchema : provider?.configuration_schema
+  const invalidate = async () => Promise.all([onChanged(), client.invalidateQueries({ queryKey: configKey })])
+  const save = useMutation({ mutationFn: (body: StorageProviderConfigBody) => storageProvidersAPI.saveInstanceConfig(instance.id, body), onSuccess: async () => { setMessage('새 immutable 설정을 저장했습니다. 기존 세대는 이전 설정을 계속 사용합니다.'); toast('저장소 인스턴스 설정을 저장했습니다.'); await invalidate() }, onError: error => setMessage(storageActionError(error)) })
+  const probe = useMutation({ mutationFn: () => storageProvidersAPI.probeInstance(instance.id), onSuccess: () => { setMessage('연결 및 읽기·쓰기 검사가 성공했습니다.'); toast('저장소 인스턴스 연결 검사를 통과했습니다.') }, onError: error => setMessage(storageActionError(error)) })
+  const activate = useMutation({ mutationFn: () => storageProvidersAPI.activateInstance(instance.id), onSuccess: async () => { setConfirmOpen(false); setMessage('새 storage generation을 활성화했습니다.'); toast('저장소 인스턴스를 활성화했습니다.'); await invalidate() }, onError: error => { setConfirmOpen(false); setMessage(storageActionError(error)) } })
+  const busy = save.isPending || probe.isPending || activate.isPending
+  const configuredSecrets = Object.fromEntries((config.data?.configured_secrets ?? []).map(name => [name, true]))
+  return <Card className="min-w-0">
+    <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border/70"><div className="min-w-0"><CardTitle className="truncate text-base">{instance.display_name}</CardTitle><p className="mt-1 font-mono text-[11px] text-muted-foreground">{instance.provider_name} · {instance.provider_id}</p></div><div className="flex flex-wrap gap-1.5"><Badge tone={active ? 'blue' : 'neutral'}>{active ? '기본 저장소' : '저장됨'}</Badge><Badge tone={instance.health === 'ready' ? 'green' : instance.health === 'unavailable' ? 'red' : 'amber'}>{instance.health === 'ready' ? '준비됨' : instance.health === 'unavailable' ? 'Provider 업데이트 필요' : '검사 필요'}</Badge></div></CardHeader>
+    <CardContent className="space-y-4 pt-4">{!provider ? <p role="status" className="text-sm text-muted-foreground">현재 provider artifact가 설치되어 있지 않습니다. 기존 세대가 고정한 immutable 설정은 보존됩니다.</p> : !schema?.fields.length ? <p className="text-sm text-muted-foreground">이 provider에는 설정 항목이 없습니다.</p> : config.isLoading ? <LoadingState label="인스턴스 설정을 불러오는 중입니다" /> : config.error ? <p role="alert" className="text-sm text-muted-foreground">인스턴스 설정을 불러오지 못했습니다.</p> : <SchemaForm key={`${instance.id}-${JSON.stringify(config.data?.values ?? {})}-${(config.data?.configured_secrets ?? []).join(',')}`} schema={schema} initialValues={config.data?.values} initialSecrets={configuredSecrets} mode="config" submitLabel="새 설정 저장" busy={busy} onSubmit={({ values, secrets }) => { setMessage(''); save.mutate({ values, secrets }) }} />}
+      <div className="flex flex-wrap gap-2 border-t border-border/70 pt-4"><Button variant="outline" disabled={!provider || instance.health === 'unavailable' || busy} onClick={() => { setMessage(''); probe.mutate() }}>{probe.isPending ? '검사 중…' : '연결 검사'}</Button><Button disabled={!provider || instance.health === 'unavailable' || active || busy} onClick={() => { setMessage(''); setConfirmOpen(true) }}>{active ? <><Check className="h-4 w-4" />기본 저장소</> : '기본 저장소로 활성화'}</Button></div>
+      {message && <p role={message.includes('성공') || message.includes('저장했습니다') || message.includes('활성화했습니다') ? 'status' : 'alert'} className="text-sm text-muted-foreground">{message}</p>}
+      <Dialog open={confirmOpen} onOpenChange={open => { if (!activate.isPending) setConfirmOpen(open) }}><DialogContent aria-describedby={`storage-instance-activate-${instance.id}`}><DialogTitle>이 저장소 인스턴스를 활성화할까요?</DialogTitle><DialogDescription id={`storage-instance-activate-${instance.id}`} className="mt-2 text-sm leading-6 text-muted-foreground">새 generation은 {instance.display_name}의 현재 immutable 설정을 고정합니다. 기존 녹화는 이전 storage generation을 계속 사용합니다.</DialogDescription><div className="mt-5 flex justify-end gap-2"><Button variant="outline" disabled={activate.isPending} onClick={() => setConfirmOpen(false)}>취소</Button><Button disabled={activate.isPending} onClick={() => activate.mutate()}>{activate.isPending ? '활성화 중…' : '확인 후 활성화'}</Button></div></DialogContent></Dialog>
+    </CardContent>
+  </Card>
 }
 
 function PrimaryStorageSummary({ status }: { status: StorageProviderStatus }) {
@@ -142,6 +201,7 @@ function storageActionError(error: unknown): string {
     storage_backend_switch_requires_empty_archive: '기존 archive를 이동하지 않으므로 비어 있지 않은 archive에서는 저장소를 변경할 수 없습니다.',
     storage_operation_conflict: '다른 저장소 작업이 진행 중입니다. 잠시 후 다시 시도하세요.',
     storage_activation_failed: '기본 저장소를 활성화하지 못했습니다.',
+    storage_instance_not_found: '저장소 인스턴스를 찾을 수 없습니다. 새로고침 후 다시 시도하세요.',
   }
   return safeMessages[text] ?? '저장소 작업을 완료하지 못했습니다. 설정과 연결 상태를 확인한 뒤 다시 시도하세요.'
 }

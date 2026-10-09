@@ -103,6 +103,14 @@ func TestResolvedStartGetStopOverIPC(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].ID != started.ID {
 		t.Fatalf("manager client list=%#v err=%v", rows, err)
 	}
+	page, next, err := managerClient.ListForManagementPage(context.Background(), "", 1)
+	if err != nil || len(page) != 1 || page[0].ID != started.ID || next != "" {
+		t.Fatalf("manager client summary page=%#v next=%q err=%v", page, next, err)
+	}
+	header, err := managerClient.GetManagementHeader(context.Background(), started.ID)
+	if err != nil || header.ID != started.ID || header.FormatVersion != storage.ShardedArchiveFormatVersion || header.SegmentCount() != 1 || len(header.Tracks["main"].Segments) != 0 {
+		t.Fatalf("manager client management header=%#v err=%v", header, err)
+	}
 	const fixedID = "1123456789abcdef0123456789abcdef"
 	fixed, err := managerClient.StartResolvedWithID(context.Background(), fixedID, "fixture", media, nil, "fixed id", nil)
 	if err != nil || fixed.ID != fixedID {

@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"strings"
 
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/controlplane"
 )
 
 const (
@@ -34,6 +36,12 @@ type Controller interface {
 // immutable adapter set and activate an application generation for it.
 type AdapterReconciler interface {
 	ReconcileAdapters(context.Context) (AdapterReconcileResult, error)
+}
+
+// AuditAppender is supplied by Runtime Host bootstrap and forwards events to
+// the active Control over its private lifecycle IPC.
+type AuditAppender interface {
+	AppendAudit(context.Context, controlplane.AuditAppendRequest) error
 }
 
 // ControllerError is a deliberately small, safe error projection. Use
@@ -64,6 +72,7 @@ var safeControllerErrors = map[string]safeErrorDefinition{
 	"plugin_install_failed":                         {http.StatusBadGateway, "플러그인 설치를 완료하지 못했습니다."},
 	"plugin_operation_conflict":                     {http.StatusConflict, "다른 Runtime 변경 작업이 진행 중입니다."},
 	"storage_provider_not_installed":                {http.StatusNotFound, "스토리지 제공자를 찾을 수 없습니다."},
+	"storage_instance_not_found":                    {http.StatusNotFound, "스토리지 인스턴스를 찾을 수 없습니다."},
 	"storage_provider_not_configured":               {http.StatusConflict, "스토리지 제공자 설정이 필요합니다."},
 	"storage_provider_config_managed":               {http.StatusConflict, "이 번들 스토리지 제공자의 설정은 Runtime Host가 관리합니다."},
 	"storage_provider_unavailable":                  {http.StatusServiceUnavailable, "스토리지 제공자를 사용할 수 없습니다."},
@@ -110,12 +119,19 @@ type handler struct {
 	auth         *authn.Service
 	authDisabled bool
 	controller   Controller
+	audit        AuditAppender
 	next         http.Handler
 }
 
 // New constructs the Runtime Host update API. authDisabled is intended only
 // for bootstrap callers that have already applied their loopback-only policy.
 func New(auth *authn.Service, authDisabled, forceSecureCookies bool, controller Controller, next http.Handler) (http.Handler, error) {
+	return NewWithAudit(auth, authDisabled, forceSecureCookies, controller, next, nil)
+}
+
+// NewWithAudit constructs the Runtime Host API with a best-effort active
+// Control audit bridge. New remains for standalone/test embedders.
+func NewWithAudit(auth *authn.Service, authDisabled, forceSecureCookies bool, controller Controller, next http.Handler, audit AuditAppender) (http.Handler, error) {
 	// The flag is accepted to keep host construction aligned with the existing
 	// auth policy. This API does not issue cookies; authn owns cookie attributes.
 	_ = forceSecureCookies
@@ -123,11 +139,15 @@ func New(auth *authn.Service, authDisabled, forceSecureCookies bool, controller 
 		return nil, errors.New("runtime update API dependencies are incomplete")
 	}
 	return &handler{
-		auth: auth, authDisabled: authDisabled, controller: controller, next: next,
+		auth: auth, authDisabled: authDisabled, controller: controller, audit: audit, next: next,
 	}, nil
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if operation, id, ok := routeStorageInstanceOperation(r.Method, r.URL.Path); ok {
+		h.serveStorageInstanceOperation(w, r, operation, id)
+		return
+	}
 	if operation, id, ok := routeStorageOperation(r.Method, r.URL.Path); ok {
 		h.serveStorageOperation(w, r, operation, id)
 		return
@@ -142,7 +162,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setResponseHeaders(w)
-	if !h.authorize(w, r, operation != operationStatus) {
+	permission := authn.PermissionUpdateManage
+	if operation == operationAdapterReconcile {
+		permission = authn.PermissionPluginManage
+	}
+	var authorized bool
+	r, authorized = h.authorize(w, r, permission, operation != operationStatus)
+	if !authorized {
 		return
 	}
 	if operation != operationStatus {
@@ -171,6 +197,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusInternalServerError, "internal_error", safeControllerErrors["internal_error"].message)
 			return
 		}
+		h.auditMutation(w, r, controlplane.AuditAdapterReconciled, "adapters")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(append(encoded, '\n'))
 		return
@@ -194,6 +221,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeControllerError(w, err)
 		return
 	}
+	switch operation {
+	case operationStage:
+		h.auditMutation(w, r, controlplane.AuditRuntimeUpdateStaged, "runtime-update")
+	case operationActivate:
+		h.auditMutation(w, r, controlplane.AuditRuntimeUpdateActivated, "runtime-update")
+	case operationRollback:
+		h.auditMutation(w, r, controlplane.AuditRuntimeUpdateRolledBack, "runtime-update")
+	}
 	if err := status.Validate(); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "internal_error", safeControllerErrors["internal_error"].message)
 		return
@@ -205,6 +240,34 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(append(encoded, '\n'))
+}
+
+func (h *handler) auditMutation(w http.ResponseWriter, r *http.Request, action, objectID string) {
+	appendRuntimeAuditBestEffort(w, r, h.audit, action, objectID)
+}
+
+func appendRuntimeAuditBestEffort(w http.ResponseWriter, r *http.Request, audit AuditAppender, action, objectID string) {
+	request := controlplane.AuditAppendRequest{Action: action, ObjectID: objectID, ActorType: "system"}
+	if principal, ok := authn.PrincipalFromContext(r.Context()); ok {
+		request.ActorType = "user"
+		request.UserID = principal.UserID
+	}
+	if request.Validate() != nil {
+		w.Header().Set("X-Audit-Status", "failed")
+		log.Printf("runtime audit append rejected after successful mutation")
+		return
+	}
+	if audit == nil {
+		w.Header().Set("X-Audit-Status", "unavailable")
+		log.Printf("runtime audit bridge unavailable after successful mutation")
+		return
+	}
+	if err := audit.AppendAudit(r.Context(), request); err != nil {
+		w.Header().Set("X-Audit-Status", "failed")
+		log.Printf("runtime audit append failed after successful mutation")
+		return
+	}
+	w.Header().Set("X-Audit-Status", "recorded")
 }
 
 type operation uint8
@@ -238,20 +301,26 @@ func routeOperation(method, path string) (operation, bool) {
 	}
 }
 
-func (h *handler) authorize(w http.ResponseWriter, r *http.Request, mutation bool) bool {
+func (h *handler) authorize(w http.ResponseWriter, r *http.Request, permission authn.Permission, mutation bool) (*http.Request, bool) {
 	if h.authDisabled {
-		return true
+		return r, true
 	}
 	token := authn.SessionToken(r)
-	if _, err := h.auth.Authenticate(token); err != nil {
+	session, err := h.auth.Authenticate(token)
+	if err != nil {
 		writeAPIError(w, http.StatusUnauthorized, "authentication_required", "인증이 필요합니다.")
-		return false
+		return r, false
+	}
+	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Role: session.Role}
+	if !authn.HasPermission(principal, permission) {
+		writeAPIError(w, http.StatusForbidden, "permission_denied", "권한이 없습니다.")
+		return r, false
 	}
 	if mutation && !h.auth.ValidCSRF(token, r.Header.Get("X-CSRF-Token")) {
 		writeAPIError(w, http.StatusForbidden, "csrf_rejected", "요청 검증에 실패했습니다.")
-		return false
+		return r, false
 	}
-	return true
+	return r.WithContext(authn.WithPrincipal(r.Context(), principal)), true
 }
 
 func validateEmptyBody(r *http.Request) error {

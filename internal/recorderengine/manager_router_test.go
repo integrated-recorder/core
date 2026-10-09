@@ -22,11 +22,37 @@ import (
 )
 
 type operationCounter struct {
-	engine          *recorderengine.Engine
-	mu              sync.Mutex
-	counts          map[string]int
-	shadow          bool
-	beforeInventory func(context.Context) error
+	engine                     *recorderengine.Engine
+	mu                         sync.Mutex
+	counts                     map[string]int
+	shadow                     bool
+	beforeInventory            func(context.Context) error
+	unsupportedManagementCache bool
+}
+
+type unsupportedRuntimeOperationError struct{}
+
+func (unsupportedRuntimeOperationError) Error() string { return "unsupported operation" }
+func (unsupportedRuntimeOperationError) PublicIPCError() (string, string) {
+	return "unsupported_operation", "runtime operation is not supported"
+}
+
+type invalidationCountStorageBackend struct {
+	storage.StorageBackend
+	mu            sync.Mutex
+	invalidations int
+}
+
+func (b *invalidationCountStorageBackend) InvalidateManagementRootCache() {
+	b.mu.Lock()
+	b.invalidations++
+	b.mu.Unlock()
+}
+
+func (b *invalidationCountStorageBackend) invalidationCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.invalidations
 }
 
 func (c *operationCounter) RuntimeInstanceID() string { return c.engine.RuntimeInstanceID() }
@@ -35,7 +61,11 @@ func (c *operationCounter) Handle(ctx context.Context, operation string, payload
 	c.mu.Lock()
 	c.counts[operation]++
 	beforeInventory := c.beforeInventory
+	unsupportedManagementCache := c.unsupportedManagementCache
 	c.mu.Unlock()
+	if operation == recorderengine.OperationInvalidateManagementRootCache && unsupportedManagementCache {
+		return nil, unsupportedRuntimeOperationError{}
+	}
 	if operation == recorderengine.OperationInventory && beforeInventory != nil {
 		if err := beforeInventory(ctx); err != nil {
 			return nil, err
@@ -249,6 +279,91 @@ func TestManagerRouterGenerationRoutingAndDetachAfterInventoryDrains(t *testing.
 	}
 	if engineB.count.count(recorderengine.OperationStop) != 1 {
 		t.Fatalf("generation b Stop invocation count=%d", engineB.count.count(recorderengine.OperationStop))
+	}
+}
+
+func TestManagerRouterInvalidatesManagementRootsOnGenerationReactivation(t *testing.T) {
+	root := shortTempRoot(t)
+	storeA, err := storage.New(filepath.Join(root, "data-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeB, err := storage.New(filepath.Join(root, "data-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendA := &invalidationCountStorageBackend{StorageBackend: storeA.StorageBackend}
+	backendB := &invalidationCountStorageBackend{StorageBackend: storeB.StorageBackend}
+	storeA.StorageBackend = backendA
+	storeB.StorageBackend = backendB
+	engineA := startTestEngine(t, filepath.Join(root, "ipc"), "engine-a", storeA, false)
+	engineB := startTestEngine(t, filepath.Join(root, "ipc"), "engine-b", storeB, false)
+	router, err := recorderengine.NewManagerRouter("engine-a", map[string]*recorderengine.ManagerClient{
+		"engine-a": engineA.client,
+		"engine-b": engineB.client,
+	}, storeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := func() {
+		t.Helper()
+		if _, err := router.ListForManagement(context.Background(), 10); err != nil {
+			t.Fatalf("ListForManagement: %v", err)
+		}
+	}
+	list() // New router invalidates active Engine once before first snapshot.
+	list() // Repeated poll reuses active Engine cache.
+	if backendA.invalidationCount() != 1 {
+		t.Fatalf("initial active Engine invalidations=%d, want 1", backendA.invalidationCount())
+	}
+
+	if err := router.SetActive("engine-b"); err != nil {
+		t.Fatal(err)
+	}
+	list()
+	list()
+	if backendB.invalidationCount() != 1 {
+		t.Fatalf("engine B activation invalidations=%d, want 1", backendB.invalidationCount())
+	}
+
+	if err := router.SetActive("engine-a"); err != nil {
+		t.Fatal(err)
+	}
+	list()
+	if backendA.invalidationCount() != 2 {
+		t.Fatalf("engine A reactivation invalidations=%d, want 2", backendA.invalidationCount())
+	}
+	if engineA.count.count(recorderengine.OperationInvalidateManagementRootCache) != 2 || engineB.count.count(recorderengine.OperationInvalidateManagementRootCache) != 1 {
+		t.Fatalf("invalidation IPC counts A=%d B=%d, want A=2 B=1", engineA.count.count(recorderengine.OperationInvalidateManagementRootCache), engineB.count.count(recorderengine.OperationInvalidateManagementRootCache))
+	}
+}
+
+func TestManagerRouterAllowsOlderEngineWithoutManagementCacheOperation(t *testing.T) {
+	root := shortTempRoot(t)
+	store, err := storage.New(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := startTestEngine(t, filepath.Join(root, "ipc"), "engine-old", store, false)
+	engine.count.mu.Lock()
+	engine.count.unsupportedManagementCache = true
+	engine.count.mu.Unlock()
+	router, err := recorderengine.NewManagerRouter("engine-old", map[string]*recorderengine.ManagerClient{
+		"engine-old": engine.client,
+	}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := router.ListForManagement(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("list through older Engine: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("older Engine returned %d rows, want empty", len(rows))
+	}
+	if engine.count.count(recorderengine.OperationInvalidateManagementRootCache) != 1 || engine.count.count(recorderengine.OperationList) != 1 {
+		t.Fatalf("older Engine calls: invalidate=%d list=%d, want 1/1", engine.count.count(recorderengine.OperationInvalidateManagementRootCache), engine.count.count(recorderengine.OperationList))
 	}
 }
 

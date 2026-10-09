@@ -339,7 +339,7 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	if recordingREnginePID == engineAPID {
 		t.Fatalf("R still uses the original Engine after same-set handover: initial=%d current=%d", engineAPID, recordingREnginePID)
 	}
-	currentR := getRecording(t, client, baseURL, recordingR.ID)
+	currentR := getRecording(t, dataDir, client, baseURL, recordingR.ID)
 	if currentR.State != domain.StateRecording || currentR.ID != recordingR.ID || len(currentR.Gaps) != 0 {
 		t.Fatalf("adapter update interrupted R or created a gap: %+v", currentR)
 	}
@@ -388,7 +388,7 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	if len(metadataAfter.Items) != 2 || stringValue(metadataAfter.Items[1].Title) != "After adapter update" {
 		t.Fatalf("Engine A metadata monitor did not survive adapter set activation: %+v", metadataAfter.Items)
 	}
-	finalR := getRecording(t, client, baseURL, recordingR.ID)
+	finalR := getRecording(t, dataDir, client, baseURL, recordingR.ID)
 	verifyRuntimeRecordingSegments(t, dataDir, finalR, streamR, 1, 15)
 	if finalR.State != domain.StateRecording || len(finalR.Gaps) != 0 || !equalSequenceRange(recordingSequences(finalR), 1, 15) {
 		t.Fatalf("Recording R continuity failed across adapter generations: state=%s gaps=%+v sequences=%v", finalR.State, finalR.Gaps, recordingSequences(finalR))

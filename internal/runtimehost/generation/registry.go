@@ -45,9 +45,10 @@ var (
 
 	// IDs are deliberately opaque and path-safe. UUIDs and 32-64 digit hex
 	// identifiers are accepted; names, slashes, and version strings are not.
-	idPattern           = regexp.MustCompile(`^(?:[0-9a-fA-F]{32,64}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})$`)
-	adapterSetIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	storageSetIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	idPattern                = regexp.MustCompile(`^(?:[0-9a-fA-F]{32,64}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})$`)
+	adapterSetIDPattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	storageSetIDPattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	storageInstanceIDPattern = regexp.MustCompile(`^(?:si_[0-9a-f]{32}|si_legacy_[0-9a-f]{24})$`)
 )
 
 // State describes one generation's lifecycle.
@@ -82,9 +83,12 @@ type Generation struct {
 	// StorageProviderSetID pins this generation to an immutable Storage
 	// Provider executable set. Empty is read only for legacy registry records
 	// and must be adopted by Runtime Host before any production process starts.
-	StorageProviderSetID string    `json:"storage_provider_set_id,omitempty"`
-	InstalledAt          time.Time `json:"installed_at"`
-	State                State     `json:"state"`
+	StorageProviderSetID string `json:"storage_provider_set_id,omitempty"`
+	// StorageInstanceID preserves the selected operator-facing identity.
+	// StorageProviderSetID remains the exact immutable execution pin.
+	StorageInstanceID string    `json:"storage_instance_id,omitempty"`
+	InstalledAt       time.Time `json:"installed_at"`
+	State             State     `json:"state"`
 	// EngineDormant records that this generation has no active Host-authorized
 	// Engine attachment. After cold recovery, an orphan OS process may still be
 	// alive; it is not an authorized writer unless it is reattached by the Host.
@@ -887,6 +891,7 @@ func validateGeneration(g Generation) error {
 		strings.TrimSpace(g.Commit) == "" || len(g.Commit) > 128 || strings.ContainsAny(g.Commit, "/\\\x00") ||
 		(g.AdapterSetID != "" && !adapterSetIDPattern.MatchString(g.AdapterSetID)) ||
 		(g.StorageProviderSetID != "" && !storageSetIDPattern.MatchString(g.StorageProviderSetID)) ||
+		(g.StorageInstanceID != "" && !storageInstanceIDPattern.MatchString(g.StorageInstanceID)) ||
 		g.InstalledAt.IsZero() || !validState(g.State) || g.ControlProtocol < 1 || g.EngineProtocol < 1 ||
 		g.ArchiveReadCompatibility.Minimum < 1 || g.ArchiveReadCompatibility.Maximum < g.ArchiveReadCompatibility.Minimum ||
 		g.ArchiveWriteFormat < 1 || !formatReadable(g, g.ArchiveWriteFormat) {

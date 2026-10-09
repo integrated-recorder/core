@@ -86,10 +86,15 @@ func recordLockIndex(id string) uint32 {
 	return h.Sum32() % 64
 }
 
-// recordingQueryItem builds one list item. Canonical metadata errors remain
-// authoritative; provider and management projections degrade per item.
+// recordingQueryItem builds a page item. It does not enumerate provider
+// objects; physical archive size stays unknown until a bounded projection
+// exists.
 func (s *Server) recordingQueryItem(ctx context.Context, recording *domain.Recording) (recordquery.Item, error) {
-	statistics, err := s.deriveRecordingStatistics(ctx, recording)
+	return s.recordingQueryBaseItem(ctx, recording, true)
+}
+
+func (s *Server) recordingQueryBaseItem(ctx context.Context, recording *domain.Recording, includeSearchMetadata bool) (recordquery.Item, error) {
+	statistics, err := s.deriveRecordingStatistics(ctx, recording, false)
 	if err != nil {
 		return recordquery.Item{}, err
 	}
@@ -105,22 +110,18 @@ func (s *Server) recordingQueryItem(ctx context.Context, recording *domain.Recor
 		StatisticsStatus: statistics.Status, UnavailableFields: append([]string{}, statistics.UnavailableFields...),
 		Tags: []string{},
 	}
-	if s.previews != nil {
-		previewSummary := s.previews.Summary(recording)
-		item.Preview = &previewSummary
+	if recording.Resource != nil {
+		item.ResourceType, item.ResourceID = recording.Resource.Type, recording.Resource.ID
 	}
 	if recording.Adapter != nil {
 		item.AdapterName = recording.Adapter.Name
 	}
-	if item.AdapterName == "" && s.adapters != nil && recording.AdapterID != "" {
+	if includeSearchMetadata && item.AdapterName == "" && s.adapters != nil && recording.AdapterID != "" {
 		if adapter, err := s.adapters.Get(recording.AdapterID); err == nil && adapter.Descriptor != nil {
 			item.AdapterName = adapter.Descriptor.Name
 		}
 	}
-	if recording.Resource != nil {
-		item.ResourceType, item.ResourceID = recording.Resource.Type, recording.Resource.ID
-	}
-	if s.products != nil {
+	if includeSearchMetadata && s.products != nil {
 		tags, err := s.products.Tags(recording.ID)
 		if err != nil {
 			item.StatisticsStatus = "partial"
@@ -133,6 +134,43 @@ func (s *Server) recordingQueryItem(ctx context.Context, recording *domain.Recor
 	return item, nil
 }
 
+func (s *Server) enrichRecordingQueryItem(recording *domain.Recording, item *recordquery.Item, includeSearchMetadata bool) {
+	if recording == nil || item == nil {
+		return
+	}
+	if !includeSearchMetadata && s.products != nil {
+		tags, err := s.products.Tags(recording.ID)
+		if err != nil {
+			item.StatisticsStatus = "partial"
+			item.UnavailableFields = appendUnique(item.UnavailableFields, "tags")
+			s.reportReadModelFailure(recording.ID, "tags", "management_unavailable")
+		} else {
+			item.Tags = tags
+		}
+	}
+	if item.AdapterName == "" && recording.Adapter != nil {
+		item.AdapterName = recording.Adapter.Name
+	}
+	if item.AdapterName == "" && s.adapters != nil && recording.AdapterID != "" {
+		if adapter, err := s.adapters.Get(recording.AdapterID); err == nil && adapter.Descriptor != nil {
+			item.AdapterName = adapter.Descriptor.Name
+		}
+	}
+	if s.previews != nil {
+		previewSummary := s.previews.Summary(recording)
+		item.Preview = &previewSummary
+	}
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, current := range values {
+		if current == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
 func addInt64(target *int64, amount int64) bool {
 	if amount < 0 || *target > math.MaxInt64-amount {
 		return false
@@ -141,8 +179,8 @@ func addInt64(target *int64, amount int64) bool {
 	return true
 }
 
-func (s *Server) deriveRecordingStatistics(ctx context.Context, recording *domain.Recording) (recordingStatistics, error) {
-	statistics, err := s.projectRecordingStatistics(ctx, recording)
+func (s *Server) deriveRecordingStatistics(ctx context.Context, recording *domain.Recording, includePhysicalArchiveSize bool) (recordingStatistics, error) {
+	statistics, err := s.projectRecordingStatistics(ctx, recording, includePhysicalArchiveSize)
 	if err != nil {
 		category := "invalid_metadata"
 		if errors.Is(err, errRecordingReadModelOverflow) {
@@ -157,9 +195,12 @@ func (s *Server) deriveRecordingStatistics(ctx context.Context, recording *domai
 	return statistics, err
 }
 
-func (s *Server) projectRecordingStatistics(ctx context.Context, recording *domain.Recording) (recordingStatistics, error) {
+func (s *Server) projectRecordingStatistics(ctx context.Context, recording *domain.Recording, includePhysicalArchiveSize bool) (recordingStatistics, error) {
 	if recording == nil {
 		return recordingStatistics{}, errInvalidRecordingReadModel
+	}
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		return s.projectShardedRecordingStatistics(recording)
 	}
 	statistics := recordingStatistics{
 		MediaPayloadSizeBytes: 0, ManifestSizeBytes: 0, InitPayloadSizeBytes: 0,
@@ -224,6 +265,11 @@ func (s *Server) projectRecordingStatistics(ctx context.Context, recording *doma
 		statistics.GapSegmentCount += int(n)
 	}
 	statistics.Integrity = s.integrityStatusFor(recording)
+	if !includePhysicalArchiveSize {
+		statistics.Status = "partial"
+		statistics.UnavailableFields = append(statistics.UnavailableFields, "archive_size_bytes")
+		return statistics, nil
+	}
 	var archiveBytes int64
 	var archiveErr error
 	if s.storage == nil {
@@ -246,6 +292,40 @@ func (s *Server) projectRecordingStatistics(ctx context.Context, recording *doma
 		}
 	} else {
 		statistics.ArchiveSizeBytes = &archiveBytes
+	}
+	return statistics, nil
+}
+
+func (s *Server) projectShardedRecordingStatistics(recording *domain.Recording) (recordingStatistics, error) {
+	if recording.ShardedArchive == nil {
+		return recordingStatistics{}, errInvalidRecordingReadModel
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	counts := []uint64{recording.ShardedArchive.InitCount, recording.ShardedArchive.ManifestSnapshotCount, recording.ShardedArchive.GapCount}
+	for _, count := range counts {
+		if count > maxInt {
+			return recordingStatistics{}, errRecordingReadModelOverflow
+		}
+	}
+	if recording.ShardedArchive.PayloadBytes > math.MaxInt64 {
+		return recordingStatistics{}, errRecordingReadModelOverflow
+	}
+	statistics := recordingStatistics{
+		MediaPayloadSizeBytes: int64(recording.ShardedArchive.PayloadBytes),
+		SegmentCount:          recording.SegmentCount(),
+		InitSegmentCount:      int(recording.ShardedArchive.InitCount),
+		ManifestSnapshotCount: int(recording.ShardedArchive.ManifestSnapshotCount),
+		GapCount:              int(recording.ShardedArchive.GapCount),
+		DurationSeconds:       recording.Duration(),
+		Integrity:             s.integrityStatusFor(recording),
+		Status:                "partial",
+		UnavailableFields: []string{
+			"archive_size_bytes", "init_payload_size_bytes",
+			"manifest_size_bytes", "gap_segment_count", "gap_duration_seconds",
+		},
+	}
+	if math.IsNaN(statistics.DurationSeconds) || math.IsInf(statistics.DurationSeconds, 0) || statistics.DurationSeconds < 0 {
+		return recordingStatistics{}, errInvalidRecordingReadModel
 	}
 	return statistics, nil
 }
@@ -300,7 +380,7 @@ func (s *Server) reportReadModelFailure(recordingID, component, category string)
 }
 
 func (s *Server) recordingDetail(ctx context.Context, recording *domain.Recording) (recordingDetail, error) {
-	statistics, err := s.deriveRecordingStatistics(ctx, recording)
+	statistics, err := s.deriveRecordingStatistics(ctx, recording, recording == nil || recording.FormatVersion != storage.ShardedArchiveFormatVersion)
 	if err != nil {
 		return recordingDetail{}, err
 	}
@@ -323,33 +403,55 @@ func (s *Server) recordingsQuery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "recording manager is unavailable")
 		return
 	}
-	recordings := s.manager.List()
+	recordings, err := listManagementSummaries(r.Context(), s.manager)
+	if errors.Is(err, acquire.ErrListLimit) {
+		writeError(w, http.StatusServiceUnavailable, "recording summary index exceeds supported bounds")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "recording summaries are temporarily unavailable")
+		return
+	}
 	items := make([]recordquery.Item, 0, len(recordings))
+	byID := make(map[string]*domain.Recording, len(recordings))
+	includeSearchMetadata := query.Q != "" || query.Tag != ""
+	tagsPartial := false
 	for _, listed := range recordings {
-		recording := listed
-		lock := s.productLock(recording.ID)
-		lock.RLock()
-		if current, getErr := s.manager.Get(recording.ID); getErr == nil {
-			recording = current
-		} else {
-			lock.RUnlock()
-			if errors.Is(getErr, storage.ErrNotFound) {
-				continue
-			}
-			writeStorageError(w, getErr)
+		if listed == nil || listed.ID == "" {
+			writeError(w, http.StatusServiceUnavailable, "recording summary metadata is invalid")
 			return
 		}
-		item, itemErr := s.recordingQueryItem(r.Context(), recording)
-		lock.RUnlock()
+		item, itemErr := s.recordingQueryBaseItem(r.Context(), listed, includeSearchMetadata)
 		if itemErr != nil {
-			writeError(w, http.StatusServiceUnavailable, "recording statistics are temporarily unavailable")
+			writeError(w, http.StatusServiceUnavailable, "recording summary metadata is invalid")
 			return
+		}
+		if includeSearchMetadata {
+			for _, unavailable := range item.UnavailableFields {
+				if unavailable == "tags" {
+					tagsPartial = true
+					break
+				}
+			}
 		}
 		items = append(items, item)
+		byID[listed.ID] = listed
 	}
 	page, err := recordquery.Page(items, query)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid recording query")
+		return
+	}
+	for index := range page.Items {
+		if recording := byID[page.Items[index].ID]; recording != nil {
+			s.enrichRecordingQueryItem(recording, &page.Items[index], includeSearchMetadata)
+		}
+	}
+	if tagsPartial {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items": page.Items, "next_cursor": page.NextCursor, "total": page.Total,
+			"partial_errors": []string{"tags"}, "total_is_partial": true,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
@@ -360,21 +462,28 @@ func (s *Server) systemStorage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "storage statistics are unavailable")
 		return
 	}
-	stats, err := s.storage.StorageStats()
+	recordings, err := listManagementSummaries(r.Context(), s.manager)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "storage statistics are unavailable")
+		writeError(w, http.StatusServiceUnavailable, "recording summaries are temporarily unavailable")
 		return
 	}
+	stats, unavailable := s.managementStorageStats(recordings)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"archive_root":               "recordings/",
 		"filesystem_total_bytes":     stats.FilesystemTotalBytes,
 		"filesystem_used_bytes":      stats.FilesystemUsedBytes,
 		"filesystem_available_bytes": stats.FilesystemAvailableBytes,
 		"recordings_bytes":           stats.RecordingBytes,
+		"recordings_bytes_known":     stats.RecordingBytesKnown,
 		"recording_count":            stats.RecordingCount,
 		"segment_count":              stats.SegmentCount,
 		"init_segment_count":         stats.InitSegmentCount,
 		"manifest_count":             stats.ManifestCount,
+		"gap_count":                  stats.GapCount,
+		"canonical_payload_bytes":    stats.CanonicalPayloadBytes,
+		"capacity_known":             stats.CapacityKnown,
+		"statistics_status":          stats.Status,
+		"unavailable_fields":         unavailable,
 	})
 }
 
@@ -397,6 +506,10 @@ type dashboardResponse struct {
 	SegmentsTotal         int                `json:"segments_total"`
 	GapsTotal             int                `json:"gaps_total"`
 	ArchiveBytes          uint64             `json:"archive_bytes"`
+	ArchiveBytesKnown     bool               `json:"archive_bytes_known"`
+	CanonicalPayloadBytes uint64             `json:"canonical_payload_bytes"`
+	StatisticsStatus      string             `json:"statistics_status"`
+	UnavailableFields     []string           `json:"unavailable_fields"`
 	FilesystemTotalBytes  uint64             `json:"filesystem_total_bytes"`
 	FilesystemFreeBytes   uint64             `json:"filesystem_free_bytes"`
 	FilesystemUsedBytes   uint64             `json:"filesystem_used_bytes"`
@@ -413,16 +526,17 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "dashboard data is unavailable")
 		return
 	}
-	stats, err := s.storage.StorageStats()
+	items, err := listManagementSummaries(r.Context(), s.manager)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "dashboard storage data is unavailable")
+		writeError(w, http.StatusServiceUnavailable, "recording summaries are temporarily unavailable")
 		return
 	}
-	items := s.manager.List()
+	stats, unavailable := s.managementStorageStats(items)
 	now := time.Now().UTC()
 	cutoff := now.Add(-24 * time.Hour)
 	result := dashboardResponse{
-		RecordingsTotal: len(items), ArchiveBytes: stats.RecordingBytes,
+		RecordingsTotal: len(items), ArchiveBytes: stats.RecordingBytes, ArchiveBytesKnown: false,
+		CanonicalPayloadBytes: stats.CanonicalPayloadBytes, StatisticsStatus: stats.Status, UnavailableFields: unavailable,
 		FilesystemTotalBytes: stats.FilesystemTotalBytes, FilesystemFreeBytes: stats.FilesystemAvailableBytes,
 		FilesystemUsedBytes: stats.FilesystemUsedBytes,
 		Integrity:           map[string]int{"verified": 0, "degraded": 0, "failed": 0, "unknown": 0, "verifying": 0},
@@ -435,7 +549,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, item := range items {
 		result.SegmentsTotal += item.SegmentCount()
-		result.GapsTotal += len(item.Gaps)
+		result.GapsTotal += recordingGapCount(item)
 		if item.State == domain.StateRecording {
 			result.ActiveRecordingsCount++
 			if len(result.ActiveRecordingItems) < 10 {
@@ -468,6 +582,100 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+type managementStorageStats struct {
+	storage.StorageStats
+	CanonicalPayloadBytes uint64 `json:"canonical_payload_bytes"`
+	GapCount              int    `json:"gap_count"`
+	Status                string `json:"statistics_status"`
+	RecordingBytesKnown   bool   `json:"recordings_bytes_known"`
+}
+
+func (s *Server) managementStorageStats(recordings []*domain.Recording) (managementStorageStats, []string) {
+	result := managementStorageStats{Status: "partial"}
+	missing := []string{"recording_archive_bytes"}
+	capacityUnavailable := true
+	if s.storage != nil {
+		capacity, err := s.storage.StorageCapacityStats()
+		if err == nil && capacity.CapacityKnown {
+			result.CapacityKnown = true
+			result.FilesystemTotalBytes = capacity.FilesystemTotalBytes
+			result.FilesystemUsedBytes = capacity.FilesystemUsedBytes
+			result.FilesystemAvailableBytes = capacity.FilesystemAvailableBytes
+			capacityUnavailable = false
+		}
+	}
+	if capacityUnavailable {
+		missing = append(missing, "filesystem_capacity")
+	}
+	for _, recording := range recordings {
+		if recording == nil {
+			result.Status = "partial"
+			continue
+		}
+		result.RecordingCount++
+		segments := recording.SegmentCount()
+		if segments > 0 && result.SegmentCount > int(^uint(0)>>1)-segments {
+			result.Status = "partial"
+			missing = appendUnique(missing, "segment_count")
+		} else {
+			result.SegmentCount += segments
+		}
+		if recording.FormatVersion == storage.ShardedArchiveFormatVersion && recording.ShardedArchive != nil {
+			if recording.ShardedArchive.InitCount <= uint64(^uint(0)>>1)-uint64(result.InitSegmentCount) {
+				result.InitSegmentCount += int(recording.ShardedArchive.InitCount)
+			} else {
+				result.Status = "partial"
+				missing = appendUnique(missing, "init_segment_count")
+			}
+			if recording.ShardedArchive.ManifestSnapshotCount <= uint64(^uint(0)>>1)-uint64(result.ManifestCount) {
+				result.ManifestCount += int(recording.ShardedArchive.ManifestSnapshotCount)
+			} else {
+				result.Status = "partial"
+				missing = appendUnique(missing, "manifest_count")
+			}
+			if recording.ShardedArchive.PayloadBytes <= ^uint64(0)-result.CanonicalPayloadBytes {
+				result.CanonicalPayloadBytes += recording.ShardedArchive.PayloadBytes
+			} else {
+				result.Status = "partial"
+				missing = appendUnique(missing, "canonical_payload_bytes")
+			}
+			maxInt := uint64(^uint(0) >> 1)
+			if recording.ShardedArchive.GapCount <= maxInt-uint64(result.GapCount) {
+				result.GapCount += int(recording.ShardedArchive.GapCount)
+			} else {
+				result.Status = "partial"
+				missing = appendUnique(missing, "gap_count")
+			}
+			continue
+		}
+		for _, track := range recording.Tracks {
+			if track == nil {
+				result.Status = "partial"
+				missing = appendUnique(missing, "recording_counts")
+				continue
+			}
+			result.InitSegmentCount += len(track.InitSegments)
+		}
+		result.ManifestCount += len(recording.Snapshots)
+		result.GapCount += len(recording.Gaps)
+	}
+	return result, missing
+}
+
+func recordingGapCount(recording *domain.Recording) int {
+	if recording == nil {
+		return 0
+	}
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion && recording.ShardedArchive != nil {
+		maxInt := uint64(^uint(0) >> 1)
+		if recording.ShardedArchive.GapCount > maxInt {
+			return int(maxInt)
+		}
+		return int(recording.ShardedArchive.GapCount)
+	}
+	return len(recording.Gaps)
 }
 
 func (s *Server) recordingTagsGet(w http.ResponseWriter, r *http.Request) {
@@ -513,7 +721,7 @@ func (s *Server) recordingTagsPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "tags update was rejected")
 		return
 	}
-	auditRecorded := s.appendAudit("recording_tags_updated", r.PathValue("id")) == nil
+	auditRecorded := s.auditMutation(w, r, "recording_tags_updated", r.PathValue("id"))
 	tags, _ := s.products.Tags(r.PathValue("id"))
 	writeJSON(w, http.StatusOK, map[string]any{"tags": tags, "audit_recorded": auditRecorded})
 }
@@ -544,15 +752,15 @@ func (s *Server) recordingDelete(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, err)
 		return
 	}
+	// Canonical deletion succeeded. Audit it before secondary bookkeeping so a
+	// projection cleanup failure cannot erase the primary mutation's audit.
+	s.auditMutation(w, r, "recording_deleted", id)
 	s.cleanupPreviewProjection(id)
 	if s.products != nil {
 		if err = s.products.ForgetRecording(id); err != nil {
 			writeError(w, http.StatusInternalServerError, "recording was deleted but management metadata cleanup is pending")
 			return
 		}
-	}
-	if s.products != nil {
-		_ = s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: "recording_deleted", At: time.Now().UTC(), ObjectID: id})
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -643,7 +851,7 @@ func (s *Server) integrityStart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if s.products != nil {
-			_ = s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: "integrity_requested", At: time.Now().UTC(), ObjectID: id})
+			s.auditMutation(w, r, "integrity_requested", id)
 		}
 		s.appendRecordingEvent(id, "integrity_started", job.CreatedAt, 0, "integrity verification started")
 		writeJSON(w, http.StatusAccepted, job)
@@ -860,7 +1068,7 @@ func (s *Server) globalSearch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "global search is temporarily unavailable")
 		}
 	}
-	recordings, err := s.manager.ListForManagement(ctx, maxGlobalSearchScan)
+	recordings, err := listManagementSummaries(ctx, s.manager)
 	if err != nil {
 		searchFailure(err)
 		return
@@ -868,6 +1076,7 @@ func (s *Server) globalSearch(w http.ResponseWriter, r *http.Request) {
 	lower := strings.ToLower(query)
 	results := make([]map[string]any, 0, limit)
 	resources := make(map[string]map[string]any)
+	tagsPartial := false
 	add := func(item map[string]any) bool {
 		if len(results) >= limit {
 			return false
@@ -884,8 +1093,9 @@ func (s *Server) globalSearch(w http.ResponseWriter, r *http.Request) {
 		if s.products != nil {
 			tags, err = s.products.Tags(recording.ID)
 			if err != nil {
-				searchFailure(err)
-				return
+				tagsPartial = true
+				s.reportReadModelFailure(recording.ID, "tags", "management_unavailable")
+				tags = []string{}
 			}
 		}
 		resourceID, resourceType := "", ""
@@ -969,7 +1179,11 @@ func (s *Server) globalSearch(w http.ResponseWriter, r *http.Request) {
 		searchFailure(err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+	response := map[string]any{"results": results}
+	if tagsPartial {
+		response["partial_errors"] = []string{"tags"}
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) recordingEvents(w http.ResponseWriter, r *http.Request) {
@@ -1170,19 +1384,6 @@ func (s *Server) recordingMetadataGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) auditList(w http.ResponseWriter, r *http.Request) {
-	if s.products == nil {
-		writeError(w, http.StatusServiceUnavailable, "audit events are unavailable")
-		return
-	}
-	limit, err := boundedLimit(r, 100, 500)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid audit limit")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": s.products.Audit(limit)})
-}
-
 func (s *Server) notificationList(w http.ResponseWriter, r *http.Request) {
 	if s.products == nil {
 		writeError(w, http.StatusServiceUnavailable, "notifications are unavailable")
@@ -1228,7 +1429,10 @@ func (s *Server) syncRecordingNotifications() error {
 		}
 		return err
 	}
-	recordings := s.manager.List()
+	recordings, err := listManagementSummaries(context.Background(), s.manager)
+	if err != nil {
+		return err
+	}
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 	for _, recording := range recordings {
 		if recording.StoppedAt == nil || recording.StoppedAt.Before(cutoff) {
@@ -1311,10 +1515,21 @@ func (s *Server) notificationReadAll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) appendAudit(kind, objectID string) error {
+	return s.appendAuditAs(kind, objectID, nil)
+}
+
+func (s *Server) appendAuditAs(kind, objectID string, actor *management.AuditActor) error {
 	if s.products == nil {
 		return nil
 	}
-	return s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: kind, At: time.Now().UTC(), ObjectID: objectID})
+	if actor == nil {
+		actor = &management.AuditActor{Type: management.AuditActorSystem}
+	}
+	err := s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: kind, At: time.Now().UTC(), ObjectID: objectID, Actor: actor})
+	if err != nil && s.logs != nil {
+		s.logs.Add("error", "audit", "audit append failed after primary mutation")
+	}
+	return err
 }
 
 func (s *Server) appendWorkflowHistory(progress adapterhost.WorkflowProgress, state string) {

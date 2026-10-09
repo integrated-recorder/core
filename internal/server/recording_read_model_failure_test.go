@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,14 +22,17 @@ import (
 
 type readModelStorageBackend struct {
 	storage.StorageBackend
-	failID             string
-	blockForStop       bool
-	started            chan struct{}
-	canceled           chan struct{}
-	afterSaveRecording func(*domain.Recording)
+	failID              string
+	directoryBytesCalls atomic.Int32
+	storageStatsCalls   atomic.Int32
+	blockForStop        bool
+	started             chan struct{}
+	canceled            chan struct{}
+	afterSaveRecording  func(*domain.Recording)
 }
 
 func (b *readModelStorageBackend) RecordingDirectoryBytesContext(ctx context.Context, id string) (int64, error) {
+	b.directoryBytesCalls.Add(1)
 	if id != b.failID {
 		return b.StorageBackend.RecordingDirectoryBytes(id)
 	}
@@ -45,6 +49,11 @@ func (b *readModelStorageBackend) RecordingDirectoryBytesContext(ctx context.Con
 		return 0, ctx.Err()
 	}
 	return 0, errors.New("provider list failed for https://private.invalid/archive?token=secret /private/archive/root")
+}
+
+func (b *readModelStorageBackend) StorageStats() (storage.StorageStats, error) {
+	b.storageStatsCalls.Add(1)
+	return storage.StorageStats{}, errors.New("full archive stats unavailable")
 }
 
 func (b *readModelStorageBackend) SaveRecording(recording *domain.Recording) error {
@@ -149,11 +158,151 @@ func TestRecordingsListDegradesOnlyAffectedItem(t *testing.T) {
 	}
 	partial, ok := byID[failed.ID]
 	if !ok || partial.State != string(domain.StateCompleted) || partial.ArchiveSizeBytes != nil || partial.StatisticsStatus != "partial" || !containsString(partial.UnavailableFields, "archive_size_bytes") {
-		t.Fatalf("failed item projection=%+v", partial)
+		t.Fatalf("unknown-size item projection=%+v", partial)
 	}
 	complete, ok := byID[healthy.ID]
-	if !ok || complete.ArchiveSizeBytes == nil || *complete.ArchiveSizeBytes <= 0 || complete.StatisticsStatus != "complete" {
-		t.Fatalf("healthy item projection=%+v", complete)
+	if !ok || complete.ArchiveSizeBytes != nil || complete.StatisticsStatus != "partial" || !containsString(complete.UnavailableFields, "archive_size_bytes") {
+		t.Fatalf("healthy root-only projection=%+v", complete)
+	}
+	if calls := store.StorageBackend.(*readModelStorageBackend).directoryBytesCalls.Load(); calls != 0 {
+		t.Fatalf("list enumerated provider archive bytes %d times", calls)
+	}
+}
+
+func TestV2RecordingDetailUsesBoundedRoot(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := v2ManagementFixture(strings.Repeat("3", 32), time.Now().UTC(), 100_000)
+	if err := store.CreateShardedRecording(root); err != nil {
+		t.Fatal(err)
+	}
+	manager := &fixedRecordingManager{recording: root}
+	handler := NewWithOptions(manager, nil, nil, Options{Storage: store})
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/recordings/"+root.ID, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", response.Code, response.Body.String())
+	}
+	if manager.getCalls != 0 {
+		t.Fatalf("V2 detail materialized archive through Manager.Get %d times", manager.getCalls)
+	}
+	var result struct {
+		SegmentCount int `json:"segment_count"`
+		Statistics   struct {
+			SegmentCount          int    `json:"segment_count"`
+			MediaPayloadSizeBytes int64  `json:"media_payload_size_bytes"`
+			ArchiveSizeBytes      *int64 `json:"archive_size_bytes"`
+			Status                string `json:"status"`
+		} `json:"statistics"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.SegmentCount != 100_000 || result.Statistics.SegmentCount != 100_000 || result.Statistics.MediaPayloadSizeBytes != 18_800_000 || result.Statistics.ArchiveSizeBytes != nil || result.Statistics.Status != "partial" {
+		t.Fatalf("V2 bounded detail=%+v", result)
+	}
+}
+
+func TestRecordingListUsesSummaryPageWithoutArchiveDetails(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &readModelStorageBackend{StorageBackend: store.StorageBackend}
+	store.StorageBackend = backend
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	recordings := []*domain.Recording{
+		v2ManagementFixture(strings.Repeat("4", 32), base, 1_000),
+		v2ManagementFixture(strings.Repeat("5", 32), base.Add(time.Minute), 10_000),
+		v2ManagementFixture(strings.Repeat("6", 32), base.Add(2*time.Minute), 100_000),
+	}
+	manager := &fixedRecordingManager{recordings: recordings}
+	handler := NewWithOptions(manager, nil, nil, Options{Storage: store})
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v2/recordings?sort=-created_at&limit=1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+	}
+	var page recordquery.Result
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 3 || len(page.Items) != 1 || page.Items[0].ID != recordings[2].ID || page.Items[0].SegmentCount != 100_000 || page.Items[0].MediaPayloadSizeBytes != 18_800_000 {
+		t.Fatalf("summary page=%+v", page)
+	}
+	if manager.getCalls != 0 {
+		t.Fatalf("summary list materialized archive through Manager.Get %d times", manager.getCalls)
+	}
+	if calls := backend.directoryBytesCalls.Load(); calls != 0 {
+		t.Fatalf("summary list enumerated physical archive size %d times", calls)
+	}
+}
+
+func TestDashboardAndStorageStatsDegradeWithoutTreeWalk(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &readModelStorageBackend{StorageBackend: store.StorageBackend}
+	store.StorageBackend = backend
+	recording := v2ManagementFixture(strings.Repeat("7", 32), time.Now().UTC(), 100_000)
+	manager := &fixedRecordingManager{recording: recording}
+	handler := NewWithOptions(manager, nil, nil, Options{Storage: store})
+
+	for _, path := range []string{"/api/dashboard", "/api/system/storage"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), `"statistics_status":"partial"`) || !strings.Contains(response.Body.String(), `"unavailable_fields"`) {
+			t.Fatalf("%s omitted partial storage state: %s", path, response.Body.String())
+		}
+		if path == "/api/system/storage" && !strings.Contains(response.Body.String(), `"recordings_bytes_known":false`) {
+			t.Fatalf("%s did not mark aggregate archive bytes unknown: %s", path, response.Body.String())
+		}
+	}
+	if calls := backend.storageStatsCalls.Load(); calls != 0 {
+		t.Fatalf("dashboard/storage endpoint invoked full StorageStats %d times", calls)
+	}
+	if calls := backend.directoryBytesCalls.Load(); calls != 0 {
+		t.Fatalf("dashboard/storage endpoint enumerated archive directory %d times", calls)
+	}
+
+	// A storage control-plane outage is a derived-statistics failure. Recording
+	// summaries remain authoritative and both endpoints stay available.
+	nilStorageHandler := NewWithOptions(manager, nil, nil, Options{})
+	for _, path := range []string{"/api/dashboard", "/api/system/storage"} {
+		response := httptest.NewRecorder()
+		nilStorageHandler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s with unavailable storage status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), `"statistics_status":"partial"`) || !strings.Contains(response.Body.String(), `"filesystem_capacity"`) {
+			t.Fatalf("%s did not identify unavailable storage capacity: %s", path, response.Body.String())
+		}
+	}
+}
+
+func v2ManagementFixture(id string, created time.Time, mediaCount uint64) *domain.Recording {
+	return &domain.Recording{
+		FormatVersion: storage.ShardedArchiveFormatVersion,
+		ID:            id,
+		Title:         "bounded fixture",
+		State:         domain.StateCompleted,
+		CreatedAt:     created,
+		StartedAt:     created,
+		Tracks: map[string]*domain.Track{
+			"main": {ID: "main", MediaCount: mediaCount, MediaHighWater: mediaCount},
+		},
+		ShardedArchive: &domain.ShardedArchiveSummary{
+			MediaCount: mediaCount, DurationSeconds: float64(mediaCount),
+			PayloadBytes: mediaCount * 188, InitCount: 1, GapCount: 2,
+		},
 	}
 }
 
@@ -357,7 +506,9 @@ func containsString(values []string, wanted string) bool {
 }
 
 type fixedRecordingManager struct {
-	recording *domain.Recording
+	recording  *domain.Recording
+	recordings []*domain.Recording
+	getCalls   int
 }
 
 func (m *fixedRecordingManager) StartResolved(context.Context, string, adapterproto.MediaSource, *adapterproto.ResourceRef, string, *adapterproto.AdapterProvenance) (*domain.Recording, error) {
@@ -369,21 +520,31 @@ func (m *fixedRecordingManager) StartResolvedWithID(context.Context, string, str
 }
 
 func (m *fixedRecordingManager) Get(id string) (*domain.Recording, error) {
-	if m.recording == nil || id != m.recording.ID {
-		return nil, storage.ErrNotFound
+	m.getCalls++
+	for _, recording := range m.rows() {
+		if recording != nil && id == recording.ID {
+			return recording, nil
+		}
 	}
-	return m.recording, nil
+	return nil, storage.ErrNotFound
 }
 
 func (m *fixedRecordingManager) List() []*domain.Recording {
+	return m.rows()
+}
+
+func (m *fixedRecordingManager) ListForManagement(context.Context, int) ([]*domain.Recording, error) {
+	return m.rows(), nil
+}
+
+func (m *fixedRecordingManager) rows() []*domain.Recording {
+	if len(m.recordings) > 0 {
+		return append([]*domain.Recording(nil), m.recordings...)
+	}
 	if m.recording == nil {
 		return nil
 	}
 	return []*domain.Recording{m.recording}
-}
-
-func (m *fixedRecordingManager) ListForManagement(context.Context, int) ([]*domain.Recording, error) {
-	return m.List(), nil
 }
 
 func (m *fixedRecordingManager) LifecycleSnapshot(_ context.Context, id string) (acquire.LifecycleSnapshot, error) {

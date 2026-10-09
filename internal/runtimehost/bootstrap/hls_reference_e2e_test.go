@@ -150,7 +150,7 @@ func TestProductionBundledHLSReferenceRecordingE2E(t *testing.T) {
 	waitRecordingSequenceCount(t, client, baseURL, recording.ID, 5, 30*time.Second)
 	stopRecording(t, client, baseURL, recording.ID)
 	waitRuntimeRecordingState(t, client, baseURL, recording.ID, domain.StateStopped, 20*time.Second)
-	final := getRecording(t, client, baseURL, recording.ID)
+	final := getRecording(t, dataDir, client, baseURL, recording.ID)
 	if final.ID != recording.ID || final.State != domain.StateStopped {
 		t.Fatalf("stop changed Recording identity or did not finalize it: created=%s final=%+v", recording.ID, final)
 	}

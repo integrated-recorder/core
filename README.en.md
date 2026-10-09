@@ -35,10 +35,10 @@ Docker is the primary way to run Core.
 
 ```sh
 docker compose up -d
-docker compose exec archiver runtime-host setup-code
+docker compose logs archiver
 ```
 
-Open [http://localhost:8080/](http://localhost:8080/) and complete `/setup`. The container uses a named `/data` volume.
+Use the one-time setup code printed to the local Runtime Host console or container logs, then open [http://localhost:8080/](http://localhost:8080/) and complete `/setup`. If logs are unavailable, run `docker compose exec archiver runtime-host setup-code`. The container uses a named `/data` volume.
 
 The official Plugin Registry catalog is `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`. The Registry distributes plugin metadata; it does not build plugins. Already installed plugins and archives remain usable when the Registry is unavailable.
 

@@ -30,11 +30,13 @@ type GenerationInventory = InventoryResult
 // authenticated Engine IPC; Store is only a safe terminal-archive deletion
 // fallback after every Engine explicitly disclaims ownership.
 type ManagerRouter struct {
-	mu       sync.RWMutex
-	mutation sync.RWMutex
-	active   string
-	clients  map[string]*ManagerClient
-	store    *storage.Store
+	mu                        sync.RWMutex
+	mutation                  sync.RWMutex
+	managementCacheMu         sync.Mutex
+	managementCacheGeneration string
+	active                    string
+	clients                   map[string]*ManagerClient
+	store                     *storage.Store
 }
 
 func NewManagerRouter(activeID string, clients map[string]*ManagerClient, store *storage.Store) (*ManagerRouter, error) {
@@ -79,6 +81,11 @@ func (r *ManagerRouter) SetActive(generationID string) error {
 	defer r.mu.Unlock()
 	if r.clients[generationID] == nil {
 		return ErrGenerationNotAttached
+	}
+	if r.active != generationID {
+		r.managementCacheMu.Lock()
+		r.managementCacheGeneration = ""
+		r.managementCacheMu.Unlock()
 	}
 	r.active = generationID
 	return nil
@@ -410,6 +417,9 @@ func (r *ManagerRouter) ListForManagement(ctx context.Context, limit int) ([]*do
 	if active == nil {
 		return nil, ErrGenerationNotAttached
 	}
+	if err := r.ensureManagementRootCache(ctx, activeID, active.client); err != nil {
+		return nil, fmt.Errorf("active Engine management snapshot could not be refreshed: %w", err)
+	}
 	rows, err := active.client.ListForManagement(ctx, limit)
 	if err != nil {
 		return nil, err
@@ -426,7 +436,7 @@ func (r *ManagerRouter) ListForManagement(ctx context.Context, limit int) ([]*do
 		if owner == nil {
 			return nil, ErrGenerationNotAttached
 		}
-		row, getErr := owner.client.GetContext(ctx, recordingID)
+		row, getErr := owner.client.GetManagementHeader(ctx, recordingID)
 		if getErr != nil {
 			return nil, fmt.Errorf("live recording owner read failed: %w", getErr)
 		}
@@ -446,6 +456,86 @@ func (r *ManagerRouter) ListForManagement(ctx context.Context, limit int) ([]*do
 		return result[i].CreatedAt.After(result[j].CreatedAt)
 	})
 	return result, nil
+}
+
+// ListForManagementPage returns one bounded page from the active Engine's
+// summary index. Owner headers replace stale read-only copies without changing
+// ID cursor order. Concurrent creates before the cursor may appear only in a
+// later traversal; deleted rows may disappear from later pages.
+func (r *ManagerRouter) ListForManagementPage(ctx context.Context, afterID string, limit int) ([]*domain.Recording, string, error) {
+	r.mutation.RLock()
+	defer r.mutation.RUnlock()
+	if limit < 1 || limit > MaximumListPageLimit || len(afterID) > 64 {
+		return nil, "", acquire.ErrListLimit
+	}
+	clients, activeID := r.clientsAndActive()
+	inventories := make([]GenerationInventory, 0, len(clients))
+	for _, attached := range clients {
+		inventory, err := attached.client.Inventory(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("engine inventory is required for a consistent recording page: %w", err)
+		}
+		if inventory.GenerationID != attached.generationID {
+			return nil, "", errors.New("engine inventory generation identity mismatch")
+		}
+		inventories = append(inventories, inventory)
+	}
+	owners, err := ownerMap(inventories)
+	if err != nil {
+		return nil, "", err
+	}
+	active := findAttached(clients, activeID)
+	if active == nil {
+		return nil, "", ErrGenerationNotAttached
+	}
+	if err := r.ensureManagementRootCache(ctx, activeID, active.client); err != nil {
+		return nil, "", fmt.Errorf("active Engine management snapshot could not be refreshed: %w", err)
+	}
+	rows, next, err := active.client.ListForManagementPage(ctx, afterID, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	for index, row := range rows {
+		if row == nil || row.ID == "" || row.ID <= afterID || index > 0 && rows[index-1].ID >= row.ID {
+			return nil, "", errors.New("engine returned an invalid recording summary page")
+		}
+		ownerID := owners[row.ID]
+		if ownerID == "" || ownerID == activeID {
+			continue
+		}
+		owner := findAttached(clients, ownerID)
+		if owner == nil {
+			return nil, "", ErrGenerationNotAttached
+		}
+		header, getErr := owner.client.GetManagementHeader(ctx, row.ID)
+		if getErr != nil {
+			return nil, "", fmt.Errorf("live recording owner summary read failed: %w", getErr)
+		}
+		if header == nil || header.ID != row.ID {
+			return nil, "", errors.New("live recording owner summary identity mismatch")
+		}
+		rows[index] = header
+	}
+	return rows, next, nil
+}
+
+func (r *ManagerRouter) ensureManagementRootCache(ctx context.Context, generationID string, client *ManagerClient) error {
+	r.managementCacheMu.Lock()
+	defer r.managementCacheMu.Unlock()
+	if r.managementCacheGeneration == generationID {
+		return nil
+	}
+	if err := client.InvalidateManagementRootCache(ctx); err != nil {
+		if errors.Is(err, ErrManagementRootCacheInvalidationUnsupported) {
+			// Older Engines do not implement the root cache, so there is nothing
+			// to invalidate. Do not mask transport or authorization failures.
+			r.managementCacheGeneration = generationID
+			return nil
+		}
+		return err
+	}
+	r.managementCacheGeneration = generationID
+	return nil
 }
 
 func (r *ManagerRouter) Stop(id string) (*domain.Recording, error) {

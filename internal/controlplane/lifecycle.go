@@ -28,9 +28,100 @@ const (
 	OperationControlDetachEngine      = "control_detach_engine"
 	OperationControlValidateInstall   = "control_validate_installation"
 	OperationControlInstallReady      = "control_installation_ready"
+	OperationControlAppendAudit       = "control_append_audit"
 )
 
 const maxDetachEngineRequestBytes = 512
+const maxAuditAppendRequestBytes = 1024
+
+// AuditAppendRequest is the bounded Runtime Host -> active Control bridge.
+// The Runtime Host derives ActorType/UserID from its authenticated principal;
+// this DTO is accepted only over the private, authenticated lifecycle IPC.
+type AuditAppendRequest struct {
+	Action    string `json:"action"`
+	ObjectID  string `json:"object_id,omitempty"`
+	ActorType string `json:"actor_type"`
+	UserID    string `json:"user_id,omitempty"`
+}
+
+const (
+	AuditRuntimeUpdateStaged        = "runtime_update_staged"
+	AuditRuntimeUpdateActivated     = "runtime_update_activated"
+	AuditRuntimeUpdateRolledBack    = "runtime_update_rolled_back"
+	AuditAdapterReconciled          = "adapter_reconciled"
+	AuditPluginRegistryRefreshed    = "plugin_registry_refreshed"
+	AuditPluginInstalled            = "plugin_installed"
+	AuditPluginUpdated              = "plugin_updated"
+	AuditPluginUninstalled          = "plugin_uninstalled"
+	AuditStorageInstanceCreated     = "storage_instance_created"
+	AuditStorageInstanceConfigured  = "storage_instance_configured"
+	AuditStorageInstanceProbed      = "storage_instance_probed"
+	AuditStorageInstanceActivated   = "storage_instance_activated"
+	AuditStorageProviderConfigured  = "storage_provider_configured"
+	AuditStorageProviderProbed      = "storage_provider_probed"
+	AuditStorageProviderActivated   = "storage_provider_activated"
+	AuditInstallationSetupBegun     = "installation_setup_begun"
+	AuditInstallationSetupCompleted = "installation_setup_completed"
+)
+
+var auditAppendActions = map[string]struct{}{
+	AuditRuntimeUpdateStaged: {}, AuditRuntimeUpdateActivated: {}, AuditRuntimeUpdateRolledBack: {},
+	AuditAdapterReconciled: {}, AuditPluginRegistryRefreshed: {}, AuditPluginInstalled: {},
+	AuditPluginUpdated: {}, AuditPluginUninstalled: {}, AuditStorageInstanceCreated: {},
+	AuditStorageInstanceConfigured: {}, AuditStorageInstanceProbed: {}, AuditStorageInstanceActivated: {},
+	AuditStorageProviderConfigured: {}, AuditStorageProviderProbed: {}, AuditStorageProviderActivated: {},
+	AuditInstallationSetupBegun: {}, AuditInstallationSetupCompleted: {},
+}
+
+// Validate rejects unbounded or arbitrary audit content before it crosses
+// lifecycle IPC. Object IDs are opaque identifiers only; paths and payloads
+// are never accepted.
+func (r AuditAppendRequest) Validate() error {
+	if _, ok := auditAppendActions[r.Action]; !ok || len(r.Action) > 64 || !validAuditIdentifier(r.ObjectID, 256) {
+		return errors.New("invalid audit append request")
+	}
+	switch r.ActorType {
+	case "system":
+		if r.UserID != "" {
+			return errors.New("invalid system audit actor")
+		}
+	case "user":
+		if !validAuditUserID(r.UserID) {
+			return errors.New("invalid user audit actor")
+		}
+	default:
+		return errors.New("invalid audit actor type")
+	}
+	return nil
+}
+
+func validAuditUserID(value string) bool {
+	if len(value) != 36 || value[:4] != "usr-" {
+		return false
+	}
+	for _, character := range value[4:] {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validAuditIdentifier(value string, max int) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > max {
+		return false
+	}
+	for index, character := range value {
+		valid := character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || index > 0 && (character == '.' || character == '_' || character == ':' || character == '-')
+		if !valid {
+			return false
+		}
+	}
+	return true
+}
 
 type LifecycleState string
 
@@ -75,6 +166,7 @@ type LifecycleHooks struct {
 	DetachEngine         func(context.Context, string) error
 	ValidateInstallation func(context.Context) error
 	InstallationReady    func(context.Context) error
+	AppendAudit          func(context.Context, AuditAppendRequest) error
 }
 
 // Lifecycle gates a Control generation's management background work. The
@@ -164,6 +256,16 @@ func (l *Lifecycle) Handle(ctx context.Context, operation string, payload json.R
 		}
 		return l.Snapshot(), nil
 	}
+	if operation == OperationControlAppendAudit {
+		request, err := decodeAuditAppendRequest(payload)
+		if err != nil {
+			return nil, err
+		}
+		if err := l.appendAudit(ctx, request); err != nil {
+			return nil, err
+		}
+		return l.Snapshot(), nil
+	}
 	if len(payload) != 0 && string(payload) != "null" && string(payload) != "{}" {
 		return nil, controlError("invalid_request", "control lifecycle request must be empty")
 	}
@@ -194,6 +296,51 @@ func (l *Lifecycle) Handle(ctx context.Context, operation string, payload json.R
 		return nil, controlError("unsupported_operation", "control lifecycle operation is unsupported")
 	}
 	return l.Snapshot(), nil
+}
+
+func decodeAuditAppendRequest(payload json.RawMessage) (AuditAppendRequest, error) {
+	var request AuditAppendRequest
+	if len(payload) == 0 || len(payload) > maxAuditAppendRequestBytes {
+		return request, controlError("invalid_request", "audit request is invalid")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return AuditAppendRequest{}, controlError("invalid_request", "audit request is invalid")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return AuditAppendRequest{}, controlError("invalid_request", "audit request is invalid")
+	}
+	if request.Validate() != nil {
+		return AuditAppendRequest{}, controlError("invalid_request", "audit request is invalid")
+	}
+	return request, nil
+}
+
+func (l *Lifecycle) appendAudit(ctx context.Context, request AuditAppendRequest) error {
+	l.opMu.Lock()
+	defer l.opMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := request.Validate(); err != nil {
+		return controlError("invalid_request", "audit request is invalid")
+	}
+	l.mu.Lock()
+	active := l.state == LifecycleActive
+	hook := l.hooks.AppendAudit
+	l.mu.Unlock()
+	if !active {
+		return controlError("invalid_state", "Control generation is not active")
+	}
+	if hook == nil {
+		return controlError("audit_unavailable", "audit append is unavailable")
+	}
+	if err := hook(ctx, request); err != nil {
+		return controlError("audit_append_failed", "audit event could not be recorded")
+	}
+	return nil
 }
 
 func (l *Lifecycle) validateInstallation(ctx context.Context) error {

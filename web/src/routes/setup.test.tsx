@@ -50,6 +50,8 @@ describe('first-run setup flow', () => {
   it('submits the one-time code, creates the administrator session, then begins setup', async () => {
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
+    expect(await screen.findByText(/로컬 콘솔과 container logs/)).toBeInTheDocument()
+    expect(screen.getByText('docker compose logs archiver')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Setup code'), { target: { value: 'test-only-code' } })
     fireEvent.change(screen.getByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.change(screen.getByLabelText('비밀번호 확인'), { target: { value: 'a-strong-passphrase' } })

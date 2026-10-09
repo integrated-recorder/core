@@ -146,6 +146,10 @@ func (h configFixtureEngine) Handle(ctx context.Context, operation string, _ jso
 		return recorderengine.InventoryResult{GenerationID: h.generation, InstanceID: h.instance, Ready: true, Active: []recorderengine.ActiveRecording{}}, nil
 	case recorderengine.OperationList:
 		return []*domain.Recording{}, nil
+	case recorderengine.OperationInvalidateManagementRootCache:
+		return struct {
+			Invalidated bool `json:"invalidated"`
+		}{Invalidated: true}, nil
 	default:
 		return nil, errors.New("unexpected operation")
 	}

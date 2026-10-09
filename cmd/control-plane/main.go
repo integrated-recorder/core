@@ -87,6 +87,7 @@ func run() error {
 		DetachEngine:         appLifecycle.detachEngine,
 		ValidateInstallation: appLifecycle.validateInstallation,
 		InstallationReady:    appLifecycle.installationReady,
+		AppendAudit:          appLifecycle.appendAudit,
 	})
 	if err != nil {
 		return err
@@ -322,6 +323,10 @@ type installationLifecycleApplication interface {
 	installationReady(context.Context) error
 }
 
+type runtimeAuditLifecycleApplication interface {
+	appendAudit(context.Context, controlplane.AuditAppendRequest) error
+}
+
 func newControlApplicationLifecycle(gate *controlplane.MutationGate, slot *handlerSlot, passive http.Handler, lifetime context.Context, open controlApplicationFactory) *controlApplicationLifecycle {
 	return &controlApplicationLifecycle{gate: gate, slot: slot, passive: passive, lifetime: lifetime, open: open}
 }
@@ -453,6 +458,22 @@ func (l *controlApplicationLifecycle) installationReady(ctx context.Context) err
 		return errors.New("Control installation activation is unavailable")
 	}
 	return app.installationReady(ctx)
+}
+
+func (l *controlApplicationLifecycle) appendAudit(ctx context.Context, request controlplane.AuditAppendRequest) error {
+	if l == nil || ctx == nil || request.Validate() != nil {
+		return errors.New("Control audit append is unavailable")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || !l.active {
+		return errors.New("active Control application is unavailable")
+	}
+	app, ok := l.app.(runtimeAuditLifecycleApplication)
+	if !ok {
+		return errors.New("Control audit store is unavailable")
+	}
+	return app.appendAudit(ctx, request)
 }
 
 func (l *controlApplicationLifecycle) resume(context.Context) error {
@@ -762,6 +783,13 @@ type controlApplication struct {
 }
 
 func (a *controlApplication) handler() http.Handler { return a.api }
+
+func (a *controlApplication) appendAudit(ctx context.Context, request controlplane.AuditAppendRequest) error {
+	if a == nil || a.api == nil || ctx == nil {
+		return errors.New("Control audit store is unavailable")
+	}
+	return a.api.AppendRuntimeAudit(ctx, request)
+}
 
 func (a *controlApplication) installationIsReady() bool {
 	return a == nil || !a.installationManaged || installation.ReadOnly(a.dataDir).State == installation.StateReady

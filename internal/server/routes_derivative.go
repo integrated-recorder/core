@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/derivative"
-	"github.com/integrated-recorder/core/internal/management"
 )
 
 func (s *Server) registerDerivativeRoutes() {
@@ -143,10 +142,10 @@ func (s *Server) exportStart(w http.ResponseWriter, r *http.Request) {
 	lock.RUnlock()
 	if err == nil {
 		if s.products != nil {
-			if auditErr := s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: "export_requested", At: time.Now().UTC(), ObjectID: id}); auditErr != nil {
-				w.Header().Set("X-Export-Audit", "failed")
-			} else {
+			if s.auditMutation(w, r, "export_requested", id) {
 				w.Header().Set("X-Export-Audit", "recorded")
+			} else {
+				w.Header().Set("X-Export-Audit", "failed")
 			}
 		}
 		writeJSON(w, http.StatusAccepted, job)

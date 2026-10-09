@@ -25,7 +25,9 @@ import (
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 	"github.com/integrated-recorder/core/internal/runtimehost/generation"
 	"github.com/integrated-recorder/core/internal/runtimehost/installation"
+	"github.com/integrated-recorder/core/internal/runtimehost/pluginregistry"
 	"github.com/integrated-recorder/core/internal/runtimehost/resources"
+	"github.com/integrated-recorder/core/internal/runtimehost/storagecatalog"
 	"github.com/integrated-recorder/core/internal/runtimehost/supervisor"
 )
 
@@ -74,7 +76,34 @@ func TestConfigFromEnvOperatorPluginOptIn(t *testing.T) {
 			if config.AdapterDirs != "/external-adapters" {
 				t.Fatalf("default operator source = %q, want /external-adapters", config.AdapterDirs)
 			}
+			if config.AllowOperatorPlugins && config.PluginRegistryURL != pluginregistry.OfficialCatalogV3URL {
+				t.Fatalf("operator opt-in changed registry default: %q", config.PluginRegistryURL)
+			}
 		})
+	}
+}
+
+func TestPluginRegistryDefaultsToOfficialCatalogAndAllowsOverride(t *testing.T) {
+	config, err := ConfigFromEnv(func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.PluginRegistryURL != pluginregistry.OfficialCatalogV3URL {
+		t.Fatalf("unset registry URL = %q, want official catalog %q", config.PluginRegistryURL, pluginregistry.OfficialCatalogV3URL)
+	}
+
+	const customCatalog = "https://registry.example.test/catalog-v3.json"
+	config, err = ConfigFromEnv(func(key string) string {
+		if key == "IR_PLUGIN_REGISTRY_URL" {
+			return customCatalog
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.PluginRegistryURL != customCatalog {
+		t.Fatalf("configured registry URL = %q, want %q", config.PluginRegistryURL, customCatalog)
 	}
 }
 
@@ -293,6 +322,29 @@ func TestPrintSetupCodeOnlyReadsExistingOneTimeToken(t *testing.T) {
 	}
 }
 
+func TestFirstRunSetupConsoleMessageIncludesOnlyUnclaimedLocalCode(t *testing.T) {
+	root := bootstrapTestDir(t, "runtime-host-console-setup-code-")
+	authService, err := authn.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := authn.ReadSetupCode(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := firstRunSetupConsoleMessage(root)
+	if !strings.Contains(message, code) || !strings.Contains(message, "local Runtime Host console/container logs") {
+		t.Fatalf("first-run setup message lacks local code guidance: %q", message)
+	}
+	if err := authService.Bootstrap(code, "runtime-host-console-setup-password"); err != nil {
+		t.Fatal(err)
+	}
+	message = firstRunSetupConsoleMessage(root)
+	if strings.Contains(message, code) || !strings.Contains(message, "setup-code") {
+		t.Fatalf("claimed setup message exposed old code or lost fallback: %q", message)
+	}
+}
+
 func TestPrintSetupCodeRefusesReadyMissingAndCorruptStatesWithoutPaths(t *testing.T) {
 	readyRoot := bootstrapTestDir(t, "runtime-host-setup-ready-")
 	if _, err := installation.Reconcile(readyRoot, installation.AdminMissing, true); err != nil {
@@ -443,10 +495,12 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 	id := strings.Repeat("a", 32)
 	oldSetID, newSetID := strings.Repeat("b", 64), strings.Repeat("c", 64)
 	storageSetID := strings.Repeat("d", 64)
+	storageInstanceID := "si_" + strings.Repeat("e", 32)
 	registryState := generationSnapshotForTest(id, build)
 	old := registryState.Generations[id]
 	old.AdapterSetID = oldSetID
 	old.StorageProviderSetID = storageSetID
+	old.StorageInstanceID = storageInstanceID
 	old.ArchiveReadCompatibility = generation.CompatibilityRange{Minimum: 2, Maximum: 2}
 	old.ArchiveWriteFormat = 2
 	registryState.Generations[id] = old
@@ -454,7 +508,7 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepared, candidate, needsStage, err := prepareStartupGeneration(selected, registryState, newSetID, storageSetID)
+	prepared, candidate, needsStage, err := prepareStartupGeneration(selected, registryState, newSetID, storageSetID, storageInstanceID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,14 +522,81 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 		t.Fatalf("startup adapter reconciliation mutated existing generation: %+v", got)
 	}
 
-	unchanged, same, stage, err := prepareStartupGeneration(selected, registryState, oldSetID, storageSetID)
+	unchanged, same, stage, err := prepareStartupGeneration(selected, registryState, oldSetID, storageSetID, storageInstanceID)
 	if err != nil || stage || unchanged.generationID != id || same.ID != id || same.AdapterSetID != oldSetID {
 		t.Fatalf("same adapter set should reuse active generation: selected=%+v generation=%+v stage=%t err=%v", unchanged, same, stage, err)
 	}
 	changedStorage := strings.Repeat("e", 64)
-	prepared, candidate, needsStage, err = prepareStartupGeneration(selected, registryState, oldSetID, changedStorage)
-	if err != nil || !needsStage || candidate.StorageProviderSetID != changedStorage || candidate.AdapterSetID != oldSetID {
+	prepared, candidate, needsStage, err = prepareStartupGeneration(selected, registryState, oldSetID, changedStorage, storageInstanceID)
+	if err != nil || !needsStage || candidate.StorageProviderSetID != changedStorage || candidate.StorageInstanceID != storageInstanceID || candidate.AdapterSetID != oldSetID {
 		t.Fatalf("storage-set-only startup change did not allocate a consistent tuple: candidate=%+v stage=%t err=%v", candidate, needsStage, err)
+	}
+	otherInstance := "si_" + strings.Repeat("f", 32)
+	prepared, candidate, needsStage, err = prepareStartupGeneration(selected, registryState, oldSetID, storageSetID, otherInstance)
+	if err != nil || !needsStage || candidate.StorageProviderSetID != storageSetID || candidate.StorageInstanceID != otherInstance {
+		t.Fatalf("instance-only startup selection did not allocate a consistent tuple: candidate=%+v stage=%t err=%v", candidate, needsStage, err)
+	}
+}
+
+type startupStorageCatalogFixture struct {
+	sets      map[string]storagecatalog.Set
+	instances map[string]storagecatalog.StorageInstance
+}
+
+func (f startupStorageCatalogFixture) LoadSet(id string) (storagecatalog.Set, error) {
+	set, ok := f.sets[id]
+	if !ok {
+		return storagecatalog.Set{}, storagecatalog.ErrSetMissing
+	}
+	return set, nil
+}
+
+func (f startupStorageCatalogFixture) LoadStorageInstance(id string) (storagecatalog.StorageInstance, error) {
+	instance, ok := f.instances[id]
+	if !ok {
+		return storagecatalog.StorageInstance{}, storagecatalog.ErrSetMissing
+	}
+	return instance, nil
+}
+
+func TestStartupStoragePinUsesCurrentDesiredSetForActiveInstance(t *testing.T) {
+	instanceID := "si_" + strings.Repeat("e", 32)
+	activeID := strings.Repeat("a", 32)
+	adapterSetID := strings.Repeat("f", 64)
+	legacySet := storagecatalog.Set{ID: strings.Repeat("d", 64), Artifact: storagecatalog.Artifact{ID: "local"}}
+	activeSet := storagecatalog.Set{ID: strings.Repeat("b", 64), Artifact: storagecatalog.Artifact{ID: "local"}}
+	desiredSet := storagecatalog.Set{ID: strings.Repeat("c", 64), Artifact: storagecatalog.Artifact{ID: "local"}}
+	instance := storagecatalog.StorageInstance{ID: instanceID, ProviderID: "local", DesiredSetID: desiredSet.ID}
+	catalog := startupStorageCatalogFixture{
+		sets:      map[string]storagecatalog.Set{legacySet.ID: legacySet, activeSet.ID: activeSet, desiredSet.ID: desiredSet},
+		instances: map[string]storagecatalog.StorageInstance{instance.ID: instance},
+	}
+	build := buildinfoForTest()
+	state := generationSnapshotForTest(activeID, build)
+	active := state.Generations[activeID]
+	active.AdapterSetID = adapterSetID
+	active.StorageProviderSetID = activeSet.ID
+	active.StorageInstanceID = instanceID
+	state.Generations[activeID] = active
+
+	storageSetID, storageInstanceID, err := resolveStartupStoragePin(catalog, state, legacySet.ID)
+	if err != nil || storageSetID != desiredSet.ID || storageInstanceID != instanceID {
+		t.Fatalf("startup storage pin = (%q, %q, %v), want current instance set %q and stable ID %q", storageSetID, storageInstanceID, err, desiredSet.ID, instanceID)
+	}
+
+	selected := runtimeRelease{generationID: activeID, appBuild: build}
+	_, candidate, needsStage, err := prepareStartupGeneration(selected, state, adapterSetID, storageSetID, storageInstanceID)
+	if err != nil || !needsStage || candidate.StorageProviderSetID != desiredSet.ID || candidate.StorageInstanceID != instanceID {
+		t.Fatalf("startup candidate = (%+v, stage=%t, err=%v), want staged generation pinned to current instance set", candidate, needsStage, err)
+	}
+	if got := state.Generations[activeID]; got.StorageProviderSetID != activeSet.ID || got.StorageInstanceID != instanceID || got.State != generation.StateActive {
+		t.Fatalf("startup changed old generation pin before staging: %+v", got)
+	}
+
+	instance.ProviderID = "other-provider"
+	catalog.instances[instanceID] = instance
+	if _, _, err := resolveStartupStoragePin(catalog, state, legacySet.ID); err == nil {
+		t.Fatal("startup accepted instance whose provider ID differs from its pinned set")
 	}
 }
 

@@ -125,6 +125,201 @@ func (s *Store) LoadSidecar(id, relativePath string, maxBytes int64, output any)
 	return reader.LoadSidecar(id, relativePath, maxBytes, output)
 }
 
+// LoadAllReadOnlyLimitContext loads bounded management headers while honoring
+// request cancellation when the backend supports context-aware enumeration.
+// The fallback preserves compatibility with storage backends that only expose
+// the older synchronous method.
+func (s *Store) LoadAllReadOnlyLimitContext(ctx context.Context, max int) ([]*domain.Recording, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s == nil || s.StorageBackend == nil {
+		return nil, errors.New("storage backend is unavailable")
+	}
+	if backend, ok := s.StorageBackend.(interface {
+		LoadAllReadOnlyLimitContext(context.Context, int) ([]*domain.Recording, error)
+	}); ok {
+		return backend.LoadAllReadOnlyLimitContext(ctx, max)
+	}
+	rows, err := s.StorageBackend.LoadAllReadOnlyLimit(max)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// LoadManagementPageContext reads at most ManagementPageLimit bounded V2
+// recording roots. Cursor order is opaque recording ID order. Concurrent
+// creates with IDs before the cursor may appear on the next request; deletes
+// disappear from later pages. Callers should start a new traversal for a
+// fresh view.
+func (s *Store) LoadManagementPageContext(ctx context.Context, afterID string, limit int) (ManagementRecordingPage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return ManagementRecordingPage{}, err
+	}
+	if s == nil || s.StorageBackend == nil || limit < 1 || limit > ManagementPageLimit || afterID != "" && !recordingIDPattern.MatchString(afterID) {
+		return ManagementRecordingPage{}, errors.New("invalid management page request")
+	}
+	backend, ok := s.StorageBackend.(interface {
+		managementRootIDsPageContext(context.Context, string, int) ([]string, string, error)
+	})
+	if !ok {
+		return ManagementRecordingPage{}, ErrManagementPagingUnsupported
+	}
+	ids, next, err := backend.managementRootIDsPageContext(ctx, afterID, limit)
+	if err != nil {
+		return ManagementRecordingPage{}, err
+	}
+	page := ManagementRecordingPage{Items: make([]*domain.Recording, 0, len(ids)), NextCursor: next}
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return ManagementRecordingPage{}, err
+		}
+		header, loadErr := s.LoadRecordingHeader(ctx, id)
+		if errors.Is(loadErr, ErrNotFound) {
+			continue
+		}
+		if loadErr != nil {
+			return ManagementRecordingPage{}, errors.New("recording root summary is unavailable")
+		}
+		page.Items = append(page.Items, header)
+	}
+	return page, nil
+}
+
+func (s *LocalFilesystemBackend) managementRootIDsPageContext(ctx context.Context, afterID string, limit int) ([]string, string, error) {
+	if err := s.ensureManagementRootIDs(ctx); err != nil {
+		return nil, "", err
+	}
+	s.managementRootsMu.RLock()
+	defer s.managementRootsMu.RUnlock()
+	start := sort.SearchStrings(s.managementRootIDs, afterID)
+	if afterID != "" && start < len(s.managementRootIDs) && s.managementRootIDs[start] == afterID {
+		start++
+	}
+	end := start + limit
+	if end > len(s.managementRootIDs) {
+		end = len(s.managementRootIDs)
+	}
+	ids := append([]string(nil), s.managementRootIDs[start:end]...)
+	next := ""
+	if end < len(s.managementRootIDs) && len(ids) > 0 {
+		next = ids[len(ids)-1]
+	}
+	return ids, next, ctx.Err()
+}
+
+func (s *LocalFilesystemBackend) ensureManagementRootIDs(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.managementRootsMu.RLock()
+		ready := s.managementRootIDsReady
+		s.managementRootsMu.RUnlock()
+		if ready {
+			return nil
+		}
+
+		s.managementRootsMu.RLock()
+		epoch := s.managementRootEpoch
+		s.managementRootsMu.RUnlock()
+		base := filepath.Join(s.root, "recordings")
+		baseInfo, err := os.Lstat(base)
+		if err != nil || !baseInfo.IsDir() || baseInfo.Mode()&os.ModeSymlink != 0 {
+			return errors.New("recording root is not a safe directory")
+		}
+		entries, err := os.ReadDir(base)
+		if err != nil {
+			return err
+		}
+		roots := make(map[string]struct{}, len(entries))
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if recordingIDPattern.MatchString(entry.Name()) {
+				roots[entry.Name()] = struct{}{}
+			}
+		}
+		s.managementRootsMu.Lock()
+		if s.managementRootEpoch != epoch {
+			s.managementRootsMu.Unlock()
+			continue
+		}
+		for id, present := range s.managementRootChanges {
+			if present {
+				roots[id] = struct{}{}
+			} else {
+				delete(roots, id)
+			}
+		}
+		s.managementRootChanges = nil
+		ids := make([]string, 0, len(roots))
+		for id := range roots {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		s.managementRootIDs = ids
+		s.managementRootIDsReady = true
+		s.managementRootsMu.Unlock()
+		return nil
+	}
+}
+
+func (s *LocalFilesystemBackend) noteManagementRoot(id string, present bool) {
+	if !recordingIDPattern.MatchString(id) {
+		return
+	}
+	s.managementRootsMu.Lock()
+	defer s.managementRootsMu.Unlock()
+	if !s.managementRootIDsReady {
+		if s.managementRootChanges == nil {
+			s.managementRootChanges = make(map[string]bool)
+		}
+		s.managementRootChanges[id] = present
+		return
+	}
+	index := sort.SearchStrings(s.managementRootIDs, id)
+	exists := index < len(s.managementRootIDs) && s.managementRootIDs[index] == id
+	if present && !exists {
+		s.managementRootIDs = append(s.managementRootIDs, "")
+		copy(s.managementRootIDs[index+1:], s.managementRootIDs[index:])
+		s.managementRootIDs[index] = id
+	} else if !present && exists {
+		s.managementRootIDs = append(s.managementRootIDs[:index], s.managementRootIDs[index+1:]...)
+	}
+}
+
+func (s *LocalFilesystemBackend) InvalidateManagementRootCache() {
+	s.managementRootsMu.Lock()
+	s.managementRootEpoch++
+	s.managementRootIDs = nil
+	s.managementRootIDsReady = false
+	s.managementRootsMu.Unlock()
+}
+
+// InvalidateManagementRootCache invalidates optional process-local root
+// enumeration caches after a recorder generation becomes active. It does not
+// publish canonical objects or change archive state.
+func (s *Store) InvalidateManagementRootCache() {
+	if s == nil || s.StorageBackend == nil {
+		return
+	}
+	if backend, ok := s.StorageBackend.(interface{ InvalidateManagementRootCache() }); ok {
+		backend.InvalidateManagementRootCache()
+	}
+}
+
 // RecordingDirectoryBytesContext returns the physical bytes below one
 // recording while allowing providers with context-aware enumeration to stop
 // work when the caller no longer needs the read-model result. The optional
@@ -219,13 +414,31 @@ func decodeStrictSidecar(data []byte, output any) error {
 // it; their physical object I/O always crosses the pinned provider protocol.
 // Canonical metadata stores only logical relative paths in either backend.
 type LocalFilesystemBackend struct {
-	root         string
-	telemetry    *telemetry
-	setupProbeMu sync.Mutex
+	root                   string
+	telemetry              *telemetry
+	setupProbeMu           sync.Mutex
+	managementRootsMu      sync.RWMutex
+	managementRootIDs      []string
+	managementRootIDsReady bool
+	managementRootEpoch    uint64
+	managementRootChanges  map[string]bool
 
 	issuesMu sync.RWMutex
 	issues   []RecoveryIssue
 }
+
+// ManagementPageLimit caps one control-plane page. Callers continue with the
+// returned cursor instead of increasing this limit for large installations.
+const ManagementPageLimit = 128
+
+// ManagementRecordingPage contains bounded V2 root summaries. NextCursor is
+// empty only after the root index reaches its end.
+type ManagementRecordingPage struct {
+	Items      []*domain.Recording
+	NextCursor string
+}
+
+var ErrManagementPagingUnsupported = errors.New("storage backend does not support management paging")
 
 // RecoveryIssue describes preserved data that could not be safely attached to
 // a recording. It intentionally contains no filesystem path, URI, or payload
@@ -668,6 +881,7 @@ func (s *LocalFilesystemBackend) createRecording(recording *domain.Recording, si
 	if err = os.Rename(stage, final); err != nil {
 		return err
 	}
+	s.noteManagementRoot(recording.ID, true)
 	return syncDirectory(base)
 }
 
@@ -931,7 +1145,7 @@ func (s *Store) LoadAll() ([]*domain.Recording, error) {
 // publishing writes. It is used by fresh Engine generations that must observe
 // archives owned by another Engine without taking ownership of them.
 func (s *LocalFilesystemBackend) LoadAllReadOnly() ([]*domain.Recording, error) {
-	return s.loadAllReadOnly(0, false)
+	return s.loadAllReadOnly(context.Background(), 0, false)
 }
 
 // LoadAllReadOnlyLimit is the bounded variant used by management snapshots.
@@ -939,10 +1153,26 @@ func (s *LocalFilesystemBackend) LoadAllReadOnlyLimit(max int) ([]*domain.Record
 	if max < 0 {
 		return nil, ErrReadOnlyListLimit
 	}
-	return s.loadAllReadOnly(max, true)
+	return s.loadAllReadOnly(context.Background(), max, true)
 }
 
-func (s *LocalFilesystemBackend) loadAllReadOnly(max int, bounded bool) ([]*domain.Recording, error) {
+// LoadAllReadOnlyLimitContext is the cancellation-aware management snapshot
+// path for local storage. Filesystem directory reads are synchronous, so the
+// context is checked between root reads and before/after directory discovery.
+func (s *LocalFilesystemBackend) LoadAllReadOnlyLimitContext(ctx context.Context, max int) ([]*domain.Recording, error) {
+	if max < 0 {
+		return nil, ErrReadOnlyListLimit
+	}
+	return s.loadAllReadOnly(ctx, max, true)
+}
+
+func (s *LocalFilesystemBackend) loadAllReadOnly(ctx context.Context, max int, bounded bool) ([]*domain.Recording, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	base := filepath.Join(s.root, "recordings")
 	baseInfo, err := os.Lstat(base)
 	if err != nil {
@@ -955,25 +1185,31 @@ func (s *LocalFilesystemBackend) loadAllReadOnly(max int, bounded bool) ([]*doma
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var recordings []*domain.Recording
 	for _, entry := range entries {
-		if !entry.IsDir() || !recordingIDPattern.MatchString(entry.Name()) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !recordingIDPattern.MatchString(entry.Name()) {
 			continue
 		}
 		recording, loadErr := s.LoadRecordingReadOnly(entry.Name())
-		if errors.Is(loadErr, os.ErrNotExist) {
+		if errors.Is(loadErr, os.ErrNotExist) || errors.Is(loadErr, ErrNotFound) {
 			continue
 		}
 		if loadErr != nil {
-			// A management snapshot is best-effort over individually malformed
-			// archive documents, matching LoadAll's preservation behavior without
-			// creating recovery side effects.
-			continue
+			return nil, fmt.Errorf("recording root metadata is unavailable: %w", loadErr)
 		}
 		recordings = append(recordings, recording)
 		if bounded && len(recordings) > max {
 			return nil, ErrReadOnlyListLimit
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	sort.Slice(recordings, func(i, j int) bool { return recordings[i].CreatedAt.After(recordings[j].CreatedAt) })
 	return recordings, nil

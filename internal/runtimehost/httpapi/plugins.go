@@ -10,6 +10,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/controlplane"
 	"github.com/integrated-recorder/core/internal/plugintrust"
 )
 
@@ -130,7 +132,8 @@ func routePluginOperation(method, path string) (pluginOperation, string, bool) {
 func (h *handler) servePluginOperation(w http.ResponseWriter, r *http.Request, operation pluginOperation, id string) {
 	setResponseHeaders(w)
 	mutation := operation != pluginStatus
-	if !h.authorize(w, r, mutation) {
+	r, authorized := h.authorize(w, r, authn.PermissionPluginManage, mutation)
+	if !authorized {
 		return
 	}
 	if mutation {
@@ -170,6 +173,16 @@ func (h *handler) servePluginOperation(w http.ResponseWriter, r *http.Request, o
 	if err != nil || len(encoded) > maxResponseBytes {
 		writeAPIError(w, http.StatusInternalServerError, "internal_error", safeControllerErrors["internal_error"].message)
 		return
+	}
+	switch operation {
+	case pluginRefresh:
+		h.auditMutation(w, r, controlplane.AuditPluginRegistryRefreshed, "plugin-registry")
+	case pluginInstall:
+		h.auditMutation(w, r, controlplane.AuditPluginInstalled, id)
+	case pluginUpdate:
+		h.auditMutation(w, r, controlplane.AuditPluginUpdated, id)
+	case pluginUninstall:
+		h.auditMutation(w, r, controlplane.AuditPluginUninstalled, id)
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(append(encoded, '\n'))

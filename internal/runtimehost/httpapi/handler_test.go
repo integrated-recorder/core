@@ -14,8 +14,19 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/controlplane"
 	"github.com/integrated-recorder/core/internal/plugintrust"
 )
+
+type fakeAuditAppender struct {
+	requests []controlplane.AuditAppendRequest
+	err      error
+}
+
+func (f *fakeAuditAppender) AppendAudit(_ context.Context, request controlplane.AuditAppendRequest) error {
+	f.requests = append(f.requests, request)
+	return f.err
+}
 
 type fakeController struct {
 	status        Status
@@ -25,9 +36,13 @@ type fakeController struct {
 	pluginStatus  PluginStatus
 	pluginErr     error
 	calls         map[string]int
+	principal     authn.Principal
 }
 
-func (f *fakeController) call(name string) (Status, error) {
+func (f *fakeController) call(ctx context.Context, name string) (Status, error) {
+	if principal, ok := authn.PrincipalFromContext(ctx); ok {
+		f.principal = principal
+	}
 	if f.calls == nil {
 		f.calls = make(map[string]int)
 	}
@@ -35,11 +50,15 @@ func (f *fakeController) call(name string) (Status, error) {
 	return f.status, f.err
 }
 
-func (f *fakeController) Status(context.Context) (Status, error)   { return f.call("status") }
-func (f *fakeController) Check(context.Context) (Status, error)    { return f.call("check") }
-func (f *fakeController) Stage(context.Context) (Status, error)    { return f.call("stage") }
-func (f *fakeController) Activate(context.Context) (Status, error) { return f.call("activate") }
-func (f *fakeController) Rollback(context.Context) (Status, error) { return f.call("rollback") }
+func (f *fakeController) Status(ctx context.Context) (Status, error) { return f.call(ctx, "status") }
+func (f *fakeController) Check(ctx context.Context) (Status, error)  { return f.call(ctx, "check") }
+func (f *fakeController) Stage(ctx context.Context) (Status, error)  { return f.call(ctx, "stage") }
+func (f *fakeController) Activate(ctx context.Context) (Status, error) {
+	return f.call(ctx, "activate")
+}
+func (f *fakeController) Rollback(ctx context.Context) (Status, error) {
+	return f.call(ctx, "rollback")
+}
 func (f *fakeController) ReconcileAdapters(context.Context) (AdapterReconcileResult, error) {
 	if f.calls == nil {
 		f.calls = make(map[string]int)
@@ -47,36 +66,39 @@ func (f *fakeController) ReconcileAdapters(context.Context) (AdapterReconcileRes
 	f.calls["reconcile_adapters"]++
 	return f.adapterResult, f.adapterErr
 }
-func (f *fakeController) pluginCall(name string) (PluginStatus, error) {
+func (f *fakeController) pluginCall(ctx context.Context, name string) (PluginStatus, error) {
+	if principal, ok := authn.PrincipalFromContext(ctx); ok {
+		f.principal = principal
+	}
 	if f.calls == nil {
 		f.calls = make(map[string]int)
 	}
 	f.calls[name]++
 	return f.pluginStatus, f.pluginErr
 }
-func (f *fakeController) PluginStatus(context.Context) (PluginStatus, error) {
-	return f.pluginCall("plugin_status")
+func (f *fakeController) PluginStatus(ctx context.Context) (PluginStatus, error) {
+	return f.pluginCall(ctx, "plugin_status")
 }
-func (f *fakeController) RefreshPlugins(context.Context) (PluginStatus, error) {
-	return f.pluginCall("plugin_refresh")
+func (f *fakeController) RefreshPlugins(ctx context.Context) (PluginStatus, error) {
+	return f.pluginCall(ctx, "plugin_refresh")
 }
-func (f *fakeController) InstallPlugin(_ context.Context, id string) (PluginStatus, error) {
+func (f *fakeController) InstallPlugin(ctx context.Context, id string) (PluginStatus, error) {
 	if id != "demo" {
 		return PluginStatus{}, NewControllerError("plugin_not_found")
 	}
-	return f.pluginCall("plugin_install")
+	return f.pluginCall(ctx, "plugin_install")
 }
-func (f *fakeController) UpdatePlugin(_ context.Context, id string) (PluginStatus, error) {
+func (f *fakeController) UpdatePlugin(ctx context.Context, id string) (PluginStatus, error) {
 	if id != "demo" {
 		return PluginStatus{}, NewControllerError("plugin_not_found")
 	}
-	return f.pluginCall("plugin_update")
+	return f.pluginCall(ctx, "plugin_update")
 }
-func (f *fakeController) UninstallPlugin(_ context.Context, id string) (PluginStatus, error) {
+func (f *fakeController) UninstallPlugin(ctx context.Context, id string) (PluginStatus, error) {
 	if id != "demo" {
 		return PluginStatus{}, NewControllerError("plugin_not_found")
 	}
-	return f.pluginCall("plugin_uninstall")
+	return f.pluginCall(ctx, "plugin_uninstall")
 }
 
 type authFixture struct {
@@ -181,6 +203,52 @@ func TestRoutesDispatchAndFallback(t *testing.T) {
 	}
 }
 
+func TestRuntimeMutationAuditUsesPrincipalAndDoesNotFailPrimaryMutation(t *testing.T) {
+	fixture := testAuth(t)
+	audit := &fakeAuditAppender{err: errors.New("private storage failure")}
+	controller := &fakeController{status: validStatus()}
+	api, err := NewWithAudit(fixture.service, false, false, controller, http.NotFoundHandler(), audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, stagePath, nil)
+	request.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: fixture.session.Token})
+	request.Header.Set("X-CSRF-Token", fixture.session.CSRFToken)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("audit failure changed successful primary status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("X-Audit-Status") != "failed" {
+		t.Fatalf("audit status=%q", response.Header().Get("X-Audit-Status"))
+	}
+	if len(audit.requests) != 1 {
+		t.Fatalf("audit requests=%+v", audit.requests)
+	}
+	got := audit.requests[0]
+	if got.Action != controlplane.AuditRuntimeUpdateStaged || got.ObjectID != "runtime-update" || got.ActorType != "user" || got.UserID != fixture.session.UserID {
+		t.Fatalf("authenticated audit request=%+v", got)
+	}
+}
+
+func TestRuntimeMutationAuditUsesSystemActorWithoutPrincipal(t *testing.T) {
+	audit := &fakeAuditAppender{}
+	controller := &fakeController{status: validStatus()}
+	api, err := NewWithAudit(nil, true, false, controller, http.NotFoundHandler(), audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, rollbackPath, nil)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("X-Audit-Status") != "recorded" {
+		t.Fatalf("system audit response=%d audit=%q body=%s", response.Code, response.Header().Get("X-Audit-Status"), response.Body.String())
+	}
+	if len(audit.requests) != 1 || audit.requests[0].ActorType != "system" || audit.requests[0].UserID != "" || audit.requests[0].Action != controlplane.AuditRuntimeUpdateRolledBack {
+		t.Fatalf("system audit request=%+v", audit.requests)
+	}
+}
+
 func TestPluginRoutesDispatchAndRejectMalformedIdentifiers(t *testing.T) {
 	controller := &fakeController{pluginStatus: PluginStatus{State: "ready", Plugins: []PluginStatusItem{{ID: "demo", Name: "Demo", AvailableVersion: "1.2.0", Installed: false, Trust: plugintrust.NewCustomRegistry()}}}}
 	api, err := New(nil, true, false, controller, http.NotFoundHandler())
@@ -266,6 +334,9 @@ func TestPluginMutationRequiresAuthenticationAndCSRF(t *testing.T) {
 	}
 	if got := request(fixture.session.Token, fixture.session.CSRFToken).Code; got != http.StatusOK {
 		t.Fatalf("authenticated refresh status = %d", got)
+	}
+	if controller.principal.UserID != fixture.session.UserID || controller.principal.Role != authn.RoleOwner {
+		t.Fatalf("plugin controller received principal=%+v, want authenticated owner %q", controller.principal, fixture.session.UserID)
 	}
 }
 

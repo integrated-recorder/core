@@ -96,6 +96,68 @@ func TestLifecycleInstallationValidationAndReadySignalRequireActiveControl(t *te
 	}
 }
 
+func TestLifecycleAuditAppendIsActiveOnlyAndPreservesValidatedActor(t *testing.T) {
+	var appended []AuditAppendRequest
+	lifecycle, err := NewLifecycleWithHooks("control-audit", true, LifecycleHooks{
+		Start:   func(context.Context) error { return nil },
+		Prepare: func(context.Context) error { return nil },
+		Resume:  func(context.Context) error { return nil },
+		Drain:   func(context.Context) error { return nil },
+		AppendAudit: func(_ context.Context, request AuditAppendRequest) error {
+			appended = append(appended, request)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userRequest := AuditAppendRequest{Action: AuditPluginInstalled, ObjectID: "fixture", ActorType: "user", UserID: "usr-0123456789abcdef0123456789abcdef"}
+	userPayload, err := json.Marshal(userRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lifecycle.Handle(context.Background(), OperationControlAppendAudit, userPayload); err == nil {
+		t.Fatal("passive Control accepted audit append")
+	}
+	if len(appended) != 0 {
+		t.Fatalf("passive Control invoked audit hook: %+v", appended)
+	}
+	if _, err := lifecycle.Handle(context.Background(), OperationControlActivate, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []AuditAppendRequest{
+		userRequest,
+		{Action: AuditRuntimeUpdateStaged, ObjectID: "runtime-update", ActorType: "system"},
+	} {
+		payload, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := lifecycle.Handle(context.Background(), OperationControlAppendAudit, payload); err != nil {
+			t.Fatalf("active Control rejected actor %q: %v", request.ActorType, err)
+		}
+	}
+	if len(appended) != 2 || appended[0] != userRequest || appended[1].ActorType != "system" || appended[1].UserID != "" {
+		t.Fatalf("audit hook requests=%+v", appended)
+	}
+	invalid, _ := json.Marshal(AuditAppendRequest{Action: AuditPluginInstalled, ActorType: "user", UserID: "../forged"})
+	if _, err := lifecycle.Handle(context.Background(), OperationControlAppendAudit, invalid); err == nil {
+		t.Fatal("invalid audit actor crossed lifecycle boundary")
+	}
+	if len(appended) != 2 {
+		t.Fatalf("invalid audit request reached hook: %+v", appended)
+	}
+	if _, err := lifecycle.Handle(context.Background(), OperationControlPrepareHandoff, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lifecycle.Handle(context.Background(), OperationControlAppendAudit, userPayload); err == nil {
+		t.Fatal("fenced Control accepted audit append")
+	}
+	if len(appended) != 2 {
+		t.Fatalf("fenced audit request reached hook: %+v", appended)
+	}
+}
+
 func TestLifecyclePreparationKeepsGenerationPassiveUntilActivation(t *testing.T) {
 	var prepared, started, drained atomic.Int32
 	lifecycle, err := NewLifecycleWithHooks("control-candidate", true, LifecycleHooks{

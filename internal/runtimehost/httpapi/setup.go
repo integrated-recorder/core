@@ -10,6 +10,7 @@ import (
 
 	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/buildinfo"
+	"github.com/integrated-recorder/core/internal/controlplane"
 	"github.com/integrated-recorder/core/internal/runtimehost/installation"
 )
 
@@ -28,7 +29,8 @@ func NewWithSetup(auth *authn.Service, authDisabled bool, store *installation.St
 	if store == nil || controller == nil || next == nil || (!authDisabled && auth == nil) {
 		return nil, errors.New("installation API dependencies are incomplete")
 	}
-	return &setupHandler{auth: auth, authDisabled: authDisabled, store: store, build: build, controller: controller, next: next}, nil
+	audit, _ := controller.(AuditAppender)
+	return &setupHandler{auth: auth, authDisabled: authDisabled, store: store, build: build, controller: controller, audit: audit, next: next}, nil
 }
 
 type setupHandler struct {
@@ -37,6 +39,7 @@ type setupHandler struct {
 	store        *installation.Store
 	build        buildinfo.Info
 	controller   InstallationController
+	audit        AuditAppender
 	next         http.Handler
 }
 
@@ -74,7 +77,9 @@ func (h *setupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeSetupError(w, http.StatusMethodNotAllowed, "method_not_allowed", "요청을 처리할 수 없습니다.")
 			return
 		}
-		if !h.authorize(w, r) || !validateSetupEmptyBody(w, r) {
+		var authorized bool
+		r, authorized = h.authorize(w, r)
+		if !authorized || !validateSetupEmptyBody(w, r) {
 			return
 		}
 		status := h.status()
@@ -83,6 +88,7 @@ func (h *setupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeSetupError(w, http.StatusConflict, safeInstallationCode(err), "설치 단계를 시작할 수 없습니다.")
 			return
 		}
+		appendRuntimeAuditBestEffort(w, r, h.audit, controlplane.AuditInstallationSetupBegun, "installation")
 		writeSetupJSON(w, http.StatusOK, h.statusFrom(snapshot))
 		return
 	}
@@ -91,7 +97,9 @@ func (h *setupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeSetupError(w, http.StatusMethodNotAllowed, "method_not_allowed", "요청을 처리할 수 없습니다.")
 			return
 		}
-		if !h.authorize(w, r) || !validateSetupEmptyBody(w, r) {
+		var authorized bool
+		r, authorized = h.authorize(w, r)
+		if !authorized || !validateSetupEmptyBody(w, r) {
 			return
 		}
 		state := h.store.Snapshot().State
@@ -108,6 +116,7 @@ func (h *setupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				writeSetupError(w, http.StatusConflict, safeInstallationCode(err), "설치 완료 상태를 저장하지 못했습니다.")
 				return
 			}
+			appendRuntimeAuditBestEffort(w, r, h.audit, controlplane.AuditInstallationSetupCompleted, "installation")
 		}
 		// This call is idempotent and is repeated on a ready-state retry. If a
 		// crash happened after the durable commit, Host/Control startup also
@@ -184,20 +193,26 @@ func updateMutationPath(method, path string) bool {
 	}
 }
 
-func (h *setupHandler) authorize(w http.ResponseWriter, r *http.Request) bool {
+func (h *setupHandler) authorize(w http.ResponseWriter, r *http.Request) (*http.Request, bool) {
 	if h.authDisabled {
-		return true
+		return r, true
 	}
 	token := authn.SessionToken(r)
-	if _, err := h.auth.Authenticate(token); err != nil {
+	session, err := h.auth.Authenticate(token)
+	if err != nil {
 		writeSetupError(w, http.StatusUnauthorized, "authentication_required", "인증이 필요합니다.")
-		return false
+		return r, false
+	}
+	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Role: session.Role}
+	if !authn.HasPermission(principal, authn.PermissionSettingsManage) {
+		writeSetupError(w, http.StatusForbidden, "permission_denied", "권한이 없습니다.")
+		return r, false
 	}
 	if !h.auth.ValidCSRF(token, r.Header.Get("X-CSRF-Token")) {
 		writeSetupError(w, http.StatusForbidden, "csrf_rejected", "요청 검증에 실패했습니다.")
-		return false
+		return r, false
 	}
-	return true
+	return r.WithContext(authn.WithPrincipal(r.Context(), principal)), true
 }
 
 func validateSetupEmptyBody(w http.ResponseWriter, r *http.Request) bool {

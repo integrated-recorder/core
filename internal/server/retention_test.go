@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/derivative"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/management"
@@ -135,8 +136,11 @@ func TestRetentionDisabledRunDoesNotDeleteAndEnabledRunClearsProjections(t *test
 		t.Fatal(err)
 	}
 	enabled := httptest.NewRecorder()
-	s.ServeHTTP(enabled, httptest.NewRequest(http.MethodPost, "/api/retention/run", strings.NewReader(`{}`)))
-	if enabled.Code != http.StatusOK || !strings.Contains(enabled.Body.String(), `"deleted_count":1`) || !strings.Contains(enabled.Body.String(), id) {
+	principal := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	runRequest := httptest.NewRequest(http.MethodPost, "/api/retention/run", strings.NewReader(`{}`))
+	runRequest = runRequest.WithContext(authn.WithPrincipal(runRequest.Context(), principal))
+	s.ServeHTTP(enabled, runRequest)
+	if enabled.Code != http.StatusOK || enabled.Header().Get("X-Audit-Status") != "recorded" || !strings.Contains(enabled.Body.String(), `"deleted_count":1`) || !strings.Contains(enabled.Body.String(), id) {
 		t.Fatalf("enabled run=%d %s", enabled.Code, enabled.Body.String())
 	}
 	if _, err := manager.Get(id); !errors.Is(err, storage.ErrNotFound) {
@@ -149,7 +153,7 @@ func TestRetentionDisabledRunDoesNotDeleteAndEnabledRunClearsProjections(t *test
 		t.Fatalf("recording events after cleanup=%v err=%v", events, err)
 	}
 	audit := products.Audit(10)
-	if len(audit) != 1 || audit[0].Type != "recording_deleted" || audit[0].ObjectID != id {
+	if len(audit) != 1 || audit[0].Type != "recording_deleted" || audit[0].ObjectID != id || audit[0].Actor == nil || audit[0].Actor.Type != management.AuditActorUser || audit[0].Actor.UserID != principal.UserID {
 		t.Fatalf("delete audit=%#v", audit)
 	}
 	for _, body := range []string{"", `null`, `{"unexpected":true}`} {
@@ -211,6 +215,54 @@ func TestRetentionDeletionCleansPreviewPolicyAndProjection(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(root, "management", "previews", id+".json")); !os.IsNotExist(err) {
 		t.Fatalf("retention deletion left preview policy: %v", err)
+	}
+}
+
+func TestRetentionAuditsCanonicalDeleteBeforeProjectionCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := systemsettings.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := settings.Update(systemsettings.Patch{RetentionEnabled: retentionPtr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("8", 32)
+	createRetentionRecording(t, store, id, domain.StateCompleted, time.Now().UTC().Add(-60*24*time.Hour))
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectionPath := filepath.Join(root, "management", "recordings", id+".json")
+	if err := os.Mkdir(projectionPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectionPath, "unsafe-entry"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	api := NewWithOptions(manager, nil, nil, Options{Management: products, Settings: settings})
+	principal := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	request := httptest.NewRequest(http.MethodPost, "/api/retention/run", strings.NewReader(`{}`))
+	request = request.WithContext(authn.WithPrincipal(request.Context(), principal))
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("X-Audit-Status") != "recorded" || !strings.Contains(response.Body.String(), `"deleted_count":1`) {
+		t.Fatalf("cleanup failure response=%d audit=%q body=%s", response.Code, response.Header().Get("X-Audit-Status"), response.Body.String())
+	}
+	if _, err := manager.Get(id); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("canonical recording survived deletion: %v", err)
+	}
+	events := products.Audit(10)
+	if len(events) != 1 || events[0].Type != "recording_deleted" || events[0].ObjectID != id || events[0].Actor == nil || events[0].Actor.Type != management.AuditActorUser || events[0].Actor.UserID != principal.UserID {
+		t.Fatalf("canonical deletion audit=%+v", events)
 	}
 }
 

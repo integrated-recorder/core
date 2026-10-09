@@ -25,6 +25,7 @@ type memoryPhysicalObjects struct {
 	modified           map[string]time.Time
 	putKeys            []string
 	listCalls          int
+	listPrefixes       []string
 	statCalls          int
 	openCalls          int
 	maxPutRead         int
@@ -49,6 +50,12 @@ type blockingListPhysicalObjects struct {
 	releaseList chan struct{}
 }
 
+type blockingPrefixListPhysicalObjects struct {
+	*memoryPhysicalObjects
+	prefix      string
+	listStarted chan context.Context
+}
+
 func (m *blockingListPhysicalObjects) List(ctx context.Context, prefix, cursor string, limit int) (PhysicalObjectPage, error) {
 	m.listStarted <- ctx
 	select {
@@ -57,6 +64,18 @@ func (m *blockingListPhysicalObjects) List(ctx context.Context, prefix, cursor s
 	case <-m.releaseList:
 		return PhysicalObjectPage{}, errors.New("test list released")
 	}
+}
+
+func (m *blockingPrefixListPhysicalObjects) List(ctx context.Context, prefix, cursor string, limit int) (PhysicalObjectPage, error) {
+	if prefix != m.prefix {
+		return m.memoryPhysicalObjects.List(ctx, prefix, cursor, limit)
+	}
+	select {
+	case m.listStarted <- ctx:
+	default:
+	}
+	<-ctx.Done()
+	return PhysicalObjectPage{}, ctx.Err()
 }
 
 type recordingDirectoryRequestContextKey struct{}
@@ -272,6 +291,7 @@ func (m *memoryPhysicalObjects) List(ctx context.Context, prefix, cursor string,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.listCalls++
+	m.listPrefixes = append(m.listPrefixes, prefix)
 	keys := make([]string, 0)
 	for key := range m.objects {
 		if strings.HasPrefix(key, prefix) && key > cursor {
@@ -291,6 +311,179 @@ func (m *memoryPhysicalObjects) List(ctx context.Context, prefix, cursor string,
 		page.NextCursor = keys[len(keys)-1]
 	}
 	return page, nil
+}
+
+func TestLoadAllReadOnlyLimitCachesRootEnumerationAndTracksLocalCreateDelete(t *testing.T) {
+	objects := newMemoryPhysicalObjects()
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const firstID = "0123456789abcdef0123456789abcdef"
+	const secondID = "1123456789abcdef0123456789abcdef"
+	if err := store.CreateRecording(stoppedRecording(firstID)); err != nil {
+		t.Fatal(err)
+	}
+
+	list := func(wantIDs ...string) {
+		t.Helper()
+		got, err := store.LoadAllReadOnlyLimit(10)
+		if err != nil {
+			t.Fatalf("LoadAllReadOnlyLimit: %v", err)
+		}
+		if len(got) != len(wantIDs) {
+			t.Fatalf("recording count = %d, want %d", len(got), len(wantIDs))
+		}
+		seen := make(map[string]bool, len(got))
+		for _, recording := range got {
+			seen[recording.ID] = true
+		}
+		for _, id := range wantIDs {
+			if !seen[id] {
+				t.Fatalf("recording %s missing from snapshot", id)
+			}
+		}
+	}
+
+	list(firstID) // First read discovers root IDs with one archive-prefix LIST.
+	list(firstID) // Repeated management poll reads bounded roots, without rescanning the archive tree.
+	if err := store.CreateRecording(stoppedRecording(secondID)); err != nil {
+		t.Fatal(err)
+	}
+	list(firstID, secondID) // Same-process create is reflected without invalidating via provider LIST.
+	if err := store.DeleteRecordingData(firstID); err != nil {
+		t.Fatal(err)
+	}
+	list(secondID) // Same-process delete is reflected without a full archive LIST.
+
+	// A new generation/backend has a fresh per-process cache and discovers the
+	// latest roots once, then reuses that snapshot for subsequent polls.
+	restarted, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := restarted.LoadAll()
+	if err != nil || len(recovered) != 1 || recovered[0].ID != secondID {
+		t.Fatalf("reopened recovery snapshot = %#v, err=%v", recovered, err)
+	}
+	for range 2 {
+		got, err := restarted.LoadAllReadOnlyLimit(10)
+		if err != nil || len(got) != 1 || got[0].ID != secondID {
+			t.Fatalf("reopened management snapshot = %#v, err=%v", got, err)
+		}
+	}
+
+	objects.mu.Lock()
+	defer objects.mu.Unlock()
+	archiveRootLists := 0
+	for _, prefix := range objects.listPrefixes {
+		if prefix == "recordings/" {
+			archiveRootLists++
+		}
+	}
+	if archiveRootLists != 2 {
+		t.Fatalf("full recordings-prefix LIST count = %d, want one cache fill per backend instance; prefixes=%v", archiveRootLists, objects.listPrefixes)
+	}
+}
+
+func TestLoadAllReadOnlyLimitContextCancelsColdRootDiscovery(t *testing.T) {
+	objects := &blockingPrefixListPhysicalObjects{
+		memoryPhysicalObjects: newMemoryPhysicalObjects(),
+		prefix:                "recordings/",
+		listStarted:           make(chan context.Context, 1),
+	}
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		rows []*domain.Recording
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		rows, loadErr := store.LoadAllReadOnlyLimitContext(requestCtx, 10)
+		done <- result{rows: rows, err: loadErr}
+	}()
+
+	var providerCtx context.Context
+	select {
+	case providerCtx = <-objects.listStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cold root discovery did not call provider List")
+	}
+	cancel()
+	if !errors.Is(providerCtx.Err(), context.Canceled) {
+		t.Fatalf("provider List context error = %v, want context.Canceled", providerCtx.Err())
+	}
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) || got.rows != nil {
+			t.Fatalf("canceled root discovery rows=%#v err=%v", got.rows, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled cold root discovery did not exit")
+	}
+}
+
+func TestLoadAllReadOnlyLimitPropagatesUnreadableRoot(t *testing.T) {
+	objects := newMemoryPhysicalObjects()
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "3123456789abcdef0123456789abcdef"
+	if err := store.CreateRecording(stoppedRecording(id)); err != nil {
+		t.Fatal(err)
+	}
+	objects.mu.Lock()
+	objects.objects[recordingObjectKey(id, "recording.json")] = []byte("not-json")
+	objects.mu.Unlock()
+
+	if rows, err := store.LoadAllReadOnlyLimit(10); err == nil || rows != nil {
+		t.Fatalf("unreadable canonical root was silently omitted: rows=%#v err=%v", rows, err)
+	}
+}
+
+func TestInvalidateManagementRootCacheSeesRootsCreatedByOtherBackend(t *testing.T) {
+	objects := newMemoryPhysicalObjects()
+	first, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const firstID = "4123456789abcdef0123456789abcdef"
+	const secondID = "5123456789abcdef0123456789abcdef"
+	if err := first.CreateRecording(stoppedRecording(firstID)); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := first.LoadAllReadOnlyLimit(10); err != nil || len(rows) != 1 || rows[0].ID != firstID {
+		t.Fatalf("initial root snapshot=%#v err=%v", rows, err)
+	}
+	if err := second.CreateRecording(stoppedRecording(secondID)); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := first.LoadAllReadOnlyLimit(10); err != nil || len(rows) != 1 {
+		t.Fatalf("warmed root cache unexpectedly changed before invalidation: rows=%#v err=%v", rows, err)
+	}
+
+	first.InvalidateManagementRootCache()
+	rows, err := first.LoadAllReadOnlyLimit(10)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("invalidated root snapshot=%#v err=%v", rows, err)
+	}
+	seen := map[string]bool{}
+	for _, row := range rows {
+		seen[row.ID] = true
+	}
+	if !seen[firstID] || !seen[secondID] {
+		t.Fatalf("invalidated root snapshot missed cross-backend recording: %#v", rows)
+	}
 }
 
 func (m *memoryPhysicalObjects) Delete(ctx context.Context, key string) error {

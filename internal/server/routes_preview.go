@@ -40,7 +40,7 @@ func (s *Server) previewList(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -131,7 +131,7 @@ func (s *Server) previewEnable(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err != nil {
 		writeStorageError(w, err)
 		return

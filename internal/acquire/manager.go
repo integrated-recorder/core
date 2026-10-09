@@ -155,15 +155,17 @@ type Manager struct {
 	// freshGeneration leaves existing archive documents read-only and does
 	// not take ownership of them. It is used for a candidate Engine generation
 	// that must not recover/interrupt work owned by an older Engine.
-	freshGeneration      bool
-	closed               bool
-	starts               sync.WaitGroup
-	startsWait           sync.Once
-	startsDone           chan struct{}
-	canonicalFence       CanonicalCommitFence
-	startAttempted       bool
-	terminalOwnerRelease func(context.Context, OwnershipToken) error
-	autoRecovery         *automaticRecoveryScheduler
+	freshGeneration         bool
+	closed                  bool
+	starts                  sync.WaitGroup
+	startsWait              sync.Once
+	startsDone              chan struct{}
+	managementEntryIDs      []string
+	managementEntryIDsValid bool
+	canonicalFence          CanonicalCommitFence
+	startAttempted          bool
+	terminalOwnerRelease    func(context.Context, OwnershipToken) error
+	autoRecovery            *automaticRecoveryScheduler
 
 	// fetchBoundaryHook is a deterministic test seam for scheduler-owned
 	// generation checks. It is configured before recording goroutines start.
@@ -744,6 +746,7 @@ func (m *Manager) CompleteHandover(id string, expectedOld OwnershipToken) error 
 		return ErrHandoverConflict
 	}
 	delete(m.entries, id)
+	m.managementEntryIDsValid = false
 	m.mu.Unlock()
 	e.mu.Lock()
 	if e.handover != op || op.state != handoverPaused {
@@ -1457,6 +1460,7 @@ func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) (result error) 
 	}
 	stage = "activate_worker"
 	m.entries[owner.RecordingID] = e
+	m.managementEntryIDsValid = false
 	delete(m.prepared, owner.RecordingID)
 	m.mu.Unlock()
 	go m.run(workerCtx, e, cloneMediaSource(prepared.media))
@@ -1820,6 +1824,7 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 	}
 	m.mu.Lock()
 	m.entries[id] = e
+	m.managementEntryIDsValid = false
 	m.mu.Unlock()
 	go m.run(workerCtx, e, cloneMediaSource(media))
 	return clone(recording), nil
@@ -1928,6 +1933,8 @@ func (m *Manager) StopContext(ctx context.Context, id string) (*domain.Recording
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	// Stop preserves the established full-recording return contract. The HTTP
+	// management read path uses bounded snapshots separately.
 	recording, err := m.Get(id)
 	e.mu.Lock()
 	terminalErr := e.terminalErr
@@ -2018,6 +2025,7 @@ func (m *Manager) delete(id string, allowUnownedTerminal bool) error {
 		return deleteErr
 	}
 	delete(m.entries, id)
+	m.managementEntryIDsValid = false
 	return nil
 }
 
@@ -2163,6 +2171,49 @@ func (m *Manager) Get(id string) (*domain.Recording, error) {
 	return copy, nil
 }
 
+// GetManagementHeader returns the bounded canonical root for management reads.
+// V2 archives stay on the root path; this method never materializes V2 shards.
+// Legacy formats retain their existing root-backed representation.
+func (m *Manager) GetManagementHeader(ctx context.Context, id string) (*domain.Recording, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !validRecordingID(id) {
+		return nil, storage.ErrNotFound
+	}
+	if e, ok := m.entry(id); ok {
+		e.mu.Lock()
+		deleted := e.deleted || e.recording == nil
+		e.mu.Unlock()
+		if deleted {
+			return nil, storage.ErrNotFound
+		}
+	}
+	version, err := m.store.RecordingFormatVersion(ctx, id)
+	if err != nil && !errors.Is(err, storage.ErrShardedArchiveUnavailable) {
+		return nil, err
+	}
+	if err == nil && version == storage.ShardedArchiveFormatVersion {
+		return m.store.LoadRecordingHeader(ctx, id)
+	}
+	// Legacy root documents own their history. They remain readable, but V2
+	// management requests above never clone or materialize archive shards.
+	return m.store.LoadRecordingReadOnly(id)
+}
+
+// InvalidateManagementRootCache invalidates the process-local root discovery
+// snapshot after Runtime Host routes management reads to this generation.
+// It performs no canonical write and adds no live-segment commit work.
+func (m *Manager) InvalidateManagementRootCache() {
+	if m == nil || m.store == nil {
+		return
+	}
+	m.store.InvalidateManagementRootCache()
+}
+
 func (m *Manager) List() []*domain.Recording {
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.entries))
@@ -2242,7 +2293,7 @@ func (m *Manager) ListForManagement(ctx context.Context, max int) ([]*domain.Rec
 			e.mu.Unlock()
 			return nil, err
 		}
-		recording := clone(e.recording)
+		recording := managementRecordingSnapshot(e.recording)
 		e.mu.Unlock()
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -2253,7 +2304,7 @@ func (m *Manager) ListForManagement(ctx context.Context, max int) ([]*domain.Rec
 		result = append(result, recording)
 	}
 	if m.freshGeneration {
-		archived, err := m.store.LoadAllReadOnlyLimit(max)
+		archived, err := m.store.LoadAllReadOnlyLimitContext(ctx, max)
 		if err != nil {
 			if errors.Is(err, storage.ErrReadOnlyListLimit) {
 				return nil, ErrListLimit
@@ -2286,9 +2337,205 @@ func (m *Manager) ListForManagement(ctx context.Context, max int) ([]*domain.Rec
 	return result, nil
 }
 
+// ListForManagementPage returns bounded root summaries in recording-ID order.
+// Cursors are stable IDs, not snapshot tokens. A concurrent create before the
+// cursor may be absent until the next traversal; deletes may disappear from a
+// later page. Callers start a new traversal for a fresh view.
+func (m *Manager) ListForManagementPage(ctx context.Context, afterID string, limit int) ([]*domain.Recording, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if limit < 1 || limit > storage.ManagementPageLimit || afterID != "" && !validRecordingID(afterID) {
+		return nil, "", ErrListLimit
+	}
+	if m.freshGeneration {
+		page, err := m.store.LoadManagementPageContext(ctx, afterID, limit)
+		if err != nil {
+			return nil, "", err
+		}
+		rows := make([]*domain.Recording, 0, len(page.Items))
+		for _, row := range page.Items {
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
+			if e, ok := m.entry(row.ID); ok {
+				snapshot, deleted, err := managementEntrySnapshot(ctx, e)
+				if err != nil {
+					return nil, "", err
+				}
+				if deleted {
+					continue
+				}
+				row = snapshot
+			}
+			rows = append(rows, row)
+		}
+		return rows, page.NextCursor, nil
+	}
+
+	ids, entries, next, err := m.managementEntryPage(ctx, afterID, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	rows := make([]*domain.Recording, 0, len(entries))
+	for index, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		snapshot, deleted, err := managementEntrySnapshot(ctx, e)
+		if err != nil {
+			return nil, "", err
+		}
+		if deleted {
+			continue
+		}
+		if snapshot.ID != ids[index] {
+			return nil, "", errors.New("recording summary identity changed during page read")
+		}
+		rows = append(rows, snapshot)
+	}
+	return rows, next, nil
+}
+
+func (m *Manager) managementEntryPage(ctx context.Context, afterID string, limit int) ([]string, []*entry, string, error) {
+	m.mu.Lock()
+	if !m.managementEntryIDsValid {
+		ids := make([]string, 0, len(m.entries))
+		for id := range m.entries {
+			if err := ctx.Err(); err != nil {
+				m.mu.Unlock()
+				return nil, nil, "", err
+			}
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		m.managementEntryIDs = ids
+		m.managementEntryIDsValid = true
+	}
+	start := sort.SearchStrings(m.managementEntryIDs, afterID)
+	if afterID != "" && start < len(m.managementEntryIDs) && m.managementEntryIDs[start] == afterID {
+		start++
+	}
+	end := start + limit
+	if end > len(m.managementEntryIDs) {
+		end = len(m.managementEntryIDs)
+	}
+	ids := append([]string(nil), m.managementEntryIDs[start:end]...)
+	entries := make([]*entry, 0, len(ids))
+	for _, id := range ids {
+		entries = append(entries, m.entries[id])
+	}
+	next := ""
+	if end < len(m.managementEntryIDs) && len(ids) > 0 {
+		next = ids[len(ids)-1]
+	}
+	m.mu.Unlock()
+	return ids, entries, next, ctx.Err()
+}
+
+func managementEntrySnapshot(ctx context.Context, e *entry) (*domain.Recording, bool, error) {
+	lockRetry := time.NewTicker(time.Millisecond)
+	defer lockRetry.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		if e.mu.TryLock() {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case <-lockRetry.C:
+		}
+	}
+	deleted := e.deleted || e.recording == nil
+	var snapshot *domain.Recording
+	if !deleted {
+		snapshot = managementRecordingSnapshot(e.recording)
+	}
+	e.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if deleted {
+		return nil, true, nil
+	}
+	if snapshot == nil {
+		return nil, false, errors.New("recording snapshot could not be copied")
+	}
+	return snapshot, false, nil
+}
+
 // OwnedStates returns only lightweight lifecycle state for this manager's
 // worker registry. A candidate manager never includes read-only archive
 // snapshots from prior generations.
+// managementRecordingSnapshot keeps V2 list snapshots on bounded root fields.
+// V2 media, gap, manifest, and metadata history lives in shards, but runtime
+// entries may also carry projection slices. Never JSON-clone those slices for
+// a management poll. Legacy roots still own their history, so preserve their
+// existing full snapshot behavior.
+func managementRecordingSnapshot(recording *domain.Recording) *domain.Recording {
+	if recording == nil {
+		return nil
+	}
+	if !isShardedRecording(recording) {
+		return clone(recording)
+	}
+
+	header := *recording
+	header.Adapter = nil
+	if recording.Adapter != nil {
+		adapter := *recording.Adapter
+		header.Adapter = &adapter
+	}
+	header.Resource = cloneManagementResource(recording.Resource)
+	header.StoppedAt = nil
+	if recording.StoppedAt != nil {
+		stoppedAt := *recording.StoppedAt
+		header.StoppedAt = &stoppedAt
+	}
+	header.Gaps = nil
+	header.Snapshots = nil
+	header.MetadataTimeline = nil
+	header.ShardedArchive = nil
+	if recording.ShardedArchive != nil {
+		archive := *recording.ShardedArchive
+		header.ShardedArchive = &archive
+	}
+	header.Tracks = make(map[string]*domain.Track, len(recording.Tracks))
+	for id, track := range recording.Tracks {
+		if track == nil {
+			header.Tracks[id] = nil
+			continue
+		}
+		trackHeader := *track
+		trackHeader.LivePresentation = nil
+		if track.LivePresentation != nil {
+			livePresentation := *track.LivePresentation
+			trackHeader.LivePresentation = &livePresentation
+		}
+		trackHeader.PendingSequences = nil
+		trackHeader.PendingSegments = nil
+		trackHeader.InitSegments = nil
+		trackHeader.Segments = nil
+		header.Tracks[id] = &trackHeader
+	}
+	return &header
+}
+
+func cloneManagementResource(resource *domain.ResourceReference) *domain.ResourceReference {
+	if resource == nil {
+		return nil
+	}
+	copy := *resource
+	copy.Parent = cloneManagementResource(resource.Parent)
+	return &copy
+}
+
 func (m *Manager) OwnedStates(max int) ([]OwnedRecordingState, error) {
 	if max < 0 {
 		return nil, ErrListLimit

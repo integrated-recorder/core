@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/acquire"
+	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/management"
 	"github.com/integrated-recorder/core/internal/storage"
@@ -34,6 +35,7 @@ type retentionRunResult struct {
 	CandidateCount int      `json:"candidate_count"`
 	DeletedCount   int      `json:"deleted_count"`
 	DeletedIDs     []string `json:"deleted_ids"`
+	auditFailed    bool     `json:"-"`
 }
 
 func (s *Server) registerRetentionRoutes() {
@@ -125,7 +127,18 @@ func (s *Server) retentionRunPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "retention cleanup is disabled")
 		return
 	}
-	result, err := s.runRetentionPass(r.Context())
+	var actor *management.AuditActor
+	if principal, ok := authn.PrincipalFromContext(r.Context()); ok {
+		actor = &management.AuditActor{Type: management.AuditActorUser, UserID: principal.UserID}
+	}
+	result, err := s.runRetentionPassAs(r.Context(), actor)
+	if result.auditFailed {
+		w.Header().Set("X-Audit-Status", "failed")
+	} else if result.DeletedCount > 0 {
+		w.Header().Set("X-Audit-Status", "recorded")
+	} else {
+		w.Header().Set("X-Audit-Status", "not_needed")
+	}
 	if errors.Is(err, errRetentionDisabled) {
 		writeError(w, http.StatusConflict, "retention cleanup is disabled")
 		return
@@ -144,6 +157,10 @@ func (s *Server) retentionRunPost(w http.ResponseWriter, r *http.Request) {
 var errRetentionDisabled = errors.New("retention cleanup is disabled")
 
 func (s *Server) runRetentionPass(ctx context.Context) (retentionRunResult, error) {
+	return s.runRetentionPassAs(ctx, nil)
+}
+
+func (s *Server) runRetentionPassAs(ctx context.Context, actor *management.AuditActor) (retentionRunResult, error) {
 	result := retentionRunResult{DeletedIDs: []string{}}
 	if ctx == nil {
 		ctx = context.Background()
@@ -176,8 +193,9 @@ func (s *Server) runRetentionPass(ctx context.Context) (retentionRunResult, erro
 		}
 		lock := s.productLock(candidate.ID)
 		lock.Lock()
-		deleted, deleteErr := s.deleteRetentionCandidateLocked(ctx, candidate.ID, settings.CompletedAfterDays)
+		deleted, auditFailed, deleteErr := s.deleteRetentionCandidateLockedAs(ctx, candidate.ID, settings.CompletedAfterDays, actor)
 		lock.Unlock()
+		result.auditFailed = result.auditFailed || auditFailed
 		if deleted {
 			result.DeletedIDs = append(result.DeletedIDs, candidate.ID)
 			result.DeletedCount++
@@ -211,7 +229,7 @@ func (s *Server) scanRetentionCandidates(ctx context.Context, days int) (retenti
 		}
 		lock := s.productLock(listed.ID)
 		lock.RLock()
-		recording, getErr := s.manager.Get(listed.ID)
+		recording, getErr := s.recordingSnapshot(ctx, listed.ID)
 		if errors.Is(getErr, storage.ErrNotFound) {
 			lock.RUnlock()
 			continue
@@ -258,44 +276,48 @@ func (s *Server) recordingJobInProgress(id string) bool {
 // deleteRetentionCandidateLocked re-reads all mutable eligibility facts while
 // holding the same per-recording write lock as explicit deletion and job APIs.
 func (s *Server) deleteRetentionCandidateLocked(ctx context.Context, id string, days int) (bool, error) {
+	deleted, _, err := s.deleteRetentionCandidateLockedAs(ctx, id, days, nil)
+	return deleted, err
+}
+
+func (s *Server) deleteRetentionCandidateLockedAs(ctx context.Context, id string, days int, actor *management.AuditActor) (bool, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return false, false, err
 	}
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(ctx, id)
 	if errors.Is(err, storage.ErrNotFound) {
-		return false, nil
+		return false, false, nil
 	}
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour)
 	if !retentionAgeEligible(recording, cutoff) || s.recordingJobInProgress(id) {
-		return false, nil
+		return false, false, nil
 	}
 	tags, err := s.products.Tags(id)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if len(tags) != 0 {
-		return false, nil
+		return false, false, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return false, false, err
 	}
 	if err := s.manager.Delete(id); err != nil {
 		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, acquire.ErrActiveRecording) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, err
+		return false, false, err
 	}
 	s.cleanupPreviewProjection(id)
+	// Record canonical deletion before best-effort management projection cleanup.
+	auditFailed := s.appendAuditAs("recording_deleted", id, actor) != nil
 	if err := s.products.ForgetRecording(id); err != nil {
-		return true, err
+		return true, auditFailed, err
 	}
-	if err := s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: "recording_deleted", At: time.Now().UTC(), ObjectID: id}); err != nil {
-		return true, err
-	}
-	return true, nil
+	return true, auditFailed, nil
 }
 
 func writeRetentionScanError(w http.ResponseWriter, err error) {

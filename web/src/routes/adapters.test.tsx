@@ -28,7 +28,7 @@ describe('adapter discovery controls', () => {
       const url = String(_input)
       const body = url === '/api/runtime/adapters/reconcile'
         ? { state: 'activated', active_adapter_count: 2, rejected_count: 0, generation_id: 'gen-123' }
-        : url === '/api/runtime/plugins' ? { state: 'not_configured', plugins: [] } : []
+        : url === '/api/runtime/plugins' ? { state: 'ready', plugins: [] } : []
       return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -38,7 +38,27 @@ describe('adapter discovery controls', () => {
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/adapters/reconcile' && init?.method === 'POST')).toBe(true))
     expect(await screen.findByText('새 어댑터 세대를 활성화했습니다.')).toBeInTheDocument()
-    expect(screen.getByText(/Runtime Host가 자동으로 검증하고 활성화합니다/)).toBeInTheDocument()
+    expect(screen.getByText(/공식 Plugin Registry에서 source plugin을 찾아 설치하세요/)).toBeInTheDocument()
+    expect(screen.getByText(/운영자 executable 가져오기는 기본적으로 비활성화되어 있습니다/)).toBeInTheDocument()
+    expect(screen.queryByText(/어댑터 디렉터리에 넣으면/)).not.toBeInTheDocument()
+  })
+
+  it('reports an unconfigured registry and disables refresh while preserving the distinction from outage', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      const body = url === '/api/runtime/plugins'
+        ? { state: 'not_configured', plugins: [] }
+        : []
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await renderAdapters()
+
+    expect(await screen.findByRole('status')).toHaveTextContent(/Plugin Registry가 비활성화되었거나 URL이 구성되지 않았습니다/)
+    expect(screen.getByRole('button', { name: 'Registry 새로고침' })).toBeDisabled()
+    expect(screen.getByText(/Registry가 비활성화되어 새 source adapter 목록을 표시하지 못했습니다/)).toBeInTheDocument()
+    expect(screen.queryByText(/아래 공식 Plugin Registry에서 source plugin을 찾아 설치하세요/)).not.toBeInTheDocument()
   })
 
   it('shows the registry and installs an available plugin through the Host API', async () => {
@@ -105,6 +125,7 @@ describe('adapter discovery controls', () => {
 
     expect(await screen.findByText(/Registry에 연결할 수 없습니다\. 이미 설치된 어댑터는 계속 사용할 수 있습니다\./)).toBeInTheDocument()
     expect(screen.getByText(/설치 1\.0\.0/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Registry 새로고침' })).toBeEnabled()
   })
 
   it('shows artifact verification failures separately from registry availability', async () => {

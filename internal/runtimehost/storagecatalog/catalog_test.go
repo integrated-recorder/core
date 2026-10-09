@@ -160,6 +160,212 @@ func TestImportCreateSetReloadInstallAndStart(t *testing.T) {
 	}
 }
 
+func TestStorageInstancesShareProviderAndKeepIndependentImmutableSets(t *testing.T) {
+	binary := buildFixtureProvider(t)
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	expected := Expected{ID: "fixture-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	root := filepath.Join(t.TempDir(), "catalog")
+	t.Cleanup(func() { _ = removeTreeOwned(root) })
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := catalog.Import(context.Background(), binary, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.InstallWithAttestation(artifact, plugintrust.NewOperator()); err != nil {
+		t.Fatal(err)
+	}
+	firstConfig := SetConfig{Values: map[string]json.RawMessage{"root": json.RawMessage(mustJSON(filepath.Join(t.TempDir(), "ssd")))}}
+	secondConfig := SetConfig{Values: map[string]json.RawMessage{"root": json.RawMessage(mustJSON(filepath.Join(t.TempDir(), "hdd")))}}
+	firstSet, err := catalog.CreateInstalledSet(artifact.ID, firstConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSet, err := catalog.CreateInstalledSet(artifact.ID, secondConfig)
+	if err != nil || firstSet.ID == secondSet.ID {
+		t.Fatalf("same provider did not produce distinct immutable sets: %q %q err=%v", firstSet.ID, secondSet.ID, err)
+	}
+	first, err := catalog.CreateStorageInstance("Local SSD", artifact.ID, firstSet.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := catalog.CreateStorageInstance("Local HDD", artifact.ID, secondSet.ID)
+	if err != nil || first.ID == second.ID {
+		t.Fatalf("same provider instances not independent: first=%+v second=%+v err=%v", first, second, err)
+	}
+	if err := catalog.UpdateStorageInstanceSet(first.ID, secondSet.ID); err != nil {
+		t.Fatalf("update instance desired set: %v", err)
+	}
+	updated, err := catalog.LoadStorageInstance(first.ID)
+	if err != nil || updated.ID != first.ID || updated.DesiredSetID != secondSet.ID {
+		t.Fatalf("instance update changed identity or lost set: %+v err=%v", updated, err)
+	}
+	other, err := catalog.LoadStorageInstance(second.ID)
+	if err != nil || other.DesiredSetID != secondSet.ID {
+		t.Fatalf("update changed second instance: %+v err=%v", other, err)
+	}
+	if err := catalog.CollectGarbage([]string{firstSet.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.LoadSet(firstSet.ID); err != nil {
+		t.Fatalf("instance update collected prior immutable set needed by existing generation pin: %v", err)
+	}
+
+	reopened, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := reopened.ListStorageInstances()
+	if err != nil || len(items) != 2 || items[0].ID == "" || items[1].ID == "" {
+		t.Fatalf("reopen instance list = %+v err=%v", items, err)
+	}
+	loadedFirst, err := reopened.LoadSet(firstSet.ID)
+	if err != nil || string(loadedFirst.Config.Values["root"]) != string(firstConfig.Values["root"]) {
+		t.Fatalf("first immutable config changed: %+v err=%v", loadedFirst, err)
+	}
+	loadedSecond, err := reopened.LoadSet(secondSet.ID)
+	if err != nil || string(loadedSecond.Config.Values["root"]) != string(secondConfig.Values["root"]) {
+		t.Fatalf("second immutable config changed: %+v err=%v", loadedSecond, err)
+	}
+}
+
+func TestStorageInstanceCatalogDoesNotExposeCredentials(t *testing.T) {
+	binary := buildProvider(t, "./testdata/secretprovider")
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	expected := Expected{ID: "secret-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	root := filepath.Join(t.TempDir(), "catalog")
+	t.Cleanup(func() { _ = removeTreeOwned(root) })
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := catalog.Import(context.Background(), binary, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.InstallWithAttestation(artifact, plugintrust.NewOperator()); err != nil {
+		t.Fatal(err)
+	}
+	firstSet, err := catalog.CreateInstalledSet(artifact.ID, SetConfig{Secrets: map[string]string{"access_token": "credential-A"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSet, err := catalog.CreateInstalledSet(artifact.ID, SetConfig{Secrets: map[string]string{"access_token": "credential-B"}})
+	if err != nil || firstSet.ID == secondSet.ID {
+		t.Fatalf("credential change did not create immutable set: %q %q err=%v", firstSet.ID, secondSet.ID, err)
+	}
+	if _, err := catalog.CreateStorageInstance("Account A", artifact.ID, firstSet.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.CreateStorageInstance("Account B", artifact.ID, secondSet.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, err := os.ReadFile(filepath.Join(root, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(state), "credential-A") || strings.Contains(string(state), "credential-B") {
+		t.Fatal("catalog state exposed provider credentials")
+	}
+	first, err := catalog.LoadSet(firstSet.ID)
+	if err != nil || first.Config.Secrets["access_token"] != "credential-A" {
+		t.Fatalf("first instance credentials changed: %+v err=%v", first.Config.Secrets, err)
+	}
+	second, err := catalog.LoadSet(secondSet.ID)
+	if err != nil || second.Config.Secrets["access_token"] != "credential-B" {
+		t.Fatalf("second instance credentials changed: %+v err=%v", second.Config.Secrets, err)
+	}
+}
+
+func TestLegacyDesiredSetsMigrateToStableStorageInstancesIdempotently(t *testing.T) {
+	binary := buildFixtureProvider(t)
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	expected := Expected{ID: "fixture-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	root := filepath.Join(t.TempDir(), "catalog")
+	t.Cleanup(func() { _ = removeTreeOwned(root) })
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := catalog.Import(context.Background(), binary, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.InstallWithAttestation(artifact, plugintrust.NewOperator()); err != nil {
+		t.Fatal(err)
+	}
+	set, err := catalog.CreateInstalledSet(artifact.ID, SetConfig{Values: map[string]json.RawMessage{"root": json.RawMessage(mustJSON(filepath.Join(t.TempDir(), "archive")))}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SelectDesiredSet(artifact.ID, set.ID); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "state.json")
+	stateBytes, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current catalogState
+	if err := json.Unmarshal(stateBytes, &current); err != nil {
+		t.Fatal(err)
+	}
+	// Serialize through the previous state field order to model a valid
+	// pre-instance catalog state without the new optional field.
+	legacyState := struct {
+		SchemaVersion         int                                  `json:"schema_version"`
+		Installed             []Artifact                           `json:"installed"`
+		DesiredSets           map[string]string                    `json:"desired_sets"`
+		ArtifactAttestations  map[string][]plugintrust.Attestation `json:"artifact_attestations,omitempty"`
+		InstalledAttestations map[string]plugintrust.Attestation   `json:"installed_attestations,omitempty"`
+	}{
+		SchemaVersion: current.SchemaVersion, Installed: current.Installed, DesiredSets: current.DesiredSets,
+		ArtifactAttestations: current.ArtifactAttestations, InstalledAttestations: current.InstalledAttestations,
+	}
+	oldBytes, err := json.Marshal(legacyState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, oldBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(root)
+	if err != nil {
+		t.Fatalf("migrate legacy desired set: %v", err)
+	}
+	instanceID := LegacyStorageInstanceID(artifact.ID)
+	first, err := migrated.LoadStorageInstance(instanceID)
+	if err != nil || first.DesiredSetID != set.ID || first.DisplayName != artifact.ID {
+		t.Fatalf("legacy instance = %+v err=%v", first, err)
+	}
+	firstState, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(root); err != nil {
+		t.Fatalf("second open after migration: %v", err)
+	}
+	secondState, err := os.ReadFile(statePath)
+	if err != nil || string(firstState) != string(secondState) {
+		t.Fatalf("migration not idempotent: before=%s after=%s err=%v", firstState, secondState, err)
+	}
+}
+
 func TestStorageSetAttestationAffectsIdentityButNotArtifact(t *testing.T) {
 	binary := buildFixtureProvider(t)
 	data, err := os.ReadFile(binary)

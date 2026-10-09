@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -23,6 +23,12 @@ export const storageAPI = {
 }
 export const storageProvidersAPI = {
   status: () => api<StorageProviderStatus>('/api/runtime/storage/provider'),
+  instances: () => api<StorageInstanceSummary[]>('/api/runtime/storage/instances'),
+  createInstance: (body: StorageInstanceCreateBody) => api<StorageInstanceSummary>('/api/runtime/storage/instances', { method: 'POST', body }),
+  instanceConfig: (id: string) => api<StorageProviderConfig>(`/api/runtime/storage/instances/${encodeURIComponent(id)}/config`),
+  saveInstanceConfig: (id: string, body: StorageProviderConfigBody) => api<StorageProviderConfig>(`/api/runtime/storage/instances/${encodeURIComponent(id)}/config`, { method: 'PUT', body }),
+  probeInstance: (id: string) => api<void>(`/api/runtime/storage/instances/${encodeURIComponent(id)}/probe`, { method: 'POST', body: {} }),
+  activateInstance: (id: string) => api<StorageProviderStatus>(`/api/runtime/storage/instances/${encodeURIComponent(id)}/activate`, { method: 'POST', body: {} }),
   config: (id: string) => api<StorageProviderConfig>(`/api/runtime/storage/providers/${encodeURIComponent(id)}/config`),
   saveConfig: (id: string, body: StorageProviderConfigBody) => api<StorageProviderConfig>(`/api/runtime/storage/providers/${encodeURIComponent(id)}/config`, { method: 'PUT', body }),
   probe: (id: string) => api<void>(`/api/runtime/storage/providers/${encodeURIComponent(id)}/probe`, { method: 'POST', body: {} }),
@@ -101,7 +107,7 @@ export const watchesAPI = {
   events: (id: string, limit = 50) => api<{ items: WatchEvent[] }>(`/api/watches/${encodeURIComponent(id)}/events${queryString({ limit })}`),
 }
 export const productAPI = {
-  search: (q: string) => api<{ results: SearchResult[] }>(`/api/search${queryString({ q, limit: 20 })}`),
+  search: (q: string) => api<{ results: SearchResult[]; partial_errors?: string[] }>(`/api/search${queryString({ q, limit: 20 })}`),
   notifications: () => api<{ items: Notification[] }>('/api/notifications'),
   markRead: (id: string) => api<void>(`/api/notifications/${encodeURIComponent(id)}/read`, { method: 'POST' }),
   markAllRead: () => api<void>('/api/notifications/read-all', { method: 'POST' }),

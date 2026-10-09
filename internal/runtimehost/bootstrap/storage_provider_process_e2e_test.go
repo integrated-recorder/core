@@ -231,10 +231,10 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 	}
 	fixture.advance(streamR, 5)
 	waitRecordingSequenceCount(t, client, baseURL, recordingR.ID, 5, 30*time.Second)
-	if current := getRecording(t, client, baseURL, recordingR.ID); current.ID != recordingR.ID || current.State != domain.StateRecording {
+	if current := getRecording(t, providerRoot, client, baseURL, recordingR.ID); current.ID != recordingR.ID || current.State != domain.StateRecording {
 		t.Fatalf("Recording R identity/state changed while v1 was active: %+v", current)
 	}
-	verifyStorageProcessE2EObjects(t, providerRoot, streamR, getRecording(t, client, baseURL, recordingR.ID), 1, 5)
+	verifyStorageProcessE2EObjects(t, providerRoot, streamR, getRecording(t, providerRoot, client, baseURL, recordingR.ID), 1, 5)
 	if pid := waitProcessForBinary(t, providerV1Path, 15*time.Second); pid == 0 {
 		t.Fatal("v1 Engine did not spawn the immutable external storage provider")
 	}
@@ -312,8 +312,8 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 	fixture.advance(streamS, 4)
 	waitRecordingSequenceCount(t, client, baseURL, recordingR.ID, 9, 30*time.Second)
 	waitRecordingSequenceCount(t, client, baseURL, recordingS.ID, 4, 30*time.Second)
-	verifyStorageProcessE2EObjects(t, providerRoot, streamR, getRecording(t, client, baseURL, recordingR.ID), 1, 9)
-	verifyStorageProcessE2EObjects(t, providerRoot, streamS, getRecording(t, client, baseURL, recordingS.ID), 1, 4)
+	verifyStorageProcessE2EObjects(t, providerRoot, streamR, getRecording(t, providerRoot, client, baseURL, recordingR.ID), 1, 9)
+	verifyStorageProcessE2EObjects(t, providerRoot, streamS, getRecording(t, providerRoot, client, baseURL, recordingS.ID), 1, 4)
 	assertNoLocalRecordingEntries(t, dataDir, recordingR.ID, recordingS.ID)
 
 	stopRecording(t, client, baseURL, recordingR.ID)
@@ -322,8 +322,8 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 	waitRuntimeRecordingState(t, client, baseURL, recordingS.ID, domain.StateStopped, 25*time.Second)
 	waitLeaseAbsent(t, dataDir, recordingR.ID, 30*time.Second)
 	waitLeaseAbsent(t, dataDir, recordingS.ID, 30*time.Second)
-	finalR := getRecording(t, client, baseURL, recordingR.ID)
-	finalS := getRecording(t, client, baseURL, recordingS.ID)
+	finalR := getRecording(t, providerRoot, client, baseURL, recordingR.ID)
+	finalS := getRecording(t, providerRoot, client, baseURL, recordingS.ID)
 	if finalR.ID != recordingR.ID || finalS.ID != recordingS.ID || finalR.State != domain.StateStopped || finalS.State != domain.StateStopped {
 		t.Fatalf("recording identities or terminal states changed: R=%+v S=%+v", finalR, finalS)
 	}
@@ -357,7 +357,7 @@ func TestProductionStorageProviderRegistryAcceptanceE2E(t *testing.T) {
 		t.Fatalf("cold Host recovery did not retain v2 primary: %+v", storageStatus.Primary)
 	}
 	for _, recordingID := range []string{recordingR.ID, recordingS.ID} {
-		reloaded := getRecording(t, client, baseURL, recordingID)
+		reloaded := getRecording(t, providerRoot, client, baseURL, recordingID)
 		if reloaded.ID != recordingID || reloaded.State != domain.StateStopped {
 			t.Fatalf("cold Host recovery did not load remote Recording %s: %+v", recordingID, reloaded)
 		}

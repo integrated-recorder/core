@@ -35,10 +35,10 @@ Docker가 기본 실행 경로입니다.
 
 ```sh
 docker compose up -d
-docker compose exec archiver runtime-host setup-code
+docker compose logs archiver
 ```
 
-브라우저에서 [http://localhost:8080/](http://localhost:8080/)을 열어 `/setup`을 완료하세요. 컨테이너는 named `/data` volume을 사용합니다.
+로컬 Runtime Host 콘솔 또는 container log에 표시된 one-time setup code를 사용해 브라우저에서 [http://localhost:8080/](http://localhost:8080/)의 `/setup`을 완료하세요. 로그에 접근할 수 없는 경우 `docker compose exec archiver runtime-host setup-code`를 실행하세요. 컨테이너는 named `/data` volume을 사용합니다.
 
 공식 Plugin Registry 주소는 `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`입니다. Registry는 plugin 배포 metadata이며 build 서비스가 아닙니다. 이미 설치된 plugin과 archive는 Registry에 연결할 수 없어도 사용할 수 있습니다.
 

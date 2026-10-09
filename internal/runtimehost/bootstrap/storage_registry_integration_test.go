@@ -511,6 +511,147 @@ func TestStorageProviderUpdateCarriesCompatibleConfiguration(t *testing.T) {
 	}
 }
 
+func TestStorageInstanceConfigureAfterProviderUpdateUsesSubmittedConfig(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	v1Binary := buildStorageProviderVariant(t, "1.0.0", "legacy", true)
+	v2Binary := buildStorageProviderVariant(t, "2.0.0", "compatible", true)
+	v1Bytes, v2Bytes := mustReadStorageBinary(t, v1Binary), mustReadStorageBinary(t, v2Binary)
+	v1Digest, v2Digest := storageBinaryDigest(v1Bytes), storageBinaryDigest(v2Bytes)
+	currentVersion := "1.0.0"
+	var versionMu sync.RWMutex
+	registryServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		versionMu.RLock()
+		version := currentVersion
+		versionMu.RUnlock()
+		binary, digest := v1Bytes, v1Digest
+		if version == "2.0.0" {
+			binary, digest = v2Bytes, v2Digest
+		}
+		switch r.URL.Path {
+		case "/registry.json":
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(storageRegistryDocument(r.Host, version, digest, int64(len(binary)))); err != nil {
+				t.Errorf("encode storage instance registry: %v", err)
+			}
+		case "/artifact/1.0.0", "/artifact/2.0.0":
+			w.Header().Set("Content-Length", fmt.Sprint(len(binary)))
+			_, _ = w.Write(binary)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer registryServer.Close()
+	api := setupStorageRegistryController(t, fixture, registryServer)
+	catalog := fixture.controller.storageCatalog
+
+	if _, code, body := callPluginAPI(t, api, http.MethodPost, httpapi.PluginsEndpoint+"/refresh"); code != http.StatusOK {
+		t.Fatalf("refresh v1: status=%d body=%s", code, body)
+	}
+	if _, code, body := callPluginAPI(t, api, http.MethodPost, httpapi.PluginsEndpoint+"/fixture-storage/install"); code != http.StatusOK {
+		t.Fatalf("install v1: status=%d body=%s", code, body)
+	}
+	rootV1 := filepath.Join(t.TempDir(), "instance-provider-v1")
+	createBody, err := json.Marshal(httpapi.StorageInstanceCreateRequest{
+		DisplayName: "Fixture account", ProviderID: "fixture-storage",
+		Values:  map[string]json.RawMessage{"root": mustStorageJSON(t, rootV1)},
+		Secrets: map[string]string{"legacy_secret": "old-artifact-secret"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, body := callStorageAPI(t, api, http.MethodPost, httpapi.StorageInstancesEndpoint, string(createBody))
+	if code != http.StatusOK {
+		t.Fatalf("create v1 storage instance: status=%d body=%s", code, body)
+	}
+	var created httpapi.StorageInstanceSummary
+	if err := json.Unmarshal([]byte(body), &created); err != nil {
+		t.Fatal(err)
+	}
+	oldSet, err := catalog.LoadSet(created.DesiredSetID)
+	if err != nil || oldSet.Artifact.Digest != v1Digest || oldSet.Config.Secrets["legacy_secret"] != "old-artifact-secret" {
+		t.Fatalf("created v1 immutable set has wrong artifact or secret presence: artifact_digest=%s err=%v", oldSet.Artifact.Digest, err)
+	}
+	if code, body := callStorageAPI(t, api, http.MethodPost, httpapi.StorageInstancesPrefix+created.ID+"/probe", `{}`); code != http.StatusOK {
+		t.Fatalf("probe v1 instance: status=%d body=%s", code, body)
+	}
+	if code, body := callStorageAPI(t, api, http.MethodPost, httpapi.StorageInstancesPrefix+created.ID+"/activate", `{}`); code != http.StatusOK {
+		t.Fatalf("activate v1 instance: status=%d body=%s", code, body)
+	}
+	activeBeforeUpdate := fixture.registry.Snapshot().Generations[fixture.registry.Snapshot().ActiveGenerationID]
+	if activeBeforeUpdate.StorageProviderSetID != oldSet.ID || activeBeforeUpdate.StorageInstanceID != created.ID {
+		t.Fatalf("active generation did not pin exact v1 instance set: %+v", activeBeforeUpdate)
+	}
+
+	versionMu.Lock()
+	currentVersion = "2.0.0"
+	versionMu.Unlock()
+	if _, code, body := callPluginAPI(t, api, http.MethodPost, httpapi.PluginsEndpoint+"/refresh"); code != http.StatusOK {
+		t.Fatalf("refresh v2: status=%d body=%s", code, body)
+	}
+	if _, code, body := callPluginAPI(t, api, http.MethodPost, httpapi.PluginsEndpoint+"/fixture-storage/update"); code != http.StatusOK {
+		t.Fatalf("update provider to v2: status=%d body=%s", code, body)
+	}
+
+	rootV2 := filepath.Join(t.TempDir(), "instance-provider-v2")
+	request := httpapi.StorageConfigRequest{
+		Values: map[string]json.RawMessage{
+			"root": mustStorageJSON(t, rootV2), "region": mustStorageJSON(t, "kr-central-1"),
+		},
+		Secrets: map[string]string{},
+	}
+	requestBody, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := httpapi.StorageInstancesPrefix + created.ID + "/config"
+	code, body = callStorageAPI(t, api, http.MethodPut, path, string(requestBody))
+	if code != http.StatusOK {
+		t.Fatalf("configure instance after provider update: status=%d body=%s", code, body)
+	}
+	if strings.Contains(body, "old-artifact-secret") || strings.Contains(body, "new-artifact-secret") {
+		t.Fatalf("configuration response exposed a credential: %s", body)
+	}
+	var view httpapi.StorageConfigView
+	if err := json.Unmarshal([]byte(body), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.ConfiguredSecrets) != 0 || string(view.Values["root"]) != mustStorageJSONString(t, rootV2) || string(view.Values["region"]) != mustStorageJSONString(t, "kr-central-1") {
+		t.Fatalf("new artifact configuration view lost submitted values or inherited old secret: %+v", view)
+	}
+	updated, err := catalog.LoadStorageInstance(created.ID)
+	if err != nil || updated.ID != created.ID || updated.DesiredSetID == oldSet.ID {
+		t.Fatalf("instance identity/config update=%+v err=%v", updated, err)
+	}
+	newSet, err := catalog.LoadSet(updated.DesiredSetID)
+	if err != nil || newSet.Artifact.Digest != v2Digest || newSet.Config.Secrets["legacy_secret"] != "" ||
+		string(newSet.Config.Values["root"]) != mustStorageJSONString(t, rootV2) || string(newSet.Config.Values["region"]) != mustStorageJSONString(t, "kr-central-1") {
+		t.Fatalf("new v2 immutable set lost submitted config or inherited old secret: artifact_digest=%s configured_secret=%t err=%v", newSet.Artifact.Digest, newSet.Config.Secrets["legacy_secret"] != "", err)
+	}
+
+	newSecretRequest := httpapi.StorageConfigRequest{Values: request.Values, Secrets: map[string]string{"legacy_secret": "new-artifact-secret"}}
+	requestBody, err = json.Marshal(newSecretRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, body = callStorageAPI(t, api, http.MethodPut, path, string(requestBody))
+	if code != http.StatusOK || strings.Contains(body, "new-artifact-secret") {
+		t.Fatalf("configure submitted v2 secret: status=%d body=%s", code, body)
+	}
+	updated, err = catalog.LoadStorageInstance(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSet, err = catalog.LoadSet(updated.DesiredSetID)
+	if err != nil || newSet.Config.Secrets["legacy_secret"] != "new-artifact-secret" {
+		t.Fatalf("submitted v2 secret was not stored in new immutable set: configured_secret=%t err=%v", newSet.Config.Secrets["legacy_secret"] != "", err)
+	}
+
+	activeAfterConfigure := fixture.registry.Snapshot().Generations[fixture.registry.Snapshot().ActiveGenerationID]
+	if activeAfterConfigure.StorageProviderSetID != oldSet.ID || activeAfterConfigure.StorageInstanceID != created.ID {
+		t.Fatalf("instance config update changed active generation's exact set pin: %+v", activeAfterConfigure)
+	}
+}
+
 func buildStorageProviderFixture(t *testing.T) string {
 	t.Helper()
 	packageDir, err := os.Getwd()

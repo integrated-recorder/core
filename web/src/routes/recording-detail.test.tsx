@@ -1,6 +1,20 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { MetadataTimeline, Timeline } from './recording-detail'
+import { recordingHasCommittedMedia, timelineProjectionOmitted } from './recording-detail-utils'
+
+describe('bounded V2 detail projection', () => {
+  it('uses summary counts to enable live playback without loading media history', () => {
+    expect(recordingHasCommittedMedia({ segment_count: 12, statistics: { segment_count: 12 } })).toBe(true)
+    expect(recordingHasCommittedMedia({ segment_count: 0, statistics: { segment_count: 0 }, tracks: {} })).toBe(false)
+  })
+
+  it('does not present omitted V2 history as an empty timeline', () => {
+    expect(timelineProjectionOmitted({ format_version: 2, segment_count: 100, statistics: { segment_count: 100, gap_count: 3 } }, 0, 0)).toBe(true)
+    expect(timelineProjectionOmitted({ format_version: 2, segment_count: 10, statistics: { segment_count: 10, gap_count: 0 } }, 10, 0)).toBe(false)
+    expect(timelineProjectionOmitted({ format_version: 1, segment_count: 10 }, 0, 0)).toBe(false)
+  })
+})
 
 describe('recording capture timeline', () => {
   it('orders each track by source epoch and sequence, not by source sequence alone', () => {

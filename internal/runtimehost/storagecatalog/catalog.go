@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +80,18 @@ type Set struct {
 	Attestation *plugintrust.Attestation `json:"attestation,omitempty"`
 }
 
+// StorageInstance gives one stable operator-facing identity to an immutable
+// provider configuration. Updating an instance replaces DesiredSetID; callers
+// that already pinned the previous set remain unchanged.
+type StorageInstance struct {
+	ID           string    `json:"id"`
+	DisplayName  string    `json:"display_name"`
+	ProviderID   string    `json:"provider_id"`
+	DesiredSetID string    `json:"desired_set_id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 // EffectiveAttestation returns the persisted Host attestation, or the
 // conservative legacy marker for a pre-provenance provider set.
 func (s Set) EffectiveAttestation() plugintrust.Attestation {
@@ -106,6 +119,7 @@ type catalogState struct {
 	SchemaVersion         int                                  `json:"schema_version"`
 	Installed             []Artifact                           `json:"installed"`
 	DesiredSets           map[string]string                    `json:"desired_sets"`
+	StorageInstances      map[string]StorageInstance           `json:"storage_instances,omitempty"`
 	ArtifactAttestations  map[string][]plugintrust.Attestation `json:"artifact_attestations,omitempty"`
 	InstalledAttestations map[string]plugintrust.Attestation   `json:"installed_attestations,omitempty"`
 }
@@ -131,8 +145,34 @@ func Open(root string) (*Catalog, error) {
 	} else if err != nil {
 		return nil, ErrUnsafeStore
 	}
-	if _, err := c.readState(); err != nil {
+	state, err := c.readState()
+	if err != nil {
 		return nil, err
+	}
+	needsInstanceMigration := false
+	for providerID := range state.DesiredSets {
+		if _, ok := state.StorageInstances[legacyStorageInstanceID(providerID)]; !ok {
+			needsInstanceMigration = true
+			break
+		}
+	}
+	if needsInstanceMigration {
+		if state.StorageInstances == nil {
+			state.StorageInstances = make(map[string]StorageInstance, len(state.DesiredSets))
+		}
+		for providerID, setID := range state.DesiredSets {
+			id := legacyStorageInstanceID(providerID)
+			if _, exists := state.StorageInstances[id]; exists {
+				continue
+			}
+			state.StorageInstances[id] = StorageInstance{
+				ID: id, DisplayName: providerID, ProviderID: providerID, DesiredSetID: setID,
+				CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Unix(0, 0).UTC(),
+			}
+		}
+		if err := c.writeState(state); err != nil {
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -607,6 +647,11 @@ func (c *Catalog) Uninstall(id string) error {
 	}
 	state.Installed = installed
 	delete(state.DesiredSets, id)
+	// The compatibility instance mirrors DesiredSets[id]; once the legacy
+	// provider selection is uninstalled it must stop acting as an independent
+	// reference root. Explicitly named instances remain operator-owned and are
+	// retained so their config and generation pins stay stable.
+	delete(state.StorageInstances, legacyStorageInstanceID(id))
 	delete(state.InstalledAttestations, id)
 	return c.writeState(state)
 }
@@ -634,6 +679,18 @@ func (c *Catalog) SelectDesiredSet(providerID, setID string) error {
 		return ErrInvalidConfig
 	}
 	state.DesiredSets[providerID] = setID
+	if state.StorageInstances == nil {
+		state.StorageInstances = map[string]StorageInstance{}
+	}
+	legacyID := legacyStorageInstanceID(providerID)
+	legacy, exists := state.StorageInstances[legacyID]
+	if !exists {
+		now := time.Now().UTC()
+		legacy = StorageInstance{ID: legacyID, DisplayName: providerID, ProviderID: providerID, CreatedAt: now}
+	}
+	legacy.DesiredSetID = setID
+	legacy.UpdatedAt = time.Now().UTC()
+	state.StorageInstances[legacyID] = legacy
 	return c.writeState(state)
 }
 
@@ -657,6 +714,148 @@ func (c *Catalog) DesiredSet(providerID string) (Set, error) {
 		return Set{}, ErrInvalidSet
 	}
 	return set, nil
+}
+
+// CreateStorageInstance records a stable user-facing identity for an
+// installed provider and one of its immutable sets. The set stores provider
+// values and credentials; the catalog index stores no credential material.
+func (c *Catalog) CreateStorageInstance(displayName, providerID, setID string) (StorageInstance, error) {
+	if c == nil || !validStorageInstanceName(displayName) || !validProviderID(providerID) || !validDigest(setID) {
+		return StorageInstance{}, ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	set, err := c.loadSet(setID)
+	if err != nil || set.Artifact.ID != providerID {
+		return StorageInstance{}, ErrInvalidSet
+	}
+	state, err := c.readState()
+	if err != nil {
+		return StorageInstance{}, err
+	}
+	installed, installedOK := installedArtifact(state.Installed, providerID)
+	if !installedOK {
+		return StorageInstance{}, ErrArtifactMissing
+	}
+	if installed.Digest != set.Artifact.Digest {
+		return StorageInstance{}, ErrInvalidSet
+	}
+	id, err := newStorageInstanceID()
+	if err != nil {
+		return StorageInstance{}, ErrUnsafeStore
+	}
+	now := time.Now().UTC()
+	instance := StorageInstance{ID: id, DisplayName: strings.TrimSpace(displayName), ProviderID: providerID, DesiredSetID: setID, CreatedAt: now, UpdatedAt: now}
+	if state.StorageInstances == nil {
+		state.StorageInstances = map[string]StorageInstance{}
+	}
+	state.StorageInstances[id] = instance
+	if err := c.writeState(state); err != nil {
+		return StorageInstance{}, err
+	}
+	return instance, nil
+}
+
+// ListStorageInstances returns stable instance identities in deterministic
+// ID order. It never returns provider configuration or credentials.
+func (c *Catalog) ListStorageInstances() ([]StorageInstance, error) {
+	if c == nil {
+		return nil, ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state, err := c.readState()
+	if err != nil {
+		return nil, err
+	}
+	items := make([]StorageInstance, 0, len(state.StorageInstances))
+	for _, instance := range state.StorageInstances {
+		items = append(items, instance)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return items, nil
+}
+
+// LoadStorageInstance returns one bounded identity record.
+func (c *Catalog) LoadStorageInstance(id string) (StorageInstance, error) {
+	if c == nil || !validStorageInstanceID(id) {
+		return StorageInstance{}, ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state, err := c.readState()
+	if err != nil {
+		return StorageInstance{}, err
+	}
+	instance, ok := state.StorageInstances[id]
+	if !ok {
+		return StorageInstance{}, ErrSetMissing
+	}
+	return instance, nil
+}
+
+// UpdateStorageInstanceSet changes only the instance's desired immutable
+// configuration reference. Existing generations keep their exact set pin.
+func (c *Catalog) UpdateStorageInstanceSet(id, setID string) error {
+	if c == nil || !validStorageInstanceID(id) || !validDigest(setID) {
+		return ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state, err := c.readState()
+	if err != nil {
+		return err
+	}
+	instance, ok := state.StorageInstances[id]
+	if !ok {
+		return ErrSetMissing
+	}
+	set, err := c.loadSet(setID)
+	if err != nil || set.Artifact.ID != instance.ProviderID {
+		return ErrInvalidSet
+	}
+	installed, installedOK := installedArtifact(state.Installed, instance.ProviderID)
+	if !installedOK {
+		return ErrArtifactMissing
+	}
+	if installed.Digest != set.Artifact.Digest {
+		return ErrInvalidSet
+	}
+	if instance.DesiredSetID == setID {
+		return nil
+	}
+	instance.DesiredSetID = setID
+	instance.UpdatedAt = time.Now().UTC()
+	state.StorageInstances[id] = instance
+	if id == legacyStorageInstanceID(instance.ProviderID) {
+		state.DesiredSets[instance.ProviderID] = setID
+	}
+	return c.writeState(state)
+}
+
+// RenameStorageInstance preserves stable identity and immutable provider set.
+func (c *Catalog) RenameStorageInstance(id, displayName string) error {
+	if c == nil || !validStorageInstanceID(id) || !validStorageInstanceName(displayName) {
+		return ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state, err := c.readState()
+	if err != nil {
+		return err
+	}
+	instance, ok := state.StorageInstances[id]
+	if !ok {
+		return ErrSetMissing
+	}
+	displayName = strings.TrimSpace(displayName)
+	if instance.DisplayName == displayName {
+		return nil
+	}
+	instance.DisplayName = displayName
+	instance.UpdatedAt = time.Now().UTC()
+	state.StorageInstances[id] = instance
+	return c.writeState(state)
 }
 
 // CollectGarbage removes unreferenced sets and artifacts. Caller-protected
@@ -684,6 +883,9 @@ func (c *Catalog) CollectGarbage(protectedSetIDs []string) error {
 	}
 	for _, id := range state.DesiredSets {
 		protected[id] = true
+	}
+	for _, instance := range state.StorageInstances {
+		protected[instance.DesiredSetID] = true
 	}
 	setRoot := filepath.Join(c.root, "sets")
 	setItems, err := os.ReadDir(setRoot)
@@ -1007,7 +1209,7 @@ func (c *Catalog) readState() (catalogState, error) {
 		return catalogState{}, ErrUnsafeStore
 	}
 	var state catalogState
-	if decodeStrict(data, &state) != nil || state.SchemaVersion != SchemaVersion || state.Installed == nil || state.DesiredSets == nil || len(state.Installed) > maxCatalogItems || len(state.DesiredSets) > maxCatalogItems || len(state.ArtifactAttestations) > maxCatalogItems || len(state.InstalledAttestations) > maxCatalogItems {
+	if decodeStrict(data, &state) != nil || state.SchemaVersion != SchemaVersion || state.Installed == nil || state.DesiredSets == nil || len(state.Installed) > maxCatalogItems || len(state.DesiredSets) > maxCatalogItems || len(state.StorageInstances) > maxCatalogItems || len(state.ArtifactAttestations) > maxCatalogItems || len(state.InstalledAttestations) > maxCatalogItems {
 		return catalogState{}, ErrUnsafeStore
 	}
 	canonical, err := encodeState(state)
@@ -1047,6 +1249,21 @@ func (c *Catalog) readState() (catalogState, error) {
 		set, loadErr := c.loadSet(setID)
 		if loadErr != nil || set.Artifact.ID != providerID || !hasInstalledID(state.Installed, providerID) {
 			return catalogState{}, ErrUnsafeStore
+		}
+	}
+	for id, instance := range state.StorageInstances {
+		if !validStorageInstanceID(id) || instance.ID != id || !validStorageInstanceName(instance.DisplayName) ||
+			!validProviderID(instance.ProviderID) || !validDigest(instance.DesiredSetID) || instance.UpdatedAt.Before(instance.CreatedAt) {
+			return catalogState{}, ErrUnsafeStore
+		}
+		set, loadErr := c.loadSet(instance.DesiredSetID)
+		if loadErr != nil || set.Artifact.ID != instance.ProviderID {
+			return catalogState{}, ErrUnsafeStore
+		}
+		if id == legacyStorageInstanceID(instance.ProviderID) {
+			if desiredSetID, exists := state.DesiredSets[instance.ProviderID]; exists && desiredSetID != instance.DesiredSetID {
+				return catalogState{}, ErrUnsafeStore
+			}
 		}
 	}
 	return state, nil
@@ -1106,6 +1323,12 @@ func encodeState(state catalogState) ([]byte, error) {
 	sort.Slice(copy.Installed, func(i, j int) bool { return copy.Installed[i].ID < copy.Installed[j].ID })
 	for id, setID := range state.DesiredSets {
 		copy.DesiredSets[id] = setID
+	}
+	if len(state.StorageInstances) > 0 {
+		copy.StorageInstances = make(map[string]StorageInstance, len(state.StorageInstances))
+		for id, instance := range state.StorageInstances {
+			copy.StorageInstances[id] = instance
+		}
 	}
 	if len(state.ArtifactAttestations) > 0 {
 		copy.ArtifactAttestations = make(map[string][]plugintrust.Attestation, len(state.ArtifactAttestations))
@@ -1296,6 +1519,63 @@ func validProviderID(id string) bool {
 	}
 	for _, value := range id[1:] {
 		if !(value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func newStorageInstanceID() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return "si_" + hex.EncodeToString(random[:]), nil
+}
+
+func legacyStorageInstanceID(providerID string) string {
+	digest := digestBytes([]byte(providerID))
+	return "si_legacy_" + digest[:24]
+}
+
+// LegacyStorageInstanceID returns deterministic identity used to preserve
+// provider-ID based DesiredSets and API routes during control-plane upgrade.
+func LegacyStorageInstanceID(providerID string) string {
+	if !validProviderID(providerID) {
+		return ""
+	}
+	return legacyStorageInstanceID(providerID)
+}
+
+func validStorageInstanceID(id string) bool {
+	if strings.HasPrefix(id, "si_legacy_") {
+		return validLowerHex(id[len("si_legacy_"):], 24)
+	}
+	if strings.HasPrefix(id, "si_") {
+		return validLowerHex(id[len("si_"):], 32)
+	}
+	return false
+}
+
+func validLowerHex(value string, size int) bool {
+	if len(value) != size {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validStorageInstanceName(name string) bool {
+	name = strings.TrimSpace(name)
+	if len(name) == 0 || len(name) > 128 {
+		return false
+	}
+	for _, character := range name {
+		if character < 0x20 || character == 0x7f {
 			return false
 		}
 	}

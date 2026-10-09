@@ -46,14 +46,15 @@ import (
 )
 
 const (
-	defaultDataDir       = "/data"
-	defaultListenAddr    = ":8080"
-	defaultAdapterDirs   = "/external-adapters"
-	defaultControlWait   = 45 * time.Second
-	controlPrepareWait   = 2 * time.Minute
-	defaultCloseWait     = 20 * time.Second
-	maximumTokenFileSize = 32
-	maxControlTrustBytes = 64 << 10
+	defaultDataDir           = "/data"
+	defaultListenAddr        = ":8080"
+	defaultAdapterDirs       = "/external-adapters"
+	defaultPluginRegistryURL = pluginregistry.OfficialCatalogV3URL
+	defaultControlWait       = 45 * time.Second
+	controlPrepareWait       = 2 * time.Minute
+	defaultCloseWait         = 20 * time.Second
+	maximumTokenFileSize     = 32
+	maxControlTrustBytes     = 64 << 10
 )
 
 // defaultBundleDir is a linker-overridable build input so process-level tests
@@ -103,7 +104,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		DataDir: defaultDataDir, BundleDir: defaultBundleDir, StorageLocalBinary: defaultStorageLocalBinary, BundledHLSBinary: defaultBundledHLSBinary,
-		ListenAddr: defaultListenAddr, AdapterDirs: defaultAdapterDirs,
+		ListenAddr: defaultListenAddr, AdapterDirs: defaultAdapterDirs, PluginRegistryURL: defaultPluginRegistryURL,
 		ControlReadyWait: defaultControlWait, ShutdownTimeout: defaultCloseWait,
 	}
 }
@@ -139,7 +140,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	c.AuthDisabled = getenv("AUTH_DISABLED") == "1"
 	c.ForceSecureCookies = getenv("COOKIE_SECURE") == "1"
 	c.ReleaseBundleDir = strings.TrimSpace(getenv("IR_RELEASE_BUNDLE_DIR"))
-	c.PluginRegistryURL = strings.TrimSpace(getenv("IR_PLUGIN_REGISTRY_URL"))
+	if value := strings.TrimSpace(getenv("IR_PLUGIN_REGISTRY_URL")); value != "" {
+		c.PluginRegistryURL = value
+	}
 	trustedKeys, err := parseTrustedReleaseKeys(strings.TrimSpace(getenv("IR_RELEASE_TRUSTED_KEYS_JSON")))
 	if err != nil {
 		return Config{}, err
@@ -236,7 +239,7 @@ func Run(ctx context.Context, config Config) error {
 		}
 	}
 	if installState.Snapshot().State == installation.StateUninitialized || installState.Snapshot().State == installation.StateSetupInProgress {
-		log.Printf("First-run setup is required. Obtain the one-time setup code with `runtime-host setup-code` inside the runtime.")
+		log.Print(firstRunSetupConsoleMessage(config.DataDir))
 	} else if installState.Snapshot().State == installation.StateRecoveryRequired {
 		log.Printf("Installation recovery is required (diagnostic: %s).", installState.Snapshot().DiagnosticCode)
 	}
@@ -396,20 +399,11 @@ func Run(ctx context.Context, config Config) error {
 			return errors.New("active Runtime Host adapter set is unavailable")
 		}
 	}
-	storageSetID := localStorageSet.ID
-	if active, ok := registrySnapshot.Generations[registrySnapshot.ActiveGenerationID]; ok && active.StorageProviderSetID != "" {
-		activeSet, setErr := storageCatalog.LoadSet(active.StorageProviderSetID)
-		if setErr != nil {
-			return errors.New("active Runtime Host storage provider set is unavailable")
-		}
-		// A selected external primary survives app and Host restarts. A changed
-		// bundled local artifact only rolls forward generations already using
-		// storage.local; active recordings keep their prior immutable set.
-		if activeSet.Artifact.ID != "local" {
-			storageSetID = active.StorageProviderSetID
-		}
+	storageSetID, storageInstanceID, err := resolveStartupStoragePin(storageCatalog, registrySnapshot, localStorageSet.ID)
+	if err != nil {
+		return err
 	}
-	selected, startupGeneration, needsRegistryStage, err := prepareStartupGeneration(selected, registrySnapshot, adapterSet.ID, storageSetID)
+	selected, startupGeneration, needsRegistryStage, err := prepareStartupGeneration(selected, registrySnapshot, adapterSet.ID, storageSetID, storageInstanceID)
 	if err != nil {
 		return err
 	}
@@ -604,7 +598,7 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return fmt.Errorf("initialize Runtime Host update controller: %w", err)
 	}
-	updateHandler, err := httpapi.New(hostAuth, config.AuthDisabled, config.ForceSecureCookies, updates, sup)
+	updateHandler, err := httpapi.NewWithAudit(hostAuth, config.AuthDisabled, config.ForceSecureCookies, updates, sup, lifecycle)
 	if err != nil {
 		return fmt.Errorf("initialize Runtime Host update API: %w", err)
 	}
@@ -674,6 +668,14 @@ func PrintSetupCode(dataDir string, output io.Writer) error {
 		return errors.New("setup code could not be written")
 	}
 	return nil
+}
+
+func firstRunSetupConsoleMessage(dataDir string) string {
+	var output strings.Builder
+	if err := PrintSetupCode(dataDir, &output); err != nil {
+		return "First-run setup is required. Obtain the one-time setup code with `runtime-host setup-code` inside the runtime."
+	}
+	return fmt.Sprintf("First-run setup is required. Enter one-time setup code from local Runtime Host console/container logs: %s. CLI fallback: `runtime-host setup-code`.", strings.TrimSpace(output.String()))
 }
 
 func releaseProcessResources(coordinator *resources.Coordinator, spec supervisor.ProcessSpec) {
@@ -994,12 +996,62 @@ func runtimeGeneration(id string, build buildinfo.Info) generation.Generation {
 	}
 }
 
+type startupStorageCatalog interface {
+	LoadSet(string) (storagecatalog.Set, error)
+	LoadStorageInstance(string) (storagecatalog.StorageInstance, error)
+}
+
+// resolveStartupStoragePin selects the current immutable set for an active
+// named instance. The active generation keeps its original set pin; callers
+// stage a new generation when the instance's desired set changed.
+func resolveStartupStoragePin(catalog startupStorageCatalog, state generation.Snapshot, localSetID string) (string, string, error) {
+	if catalog == nil || localSetID == "" {
+		return "", "", errors.New("Runtime Host storage provider set is unavailable")
+	}
+	storageSetID := localSetID
+	storageInstanceID := storagecatalog.LegacyStorageInstanceID("local")
+	active, exists := state.Generations[state.ActiveGenerationID]
+	if !exists || state.ActiveGenerationID == "" {
+		return storageSetID, storageInstanceID, nil
+	}
+	if active.StorageProviderSetID == "" {
+		if active.StorageInstanceID != "" {
+			return "", "", errors.New("active Runtime Host storage instance is unavailable")
+		}
+		return storageSetID, storageInstanceID, nil
+	}
+	activeSet, err := catalog.LoadSet(active.StorageProviderSetID)
+	if err != nil {
+		return "", "", errors.New("active Runtime Host storage provider set is unavailable")
+	}
+	if active.StorageInstanceID != "" {
+		instance, err := catalog.LoadStorageInstance(active.StorageInstanceID)
+		if err != nil || instance.ID != active.StorageInstanceID || instance.ProviderID != activeSet.Artifact.ID {
+			return "", "", errors.New("active Runtime Host storage instance is unavailable")
+		}
+		desiredSet, err := catalog.LoadSet(instance.DesiredSetID)
+		if err != nil || desiredSet.Artifact.ID != instance.ProviderID {
+			return "", "", errors.New("active Runtime Host storage instance set is unavailable")
+		}
+		return desiredSet.ID, instance.ID, nil
+	}
+
+	// Legacy generations have no named instance pin. A selected external
+	// provider survives restart; a bundled local artifact change rolls forward
+	// the legacy local instance without changing existing recording pins.
+	if activeSet.Artifact.ID != "local" {
+		storageSetID = active.StorageProviderSetID
+	}
+	storageInstanceID = storagecatalog.LegacyStorageInstanceID(activeSet.Artifact.ID)
+	return storageSetID, storageInstanceID, nil
+}
+
 // prepareStartupGeneration binds the selected application release to both
 // immutable source-adapter and physical-storage sets. A set change over an
 // existing active application allocates a new generation identity and copies
 // the exact application compatibility tuple; it never edits the old one.
-func prepareStartupGeneration(selected runtimeRelease, registryState generation.Snapshot, adapterSetID, storageProviderSetID string) (runtimeRelease, generation.Generation, bool, error) {
-	if adapterSetID == "" || storageProviderSetID == "" {
+func prepareStartupGeneration(selected runtimeRelease, registryState generation.Snapshot, adapterSetID, storageProviderSetID, storageInstanceID string) (runtimeRelease, generation.Generation, bool, error) {
+	if adapterSetID == "" || storageProviderSetID == "" || storageInstanceID == "" {
 		return runtimeRelease{}, generation.Generation{}, false, errors.New("adapter or storage provider set identity is unavailable")
 	}
 	if registryState.ActiveGenerationID != "" {
@@ -1007,7 +1059,7 @@ func prepareStartupGeneration(selected runtimeRelease, registryState generation.
 		if !ok || active.State != generation.StateActive {
 			return runtimeRelease{}, generation.Generation{}, false, errors.New("active application generation is inconsistent")
 		}
-		if active.AdapterSetID != adapterSetID || active.StorageProviderSetID != storageProviderSetID {
+		if active.AdapterSetID != adapterSetID || active.StorageProviderSetID != storageProviderSetID || active.StorageInstanceID != storageInstanceID {
 			id, err := newGenerationID()
 			if err != nil {
 				return runtimeRelease{}, generation.Generation{}, false, err
@@ -1016,6 +1068,7 @@ func prepareStartupGeneration(selected runtimeRelease, registryState generation.
 			candidate.ID = id
 			candidate.AdapterSetID = adapterSetID
 			candidate.StorageProviderSetID = storageProviderSetID
+			candidate.StorageInstanceID = storageInstanceID
 			candidate.InstalledAt = time.Now().UTC()
 			candidate.State = generation.StateStaging
 			candidate.EngineDormant = false
@@ -1031,6 +1084,7 @@ func prepareStartupGeneration(selected runtimeRelease, registryState generation.
 	candidate := runtimeGeneration(selected.generationID, selected.appBuild)
 	candidate.AdapterSetID = adapterSetID
 	candidate.StorageProviderSetID = storageProviderSetID
+	candidate.StorageInstanceID = storageInstanceID
 	return selected, candidate, true, nil
 }
 
@@ -1428,6 +1482,10 @@ func (c *controlLifecycle) register(generationID, socket, tokenPath, instanceID 
 }
 
 func (c *controlLifecycle) call(ctx context.Context, generationID, operation string) (controlplane.LifecycleSnapshot, error) {
+	return c.callPayload(ctx, generationID, operation, nil)
+}
+
+func (c *controlLifecycle) callPayload(ctx context.Context, generationID, operation string, payload any) (controlplane.LifecycleSnapshot, error) {
 	<-c.mu
 	client := c.clients[generationID]
 	c.mu <- struct{}{}
@@ -1435,13 +1493,33 @@ func (c *controlLifecycle) call(ctx context.Context, generationID, operation str
 		return controlplane.LifecycleSnapshot{}, errors.New("Control lifecycle IPC endpoint is unavailable")
 	}
 	var snapshot controlplane.LifecycleSnapshot
-	if err := client.Call(ctx, operation, nil, &snapshot); err != nil {
+	if err := client.Call(ctx, operation, payload, &snapshot); err != nil {
 		return controlplane.LifecycleSnapshot{}, err
 	}
 	if snapshot.GenerationID != generationID {
 		return controlplane.LifecycleSnapshot{}, errors.New("Control lifecycle response generation mismatch")
 	}
 	return snapshot, nil
+}
+
+// AppendAudit forwards only to the Host-selected active Control. The Control
+// lifecycle checks ACTIVE again while serialized with handoff, so a stale Host
+// selection cannot append through a passive generation.
+func (c *controlLifecycle) AppendAudit(ctx context.Context, request controlplane.AuditAppendRequest) error {
+	if c == nil || ctx == nil || request.Validate() != nil {
+		return errors.New("active Control audit append is unavailable")
+	}
+	generationID := c.activeGenerationID()
+	if generationID == "" {
+		return errors.New("active Control audit append is unavailable")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	snapshot, err := c.callPayload(callCtx, generationID, controlplane.OperationControlAppendAudit, request)
+	if err != nil || !snapshot.Active || snapshot.State != controlplane.LifecycleActive {
+		return errors.New("active Control audit append was not confirmed")
+	}
+	return nil
 }
 
 func (c *controlLifecycle) PrepareHandoff(ctx context.Context, oldID, _ string) error {

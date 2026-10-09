@@ -132,7 +132,7 @@ func (s *Server) adapterRestart(w http.ResponseWriter, r *http.Request) {
 		writeAdapterControlError(w, err)
 		return
 	}
-	auditErr := s.appendAudit("adapter_restarted", adapter.Status.ID)
+	auditErr := s.appendAuditForRequest(r, "adapter_restarted", adapter.Status.ID)
 	setAdapterAuditHeader(w, s.products != nil, auditErr, true)
 	writeJSON(w, http.StatusOK, s.projectAdapter(adapter))
 }
@@ -178,7 +178,7 @@ func (s *Server) adapterSetEnabled(w http.ResponseWriter, r *http.Request, enabl
 		if !enabled {
 			auditType = "adapter_disabled"
 		}
-		auditErr = s.appendAudit(auditType, id)
+		auditErr = s.appendAuditForRequest(r, auditType, id)
 	}
 	setAdapterAuditHeader(w, s.products != nil, auditErr, wasEnabled != enabled)
 	adapter, err := s.adapters.Get(id)

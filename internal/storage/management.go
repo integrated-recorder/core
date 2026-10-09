@@ -76,6 +76,21 @@ type StorageStats struct {
 	ManifestCount            int    `json:"manifest_count"`
 }
 
+// StorageCapacityStats returns filesystem capacity without walking archive
+// contents. Remote providers may not expose host filesystem capacity.
+func (s *Store) StorageCapacityStats() (StorageStats, error) {
+	if s == nil || s.StorageBackend == nil {
+		return StorageStats{}, errors.New("storage backend is unavailable")
+	}
+	reader, ok := s.StorageBackend.(interface {
+		StorageCapacityStats() (StorageStats, error)
+	})
+	if !ok {
+		return StorageStats{CapacityKnown: false}, nil
+	}
+	return reader.StorageCapacityStats()
+}
+
 type archiveReference struct {
 	path string
 	kind string
@@ -333,31 +348,11 @@ func (r contextReader) Read(buffer []byte) (int, error) {
 // StorageStats returns canonical object counts and physical bytes below the
 // recordings directory. Symlinks are counted neither as files nor traversed.
 func (s *LocalFilesystemBackend) StorageStats() (StorageStats, error) {
-	stats := StorageStats{ArchiveRoot: s.root}
-	var fs syscall.Statfs_t
-	if err := syscall.Statfs(s.root, &fs); err != nil {
-		return StorageStats{}, errors.New("filesystem statistics unavailable")
+	stats, err := s.StorageCapacityStats()
+	if err != nil {
+		return StorageStats{}, err
 	}
-	blockSize := uint64(fs.Bsize)
-	if fs.Bfree > fs.Blocks || fs.Bavail > fs.Blocks {
-		return StorageStats{}, errors.New("filesystem statistics are inconsistent")
-	}
-	total, ok := checkedByteProduct(fs.Blocks, blockSize)
-	if !ok {
-		return StorageStats{}, errors.New("filesystem statistics overflow")
-	}
-	used, ok := checkedByteProduct(fs.Blocks-fs.Bfree, blockSize)
-	if !ok {
-		return StorageStats{}, errors.New("filesystem statistics overflow")
-	}
-	available, ok := checkedByteProduct(fs.Bavail, blockSize)
-	if !ok {
-		return StorageStats{}, errors.New("filesystem statistics overflow")
-	}
-	stats.FilesystemTotalBytes = total
-	stats.FilesystemUsedBytes = used
-	stats.FilesystemAvailableBytes = available
-	stats.CapacityKnown = true
+	stats.ArchiveRoot = s.root
 
 	base := filepath.Join(s.root, "recordings")
 	baseInfo, err := os.Lstat(base)
@@ -413,6 +408,36 @@ func (s *LocalFilesystemBackend) StorageStats() (StorageStats, error) {
 	return stats, nil
 }
 
+// StorageCapacityStats uses statfs only. It does not traverse recordings.
+func (s *LocalFilesystemBackend) StorageCapacityStats() (StorageStats, error) {
+	stats := StorageStats{ArchiveRoot: s.root}
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(s.root, &fs); err != nil {
+		return StorageStats{}, errors.New("filesystem statistics unavailable")
+	}
+	blockSize := uint64(fs.Bsize)
+	if fs.Bfree > fs.Blocks || fs.Bavail > fs.Blocks {
+		return StorageStats{}, errors.New("filesystem statistics are inconsistent")
+	}
+	total, ok := checkedByteProduct(fs.Blocks, blockSize)
+	if !ok {
+		return StorageStats{}, errors.New("filesystem statistics overflow")
+	}
+	used, ok := checkedByteProduct(fs.Blocks-fs.Bfree, blockSize)
+	if !ok {
+		return StorageStats{}, errors.New("filesystem statistics overflow")
+	}
+	available, ok := checkedByteProduct(fs.Bavail, blockSize)
+	if !ok {
+		return StorageStats{}, errors.New("filesystem statistics overflow")
+	}
+	stats.FilesystemTotalBytes = total
+	stats.FilesystemUsedBytes = used
+	stats.FilesystemAvailableBytes = available
+	stats.CapacityKnown = true
+	return stats, nil
+}
+
 // DeleteRecordingData atomically hides a recording by renaming its directory
 // to a random tombstone before removing it. Calls for an already absent ID are
 // successful, making retries idempotent.
@@ -458,6 +483,7 @@ func (s *LocalFilesystemBackend) DeleteRecordingData(id string) error {
 			return errors.New("recording could not be moved to deletion tombstone")
 		}
 		tombstone = candidate
+		s.noteManagementRoot(id, false)
 		break
 	}
 	if tombstone == "" {

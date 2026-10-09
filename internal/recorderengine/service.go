@@ -23,30 +23,34 @@ import (
 )
 
 const (
-	OperationReady                  = "ready"
-	OperationHeartbeat              = "heartbeat"
-	OperationStartResolved          = "start_resolved"
-	OperationBeginDrain             = "begin_drain"
-	OperationActiveCount            = "active_recordings"
-	OperationGet                    = "get"
-	OperationLifecycleSnapshot      = "lifecycle_snapshot"
-	OperationLivePlaybackSnapshot   = "live_playback_snapshot"
-	OperationList                   = "list"
-	OperationStop                   = "stop"
-	OperationComplete               = "complete_recording"
-	OperationSealArchive            = "seal_archive"
-	OperationDelete                 = "delete"
-	OperationDeleteTerminal         = "delete_terminal_archive"
-	OperationInventory              = "inventory"
-	OperationHandoverSnapshot       = "handover_snapshot"
-	OperationHandoverPause          = "handover_pause"
-	OperationHandoverResume         = "handover_resume"
-	OperationHandoverComplete       = "handover_complete"
-	OperationHandoverPrepareTarget  = "handover_prepare_target"
-	OperationHandoverActivateTarget = "handover_activate_target"
-	OperationHandoverDiscardTarget  = "handover_discard_target"
-	DefaultListLimit                = 2000
-	MaximumListLimit                = 10000
+	OperationReady                         = "ready"
+	OperationHeartbeat                     = "heartbeat"
+	OperationStartResolved                 = "start_resolved"
+	OperationBeginDrain                    = "begin_drain"
+	OperationActiveCount                   = "active_recordings"
+	OperationGet                           = "get"
+	OperationGetManagementHeader           = "get_management_header"
+	OperationInvalidateManagementRootCache = "invalidate_management_root_cache"
+	OperationLifecycleSnapshot             = "lifecycle_snapshot"
+	OperationLivePlaybackSnapshot          = "live_playback_snapshot"
+	OperationList                          = "list"
+	OperationListPage                      = "list_page"
+	OperationStop                          = "stop"
+	OperationComplete                      = "complete_recording"
+	OperationSealArchive                   = "seal_archive"
+	OperationDelete                        = "delete"
+	OperationDeleteTerminal                = "delete_terminal_archive"
+	OperationInventory                     = "inventory"
+	OperationHandoverSnapshot              = "handover_snapshot"
+	OperationHandoverPause                 = "handover_pause"
+	OperationHandoverResume                = "handover_resume"
+	OperationHandoverComplete              = "handover_complete"
+	OperationHandoverPrepareTarget         = "handover_prepare_target"
+	OperationHandoverActivateTarget        = "handover_activate_target"
+	OperationHandoverDiscardTarget         = "handover_discard_target"
+	DefaultListLimit                       = 2000
+	MaximumListLimit                       = 10000
+	MaximumListPageLimit                   = 128
 )
 
 type StartResolvedRequest struct {
@@ -117,6 +121,16 @@ type GenerationRequest struct {
 
 type ListRequest struct {
 	Limit int `json:"limit,omitempty"`
+}
+
+type ListPageRequest struct {
+	AfterID string `json:"after_id,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+}
+
+type ListPageResult struct {
+	Items      []*domain.Recording `json:"items"`
+	NextCursor string              `json:"next_cursor,omitempty"`
 }
 
 type ReadyResult struct {
@@ -373,6 +387,24 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 			return nil, publicError("read_failed", "recording could not be read")
 		}
 		return result, nil
+	case OperationGetManagementHeader:
+		var request RecordingIDRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {
+			return nil, publicError("invalid_request", "recording identity is invalid")
+		}
+		result, err := e.manager.GetManagementHeader(ctx, request.RecordingID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, publicError("not_found", "recording was not found")
+			}
+			return nil, publicError("read_failed", "recording management header could not be read")
+		}
+		return result, nil
+	case OperationInvalidateManagementRootCache:
+		e.manager.InvalidateManagementRootCache()
+		return struct {
+			Invalidated bool `json:"invalidated"`
+		}{Invalidated: true}, nil
 	case OperationLifecycleSnapshot:
 		var request RecordingIDRequest
 		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {
@@ -419,6 +451,36 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 			return nil, publicError("read_failed", "recording list could not be read")
 		}
 		return result, nil
+	case OperationListPage:
+		var request ListPageRequest
+		if err := decodePayload(payload, &request); err != nil {
+			return nil, publicError("invalid_request", "recording list page request is invalid")
+		}
+		limit := request.Limit
+		if limit == 0 {
+			limit = MaximumListPageLimit
+		}
+		if limit < 1 || limit > MaximumListPageLimit || len(request.AfterID) > 64 {
+			return nil, publicError("invalid_request", "recording list page is outside the supported range")
+		}
+		for {
+			rows, next, err := e.manager.ListForManagementPage(ctx, request.AfterID, limit)
+			if errors.Is(err, acquire.ErrListLimit) {
+				return nil, publicError("invalid_request", "recording list page is outside the supported range")
+			}
+			if err != nil {
+				return nil, publicError("read_failed", "recording summary page could not be read")
+			}
+			result := ListPageResult{Items: rows, NextCursor: next}
+			encoded, marshalErr := json.Marshal(result)
+			if marshalErr == nil && len(encoded) <= runtimeipc.MaxFrameBytes/2 {
+				return result, nil
+			}
+			if limit == 1 {
+				return nil, publicError("response_too_large", "recording summary page exceeds the runtime message limit")
+			}
+			limit /= 2
+		}
 	case OperationStop:
 		var request RecordingIDRequest
 		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {

@@ -364,7 +364,8 @@ func (c *updateController) Stage(ctx context.Context) (httpapi.Status, error) {
 	newGeneration := generation.Generation{
 		ID: genID, Version: installed.Manifest.ReleaseVersion, Commit: strings.ToLower(installed.Manifest.Commit),
 		AdapterSetID: activeGeneration.AdapterSetID, StorageProviderSetID: activeGeneration.StorageProviderSetID,
-		InstalledAt: time.Now().UTC(), State: generation.StateStaging,
+		StorageInstanceID: activeGeneration.StorageInstanceID,
+		InstalledAt:       time.Now().UTC(), State: generation.StateStaging,
 		ControlProtocol: installed.Manifest.ControlProtocolVersion, EngineProtocol: installed.Manifest.EngineProtocolVersion,
 		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: installed.Manifest.ArchiveReadMinimum, Maximum: installed.Manifest.ArchiveReadMaximum},
 		ArchiveWriteFormat:       installed.Manifest.ArchiveWriteFormat,

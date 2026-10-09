@@ -231,6 +231,9 @@ func TestAuditAndNotificationSemantics(t *testing.T) {
 	if err := store.AppendAudit(AuditEvent{ID: "bad", Type: "config_changed", At: now, ObjectID: "token=secret"}); err == nil {
 		t.Fatal("audit accepted arbitrary object identifier")
 	}
+	if got := store.Audit(10)[0].Actor; got == nil || got.Type != AuditActorSystem {
+		t.Fatalf("implicit system audit actor = %+v", got)
+	}
 	for _, notification := range []Notification{
 		{ID: "notice-1", Type: "recording_completed", At: now, ObjectID: testRecordingID},
 		{ID: "notice-2", Type: "integrity_failure", At: now.Add(time.Second), ObjectID: testRecordingID},
@@ -258,6 +261,75 @@ func TestAuditAndNotificationSemantics(t *testing.T) {
 	}
 	if got := reloaded.Notifications(false, 10); len(got) != 2 || !got[0].Read || !got[1].Read {
 		t.Fatalf("notification read state did not persist: %+v", got)
+	}
+}
+
+func TestAuditActorValidationAndCursorPaginationAcrossTenThousandEvents(t *testing.T) {
+	store, root := openTestStore(t)
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	events := make([]AuditEvent, maxAuditEvents)
+	for i := range events {
+		events[i] = AuditEvent{
+			ID: fmt.Sprintf("audit-%05d", i), Type: "config_changed",
+			At:    base.Add(time.Duration(i%23) * time.Second),
+			Actor: &AuditActor{Type: AuditActorUser, UserID: "user_0123456789abcdef0123456789abcdef"},
+		}
+	}
+	store.audit = sortAudit(events)
+	if err := store.write(filepath.Join(store.root, "audit.json"), store.audit); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reload persisted data. This checks actor schema and pagination over the
+	// actual 10,000-event store limit without 10,000 full-file rewrites.
+	store, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := store.Audit(maxAuditEvents)
+	seen := make(map[string]bool, len(want))
+	var gotAll []AuditEvent
+	cursor := ""
+	for pageNumber := 0; ; pageNumber++ {
+		page, next, err := store.AuditPage(137, cursor)
+		if err != nil {
+			t.Fatalf("AuditPage(%d): %v", pageNumber, err)
+		}
+		if len(page) == 0 && cursor != "" {
+			break
+		}
+		for _, event := range page {
+			if seen[event.ID] {
+				t.Fatalf("duplicate audit event %q", event.ID)
+			}
+			seen[event.ID] = true
+			gotAll = append(gotAll, event)
+		}
+		if len(page) > 137 {
+			t.Fatalf("page size %d exceeded requested bound", len(page))
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if len(gotAll) != len(want) {
+		t.Fatalf("paginated %d audit events, want %d", len(gotAll), len(want))
+	}
+	for i := range want {
+		if gotAll[i].ID != want[i].ID {
+			t.Fatalf("page order[%d]=%q, want %q", i, gotAll[i].ID, want[i].ID)
+		}
+		if gotAll[i].Actor == nil || gotAll[i].Actor.Type != AuditActorUser || gotAll[i].Actor.UserID != "user_0123456789abcdef0123456789abcdef" {
+			t.Fatalf("actor[%d]=%+v", i, gotAll[i].Actor)
+		}
+	}
+
+	if _, _, err := store.AuditPage(10, strings.Repeat("x", maxAuditCursorBytes+1)); !errors.Is(err, ErrInvalidAuditCursor) {
+		t.Fatalf("oversized cursor error=%v", err)
+	}
+	if err := store.AppendAudit(AuditEvent{ID: "bad-actor", Type: "config_changed", At: base, Actor: &AuditActor{Type: AuditActorUser, UserID: "../admin"}}); err == nil {
+		t.Fatal("audit accepted path-like user ID")
 	}
 }
 

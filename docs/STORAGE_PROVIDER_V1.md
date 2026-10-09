@@ -67,8 +67,9 @@ missing or unavailable provider does not trigger direct-local fallback.
 
 ## Plugin Registry compatibility and v2
 
-`IR_PLUGIN_REGISTRY_URL` optionally configures the static HTTPS approval
-catalog. There is no built-in production registry URL. The registry approves
+`IR_PLUGIN_REGISTRY_URL` defaults to the official static HTTPS approval
+catalog at `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`.
+Operators can override it with another HTTPS catalog URL. The registry approves
 an exact executable; it does not build or clone source. A GitHub Release or CDN
 is transport only. Publisher PKI/signatures are not part of the current trust
 model: the configured registry pins the artifact filename, platform, exact

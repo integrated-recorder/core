@@ -1,4 +1,4 @@
-// Package authn provides the single-administrator authentication foundation.
+// Package authn provides local user identity, sessions, and authorization.
 // It intentionally contains no HTTP routes or server path policy.
 package authn
 
@@ -25,6 +25,7 @@ const (
 	securityDirectory       = "security"
 	sessionDirectory        = "sessions"
 	adminFilename           = "admin.json"
+	usersFilename           = "users.json"
 	bootstrapTokenFilename  = "bootstrap-token"
 	maxPasswordBytes        = 72 // bcrypt's input limit.
 	minPasswordBytes        = 12
@@ -33,6 +34,7 @@ const (
 	defaultBcryptCost       = bcrypt.DefaultCost
 	maxBootstrapTokenLength = 256
 	maxSessionRecordBytes   = 1024
+	maxUserStoreBytes       = 1 << 20
 )
 
 var (
@@ -43,6 +45,8 @@ var (
 	ErrUnauthenticated       = errors.New("unauthenticated")
 	ErrSessionCapacity       = errors.New("session capacity reached")
 	ErrNotBootstrapped       = errors.New("administrator is not configured")
+	ErrUserNotFound          = errors.New("user not found")
+	ErrDuplicateLogin        = errors.New("login identity already exists")
 	ErrStorage               = errors.New("authentication storage failure")
 	ErrCorruptStore          = errors.New("authentication store is invalid")
 )
@@ -54,33 +58,66 @@ type Session struct {
 	Token     string    `json:"-"`
 	CSRFToken string    `json:"csrf_token,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
+	UserID    string    `json:"-"`
+	Login     string    `json:"-"`
+	Role      string    `json:"-"`
 }
 
 type adminRecord struct {
 	PasswordHash string `json:"password_hash"`
 }
 
+const (
+	RoleOwner        = "owner"
+	UserStatusActive = "active"
+)
+
+// User is safe identity metadata. Password hashes never leave the private
+// persisted user record.
+type User struct {
+	ID        string    `json:"user_id"`
+	Login     string    `json:"login"`
+	Role      string    `json:"role"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type userRecord struct {
+	User
+	PasswordHash string `json:"password_hash"`
+}
+
+type persistedUserStore struct {
+	Version int          `json:"version"`
+	Users   []userRecord `json:"users"`
+}
+
+const userStoreVersion = 1
+
 type sessionRecord struct {
 	csrfHash  [sha256.Size]byte
 	expiresAt time.Time
+	userID    string
 }
 
 type persistedSessionRecord struct {
 	CSRFHash  string    `json:"csrf_hash"`
 	ExpiresAt time.Time `json:"expires_at"`
+	UserID    string    `json:"user_id,omitempty"`
 }
 
-// Service manages one local administrator and sessions persisted as private,
+// Service manages local users and sessions persisted as private,
 // per-session records. Per-session records allow overlapping control-plane
 // generations to share session validity without read-modify-write races on a
 // shared session-map file.
 type Service struct {
 	mu sync.Mutex
 
-	securityDir string
-	sessionsDir string
-	adminHash   []byte
-	allowToken  bool
+	securityDir          string
+	sessionsDir          string
+	allowToken           bool
+	removeSessionFile    func(string) error
+	syncSessionDirectory func(string) error
 
 	now        func() time.Time
 	bcryptCost int
@@ -129,38 +166,33 @@ func open(dataRoot string, allowToken bool) (*Service, error) {
 	}
 
 	s := &Service{
-		securityDir: securityDir,
-		sessionsDir: sessionsDir,
-		now:         time.Now,
-		bcryptCost:  defaultBcryptCost,
-		allowToken:  allowToken,
+		securityDir:          securityDir,
+		sessionsDir:          sessionsDir,
+		now:                  time.Now,
+		bcryptCost:           defaultBcryptCost,
+		allowToken:           allowToken,
+		removeSessionFile:    os.Remove,
+		syncSessionDirectory: syncDirectory,
 	}
-	adminPath := filepath.Join(securityDir, adminFilename)
-	hash, err := readAdminHash(adminPath)
-	if err == nil {
-		s.adminHash = hash
-		// Once the administrator record exists, a leftover token is never
-		// usable. Remove crash residue rather than allowing stale bootstrap data.
+	if err := s.loadOrMigrateUsers(allowToken); err != nil {
+		if !allowToken && errors.Is(err, ErrCorruptStore) {
+			// Recovery mode can serve its bounded UI, but corrupt identity state
+			// never becomes claimable or writable.
+			return s, nil
+		}
+		return nil, err
+	}
+	if _, err := os.Stat(filepath.Join(securityDir, usersFilename)); err == nil {
+		// Older session records have no user binding. Invalidate them on the
+		// identity model transition instead of guessing which user owns them.
+		if err := s.invalidateUnboundSessions(); err != nil {
+			return nil, err
+		}
 		if err := removeIfExists(filepath.Join(securityDir, bootstrapTokenFilename)); err != nil {
 			return nil, fmt.Errorf("%w: remove consumed bootstrap token", ErrStorage)
 		}
 		if err := syncDirectory(securityDir); err != nil {
 			return nil, fmt.Errorf("%w: sync security directory", ErrStorage)
-		}
-		return s, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		if !allowToken {
-			// Recovery-mode servers still need to serve the bounded recovery UI.
-			// All authentication operations fail closed when the underlying admin
-			// record is corrupt; critically, no replacement claim token is made.
-			return s, nil
-		}
-		return nil, err
-	}
-	if allowToken {
-		if err := ensureBootstrapToken(securityDir); err != nil {
-			return nil, err
 		}
 	}
 	return s, nil
@@ -184,14 +216,18 @@ func InspectAdministrator(dataRoot string) (bool, error) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return false, ErrStorage
 	}
+	users, err := readUserStore(filepath.Join(securityDir, usersFilename))
+	if err == nil {
+		return len(users.Users) > 0, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
 	_, err = readAdminHashReadOnly(filepath.Join(securityDir, adminFilename))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return err == nil, err
 }
 
 // ReadSetupCode returns the existing one-time bootstrap credential for a
@@ -221,26 +257,32 @@ func ReadSetupCode(dataRoot string) (string, error) {
 	return string(token), nil
 }
 
-// AdministratorConfigured re-reads the shared durable admin record so Host
+// AdministratorConfigured re-reads the shared durable user store so Host
 // and Control instances observe a bootstrap performed by the other process.
 func (s *Service) AdministratorConfigured() (bool, error) {
 	if s == nil {
 		return false, ErrStorage
 	}
-	hash, err := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename))
-	if errors.Is(err, os.ErrNotExist) {
-		s.mu.Lock()
-		s.adminHash = nil
-		s.mu.Unlock()
-		return false, nil
+	users, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+	if err == nil {
+		return len(users.Users) > 0, nil
 	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	// An older installation may have been created before this service opened.
+	// Migrate its existing bcrypt hash without needing plaintext credentials.
+	if err := s.migrateLegacyAdmin(); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	users, err = readUserStore(filepath.Join(s.securityDir, usersFilename))
 	if err != nil {
 		return false, err
 	}
-	s.mu.Lock()
-	s.adminHash = append(s.adminHash[:0], hash...)
-	s.mu.Unlock()
-	return true, nil
+	return len(users.Users) > 0, nil
 }
 
 // NeedsBootstrap is retained for compatibility. Read failures fail closed by
@@ -250,7 +292,7 @@ func (s *Service) NeedsBootstrap() bool {
 	return err != nil || !configured
 }
 
-// Bootstrap installs the single administrator password if token matches the
+// Bootstrap creates first owner if token matches the
 // persisted first-run token. A successful call consumes the bootstrap token.
 func (s *Service) Bootstrap(token, password string) error {
 	if !validPasswordLength(password) {
@@ -262,13 +304,14 @@ func (s *Service) Bootstrap(token, password string) error {
 	if !s.allowToken {
 		return ErrBootstrapUnavailable
 	}
-	if hash, err := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename)); err == nil {
-		s.adminHash = append(s.adminHash[:0], hash...)
+	if users, err := readUserStore(filepath.Join(s.securityDir, usersFilename)); err == nil && len(users.Users) > 0 {
 		return ErrBootstrapUnavailable
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ErrBootstrapUnavailable
 	}
-	if len(s.adminHash) != 0 {
+	if _, err := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename)); err == nil {
+		return ErrBootstrapUnavailable
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return ErrBootstrapUnavailable
 	}
 
@@ -289,17 +332,20 @@ func (s *Service) Bootstrap(token, password string) error {
 	if err != nil {
 		return fmt.Errorf("%w: hash administrator password", ErrStorage)
 	}
-	record, err := json.Marshal(adminRecord{PasswordHash: string(hash)})
+	owner, err := newUserRecord("owner", RoleOwner, string(hash), s.now())
 	if err != nil {
-		return fmt.Errorf("%w: encode administrator record", ErrStorage)
+		return err
 	}
-	if err := atomicCreate(filepath.Join(s.securityDir, adminFilename), append(record, '\n'), 0600); err != nil {
+	data, err := encodeUserStore([]userRecord{owner})
+	if err != nil {
+		return err
+	}
+	if err := atomicCreate(filepath.Join(s.securityDir, usersFilename), data, 0600); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return ErrBootstrapUnavailable
 		}
 		return err
 	}
-	s.adminHash = append([]byte(nil), hash...)
 	if err := removeIfExists(filepath.Join(s.securityDir, bootstrapTokenFilename)); err != nil {
 		return fmt.Errorf("%w: consume bootstrap token", ErrStorage)
 	}
@@ -317,25 +363,21 @@ func (s *Service) BootstrapTokenRelativePath() string {
 	return filepath.ToSlash(filepath.Join(securityDirectory, bootstrapTokenFilename))
 }
 
-// Login verifies the password and creates a durable, process-shared session.
+// Login preserves password-only owner login for existing browser clients.
 func (s *Service) Login(password string) (Session, error) {
+	return s.LoginAs("owner", password)
+}
+
+// LoginAs verifies a login identity and creates a durable, user-bound session.
+func (s *Service) LoginAs(login, password string) (Session, error) {
 	if !validPasswordLength(password) {
 		return Session{}, ErrInvalidCredentials
 	}
-	passwordHash, readErr := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename))
-	if errors.Is(readErr, os.ErrNotExist) {
-		s.mu.Lock()
-		s.adminHash = nil
-		s.mu.Unlock()
-		return Session{}, ErrNotBootstrapped
-	}
-	if readErr != nil {
-		return Session{}, ErrInvalidCredentials
-	}
-	s.mu.Lock()
-	s.adminHash = append(s.adminHash[:0], passwordHash...)
-	s.mu.Unlock()
-	if bcrypt.CompareHashAndPassword(passwordHash, []byte(password)) != nil {
+	user, err := s.VerifyCredentials(login, password)
+	if err != nil {
+		if errors.Is(err, ErrNotBootstrapped) {
+			return Session{}, ErrNotBootstrapped
+		}
 		return Session{}, ErrInvalidCredentials
 	}
 
@@ -348,7 +390,7 @@ func (s *Service) Login(password string) (Session, error) {
 		return Session{}, fmt.Errorf("%w: generate CSRF token", ErrStorage)
 	}
 	now := s.now()
-	session := Session{Token: token, CSRFToken: csrf, ExpiresAt: now.Add(defaultSessionLifetime)}
+	session := Session{Token: token, CSRFToken: csrf, ExpiresAt: now.Add(defaultSessionLifetime), UserID: user.ID, Login: user.Login, Role: user.Role}
 	csrfHash := sha256.Sum256([]byte(csrf))
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -359,7 +401,7 @@ func (s *Service) Login(password string) (Session, error) {
 	if active >= maxActiveSessions {
 		return Session{}, ErrSessionCapacity
 	}
-	if err := s.writeSession(token, sessionRecord{csrfHash: csrfHash, expiresAt: session.ExpiresAt}); err != nil {
+	if err := s.writeSession(token, sessionRecord{csrfHash: csrfHash, expiresAt: session.ExpiresAt, userID: user.ID}); err != nil {
 		return Session{}, err
 	}
 	// A second control process may have admitted a login concurrently. Keep the
@@ -387,19 +429,24 @@ func (s *Service) Authenticate(token string) (Session, error) {
 	if err != nil {
 		return Session{}, ErrUnauthenticated
 	}
-	if !s.now().Before(record.expiresAt) {
+	if !s.now().Before(record.expiresAt) || !validUserID(record.userID) {
 		s.removeSession(token)
 		return Session{}, ErrUnauthenticated
 	}
-	return Session{ExpiresAt: record.expiresAt}, nil
+	user, err := s.GetUser(record.userID)
+	if err != nil || user.Status != UserStatusActive {
+		s.removeSession(token)
+		return Session{}, ErrUnauthenticated
+	}
+	return Session{ExpiresAt: record.expiresAt, UserID: user.ID, Login: user.Login, Role: user.Role}, nil
 }
 
-// Logout revokes a session. Unknown and empty tokens are harmless.
-func (s *Service) Logout(token string) {
+// Logout durably revokes a session. Unknown and empty tokens are harmless.
+func (s *Service) Logout(token string) error {
 	if token == "" {
-		return
+		return nil
 	}
-	s.removeSession(token)
+	return s.removeSession(token)
 }
 
 // ValidCSRF compares the supplied value with the CSRF token bound to a live
@@ -417,7 +464,7 @@ func (s *Service) ValidCSRF(sessionToken, supplied string) bool {
 		s.removeSession(sessionToken)
 		return false
 	}
-	return subtle.ConstantTimeCompare(record.csrfHash[:], suppliedHash[:]) == 1
+	return validUserID(record.userID) && subtle.ConstantTimeCompare(record.csrfHash[:], suppliedHash[:]) == 1
 }
 
 func (s *Service) readSession(token string) (sessionRecord, error) {
@@ -461,7 +508,7 @@ func (s *Service) writeSession(token string, record sessionRecord) error {
 	if err := securePrivateDirectory(s.sessionsDir); err != nil {
 		return fmt.Errorf("%w: secure session directory", ErrStorage)
 	}
-	persisted := persistedSessionRecord{CSRFHash: hex.EncodeToString(record.csrfHash[:]), ExpiresAt: record.expiresAt.UTC()}
+	persisted := persistedSessionRecord{CSRFHash: hex.EncodeToString(record.csrfHash[:]), ExpiresAt: record.expiresAt.UTC(), UserID: record.userID}
 	data, err := json.Marshal(persisted)
 	if err != nil {
 		return fmt.Errorf("%w: encode session record", ErrStorage)
@@ -475,14 +522,28 @@ func (s *Service) writeSession(token string, record sessionRecord) error {
 	return nil
 }
 
-func (s *Service) removeSession(token string) {
-	if token == "" || validatePrivateDirectory(s.sessionsDir) != nil {
-		return
+func (s *Service) removeSession(token string) error {
+	if token == "" {
+		return nil
 	}
-	if err := os.Remove(s.sessionPath(token)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return
+	if validatePrivateDirectory(s.sessionsDir) != nil {
+		return fmt.Errorf("%w: validate session directory", ErrStorage)
 	}
-	_ = syncDirectory(s.sessionsDir)
+	remove := s.removeSessionFile
+	if remove == nil {
+		remove = os.Remove
+	}
+	if err := remove(s.sessionPath(token)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: revoke session", ErrStorage)
+	}
+	syncDir := s.syncSessionDirectory
+	if syncDir == nil {
+		syncDir = syncDirectory
+	}
+	if err := syncDir(s.sessionsDir); err != nil {
+		return fmt.Errorf("%w: persist session revocation", ErrStorage)
+	}
+	return nil
 }
 
 func (s *Service) sessionPath(token string) string {
@@ -515,7 +576,7 @@ func (s *Service) countAndCleanSessions(now time.Time) (int, error) {
 			// closed instead of silently counting attacker-controlled state.
 			return 0, fmt.Errorf("%w: inspect session record", ErrStorage)
 		}
-		if !now.Before(record.expiresAt) {
+		if !now.Before(record.expiresAt) || !validUserID(record.userID) {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return 0, fmt.Errorf("%w: remove expired session", ErrStorage)
 			}
@@ -552,7 +613,10 @@ func decodeSessionRecord(data []byte) (sessionRecord, error) {
 	}
 	var csrfHash [sha256.Size]byte
 	copy(csrfHash[:], csrfBytes)
-	return sessionRecord{csrfHash: csrfHash, expiresAt: persisted.ExpiresAt}, nil
+	if persisted.UserID != "" && !validUserID(persisted.UserID) {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	return sessionRecord{csrfHash: csrfHash, expiresAt: persisted.ExpiresAt, userID: persisted.UserID}, nil
 }
 
 func securePrivateDirectory(path string) error {
@@ -591,45 +655,6 @@ func randomToken() (string, error) {
 
 func hashSessionToken(token string) [sha256.Size]byte {
 	return sha256.Sum256([]byte(token))
-}
-
-func readAdminHash(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, os.ErrNotExist
-		}
-		return nil, fmt.Errorf("%w: inspect administrator record", ErrStorage)
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, ErrCorruptStore
-	}
-	if info.Size() <= 0 || info.Size() > 4096 {
-		return nil, ErrCorruptStore
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return nil, fmt.Errorf("%w: secure administrator record", ErrStorage)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("%w: read administrator record", ErrStorage)
-	}
-	defer f.Close()
-	decoder := json.NewDecoder(io.LimitReader(f, 4096))
-	decoder.DisallowUnknownFields()
-	var record adminRecord
-	if err := decoder.Decode(&record); err != nil || record.PasswordHash == "" {
-		return nil, ErrCorruptStore
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, ErrCorruptStore
-	}
-	hash := []byte(record.PasswordHash)
-	if _, err := bcrypt.Cost(hash); err != nil {
-		return nil, ErrCorruptStore
-	}
-	return hash, nil
 }
 
 func readAdminHashReadOnly(path string) ([]byte, error) {

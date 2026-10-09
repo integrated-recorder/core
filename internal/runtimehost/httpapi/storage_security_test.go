@@ -18,6 +18,8 @@ type storageSecurityController struct {
 	configErr    error
 }
 
+const storageTestInstanceID = "si_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func (c *storageSecurityController) storageCall(name string) {
 	if c.storageCalls == nil {
 		c.storageCalls = make(map[string]int)
@@ -57,6 +59,36 @@ func (c *storageSecurityController) ActivateStorage(context.Context, string) (St
 		Primary:   PrimaryStorageStatus{Kind: "local", State: "ready"},
 		Providers: []StorageProviderSummary{},
 	}, nil
+}
+
+func (c *storageSecurityController) ListStorageInstances(context.Context) ([]StorageInstanceSummary, error) {
+	c.storageCall("instance_list")
+	return []StorageInstanceSummary{{ID: storageTestInstanceID, DisplayName: "Archive A", ProviderID: "fixture", ProviderName: "Fixture", DesiredSetID: strings.Repeat("a", 64), Health: "unknown"}}, nil
+}
+
+func (c *storageSecurityController) CreateStorageInstance(context.Context, StorageInstanceCreateRequest) (StorageInstanceSummary, error) {
+	c.storageCall("instance_create")
+	return StorageInstanceSummary{ID: storageTestInstanceID, DisplayName: "Archive A", ProviderID: "fixture", ProviderName: "Fixture", DesiredSetID: strings.Repeat("a", 64), Health: "unknown"}, nil
+}
+
+func (c *storageSecurityController) StorageInstanceConfig(context.Context, string) (StorageConfigView, error) {
+	c.storageCall("instance_config_read")
+	return c.configView(), nil
+}
+
+func (c *storageSecurityController) ConfigureStorageInstance(context.Context, string, StorageConfigRequest) (StorageConfigView, error) {
+	c.storageCall("instance_config_write")
+	return c.configView(), nil
+}
+
+func (c *storageSecurityController) ProbeStorageInstance(context.Context, string) (StorageProbeResult, error) {
+	c.storageCall("instance_probe")
+	return StorageProbeResult{State: "ready"}, nil
+}
+
+func (c *storageSecurityController) ActivateStorageInstance(context.Context, string) (StorageProviderStatus, error) {
+	c.storageCall("instance_activate")
+	return StorageProviderStatus{Primary: PrimaryStorageStatus{Kind: "local", State: "ready"}, Providers: []StorageProviderSummary{}}, nil
 }
 
 func (c *storageSecurityController) configView() StorageConfigView {
@@ -104,6 +136,8 @@ func TestStorageGETRoutesRequireAuthenticationButNotCSRF(t *testing.T) {
 	}{
 		{StorageProviderEndpoint, "status"},
 		{StorageProvidersPrefix + "fixture/config", "config_read"},
+		{StorageInstancesEndpoint, "instance_list"},
+		{StorageInstancesPrefix + storageTestInstanceID + "/config", "instance_config_read"},
 	} {
 		if response := storageSecurityRequest(api, fixture, http.MethodGet, tc.path, "", false, false); response.Code != http.StatusUnauthorized {
 			t.Errorf("anonymous GET %s status=%d, want %d", tc.path, response.Code, http.StatusUnauthorized)
@@ -135,6 +169,10 @@ func TestStorageMutationsRequireAuthenticationAndCSRF(t *testing.T) {
 		{http.MethodPut, StorageProvidersPrefix + "fixture/config", configBody, "config_write"},
 		{http.MethodPost, StorageProvidersPrefix + "fixture/probe", `{}`, "probe"},
 		{http.MethodPost, StorageProvidersPrefix + "fixture/activate", `{}`, "activate"},
+		{http.MethodPost, StorageInstancesEndpoint, `{"display_name":"Archive A","provider_id":"fixture","values":{"endpoint":"https://storage.example.test"},"secrets":{"access_key_id":"a","secret_access_key":"b"}}`, "instance_create"},
+		{http.MethodPut, StorageInstancesPrefix + storageTestInstanceID + "/config", configBody, "instance_config_write"},
+		{http.MethodPost, StorageInstancesPrefix + storageTestInstanceID + "/probe", `{}`, "instance_probe"},
+		{http.MethodPost, StorageInstancesPrefix + storageTestInstanceID + "/activate", `{}`, "instance_activate"},
 	} {
 		if response := storageSecurityRequest(api, fixture, tc.method, tc.path, tc.body, false, false); response.Code != http.StatusUnauthorized {
 			t.Errorf("anonymous %s %s status=%d, want %d", tc.method, tc.path, response.Code, http.StatusUnauthorized)

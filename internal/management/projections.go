@@ -1,6 +1,8 @@
 package management
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,7 +14,10 @@ import (
 	"unicode/utf8"
 )
 
-var ErrDuplicateNotification = errors.New("duplicate notification identifier")
+var (
+	ErrDuplicateNotification = errors.New("duplicate notification identifier")
+	ErrInvalidAuditCursor    = errors.New("invalid audit cursor")
+)
 
 // ResourceRef is a deliberately small, opaque resource reference. It contains
 // no adapter attributes, configuration, credentials, or source URLs.
@@ -57,10 +62,32 @@ type RecordingEvent struct {
 // AuditEvent contains only a type and opaque object reference, never arbitrary
 // request payloads or user-provided secret values.
 type AuditEvent struct {
-	ID       string    `json:"id"`
-	Type     string    `json:"type"`
-	At       time.Time `json:"at"`
-	ObjectID string    `json:"object_id,omitempty"`
+	ID       string      `json:"id"`
+	Type     string      `json:"type"`
+	At       time.Time   `json:"at"`
+	ObjectID string      `json:"object_id,omitempty"`
+	Actor    *AuditActor `json:"actor,omitempty"`
+}
+
+// AuditActor identifies the control-plane principal that caused an event.
+// Canonical archive provenance does not use this type.
+type AuditActor struct {
+	Type   string `json:"type"`
+	UserID string `json:"user_id,omitempty"`
+}
+
+const (
+	AuditActorUser      = "user"
+	AuditActorSystem    = "system"
+	auditCursorVersion  = 1
+	maxAuditCursorBytes = 256
+	maxAuditPageSize    = 500
+)
+
+type auditCursor struct {
+	Version int       `json:"v"`
+	At      time.Time `json:"at"`
+	ID      string    `json:"id"`
 }
 
 // Notification is a bounded, user-facing event with an explicit read state.
@@ -99,6 +126,12 @@ var auditTypes = map[string]struct{}{
 	"recording_tags_updated": {},
 	"watch_created":          {}, "watch_updated": {}, "watch_enabled": {}, "watch_disabled": {},
 	"watch_deleted": {}, "manual_watch_check": {},
+	"runtime_update_staged": {}, "runtime_update_activated": {}, "runtime_update_rolled_back": {},
+	"adapter_reconciled": {}, "plugin_registry_refreshed": {}, "plugin_installed": {},
+	"plugin_updated": {}, "plugin_uninstalled": {},
+	"storage_instance_created": {}, "storage_instance_configured": {}, "storage_instance_probed": {},
+	"storage_instance_activated": {}, "storage_provider_configured": {}, "storage_provider_probed": {},
+	"storage_provider_activated": {}, "installation_setup_begun": {}, "installation_setup_completed": {},
 }
 
 var notificationTypes = map[string]struct{}{
@@ -323,6 +356,11 @@ func (s *Store) RecordingEvents(recordingID string, limit int) ([]RecordingEvent
 }
 
 func (s *Store) AppendAudit(event AuditEvent) error {
+	if event.Actor == nil {
+		// Existing internal callers represent background/system actions. HTTP
+		// mutations set a user actor explicitly from the authenticated principal.
+		event.Actor = &AuditActor{Type: AuditActorSystem}
+	}
 	if err := validateAuditEvent(event); err != nil {
 		return err
 	}
@@ -341,6 +379,73 @@ func (s *Store) AppendAudit(event AuditEvent) error {
 	}
 	s.audit = next
 	return nil
+}
+
+// AuditPage returns one stable newest-first page. Cursor identifies last event
+// from previous page by timestamp and ID, so equal timestamps cannot duplicate
+// or skip events.
+func (s *Store) AuditPage(limit int, cursor string) ([]AuditEvent, string, error) {
+	if limit <= 0 {
+		limit = defaultQueryLimit
+	}
+	if limit > maxAuditPageSize {
+		limit = maxAuditPageSize
+	}
+	var boundary auditCursor
+	if cursor != "" {
+		decoded, err := decodeAuditCursor(cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		boundary = decoded
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	start := 0
+	if cursor != "" {
+		start = sort.Search(len(s.audit), func(index int) bool {
+			event := s.audit[index]
+			return event.At.Before(boundary.At) || (event.At.Equal(boundary.At) && event.ID < boundary.ID)
+		})
+	}
+	end := start + limit
+	if end > len(s.audit) {
+		end = len(s.audit)
+	}
+	items := append([]AuditEvent{}, s.audit[start:end]...)
+	next := ""
+	if end < len(s.audit) && len(items) != 0 {
+		encoded, err := encodeAuditCursor(items[len(items)-1])
+		if err != nil {
+			return nil, "", err
+		}
+		next = encoded
+	}
+	return items, next, nil
+}
+
+func encodeAuditCursor(event AuditEvent) (string, error) {
+	data, err := json.Marshal(auditCursor{Version: auditCursorVersion, At: event.At.UTC(), ID: event.ID})
+	if err != nil || len(data) > maxAuditCursorBytes {
+		return "", ErrInvalidAuditCursor
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+func decodeAuditCursor(encoded string) (auditCursor, error) {
+	if len(encoded) == 0 || len(encoded) > maxAuditCursorBytes {
+		return auditCursor{}, ErrInvalidAuditCursor
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(data) > maxAuditCursorBytes {
+		return auditCursor{}, ErrInvalidAuditCursor
+	}
+	var cursor auditCursor
+	if json.Unmarshal(data, &cursor) != nil || cursor.Version != auditCursorVersion || cursor.At.IsZero() || !validIdentifier(cursor.ID, 128) {
+		return auditCursor{}, ErrInvalidAuditCursor
+	}
+	return cursor, nil
 }
 
 // Audit returns audit events newest-first.
@@ -508,6 +613,23 @@ func validateAuditEvent(event AuditEvent) error {
 	}
 	if event.ObjectID != "" && !validIdentifier(event.ObjectID, 256) {
 		return fmt.Errorf("invalid audit object identifier")
+	}
+	if event.Actor == nil {
+		return nil // Legacy audit entries had no actor.
+	}
+	switch event.Actor.Type {
+	case "":
+		return fmt.Errorf("invalid audit actor type")
+	case AuditActorSystem:
+		if event.Actor.UserID != "" {
+			return fmt.Errorf("invalid system audit actor")
+		}
+	case AuditActorUser:
+		if !validIdentifier(event.Actor.UserID, 128) {
+			return fmt.Errorf("invalid user audit actor")
+		}
+	default:
+		return fmt.Errorf("invalid audit actor type")
 	}
 	return nil
 }

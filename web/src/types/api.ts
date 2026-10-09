@@ -81,7 +81,7 @@ export type RecordingDetail = {
   source_url?: string; state: RecordingState; created_at: string; started_at: string; stopped_at?: string | null;
   tracks?: Record<string, Track>; gaps?: Gap[];
   manifest_snapshots?: { storage_path?: string; size?: number; sha256?: string; captured_at?: string }[];
-  last_error?: string; statistics?: RecordingStatistics; integrity?: IntegrityStatus; preview?: PreviewSummary;
+  last_error?: string; segment_count?: number; duration_seconds?: number; statistics?: RecordingStatistics; integrity?: IntegrityStatus; preview?: PreviewSummary;
   archive_sealed?: boolean; archive_revision?: number; timeline_revision?: number
 }
 export type RecordingLifecycle = {
@@ -98,7 +98,7 @@ export type RecordingStatistics = {
   gap_segment_count?: number; gap_duration_seconds?: number | null; integrity?: IntegrityStatus;
   status?: 'complete' | 'partial'; unavailable_fields?: string[]
 }
-export type RecordingPage = { items: RecordingListItem[]; next_cursor?: string; total: number }
+export type RecordingPage = { items: RecordingListItem[]; next_cursor?: string; total: number; total_is_partial?: boolean; partial_errors?: string[] }
 export type RevisionFreshness = 'unknown' | 'current' | 'stale'
 export type IntegrityResult = { status: IntegrityStatus; last_verified_at?: string; objects_total?: number; objects_verified?: number; objects_missing?: number; objects_corrupt?: number; issues?: { code: string; path?: string }[]; freshness?: RevisionFreshness; revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number }
 export type IntegrityJob = { id: string; recording_id: string; state: 'queued' | 'running' | 'completed' | 'failed' | 'canceled'; created_at: string; started_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness; result?: IntegrityResult }
@@ -119,11 +119,12 @@ export type AdapterConfig = {
 }
 export type Dashboard = {
   active_recordings_count: number; completed_last_24h: number; interrupted_last_24h: number; recordings_total: number;
-  segments_total: number; gaps_total: number; archive_bytes: number; filesystem_total_bytes: number; filesystem_free_bytes: number; filesystem_used_bytes: number;
+  segments_total: number; gaps_total: number; archive_bytes: number; archive_bytes_known?: boolean; statistics_status?: 'complete' | 'partial'; unavailable_fields?: string[];
+  filesystem_total_bytes: number; filesystem_free_bytes: number; filesystem_used_bytes: number;
   integrity: Record<string, number>; adapters: Record<string, number>; export_available: boolean; recent_recordings: RecordingSummary[]; active_recordings: RecordingSummary[];
   watches?: { total: number; enabled: number; recording: number; offline: number; backoff: number; attention_required: number }
 }
-export type StorageInfo = { archive_root: string; filesystem_total_bytes: number; filesystem_used_bytes: number; filesystem_available_bytes: number; recordings_bytes: number; recording_count: number; segment_count: number; init_segment_count: number; manifest_count: number }
+export type StorageInfo = { archive_root: string; filesystem_total_bytes: number; filesystem_used_bytes: number; filesystem_available_bytes: number; recordings_bytes: number | null; recordings_bytes_known?: boolean; recording_count: number; segment_count: number; init_segment_count: number; manifest_count: number; statistics_status?: 'complete' | 'partial'; unavailable_fields?: string[] }
 export type StoragePool = {
   id: string; display_name: string; kind: string; role: string; health: string;
   capacity_known: boolean;
@@ -139,7 +140,7 @@ export type StorageMetricSample = { at: string; read_bytes_per_second: number; w
 export type StoragePoolsResponse = { items: StoragePool[] }
 export type StorageMetricsResponse = { pool_id: string; sample_interval_ms: number; sample_interval_seconds: number; items: StorageMetricSample[] }
 export type StorageProviderHealth = 'ready' | 'unknown' | 'failed'
-export type StoragePrimaryProvider = { kind: 'plugin'; provider_id: string; version: string; state: 'ready' | 'unavailable' }
+export type StoragePrimaryProvider = { kind: 'plugin'; provider_id: string; instance_id?: string; version: string; state: 'ready' | 'unavailable' }
 export type StorageProviderSummary = {
   id: string; name: string; version: string; configured: boolean; active: boolean;
   health: StorageProviderHealth; configuration_schema: Schema;
@@ -148,6 +149,8 @@ export type StorageProviderSummary = {
 export type StorageProviderStatus = { primary: StoragePrimaryProvider; providers: StorageProviderSummary[] }
 export type StorageProviderConfig = { values: Record<string, unknown>; configured_secrets: string[] }
 export type StorageProviderConfigBody = { values: Record<string, unknown>; secrets: Record<string, string> }
+export type StorageInstanceSummary = { id: string; display_name: string; provider_id: string; provider_name: string; desired_set_id: string; active: boolean; health: 'ready' | 'unknown' | 'unavailable' }
+export type StorageInstanceCreateBody = { display_name: string; provider_id: string; values: Record<string, unknown>; secrets: Record<string, string> }
 export type SystemInfo = { version: string; commit: string; go_version: string; goos: string; goarch: string; started_at: string; uptime_seconds: number; export_available: boolean }
 export type RuntimeBuildIdentity = { version: string; commit: string; build_time: string; release_channel: string; runtime_protocol_version: number }
 export type RuntimeGenerationSummary = { id: string; version: string; commit: string; installed_at: string; state: string; active_recordings: number }

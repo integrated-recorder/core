@@ -195,6 +195,297 @@ func TestShardedCoverageRevisionTracksSemanticStateChanges(t *testing.T) {
 	if err != nil || persisted.ArchiveRevision != 1 || persisted.TimelineRevision != 0 {
 		t.Fatalf("persisted revisions archive=%d timeline=%d err=%v", persisted.ArchiveRevision, persisted.TimelineRevision, err)
 	}
+	coverageCount := 0
+	if err := store.IterateShardedCoverage(ctx, header.ID, func(observation archiveindex.Coverage) error {
+		coverageCount++
+		if observation.State == archiveindex.CoverageAcquisitionFailed && observation.Reason != "temporary fetch failure" {
+			t.Fatalf("recovery observation was not retained: %+v", observation)
+		}
+		return nil
+	}); err != nil || coverageCount != 3 {
+		t.Fatalf("coverage recovery observations count=%d err=%v, want known, reobserved, and acquisition-failed records", coverageCount, err)
+	}
+}
+
+func TestShardedCoverageStateIndexPreservesRevisionSemantics(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, "f4e2f247ab144c6a850fd5c07fb1e6a4")
+	now := time.Date(2026, 10, 9, 1, 0, 0, 0, time.UTC)
+	coverage := archiveindex.Coverage{
+		SessionID: header.SourceSessionID, TrackID: "main", SourceEpoch: 4,
+		DiscontinuitySequence: 2, FromSequence: 71, ToSequence: 71,
+		State: archiveindex.CoverageAcquisitionFailed, ObservedAt: now,
+		Reason: "temporary fetch failure", Kind: archiveindex.ObjectMedia,
+	}
+	appendCoverage := func(state archiveindex.CoverageState, observed time.Time) ShardedRevisionResult {
+		t.Helper()
+		coverage.State, coverage.ObservedAt = state, observed
+		result, err := store.AppendShardedCoverageWithRevision(ctx, header.ID, coverage)
+		if err != nil {
+			t.Fatalf("append %s coverage: %v", state, err)
+		}
+		return result
+	}
+	if result := appendCoverage(archiveindex.CoverageAcquisitionFailed, now); result.ArchiveRevision != 0 || result.Changed {
+		t.Fatalf("acquisition_failed result=%+v, want no canonical change", result)
+	}
+	if result := appendCoverage(archiveindex.CoverageKnownMissing, now.Add(time.Minute)); result.ArchiveRevision != 1 || !result.Changed {
+		t.Fatalf("unknown->known_missing result=%+v, want revision 1", result)
+	}
+	if result := appendCoverage(archiveindex.CoverageKnownMissing, now.Add(2*time.Minute)); result.ArchiveRevision != 1 || result.Changed {
+		t.Fatalf("known_missing reobservation result=%+v, want no-op", result)
+	}
+	if result := appendCoverage(archiveindex.CoveragePresent, now.Add(3*time.Minute)); result.ArchiveRevision != 2 || !result.Changed {
+		t.Fatalf("known_missing->present result=%+v, want revision 2", result)
+	}
+	if result := appendCoverage(archiveindex.CoverageKnownMissing, now.Add(4*time.Minute)); result.ArchiveRevision != 2 || result.Changed {
+		t.Fatalf("present->known_missing reobservation result=%+v, want no-op", result)
+	}
+	if result := appendCoverage(archiveindex.CoverageConflict, now.Add(5*time.Minute)); result.ArchiveRevision != 3 || !result.Changed {
+		t.Fatalf("present->conflict result=%+v, want revision 3", result)
+	}
+	if result := appendCoverage(archiveindex.CoveragePresent, now.Add(6*time.Minute)); result.ArchiveRevision != 3 || result.Changed {
+		t.Fatalf("conflict->present reobservation result=%+v, want no-op", result)
+	}
+}
+
+func TestShardedCoverageStateIndexRebuildsAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, "04e2f247ab144c6a850fd5c07fb1e6a4")
+	now := time.Date(2026, 10, 9, 1, 0, 0, 0, time.UTC)
+	coverage := archiveindex.Coverage{
+		SessionID: header.SourceSessionID, TrackID: "main", SourceEpoch: 4,
+		DiscontinuitySequence: 2, FromSequence: 71, ToSequence: 71,
+		State: archiveindex.CoverageKnownMissing, ObservedAt: now, Kind: archiveindex.ObjectMedia,
+	}
+	first, err := store.AppendShardedCoverageWithRevision(ctx, header.ID, coverage)
+	if err != nil || first.ArchiveRevision != 1 || !first.Changed {
+		t.Fatalf("first coverage result=%+v err=%v", first, err)
+	}
+	marker := filepath.Join(store.Root(), "recordings", header.ID, filepath.FromSlash(v2CoverageStateIndexMarkerPath+".json"))
+	if err := os.Remove(marker); err != nil {
+		t.Fatalf("remove derived index marker: %v", err)
+	}
+	reopened, err := New(store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	coverage.ObservedAt = now.Add(time.Minute)
+	second, err := reopened.AppendShardedCoverageWithRevision(ctx, header.ID, coverage)
+	if err != nil || second.ArchiveRevision != 1 || second.Changed {
+		t.Fatalf("recovered known_missing result=%+v err=%v, want no-op", second, err)
+	}
+	coverage.State, coverage.ObservedAt = archiveindex.CoveragePresent, now.Add(2*time.Minute)
+	third, err := reopened.AppendShardedCoverageWithRevision(ctx, header.ID, coverage)
+	if err != nil || third.ArchiveRevision != 2 || !third.Changed {
+		t.Fatalf("recovered present result=%+v err=%v, want revision 2", third, err)
+	}
+}
+
+func TestShardedEmptyCoverageRecoverySkipsIndexMarkerUntilObservation(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, "24e2f247ab144c6a850fd5c07fb1e6a4")
+	marker := filepath.Join(store.Root(), "recordings", header.ID, filepath.FromSlash(v2CoverageStateIndexMarkerPath+".json"))
+
+	if err := store.ReconcileShardedArchive(ctx, header.ID); err != nil {
+		t.Fatalf("reconcile empty archive: %v", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty archive coverage marker stat error=%v, want not found", err)
+	}
+
+	now := time.Date(2026, 10, 9, 1, 0, 0, 0, time.UTC)
+	coverage := archiveindex.Coverage{
+		SessionID: header.SourceSessionID, TrackID: "main", SourceEpoch: 4,
+		DiscontinuitySequence: 2, FromSequence: 71, ToSequence: 71,
+		State: archiveindex.CoverageKnownMissing, ObservedAt: now, Kind: archiveindex.ObjectMedia,
+	}
+	first, err := store.AppendShardedCoverageWithRevision(ctx, header.ID, coverage)
+	if err != nil || !first.Changed || first.ArchiveRevision != 1 {
+		t.Fatalf("first coverage result=%+v err=%v, want changed archive revision 1", first, err)
+	}
+	var published v2CoverageStateIndexMarker
+	if err := store.loadV2JSON(ctx, header.ID, v2CoverageStateIndexMarkerPath, archiveShardMaxBytes, &published); err != nil {
+		t.Fatalf("first real observation did not initialize coverage index: %v", err)
+	}
+	if published.Version != 1 || !published.Ready {
+		t.Fatalf("first observation marker=%+v, want ready v1", published)
+	}
+
+	local := store.StorageBackend.(*LocalFilesystemBackend)
+	counter := &countingV2Backend{StorageBackend: local, local: local}
+	store.StorageBackend = counter
+	coverage.FromSequence, coverage.ToSequence = 72, 72
+	coverage.ObservedAt = now.Add(time.Minute)
+	if _, err := store.AppendShardedCoverageWithRevision(ctx, header.ID, coverage); err != nil {
+		t.Fatalf("append after index initialization: %v", err)
+	}
+	stats := counter.snapshot()
+	if stats.coverageStatePageReads != 1 || stats.coverageStatePageWrites != 1 || stats.listRequests != 0 {
+		t.Fatalf("post-initialization coverage work reads=%d writes=%d list=%d, want 1/1/0", stats.coverageStatePageReads, stats.coverageStatePageWrites, stats.listRequests)
+	}
+}
+
+func TestShardedCoverageStateIndexCachesCanonicalMediaState(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, "14e2f247ab144c6a850fd5c07fb1e6a4")
+	coordinate := archiveindex.Coordinate{
+		SessionID: header.SourceSessionID, TrackID: "main", SourceEpoch: 4,
+		DiscontinuitySequence: 2, Sequence: 71, Kind: archiveindex.ObjectMedia,
+	}
+	segment := domain.Segment{ID: "seg-00000000000000000001", TrackID: "main", ArchiveOrdinal: 1, Duration: 2}
+	mediaRecord := V2MediaRecord{Coordinate: coordinate, Segment: segment, ClaimState: archiveindex.CoveragePresent}
+	mediaPage := v2MediaPage{Version: 1, TrackID: "main", Number: 0, Entries: []V2MediaRecord{mediaRecord}}
+	timelinePage := v2TimelinePage{
+		Version: 1, TrackID: coordinate.TrackID, SourceEpoch: coordinate.SourceEpoch,
+		DiscontinuitySequence: coordinate.DiscontinuitySequence, SequenceBucket: coordinate.Sequence / mediaShardMaxEntries,
+		Kind: coordinate.Kind, Entries: []v2TimelineEntry{{Coordinate: coordinate, ArchiveOrdinal: 1, ID: segment.ID, Duration: segment.Duration}},
+	}
+	if err := store.saveV2JSON(ctx, header.ID, v2MediaPagePath(coordinate.TrackID, false, 0), mediaPage, archiveShardMaxBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.saveV2JSON(ctx, header.ID, v2TimelinePagePath(coordinate), timelinePage, archiveShardMaxBytes); err != nil {
+		t.Fatal(err)
+	}
+	header.Tracks[coordinate.TrackID].MediaHighWater = 1
+	if err := store.SaveRecordingHeader(ctx, header); err != nil {
+		t.Fatal(err)
+	}
+	local := store.StorageBackend.(*LocalFilesystemBackend)
+	counter := &countingV2Backend{StorageBackend: local, local: local}
+	store.StorageBackend = counter
+	now := time.Date(2026, 10, 9, 1, 0, 0, 0, time.UTC)
+	coverage := archiveindex.Coverage{
+		SessionID: coordinate.SessionID, TrackID: coordinate.TrackID, SourceEpoch: coordinate.SourceEpoch,
+		DiscontinuitySequence: coordinate.DiscontinuitySequence, FromSequence: coordinate.Sequence,
+		ToSequence: coordinate.Sequence, State: archiveindex.CoverageKnownMissing, ObservedAt: now,
+		Kind: archiveindex.ObjectMedia,
+	}
+	first, err := store.AppendShardedCoverageWithRevision(ctx, header.ID, coverage)
+	if err != nil || first.Changed || first.ArchiveRevision != 0 {
+		t.Fatalf("known_missing over existing canonical media result=%+v err=%v, want no canonical revision", first, err)
+	}
+	counter.mu.Lock()
+	counter.stats = countedV2IO{}
+	counter.mu.Unlock()
+	coverage.ObservedAt = now.Add(time.Minute)
+	coverage.Reason = "reobserved"
+	second, err := store.AppendShardedCoverageWithRevision(ctx, header.ID, coverage)
+	if err != nil || second.Changed || second.ArchiveRevision != 0 {
+		t.Fatalf("repeated known_missing over canonical media result=%+v err=%v, want no-op", second, err)
+	}
+	stats := counter.snapshot()
+	if stats.coverageStatePageReads != 1 || stats.timelinePageReads != 0 || stats.mediaPageReads != 0 || stats.coverageStatePageWrites != 0 {
+		t.Fatalf("repeated observation reread canonical media: stats=%+v, want only one derived index page read", stats)
+	}
+}
+
+func TestShardedCoverageObservationTouchesBoundedIndexPages(t *testing.T) {
+	readsByCollection := make(map[string]map[uint64]int)
+	for _, history := range []uint64{1_000, 10_000} {
+		for _, collection := range []string{"coverage", "gap"} {
+			t.Run(fmt.Sprintf("%s_history_%d", collection, history), func(t *testing.T) {
+				ctx := context.Background()
+				store, header := newShardedArchiveTestStore(t, fmt.Sprintf("%032x", history+100))
+				if collection == "coverage" {
+					header.ShardedArchive.CoverageObservationCount = history
+				} else {
+					header.ShardedArchive.GapCount = history
+				}
+				if err := store.SaveRecordingHeader(ctx, header); err != nil {
+					t.Fatal(err)
+				}
+				local := store.StorageBackend.(*LocalFilesystemBackend)
+				counter := &countingV2Backend{StorageBackend: local, local: local}
+				store.StorageBackend = counter
+				now := time.Date(2026, 10, 9, 1, 0, 0, 0, time.UTC)
+				candidate := archiveindex.Coverage{
+					SessionID: header.SourceSessionID, TrackID: "main", SourceEpoch: 4,
+					DiscontinuitySequence: 2, FromSequence: 0, ToSequence: 0,
+					State: archiveindex.CoverageKnownMissing, ObservedAt: now, Kind: archiveindex.ObjectMedia,
+				}
+				if err := store.saveV2JSON(ctx, header.ID, v2CoverageStateIndexMarkerPath, v2CoverageStateIndexMarker{Version: 1, Ready: true}, archiveShardMaxBytes); err != nil {
+					t.Fatal(err)
+				}
+				pageCount := (history + mediaShardMaxEntries - 1) / mediaShardMaxEntries
+				for bucket := uint64(0); bucket < pageCount; bucket++ {
+					page := v2CoverageStatePage{
+						Version: 1, SessionID: candidate.SessionID, TrackID: candidate.TrackID,
+						SourceEpoch: candidate.SourceEpoch, DiscontinuitySequence: candidate.DiscontinuitySequence,
+						Kind: candidate.Kind, Bucket: bucket,
+					}
+					start, end := coverageBucketRange(archiveindex.Coverage{
+						SessionID: candidate.SessionID, TrackID: candidate.TrackID, SourceEpoch: candidate.SourceEpoch,
+						DiscontinuitySequence: candidate.DiscontinuitySequence, FromSequence: 0,
+						ToSequence: history - 1, Kind: candidate.Kind,
+					}, bucket)
+					for sequence := start; ; sequence++ {
+						page.States[sequence%mediaShardMaxEntries] = 1
+						if sequence == end {
+							break
+						}
+					}
+					if err := store.saveV2JSON(ctx, header.ID, v2CoverageStatePagePath(candidate, bucket), page, archiveShardMaxBytes); err != nil {
+						t.Fatal(err)
+					}
+				}
+				candidate.FromSequence, candidate.ToSequence = history, history
+				candidate.ObservedAt = now.Add(time.Minute)
+				counter.mu.Lock()
+				counter.stats = countedV2IO{}
+				counter.mu.Unlock()
+				var result ShardedRevisionResult
+				var err error
+				if collection == "coverage" {
+					result, err = store.AppendShardedCoverageWithRevision(ctx, header.ID, candidate)
+				} else {
+					result, err = store.AppendShardedGapWithRevision(ctx, header.ID, domain.Gap{
+						TrackID: candidate.TrackID, SourceEpoch: candidate.SourceEpoch,
+						DiscontinuitySequence: candidate.DiscontinuitySequence,
+						FromSequence:          history, ToSequence: history, DetectedAt: candidate.ObservedAt, Reason: "declared gap",
+					})
+				}
+				if err != nil || !result.Changed {
+					t.Fatalf("append %s at history %d result=%+v err=%v, want canonical change", collection, history, result, err)
+				}
+				stats := counter.snapshot()
+				if stats.coverageStatePageReads != 1 || stats.coverageStatePageWrites != 1 || stats.listRequests != 0 {
+					t.Fatalf("%s history %d coverage index reads=%d writes=%d list=%d; want 1/1/0 (sidecars=%d)", collection, history, stats.coverageStatePageReads, stats.coverageStatePageWrites, stats.listRequests, stats.sidecarReads)
+				}
+				if readsByCollection[collection] == nil {
+					readsByCollection[collection] = make(map[uint64]int)
+				}
+				readsByCollection[collection][history] = stats.sidecarReads
+			})
+		}
+	}
+	for _, collection := range []string{"coverage", "gap"} {
+		if readsByCollection[collection][1_000] != readsByCollection[collection][10_000] {
+			t.Fatalf("%s history sidecar reads grew with history: 1k=%d 10k=%d", collection, readsByCollection[collection][1_000], readsByCollection[collection][10_000])
+		}
+	}
+}
+
+func TestShardedUnknownCoverageObservationDoesNotScanSequenceRange(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, "a4e2f247ab144c6a850fd5c07fb1e6a1")
+	local := store.StorageBackend.(*LocalFilesystemBackend)
+	counter := &countingV2Backend{StorageBackend: local, local: local}
+	store.StorageBackend = counter
+	candidate := archiveindex.Coverage{
+		SessionID: header.SourceSessionID, TrackID: "main", SourceEpoch: 4,
+		DiscontinuitySequence: 2, FromSequence: 0, ToSequence: 10_000,
+		State: archiveindex.CoverageUnknown, Kind: archiveindex.ObjectMedia,
+	}
+
+	changed, updates, err := store.coverageObservationChanges(ctx, header.ID, header, candidate)
+	if err != nil || changed || len(updates) != 0 {
+		t.Fatalf("unknown coverage result changed=%t updates=%d err=%v, want no-op", changed, len(updates), err)
+	}
+	stats := counter.snapshot()
+	if stats.coverageStatePageReads != 0 || stats.mediaPageReads != 0 || stats.timelinePageReads != 0 || stats.sidecarReads != 0 {
+		t.Fatalf("unknown coverage observation touched archive history: %+v", stats)
+	}
 }
 
 func TestSealedShardedArchiveRejectsMutationAndSkipsOrphanAdoption(t *testing.T) {
@@ -423,6 +714,58 @@ func TestShardedLiveGapRootFailureRetryPreservesTimelineRevision(t *testing.T) {
 	duplicate, err := store.AppendShardedGapWithRevision(ctx, header.ID, gap)
 	if err != nil || duplicate.Changed || duplicate.ArchiveRevision != 1 || duplicate.TimelineRevision != 1 {
 		t.Fatalf("live gap duplicate result=%+v err=%v, want stable revision", duplicate, err)
+	}
+}
+
+func TestShardedLiveGapRootFailureRestartReconciliationPreservesTimelineRevision(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, "f4e2f247ab144c6a850fd5c07fb1e6a9")
+	track := header.Tracks["main"]
+	track.LivePresentation = &domain.LivePresentationState{NextOrdinal: 2, FirstPresentationOrdinal: 1}
+	track.LiveSlotHighWater = 1 // The live slot is reserved before its gap page is published.
+	if err := store.SaveRecordingHeader(ctx, header); err != nil {
+		t.Fatal(err)
+	}
+	gap := domain.Gap{
+		TrackID: "main", SourceEpoch: 0, DiscontinuitySequence: 0,
+		FromSequence: 10, ToSequence: 10, DetectedAt: time.Date(2026, 10, 9, 2, 0, 0, 0, time.UTC),
+		Reason: "live source gap", LivePresentationOrdinal: 1, LiveDuration: 2,
+	}
+	local := store.StorageBackend.(*LocalFilesystemBackend)
+	injectedFailure := errors.New("injected live gap root publication failure before restart")
+	failing := &failBeforeV2RootSave{LocalFilesystemBackend: local, failure: injectedFailure, matches: func(candidate *domain.Recording) bool {
+		return candidate.ShardedArchive.GapCount == 1 && candidate.ArchiveRevision == 1 && candidate.TimelineRevision == 1
+	}}
+	store.StorageBackend = failing
+	if _, err := store.AppendShardedGapWithRevision(ctx, header.ID, gap); !errors.Is(err, injectedFailure) {
+		t.Fatalf("first live gap append error=%v, want injected root failure", err)
+	}
+	if !failing.fired {
+		t.Fatal("injected root failure did not reach the live gap publication boundary")
+	}
+	store.StorageBackend = local
+	slot, err := store.LookupShardedLiveSlot(ctx, header.ID, "main", 1)
+	if err != nil || slot.Gap == nil || slot.Segment != nil {
+		t.Fatalf("reserved live gap slot=%+v err=%v, want durable gap before root retry", slot, err)
+	}
+
+	reopened, err := New(local.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.ReconcileShardedArchive(ctx, header.ID); err != nil {
+		t.Fatalf("reconcile gap after restart: %v", err)
+	}
+	root, err := reopened.LoadRecordingHeader(ctx, header.ID)
+	if err != nil || root.ShardedArchive.GapCount != 1 || root.ArchiveRevision != 1 || root.TimelineRevision != 1 {
+		t.Fatalf("reconciled root gap=%d archive=%d timeline=%d err=%v", root.ShardedArchive.GapCount, root.ArchiveRevision, root.TimelineRevision, err)
+	}
+	if err := reopened.ReconcileShardedArchive(ctx, header.ID); err != nil {
+		t.Fatalf("repeat gap reconciliation: %v", err)
+	}
+	root, err = reopened.LoadRecordingHeader(ctx, header.ID)
+	if err != nil || root.ArchiveRevision != 1 || root.TimelineRevision != 1 {
+		t.Fatalf("repeat reconciliation changed revisions: archive=%d timeline=%d err=%v", root.ArchiveRevision, root.TimelineRevision, err)
 	}
 }
 
@@ -2639,6 +2982,9 @@ type countedV2IO struct {
 	claimPageWrites             int
 	timelinePageReads           int
 	mediaPageReads              int
+	coverageStatePageReads      int
+	coverageStatePageWrites     int
+	listRequests                int
 	payloadBytesWritten         int64
 	bytesRead, bytesWritten     int64
 }
@@ -2793,6 +3139,9 @@ func (b *countingV2Backend) LoadSidecarContext(ctx context.Context, id, relative
 	if strings.HasPrefix(relative, "archive/v2/media/") {
 		b.stats.mediaPageReads++
 	}
+	if strings.HasPrefix(relative, "archive/v2/coverage-state/") {
+		b.stats.coverageStatePageReads++
+	}
 	b.stats.bytesRead += b.fileSize(id, relative+".json")
 	b.mu.Unlock()
 	return b.local.LoadSidecarContext(ctx, id, relative, limit, output)
@@ -2811,6 +3160,8 @@ func (b *countingV2Backend) SaveSidecarContext(ctx context.Context, id, relative
 		b.stats.livePageWrites++
 	case strings.HasPrefix(relative, "archive/v2/claims/"):
 		b.stats.claimPageWrites++
+	case strings.HasPrefix(relative, "archive/v2/coverage-state/"):
+		b.stats.coverageStatePageWrites++
 	}
 	b.stats.bytesWritten += int64(len(encoded) + 1)
 	b.mu.Unlock()
@@ -2818,6 +3169,9 @@ func (b *countingV2Backend) SaveSidecarContext(ctx context.Context, id, relative
 }
 
 func (b *countingV2Backend) ListSidecarsContext(ctx context.Context, id, prefix, cursor string, limit int) (V2SidecarPage, error) {
+	b.mu.Lock()
+	b.stats.listRequests++
+	b.mu.Unlock()
 	return b.local.ListSidecarsContext(ctx, id, prefix, cursor, limit)
 }
 

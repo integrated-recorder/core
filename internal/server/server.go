@@ -50,6 +50,7 @@ type Server struct {
 	previews                    *preview.Service
 	watches                     *watch.Service
 	auth                        *authn.Service
+	logoutSession               func(string) error
 	storageDiagnostics          *storagediagnostic.Store
 	settings                    *systemsettings.Store
 	effectiveStorage            systemsettings.StorageSettings
@@ -86,6 +87,50 @@ type recordingManager interface {
 	CompleteRecording(context.Context, string) (*domain.Recording, error)
 	SealArchiveContext(context.Context, string) error
 	Delete(string) error
+}
+
+type recordingManagementPager interface {
+	ListForManagementPage(context.Context, string, int) ([]*domain.Recording, string, error)
+}
+
+// listManagementSummaries drains bounded Engine pages before applying the
+// public query's global filter/sort/page. Cursors use recording ID order and
+// do not freeze a snapshot across concurrent creates or deletes. Test/embed
+// managers without the page capability retain the legacy bounded fallback.
+func listManagementSummaries(ctx context.Context, manager recordingManager) ([]*domain.Recording, error) {
+	if manager == nil {
+		return nil, errors.New("recording manager is unavailable")
+	}
+	pager, ok := manager.(recordingManagementPager)
+	if !ok {
+		return manager.ListForManagement(ctx, maxGlobalSearchScan)
+	}
+	var recordings []*domain.Recording
+	seen := make(map[string]struct{})
+	cursor := ""
+	for {
+		page, next, err := pager.ListForManagementPage(ctx, cursor, storage.ManagementPageLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, recording := range page {
+			if recording == nil || recording.ID == "" {
+				return nil, errors.New("recording summary page is invalid")
+			}
+			if _, duplicate := seen[recording.ID]; duplicate {
+				return nil, errors.New("recording summary paging returned a duplicate")
+			}
+			seen[recording.ID] = struct{}{}
+			recordings = append(recordings, recording)
+		}
+		if next == "" {
+			return recordings, nil
+		}
+		if next <= cursor {
+			return nil, errors.New("recording summary cursor did not advance")
+		}
+		cursor = next
+	}
 }
 
 // Options contains optional product-management services. New remains available
@@ -175,6 +220,9 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 		}
 	}
 	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, adapterTrust: validatedAdapterTrust(options.AdapterTrust), configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, storageDiagnostics: options.StorageDiagnostics, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, installationManaged: options.InstallationManaged, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
+	if options.Auth != nil {
+		s.logoutSession = options.Auth.Logout
+	}
 	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
@@ -660,7 +708,7 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "adapter configuration could not be read")
 		return
 	}
-	if auditErr := s.appendAudit("config_changed", id); auditErr != nil {
+	if !s.auditMutation(w, r, "config_changed", id) {
 		w.Header().Set("X-Config-Audit", "failed")
 	} else if s.products != nil {
 		w.Header().Set("X-Config-Audit", "recorded")
@@ -748,7 +796,7 @@ func summary(r *domain.Recording) recordingSummary {
 	if classification == "" {
 		classification = "sensitive"
 	}
-	return recordingSummary{ID: r.ID, Title: r.Title, AdapterID: r.AdapterID, Adapter: r.Adapter, Resource: r.Resource, SourceURIClassification: classification, State: r.State, CreatedAt: r.CreatedAt, StartedAt: r.StartedAt, StoppedAt: r.StoppedAt, TrackCount: len(r.Tracks), SegmentCount: r.SegmentCount(), Duration: r.Duration(), GapCount: len(r.Gaps), LastError: publicLastError(r.LastError)}
+	return recordingSummary{ID: r.ID, Title: r.Title, AdapterID: r.AdapterID, Adapter: r.Adapter, Resource: r.Resource, SourceURIClassification: classification, State: r.State, CreatedAt: r.CreatedAt, StartedAt: r.StartedAt, StoppedAt: r.StoppedAt, TrackCount: len(r.Tracks), SegmentCount: r.SegmentCount(), Duration: r.Duration(), GapCount: recordingGapCount(r), LastError: publicLastError(r.LastError)}
 }
 
 func (s *Server) recordingSummary(r *domain.Recording) recordingSummary {
@@ -824,7 +872,11 @@ func detail(r *domain.Recording) recordingDetail {
 	return recordingDetail{Recording: &projected, TrackCount: len(r.Tracks), SegmentCount: r.SegmentCount(), Duration: r.Duration()}
 }
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	recordings := s.manager.List()
+	recordings, err := listManagementSummaries(r.Context(), s.manager)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "recording summaries are temporarily unavailable")
+		return
+	}
 	out := make([]recordingSummary, 0, len(recordings))
 	for _, recording := range recordings {
 		out = append(out, s.recordingSummary(recording))
@@ -835,7 +887,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(r.PathValue("id"))
 	lock.RLock()
 	defer lock.RUnlock()
-	recording, err := s.manager.Get(r.PathValue("id"))
+	recording, err := s.recordingSnapshot(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeStorageError(w, err)
 		return

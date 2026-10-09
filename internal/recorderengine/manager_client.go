@@ -13,6 +13,11 @@ import (
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
+// ErrManagementRootCacheInvalidationUnsupported is returned by Engines that
+// predate the optional management root cache operation. Such Engines have no
+// cache to refresh; all other IPC failures remain fatal to the read snapshot.
+var ErrManagementRootCacheInvalidationUnsupported = errors.New("recorder engine does not support management root cache invalidation")
+
 // ManagerClient adapts one generation-pinned Engine IPC client to the
 // recordingManager method set consumed by the Control Plane. It has no local
 // storage fallback: all lifecycle mutations are sent to the selected Engine.
@@ -255,6 +260,38 @@ func (m *ManagerClient) GetContext(ctx context.Context, id string) (*domain.Reco
 	return &recording, nil
 }
 
+// GetManagementHeader reads bounded recording root without materializing V2
+// archive shards. Use Get only for workflows that need full archive history.
+func (m *ManagerClient) GetManagementHeader(ctx context.Context, id string) (*domain.Recording, error) {
+	if id == "" {
+		return nil, errors.New("recording identity is required")
+	}
+	var recording domain.Recording
+	if err := m.client.Call(ctx, OperationGetManagementHeader, RecordingIDRequest{RecordingID: id}, &recording); err != nil {
+		return nil, normalizeEngineError(err)
+	}
+	return &recording, nil
+}
+
+// InvalidateManagementRootCache refreshes this Engine's process-local root ID
+// snapshot before it becomes the active management read generation.
+func (m *ManagerClient) InvalidateManagementRootCache(ctx context.Context) error {
+	var result struct {
+		Invalidated bool `json:"invalidated"`
+	}
+	if err := m.client.Call(ctx, OperationInvalidateManagementRootCache, nil, &result); err != nil {
+		var remote *runtimeipc.RemoteError
+		if errors.As(err, &remote) && remote.Code == "unsupported_operation" {
+			return ErrManagementRootCacheInvalidationUnsupported
+		}
+		return normalizeEngineError(err)
+	}
+	if !result.Invalidated {
+		return errors.New("recorder engine did not invalidate management root cache")
+	}
+	return nil
+}
+
 // LifecycleSnapshot requests a bounded lifecycle projection from this Engine.
 func (m *ManagerClient) LifecycleSnapshot(ctx context.Context, id string) (acquire.LifecycleSnapshot, error) {
 	var snapshot acquire.LifecycleSnapshot
@@ -360,6 +397,36 @@ func (m *ManagerClient) ListForManagement(ctx context.Context, limit int) ([]*do
 		return []*domain.Recording{}, nil
 	}
 	return recordings, nil
+}
+
+// ListForManagementPage transfers one bounded summary page over Engine IPC.
+// Cursors use stable recording IDs and are not a snapshot across concurrent
+// creates or deletes.
+func (m *ManagerClient) ListForManagementPage(ctx context.Context, afterID string, limit int) ([]*domain.Recording, string, error) {
+	if limit < 1 || limit > MaximumListPageLimit || len(afterID) > 64 {
+		return nil, "", acquire.ErrListLimit
+	}
+	var result ListPageResult
+	if err := m.client.Call(ctx, OperationListPage, ListPageRequest{AfterID: afterID, Limit: limit}, &result); err != nil {
+		return nil, "", normalizeEngineError(err)
+	}
+	if len(result.Items) > limit || result.NextCursor != "" && result.NextCursor <= afterID {
+		return nil, "", errors.New("recorder engine returned an invalid recording summary page")
+	}
+	previousID := afterID
+	for _, item := range result.Items {
+		if item == nil || item.ID == "" || item.ID <= previousID {
+			return nil, "", errors.New("recorder engine returned an invalid recording summary page")
+		}
+		previousID = item.ID
+	}
+	if result.NextCursor != "" && len(result.Items) > 0 && result.NextCursor < result.Items[len(result.Items)-1].ID {
+		return nil, "", errors.New("recorder engine returned an invalid recording summary cursor")
+	}
+	if result.Items == nil {
+		result.Items = []*domain.Recording{}
+	}
+	return result.Items, result.NextCursor, nil
 }
 
 func (m *ManagerClient) Stop(id string) (*domain.Recording, error) {

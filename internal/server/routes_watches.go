@@ -38,10 +38,7 @@ func (s *Server) watchCreate(w http.ResponseWriter, r *http.Request) {
 		writeWatchError(w, err)
 		return
 	}
-	if err := s.appendAudit("watch_created", view.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "Watch was created but audit record could not be saved")
-		return
-	}
+	s.auditMutation(w, r, "watch_created", view.ID)
 	writeJSON(w, http.StatusCreated, view)
 }
 
@@ -81,10 +78,7 @@ func (s *Server) watchUpdate(w http.ResponseWriter, r *http.Request) {
 		writeWatchError(w, err)
 		return
 	}
-	if err := s.appendAudit("watch_updated", view.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "Watch was updated but audit record could not be saved")
-		return
-	}
+	s.auditMutation(w, r, "watch_updated", view.ID)
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -98,10 +92,7 @@ func (s *Server) watchDelete(w http.ResponseWriter, r *http.Request) {
 		writeWatchError(w, err)
 		return
 	}
-	if err := s.appendAudit("watch_deleted", id); err != nil {
-		writeError(w, http.StatusInternalServerError, "Watch was deleted but audit record could not be saved")
-		return
-	}
+	s.auditMutation(w, r, "watch_deleted", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -122,10 +113,7 @@ func (s *Server) watchSetEnabled(w http.ResponseWriter, r *http.Request, enabled
 	if !enabled {
 		kind = "watch_disabled"
 	}
-	if err := s.appendAudit(kind, view.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "Watch state changed but audit record could not be saved")
-		return
-	}
+	s.auditMutation(w, r, kind, view.ID)
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -135,16 +123,13 @@ func (s *Server) watchCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if err := s.appendAudit("manual_watch_check", id); err != nil {
-		writeError(w, http.StatusInternalServerError, "Watch check audit record could not be saved")
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 27*time.Second)
 	defer cancel()
 	if err := s.watches.ManualCheck(ctx, id); err != nil {
 		writeWatchError(w, err)
 		return
 	}
+	s.auditMutation(w, r, "manual_watch_check", id)
 	view, err := s.watches.Get(id)
 	if err != nil {
 		writeWatchError(w, err)
@@ -170,7 +155,7 @@ func (s *Server) watchRecordings(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]recordingSummary, 0, len(relations))
 	for _, relation := range relations {
-		recording, getErr := s.manager.Get(relation.RecordingID)
+		recording, getErr := s.recordingSnapshot(r.Context(), relation.RecordingID)
 		if getErr != nil {
 			continue
 		}

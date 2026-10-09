@@ -43,6 +43,21 @@ type ObjectStoreArchiveBackend struct {
 
 	issuesMu sync.RWMutex
 	issues   []RecoveryIssue
+
+	// Recording roots are enumerated once per backend process for management
+	// snapshots. The archive object prefix can contain millions of media and
+	// sidecar objects, so rediscovering root IDs with LIST on every poll makes
+	// management traffic proportional to total archive size. Root publications
+	// made by this backend update the cache without adding provider operations.
+	rootIDsMu             sync.RWMutex
+	rootIDsInitOnce       sync.Once
+	rootIDsInitGate       chan struct{}
+	rootIDsEpoch          uint64
+	rootIDs               map[string]struct{}
+	rootIDList            []string
+	rootIDChanges         map[string]bool
+	rootIDsLoaded         bool
+	onRootIDSnapshotClone func(int) // test hook; nil in production
 }
 
 var _ StorageBackend = (*ObjectStoreArchiveBackend)(nil)
@@ -110,6 +125,212 @@ func (b *ObjectStoreArchiveBackend) CreateRecording(recording *domain.Recording)
 	}
 	b.telemetry.recordWrite(uint64(marshalSize(recording)), time.Since(started))
 	return nil
+}
+
+func recordingIDFromRootKey(key string) (string, bool) {
+	const prefix = "recordings/"
+	const suffix = "/recording.json"
+	if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) {
+		return "", false
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(key, prefix), suffix)
+	return id, recordingIDPattern.MatchString(id) && !strings.Contains(id, "/")
+}
+
+func (b *ObjectStoreArchiveBackend) noteRecordingRoot(id string, present bool) {
+	if !recordingIDPattern.MatchString(id) {
+		return
+	}
+	b.rootIDsMu.Lock()
+	defer b.rootIDsMu.Unlock()
+	if b.rootIDsLoaded {
+		if present {
+			b.rootIDs[id] = struct{}{}
+		} else {
+			delete(b.rootIDs, id)
+		}
+		index := sort.SearchStrings(b.rootIDList, id)
+		exists := index < len(b.rootIDList) && b.rootIDList[index] == id
+		if present && !exists {
+			b.rootIDList = append(b.rootIDList, "")
+			copy(b.rootIDList[index+1:], b.rootIDList[index:])
+			b.rootIDList[index] = id
+		} else if !present && exists {
+			b.rootIDList = append(b.rootIDList[:index], b.rootIDList[index+1:]...)
+		}
+		return
+	}
+	if b.rootIDChanges == nil {
+		b.rootIDChanges = make(map[string]bool)
+	}
+	b.rootIDChanges[id] = present
+}
+
+func (b *ObjectStoreArchiveBackend) recordingRootIDsSnapshot() ([]string, error) {
+	return b.recordingRootIDsSnapshotContext(context.Background())
+}
+
+func (b *ObjectStoreArchiveBackend) recordingRootIDsSnapshotContext(ctx context.Context) ([]string, error) {
+	if err := b.ensureRecordingRootIDsContext(ctx); err != nil {
+		return nil, err
+	}
+	b.rootIDsMu.RLock()
+	defer b.rootIDsMu.RUnlock()
+	ids := append([]string(nil), b.rootIDList...)
+	if b.onRootIDSnapshotClone != nil {
+		b.onRootIDSnapshotClone(len(ids))
+	}
+	return ids, nil
+}
+
+// ensureRecordingRootIDsContext initializes the process-local root cache
+// without copying the full sorted ID index. Page readers use this helper and
+// copy only their selected range; snapshot readers retain the copying method.
+func (b *ObjectStoreArchiveBackend) ensureRecordingRootIDsContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if b.recordingRootIDsLoaded() {
+		return nil
+	}
+
+	// Serialize only cold provider scans. The context-aware gate lets a waiting
+	// management request leave without waiting for another generation's scan.
+	if err := b.lockRecordingRootScan(ctx); err != nil {
+		return err
+	}
+	defer b.unlockRecordingRootScan()
+	for {
+		if b.recordingRootIDsLoaded() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		b.rootIDsMu.RLock()
+		epoch := b.rootIDsEpoch
+		b.rootIDsMu.RUnlock()
+
+		roots := make(map[string]struct{})
+		err := b.walkPagesUnbounded(ctx, "recordings/", func(item PhysicalObjectInfo) error {
+			if id, ok := recordingIDFromRootKey(item.Key); ok {
+				roots[id] = struct{}{}
+			}
+			return nil
+		})
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return errors.New("recording archive listing is unavailable")
+		}
+
+		_, current := b.publishRecordingRootIDs(roots, epoch)
+		if current {
+			return nil
+		}
+	}
+}
+
+func (b *ObjectStoreArchiveBackend) recordingRootIDsLoaded() bool {
+	b.rootIDsMu.RLock()
+	defer b.rootIDsMu.RUnlock()
+	return b.rootIDsLoaded
+}
+
+func (b *ObjectStoreArchiveBackend) lockRecordingRootScan(ctx context.Context) error {
+	b.rootIDsInitOnce.Do(func() { b.rootIDsInitGate = make(chan struct{}, 1) })
+	select {
+	case b.rootIDsInitGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *ObjectStoreArchiveBackend) unlockRecordingRootScan() {
+	<-b.rootIDsInitGate
+}
+
+func (b *ObjectStoreArchiveBackend) publishRecordingRootIDs(roots map[string]struct{}, expectedEpoch uint64) ([]string, bool) {
+	b.rootIDsMu.Lock()
+	if b.rootIDsEpoch != expectedEpoch {
+		b.rootIDsMu.Unlock()
+		return nil, false
+	}
+	b.rootIDs = roots
+	for id, present := range b.rootIDChanges {
+		if present {
+			b.rootIDs[id] = struct{}{}
+		} else {
+			delete(b.rootIDs, id)
+		}
+	}
+	b.rootIDChanges = nil
+	b.rootIDsLoaded = true
+	ids := make([]string, 0, len(b.rootIDs))
+	for id := range b.rootIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	b.rootIDList = ids
+	b.rootIDsMu.Unlock()
+	return ids, true
+}
+
+func (b *ObjectStoreArchiveBackend) managementRootIDsPageContext(ctx context.Context, afterID string, limit int) ([]string, string, error) {
+	deleted, err := b.deletionIDsContext(ctx)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, "", ctxErr
+		}
+		return nil, "", errors.New("recording deletion state is unavailable")
+	}
+	if err := b.ensureRecordingRootIDsContext(ctx); err != nil {
+		return nil, "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	b.rootIDsMu.RLock()
+	defer b.rootIDsMu.RUnlock()
+	start := sort.SearchStrings(b.rootIDList, afterID)
+	if afterID != "" && start < len(b.rootIDList) && b.rootIDList[start] == afterID {
+		start++
+	}
+	ids := make([]string, 0, limit)
+	lastScanned := ""
+	index := start
+	for ; index < len(b.rootIDList) && len(ids) < limit; index++ {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		id := b.rootIDList[index]
+		lastScanned = id
+		if _, hidden := deleted[id]; !hidden {
+			ids = append(ids, id)
+		}
+	}
+	next := ""
+	if index < len(b.rootIDList) {
+		next = lastScanned
+	}
+	return ids, next, nil
+}
+
+// InvalidateManagementRootCache clears process-local root discovery state.
+// Runtime generation routing calls this when an Engine becomes active so a
+// previously warmed generation cannot hide roots created by another Engine.
+func (b *ObjectStoreArchiveBackend) InvalidateManagementRootCache() {
+	b.rootIDsMu.Lock()
+	b.rootIDsEpoch++
+	b.rootIDs = nil
+	b.rootIDList = nil
+	b.rootIDsLoaded = false
+	b.rootIDsMu.Unlock()
 }
 
 // CreateRecordingWithSidecar publishes a private initial sidecar before the
@@ -190,30 +411,18 @@ func (b *ObjectStoreArchiveBackend) LoadAll() ([]*domain.Recording, error) {
 	if err != nil {
 		return nil, errors.New("recording deletion state is unavailable")
 	}
-	roots := make(map[string]struct{})
-	err = b.walkPagesUnbounded(context.Background(), "recordings/", func(item PhysicalObjectInfo) error {
-		const suffix = "/recording.json"
-		if !strings.HasPrefix(item.Key, "recordings/") || !strings.HasSuffix(item.Key, suffix) {
-			return nil
-		}
-		id := strings.TrimSuffix(strings.TrimPrefix(item.Key, "recordings/"), suffix)
-		if recordingIDPattern.MatchString(id) {
-			roots[id] = struct{}{}
-		}
-		return nil
-	})
+	ids, err := b.recordingRootIDsSnapshot()
 	if err != nil {
-		return nil, errors.New("recording archive listing is unavailable")
+		return nil, err
 	}
-	ids := make([]string, 0, len(roots))
-	for id := range roots {
+	visibleIDs := make([]string, 0, len(ids))
+	for _, id := range ids {
 		if _, hidden := deleted[id]; !hidden {
-			ids = append(ids, id)
+			visibleIDs = append(visibleIDs, id)
 		}
 	}
-	sort.Strings(ids)
 	var recordings []*domain.Recording
-	for _, id := range ids {
+	for _, id := range visibleIDs {
 		recording, readErr := b.loadRecordingForRecovery(context.Background(), id)
 		if readErr != nil {
 			code := "metadata_invalid"
@@ -297,49 +506,58 @@ func markInterrupted(recording *domain.Recording, now time.Time) {
 }
 
 func (b *ObjectStoreArchiveBackend) LoadAllReadOnly() ([]*domain.Recording, error) {
-	return b.loadAllReadOnly(0, false)
+	return b.loadAllReadOnly(context.Background(), 0, false)
 }
 
 func (b *ObjectStoreArchiveBackend) LoadAllReadOnlyLimit(max int) ([]*domain.Recording, error) {
 	if max < 0 {
 		return nil, ErrReadOnlyListLimit
 	}
-	return b.loadAllReadOnly(max, true)
+	return b.loadAllReadOnly(context.Background(), max, true)
 }
 
-func (b *ObjectStoreArchiveBackend) loadAllReadOnly(max int, bounded bool) ([]*domain.Recording, error) {
-	deleted, err := b.deletionIDs()
+// LoadAllReadOnlyLimitContext is the cancellation-aware management list path.
+// Root discovery still scans recordings/ once per backend generation because
+// the provider List contract has no delimiter or root-only index operation.
+func (b *ObjectStoreArchiveBackend) LoadAllReadOnlyLimitContext(ctx context.Context, max int) ([]*domain.Recording, error) {
+	if max < 0 {
+		return nil, ErrReadOnlyListLimit
+	}
+	return b.loadAllReadOnly(ctx, max, true)
+}
+
+func (b *ObjectStoreArchiveBackend) loadAllReadOnly(ctx context.Context, max int, bounded bool) ([]*domain.Recording, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	deleted, err := b.deletionIDsContext(ctx)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, errors.New("recording deletion state is unavailable")
 	}
-	roots := map[string]struct{}{}
-	err = b.walkPagesUnbounded(context.Background(), "recordings/", func(item PhysicalObjectInfo) error {
-		if strings.HasPrefix(item.Key, "recordings/") && strings.HasSuffix(item.Key, "/recording.json") {
-			id := strings.TrimSuffix(strings.TrimPrefix(item.Key, "recordings/"), "/recording.json")
-			if recordingIDPattern.MatchString(id) {
-				roots[id] = struct{}{}
-			}
-		}
-		return nil
-	})
+	ids, err := b.recordingRootIDsSnapshotContext(ctx)
 	if err != nil {
-		return nil, errors.New("recording archive listing is unavailable")
+		return nil, err
 	}
-	ids := make([]string, 0, len(roots))
-	for id := range roots {
+	visibleIDs := make([]string, 0, len(ids))
+	for _, id := range ids {
 		if _, hidden := deleted[id]; !hidden {
-			ids = append(ids, id)
+			visibleIDs = append(visibleIDs, id)
 		}
 	}
-	sort.Strings(ids)
 	var recordings []*domain.Recording
-	for _, id := range ids {
-		recording, err := b.loadRecording(context.Background(), id)
+	for _, id := range visibleIDs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		recording, err := b.loadRecording(ctx, id)
 		if err != nil {
-			if isObjectNotFound(err) {
-				continue
-			}
-			continue
+			return nil, fmt.Errorf("recording root metadata is unavailable: %w", err)
 		}
 		for _, track := range recording.Tracks {
 			if track == nil {
@@ -351,6 +569,9 @@ func (b *ObjectStoreArchiveBackend) loadAllReadOnly(max int, bounded bool) ([]*d
 		if bounded && len(recordings) > max {
 			return nil, ErrReadOnlyListLimit
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	sort.Slice(recordings, func(i, j int) bool { return recordings[i].CreatedAt.After(recordings[j].CreatedAt) })
 	return recordings, nil
@@ -529,12 +750,18 @@ func (b *ObjectStoreArchiveBackend) putBytes(ctx context.Context, key string, da
 			b.telemetry.recordError()
 			return errors.New("physical object publication was not verified")
 		}
+		if id, ok := recordingIDFromRootKey(key); ok {
+			b.noteRecordingRoot(id, true)
+		}
 		return nil
 	}
 	// An IPC/transport error can happen after the provider atomically published
 	// the object. Accept that uncertain outcome only after independently
 	// confirming exact size and digest, as with streamed payload publication.
 	if confirmErr := b.confirmObject(ctx, key, int64(len(data)), hexdigest); confirmErr == nil {
+		if id, ok := recordingIDFromRootKey(key); ok {
+			b.noteRecordingRoot(id, true)
+		}
 		return nil
 	}
 	b.telemetry.recordError()
@@ -977,7 +1204,14 @@ func (b *ObjectStoreArchiveBackend) deletionMarkerKey(id string) string {
 }
 
 func (b *ObjectStoreArchiveBackend) deletionIDs() (map[string]struct{}, error) {
-	items, err := b.listAll(context.Background(), deletionMarkerPrefix, maxArchiveEnumeration)
+	return b.deletionIDsContext(context.Background())
+}
+
+func (b *ObjectStoreArchiveBackend) deletionIDsContext(ctx context.Context) (map[string]struct{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	items, err := b.listAll(ctx, deletionMarkerPrefix, maxArchiveEnumeration)
 	if err != nil {
 		return nil, err
 	}
@@ -1027,6 +1261,7 @@ func (b *ObjectStoreArchiveBackend) DeleteRecordingData(id string) error {
 		b.telemetry.recordError()
 		return errors.New("recording deletion could not be completed")
 	}
+	b.noteRecordingRoot(id, false)
 	if err := b.delete(context.Background(), marker); err != nil {
 		b.telemetry.recordError()
 		return errors.New("recording deletion could not be completed")

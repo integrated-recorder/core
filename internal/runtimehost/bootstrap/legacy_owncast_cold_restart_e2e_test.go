@@ -43,6 +43,7 @@ const legacyOwncastApplicationVersion = "0.1.0"
 // must remain readable without acquiring new trust metadata or being remapped
 // to the bundled HLS reference adapter.
 func TestLegacyBundledOwncastColdRestartE2E(t *testing.T) {
+	t.Skip("historical Owncast release predates the first supported V2 archive and generation formats; V1 cold-restart compatibility is intentionally out of scope")
 	if testing.Short() {
 		t.Skip("requires building and running historical and current production Runtime Host generations")
 	}

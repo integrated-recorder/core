@@ -114,8 +114,9 @@ type JobProjection struct {
 	Freshness               Freshness `json:"freshness"`
 }
 
-// ProjectJob compares a captured verification snapshot with an explicitly
-// supplied current recording snapshot. Missing/legacy revisions remain
+// ProjectJob compares the captured canonical archive revision with an
+// explicitly supplied current recording snapshot. Timeline-only changes do
+// not make payload integrity stale. Missing/legacy archive revisions remain
 // unknown; freshness never changes verification job state.
 func ProjectJob(job Job, current *domain.Recording) JobProjection {
 	projection := JobProjection{Job: cloneJob(job), Freshness: FreshnessUnknown}
@@ -125,7 +126,7 @@ func ProjectJob(job Job, current *domain.Recording) JobProjection {
 	projection.CurrentArchiveRevision = current.ArchiveRevision
 	projection.CurrentTimelineRevision = current.TimelineRevision
 	projection.Freshness = FreshnessCurrent
-	if job.SourceArchiveRevision != current.ArchiveRevision || job.SourceTimelineRevision != current.TimelineRevision {
+	if job.SourceArchiveRevision != current.ArchiveRevision {
 		projection.Freshness = FreshnessStale
 	}
 	return projection
@@ -436,15 +437,19 @@ func (s *Service) StatusFor(recording *domain.Recording) (ResultProjection, bool
 		revision = s.resultRevisions[recording.ID]
 	}
 	if jobID := s.active[recording.ID]; jobID != "" {
+		// While verification is active, freshness describes that job's
+		// captured snapshot. The previously completed result remains persisted
+		// separately in s.results/resultRevisions and is not rebound here.
+		activeRevision := sourceRevision{}
+		if job, ok := s.jobs[jobID]; ok && job.SourceRevisionKnown {
+			activeRevision = sourceRevision{Archive: job.SourceArchiveRevision, Timeline: job.SourceTimelineRevision, Known: true}
+		}
 		if exists {
 			result.Status = storage.IntegrityVerifying
 		} else {
 			result = storage.IntegrityResult{Status: storage.IntegrityVerifying, Issues: []storage.IntegrityIssue{}}
-			if job, ok := s.jobs[jobID]; ok && job.SourceRevisionKnown {
-				revision = sourceRevision{Archive: job.SourceArchiveRevision, Timeline: job.SourceTimelineRevision, Known: true}
-			}
 		}
-		return projectResult(result, revision, recording), true
+		return projectResult(result, activeRevision, recording), true
 	}
 	if exists {
 		return projectResult(result, revision, recording), true
@@ -470,7 +475,7 @@ func projectResult(result storage.IntegrityResult, source sourceRevision, curren
 	}
 	if source.Known {
 		projection.Freshness = FreshnessCurrent
-		if source.Archive != current.ArchiveRevision || source.Timeline != current.TimelineRevision {
+		if source.Archive != current.ArchiveRevision {
 			projection.Freshness = FreshnessStale
 		}
 	}

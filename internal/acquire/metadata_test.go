@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/storage"
 	"github.com/integrated-recorder/core/internal/streammeta"
@@ -39,17 +40,26 @@ func TestMetadataObservationDeduplicatesAndPreservesKnownEmpty(t *testing.T) {
 	if err != nil || !active || truncated || committed != 1 || len(e.recording.MetadataTimeline) != 1 {
 		t.Fatalf("first observation active=%v truncated=%v committed=%d timeline=%#v err=%v", active, truncated, committed, e.recording.MetadataTimeline, err)
 	}
+	if e.recording.ArchiveRevision != 1 {
+		t.Fatalf("first canonical metadata change archive revision=%d, want 1", e.recording.ArchiveRevision)
+	}
 	// A source timestamp-only change is not a semantic content revision.
 	sourceTime = sourceTime.Add(time.Minute)
 	active, _, err = manager.commitMetadataObservation(e, 7, time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC), first, func() error { committed++; return nil })
 	if err != nil || !active || committed != 2 || len(e.recording.MetadataTimeline) != 1 {
 		t.Fatalf("duplicate observation timeline=%#v err=%v", e.recording.MetadataTimeline, err)
 	}
+	if e.recording.ArchiveRevision != 1 {
+		t.Fatalf("duplicate metadata observation archive revision=%d, want unchanged 1", e.recording.ArchiveRevision)
+	}
 	empty := ""
 	clearDescription := adapterproto.MetadataResult{Metadata: adapterproto.StreamMetadata{Description: &empty}}
 	active, _, err = manager.commitMetadataObservation(e, 7, time.Date(2026, 9, 29, 12, 1, 0, 0, time.UTC), clearDescription, nil)
 	if err != nil || !active || len(e.recording.MetadataTimeline) != 2 {
 		t.Fatalf("description clear timeline=%#v err=%v", e.recording.MetadataTimeline, err)
+	}
+	if e.recording.ArchiveRevision != 2 {
+		t.Fatalf("second canonical metadata change archive revision=%d, want 2", e.recording.ArchiveRevision)
 	}
 	last := e.recording.MetadataTimeline[1]
 	if last.Title == nil || *last.Title != "A" || last.Description == nil || *last.Description != "" {
@@ -71,6 +81,52 @@ func TestMetadataObservationDeduplicatesAndPreservesKnownEmpty(t *testing.T) {
 	loaded, err := store.LoadAll()
 	if err != nil || len(loaded) != 1 || len(loaded[0].MetadataTimeline) != 2 || loaded[0].MetadataTimeline[1].Description == nil || *loaded[0].MetadataTimeline[1].Description != "" {
 		t.Fatalf("metadata did not survive archive reload: %#v err=%v", loaded, err)
+	}
+}
+
+func TestShardedMetadataObservationAdvancesArchiveRevisionOncePerSemanticChange(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "acdef0123456789abcdef0123456789a"
+	identity, err := archiveindex.NewSessionIdentity(id, "fixture", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	recording := &domain.Recording{
+		FormatVersion: storage.ShardedArchiveFormatVersion, ShardedArchive: &domain.ShardedArchiveSummary{},
+		ID: id, SourceSessionID: identity.ID, State: domain.StateRecording, CreatedAt: now, StartedAt: now,
+		ArchiveRevision: 1, Tracks: map[string]*domain.Track{"main": {ID: "main", NextArchiveOrdinal: 1}},
+	}
+	if err := store.CreateShardedRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{store: store}
+	e := &entry{recording: recording, mediaGeneration: 3}
+	firstTitle := "first"
+	first := adapterproto.MetadataResult{Metadata: adapterproto.StreamMetadata{Title: &firstTitle}}
+	if active, _, err := manager.commitMetadataObservation(e, 3, now, first, nil); err != nil || !active {
+		t.Fatalf("first V2 metadata observation active=%v err=%v", active, err)
+	}
+	if e.recording.ArchiveRevision != 2 {
+		t.Fatalf("first V2 metadata revision=%d, want 2", e.recording.ArchiveRevision)
+	}
+	if active, _, err := manager.commitMetadataObservation(e, 3, now.Add(time.Second), first, nil); err != nil || !active {
+		t.Fatalf("duplicate V2 metadata observation active=%v err=%v", active, err)
+	}
+	if e.recording.ArchiveRevision != 2 {
+		t.Fatalf("duplicate V2 metadata revision=%d, want unchanged 2", e.recording.ArchiveRevision)
+	}
+	secondTitle := "second"
+	second := adapterproto.MetadataResult{Metadata: adapterproto.StreamMetadata{Title: &secondTitle}}
+	if active, _, err := manager.commitMetadataObservation(e, 3, now.Add(2*time.Second), second, nil); err != nil || !active {
+		t.Fatalf("changed V2 metadata observation active=%v err=%v", active, err)
+	}
+	header, err := store.LoadRecordingHeader(context.Background(), id)
+	if err != nil || header.ArchiveRevision != 3 || header.ShardedArchive.MetadataRevisionCount != 2 {
+		t.Fatalf("V2 metadata root revision=%d count=%d err=%v, want revision 3/count 2", header.ArchiveRevision, header.ShardedArchive.MetadataRevisionCount, err)
 	}
 }
 

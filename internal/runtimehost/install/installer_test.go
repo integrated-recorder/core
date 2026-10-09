@@ -286,7 +286,7 @@ func newBundle(t *testing.T) *bundleFixture {
 			ControlProtocolRange: release.ProtocolRange{Minimum: 1, Maximum: 1},
 			EngineProtocolRange:  release.ProtocolRange{Minimum: 1, Maximum: 1},
 			AdapterProtocolRange: release.ProtocolRange{Minimum: 1, Maximum: 2},
-			ArchiveReadRange:     release.ProtocolRange{Minimum: 1, Maximum: 2}, ArchiveWriteEpoch: 1,
+			ArchiveReadRange:     release.ProtocolRange{Minimum: 2, Maximum: 2}, ArchiveWriteFormat: 2,
 			ManagementSchemaVersion: 1,
 		},
 		payloads: make(map[string][]byte),
@@ -296,7 +296,7 @@ func newBundle(t *testing.T) *bundleFixture {
 		BuildTime: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC).Format(time.RFC3339),
 		Channel:   "stable", KeyID: "fixture-key", MinimumHostProtocol: 1, MaximumHostProtocol: 1,
 		ControlProtocolVersion: 1, EngineProtocolVersion: 1, AdapterProtocolMinimum: 1, AdapterProtocolMaximum: 2,
-		ArchiveReadMinimum: 1, ArchiveReadMaximum: 2, ArchiveWriteEpoch: 1,
+		ArchiveReadMinimum: 2, ArchiveReadMaximum: 2, ArchiveWriteFormat: 2,
 		ManagementSchemaMinimum: 1, ManagementSchemaMaximum: 1, Platform: "linux", Architecture: "amd64",
 	}
 	roles := []struct{ role, filename string }{

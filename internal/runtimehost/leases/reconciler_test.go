@@ -278,7 +278,7 @@ func stageReady(t *testing.T, r *generation.Registry, id string) {
 	t.Helper()
 	now := time.Now().UTC()
 	gen := generation.Generation{ID: id, Version: "1.0", Commit: "abc123", InstalledAt: now, State: generation.StateStaging,
-		ControlProtocol: 1, EngineProtocol: 1, ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1}
+		ControlProtocol: 1, EngineProtocol: 1, ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 2, Maximum: 2}, ArchiveWriteFormat: 2}
 	if err := r.Stage(gen); err != nil {
 		t.Fatal(err)
 	}

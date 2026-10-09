@@ -340,23 +340,27 @@ func (s *Supervisor) ActivateControlWith(ctx context.Context, generationID strin
 	// one generation can run Watch/retention/background admission at a time.
 	s.mu.Lock()
 	if s.closed || s.gens[generationID] != candidate || candidate.control == nil || candidate.control.state != ProcessReady {
+		routeBeforeAbort := s.activeControl
 		s.mu.Unlock()
+		if err := s.abortDurableActivation(afterAbort, ErrCandidateNotReady); err != nil {
+			return err
+		}
+		s.setActiveControlRoute(routeBeforeAbort)
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), s.cleanup)
 		_ = s.handoff.Rollback(rollbackCtx, oldID, generationID)
 		cancel()
-		if afterAbort != nil {
-			_ = afterAbort()
-		}
 		return ErrCandidateNotReady
 	}
 	if s.activeControl != oldID {
+		routeBeforeAbort := s.activeControl
 		s.mu.Unlock()
+		if err := s.abortDurableActivation(afterAbort, ErrCandidateNotReady); err != nil {
+			return err
+		}
+		s.setActiveControlRoute(routeBeforeAbort)
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), s.cleanup)
 		_ = s.handoff.Rollback(rollbackCtx, oldID, generationID)
 		cancel()
-		if afterAbort != nil {
-			_ = afterAbort()
-		}
 		return ErrCandidateNotReady
 	}
 	s.activeControl = generationID
@@ -368,22 +372,14 @@ func (s *Supervisor) ActivateControlWith(ctx context.Context, generationID strin
 	// Routing changes before the candidate starts background work. A passive
 	// candidate may serve safe reads during this small interval, while mutation
 	// requests remain fenced by its Control lifecycle gate.
-	if err := s.handoff.Activate(ctx, generationID); err != nil {
-		s.mu.Lock()
-		if s.activeControl == generationID {
-			s.activeControl = oldID
+	if activateErr := s.handoff.Activate(ctx, generationID); activateErr != nil {
+		if err := s.abortDurableActivation(afterAbort, activateErr); err != nil {
+			return err
 		}
-		candidate.controlActive = false
-		if old != nil {
-			old.controlActive = true
-		}
-		s.mu.Unlock()
+		s.setActiveControlRoute(oldID)
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), s.cleanup)
 		_ = s.handoff.Rollback(rollbackCtx, oldID, generationID)
 		cancel()
-		if afterAbort != nil {
-			_ = afterAbort()
-		}
 		return errors.New("candidate control activation failed")
 	}
 	if old != nil && old.control != nil {
@@ -397,6 +393,39 @@ func (s *Supervisor) ActivateControlWith(ctx context.Context, generationID strin
 		}
 	}
 	return nil
+}
+
+// activationAbortFailure keeps the returned error text stable while retaining
+// both the activation failure and durable abort failure for internal
+// classification with errors.Is/errors.As.
+type activationAbortFailure struct {
+	cause error
+}
+
+func (e activationAbortFailure) Error() string { return "durable control activation abort failed" }
+func (e activationAbortFailure) Unwrap() error { return e.cause }
+
+// abortDurableActivation disables routing before reversing durable activation
+// state. If reversal fails, caller must leave routing unavailable and skip
+// handoff rollback because the old generation may no longer be compatible.
+func (s *Supervisor) abortDurableActivation(afterAbort func() error, cause error) error {
+	if afterAbort == nil {
+		return nil
+	}
+	s.setActiveControlRoute("")
+	if err := afterAbort(); err != nil {
+		return activationAbortFailure{cause: errors.Join(cause, err)}
+	}
+	return nil
+}
+
+func (s *Supervisor) setActiveControlRoute(generationID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activeControl = generationID
+	for _, generation := range s.gens {
+		generation.controlActive = generationID != "" && generation.id == generationID
+	}
 }
 
 // confirmedDeadControl reports whether this specific Control child is both

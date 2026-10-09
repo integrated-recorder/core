@@ -447,8 +447,8 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 	old := registryState.Generations[id]
 	old.AdapterSetID = oldSetID
 	old.StorageProviderSetID = storageSetID
-	old.ArchiveReadCompatibility = generation.CompatibilityRange{Minimum: 2, Maximum: 7}
-	old.ArchiveWriteEpoch = 5
+	old.ArchiveReadCompatibility = generation.CompatibilityRange{Minimum: 2, Maximum: 2}
+	old.ArchiveWriteFormat = 2
 	registryState.Generations[id] = old
 	selected, err := selectRuntimeRelease(registryState, build, bundle, filepath.Join(t.TempDir(), "runtime"), nil)
 	if err != nil {
@@ -461,7 +461,7 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 	if !needsStage || !prepared.needsStage || prepared.generationID == id || candidate.ID != prepared.generationID || candidate.AdapterSetID != newSetID || candidate.State != generation.StateStaging {
 		t.Fatalf("adapter-set-only startup did not allocate a staged generation: selected=%+v candidate=%+v stage=%t", prepared, candidate, needsStage)
 	}
-	if candidate.Version != old.Version || candidate.Commit != old.Commit || candidate.ArchiveReadCompatibility != old.ArchiveReadCompatibility || candidate.ArchiveWriteEpoch != old.ArchiveWriteEpoch {
+	if candidate.Version != old.Version || candidate.Commit != old.Commit || candidate.ArchiveReadCompatibility != old.ArchiveReadCompatibility || candidate.ArchiveWriteFormat != old.ArchiveWriteFormat {
 		t.Fatalf("adapter-only candidate changed application release compatibility: old=%+v new=%+v", old, candidate)
 	}
 	if got := registryState.Generations[id]; got.AdapterSetID != oldSetID || got.State != generation.StateActive {

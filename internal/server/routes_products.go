@@ -223,11 +223,7 @@ func (s *Server) projectRecordingStatistics(ctx context.Context, recording *doma
 		}
 		statistics.GapSegmentCount += int(n)
 	}
-	if s.integrity != nil {
-		if result, ok := s.integrity.Status(recording.ID); ok {
-			statistics.Integrity = result.Status
-		}
-	}
+	statistics.Integrity = s.integrityStatusFor(recording)
 	var archiveBytes int64
 	var archiveErr error
 	if s.storage == nil {
@@ -252,6 +248,26 @@ func (s *Server) projectRecordingStatistics(ctx context.Context, recording *doma
 		statistics.ArchiveSizeBytes = &archiveBytes
 	}
 	return statistics, nil
+}
+
+// integrityStatusFor projects a saved integrity result against the current
+// canonical recording snapshot. Stale or revision-unknown results are not
+// current archive health; an active verifier remains visible as verifying.
+func (s *Server) integrityStatusFor(recording *domain.Recording) storage.IntegrityStatus {
+	if s.integrity == nil || recording == nil {
+		return storage.IntegrityUnknown
+	}
+	projection, ok := s.integrity.StatusFor(recording)
+	if !ok {
+		return storage.IntegrityUnknown
+	}
+	if projection.Status == storage.IntegrityVerifying {
+		return storage.IntegrityVerifying
+	}
+	if projection.Freshness != integrity.FreshnessCurrent {
+		return storage.IntegrityUnknown
+	}
+	return projection.Status
 }
 
 func (s *Server) reportReadModelFailure(recordingID, component, category string) {
@@ -434,12 +450,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 				result.InterruptedLast24H++
 			}
 		}
-		status := string(storage.IntegrityUnknown)
-		if s.integrity != nil {
-			if report, ok := s.integrity.Status(item.ID); ok {
-				status = string(report.Status)
-			}
-		}
+		status := string(s.integrityStatusFor(item))
 		if _, ok := result.Integrity[status]; !ok {
 			status = string(storage.IntegrityUnknown)
 		}
@@ -1053,7 +1064,9 @@ func (s *Server) recordingEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.integrity != nil {
-		if result, ok := s.integrity.Status(id); ok && !result.LastVerifiedAt.IsZero() {
+		// Completion is a historical event. Keep it visible after an archive
+		// mutation, but derive the event from the revision-aware projection.
+		if result, ok := s.integrity.StatusFor(recording); ok && !result.LastVerifiedAt.IsZero() {
 			add("integrity_completed", result.LastVerifiedAt, result.ObjectsVerified, "integrity verification completed")
 		}
 	}
@@ -1249,8 +1262,8 @@ func (s *Server) syncRecordingNotifications() error {
 	}
 	if s.integrity != nil {
 		for _, recording := range recordings {
-			result, ok := s.integrity.Status(recording.ID)
-			if !ok || result.Status != storage.IntegrityFailed || result.LastVerifiedAt.IsZero() {
+			result, ok := s.integrity.StatusFor(recording)
+			if !ok || result.Freshness != integrity.FreshnessCurrent || result.Status != storage.IntegrityFailed || result.LastVerifiedAt.IsZero() {
 				continue
 			}
 			id := "integrity-" + recording.ID + "-" + strconv.FormatInt(result.LastVerifiedAt.UnixNano(), 10)

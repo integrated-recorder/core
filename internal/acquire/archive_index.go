@@ -32,7 +32,7 @@ const (
 var (
 	ErrArchiveIndexUnavailable = errors.New("archive index is unavailable")
 	ErrArchiveIndexLimit       = errors.New("archive index limit exceeded")
-	ErrArchiveSealed           = errors.New("archive is sealed")
+	ErrArchiveSealed           = storage.ErrArchiveSealed
 	ErrHistoricalUnavailable   = errors.New("declared historical media is unavailable")
 )
 

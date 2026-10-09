@@ -81,6 +81,77 @@ func TestVerificationCompletesPersistsAndReloads(t *testing.T) {
 	if projected.Freshness != FreshnessStale || projected.State != StateCompleted {
 		t.Fatalf("job projection after archive revision change=%+v, want stale completed job", projected)
 	}
+	timelineOnly := *recording
+	timelineOnly.TimelineRevision++
+	current, ok = reloaded.StatusFor(&timelineOnly)
+	if !ok || current.Freshness != FreshnessCurrent || current.SourceArchiveRevision != 7 || current.SourceTimelineRevision != 3 || current.CurrentTimelineRevision != 4 {
+		t.Fatalf("timeline-only change should remain current for payload integrity: %+v present=%t", current, ok)
+	}
+	projected = ProjectJob(reloadedJob, &timelineOnly)
+	if projected.Freshness != FreshnessCurrent || projected.CurrentTimelineRevision != 4 {
+		t.Fatalf("timeline-only job projection=%+v, want current", projected)
+	}
+}
+
+func TestActiveVerificationProjectsItsCapturedArchiveRevision(t *testing.T) {
+	root := t.TempDir()
+	store, recording := makeIntegrityArchive(t, root, "efefefefefefefefefefefefefefefef", []byte("original"))
+	recording.ArchiveRevision = 7
+	recording.TimelineRevision = 3
+	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	service, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeService(t, service)
+
+	prior, err := service.Start(context.Background(), recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed := waitJobState(t, service, prior.ID, StateCompleted); completed.Result == nil || completed.Result.Status != storage.IntegrityVerified {
+		t.Fatalf("initial verification did not complete successfully: %+v", completed)
+	}
+
+	// Begin a new verification against a newer archive snapshot while retaining
+	// the previously persisted result at revision 7.
+	recording.ArchiveRevision = 8
+	recording.TimelineRevision = 4
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	service.verify = func(_ context.Context, _ *domain.Recording) storage.IntegrityResult {
+		entered <- struct{}{}
+		<-release
+		return storage.IntegrityResult{Status: storage.IntegrityVerified, Issues: []storage.IntegrityIssue{}}
+	}
+	active, err := service.Start(context.Background(), recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second verification did not start")
+	}
+
+	projection, ok := service.StatusFor(recording)
+	if !ok || projection.Status != storage.IntegrityVerifying || projection.Freshness != FreshnessCurrent || !projection.RevisionKnown || projection.SourceArchiveRevision != 8 || projection.SourceTimelineRevision != 4 {
+		t.Fatalf("active verification projection=%+v present=%t, want current at active job revision 8", projection, ok)
+	}
+	service.mu.Lock()
+	priorRevision := service.resultRevisions[recording.ID]
+	service.mu.Unlock()
+	if !priorRevision.Known || priorRevision.Archive != 7 {
+		t.Fatalf("active projection overwrote persisted prior result revision: %+v", priorRevision)
+	}
+
+	close(release)
+	completed := waitJobState(t, service, active.ID, StateCompleted)
+	if completed.SourceArchiveRevision != 8 || completed.SourceTimelineRevision != 4 {
+		t.Fatalf("completed active job lost captured revisions: %+v", completed)
+	}
 }
 
 func TestLegacyIntegrityResultFreshnessIsUnknown(t *testing.T) {
@@ -193,8 +264,8 @@ func TestV2IntegrityStreamsShardedMediaInitAndManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !job.SourceRevisionKnown || job.SourceArchiveRevision != 7 || job.SourceTimelineRevision != 3 {
-		t.Fatalf("v2 integrity job did not capture current header revisions: %+v", job)
+	if !job.SourceRevisionKnown || job.SourceArchiveRevision != header.ArchiveRevision || job.SourceTimelineRevision != header.TimelineRevision {
+		t.Fatalf("v2 integrity job did not capture current canonical header revisions: job=%+v header_archive=%d header_timeline=%d", job, header.ArchiveRevision, header.TimelineRevision)
 	}
 	completed := waitJobState(t, service, job.ID, StateCompleted)
 	if completed.Result == nil || completed.Result.Status != storage.IntegrityVerified || completed.Result.ObjectsTotal != 3 || completed.Result.ObjectsVerified != 3 {

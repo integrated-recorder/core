@@ -36,7 +36,18 @@ func (m *Manager) LifecycleSnapshot(ctx context.Context, id string) (LifecycleSn
 	}
 	e, ok := m.entry(id)
 	if !ok {
-		return LifecycleSnapshot{}, storage.ErrNotFound
+		// A fresh application generation may serve management reads before an
+		// active Engine has adopted this recording into its in-memory Manager.
+		// Lifecycle is a bounded root projection; do not require a full domain
+		// Recording clone merely to poll terminal VOD revisions.
+		recording, err := m.loadLifecycleRecording(ctx, id)
+		if err != nil {
+			return LifecycleSnapshot{}, err
+		}
+		if recording == nil || recording.ID != id {
+			return LifecycleSnapshot{}, storage.ErrNotFound
+		}
+		return m.lifecycleSnapshotFromRecording(id, recording), nil
 	}
 	e.mu.Lock()
 	if e.deleted || e.recording == nil {
@@ -67,6 +78,42 @@ func (m *Manager) LifecycleSnapshot(ctx context.Context, id string) (LifecycleSn
 		view.RecoveryState = scheduler.stateFor(id)
 	}
 	return view, nil
+}
+
+func (m *Manager) loadLifecycleRecording(ctx context.Context, id string) (*domain.Recording, error) {
+	if version, err := m.store.RecordingFormatVersion(ctx, id); err == nil {
+		if version == storage.ShardedArchiveFormatVersion {
+			return m.store.LoadRecordingHeader(ctx, id)
+		}
+		if version != 0 && version != 1 {
+			return nil, storage.ErrUnsupportedRecordingFormat
+		}
+	} else if !errors.Is(err, storage.ErrShardedArchiveUnavailable) && !errors.Is(err, storage.ErrSidecarReadUnsupported) {
+		return nil, err
+	}
+	// V0/V1 keep history in recording.json, so their reader necessarily
+	// decodes that legacy root. New V2 records take the bounded path above.
+	return m.store.LoadRecordingReadOnly(id)
+}
+
+func (m *Manager) lifecycleSnapshotFromRecording(id string, recording *domain.Recording) LifecycleSnapshot {
+	view := LifecycleSnapshot{
+		RecordingID: id, CaptureState: recording.State,
+		ArchiveSealed: recording.ArchiveSealed, Repairable: !recording.ArchiveSealed,
+		TimelineRevision: recording.TimelineRevision, ArchiveRevision: recording.ArchiveRevision,
+		RecoveryState: "idle",
+	}
+	if view.ArchiveSealed {
+		view.RecoveryState = "sealed"
+		return view
+	}
+	m.mu.RLock()
+	scheduler := m.autoRecovery
+	m.mu.RUnlock()
+	if scheduler != nil {
+		view.RecoveryState = scheduler.stateFor(id)
+	}
+	return view
 }
 
 // CompleteRecording explicitly marks a stopped capture as completed. It does
@@ -159,7 +206,7 @@ func (m *Manager) SealArchiveContext(ctx context.Context, id string) error {
 	if owner == nil && m.canonicalFenceConfigured() {
 		return ErrOwnershipRequired
 	}
-	if err := m.sealArchiveUnderRecoveryGate(e, owner); err != nil {
+	if err := m.sealArchiveUnderRecoveryGate(ctx, e, owner); err != nil {
 		if claimed && owner != nil {
 			return errors.Join(err, m.releaseLifecycleOwner(ctx, e, *owner))
 		}

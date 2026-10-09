@@ -1050,7 +1050,7 @@ func testGeneration(id string, state State) Generation {
 	return Generation{
 		ID: id, Version: "1.2.3", Commit: "0123456789abcdef", InstalledAt: time.Now().UTC(), State: state,
 		ControlProtocol: 1, EngineProtocol: 1,
-		ArchiveReadCompatibility: CompatibilityRange{Minimum: 1, Maximum: 3}, ArchiveWriteEpoch: 2,
+		ArchiveReadCompatibility: CompatibilityRange{Minimum: CurrentArchiveFormatVersion, Maximum: CurrentArchiveFormatVersion}, ArchiveWriteFormat: CurrentArchiveFormatVersion,
 	}
 }
 

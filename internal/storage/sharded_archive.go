@@ -53,6 +53,8 @@ var (
 	ErrShardedArchiveUnavailable = errors.New("sharded archive capability is unavailable")
 	ErrShardedArchiveConflict    = errors.New("sharded archive identity conflict")
 	ErrShardedArchiveInvalid     = errors.New("sharded archive document is invalid")
+	ErrArchiveSealed             = errors.New("archive is sealed")
+	ErrArchiveRecoveryPending    = errors.New("archive recovery state is pending")
 	shardPageName                = regexp.MustCompile(`^[0-9]{20}$`)
 	mediaSegmentID               = regexp.MustCompile(`^seg-([0-9]{20})$`)
 )
@@ -94,6 +96,14 @@ type V2LiveSlot struct {
 type V2SidecarPage struct {
 	Paths      []string
 	NextCursor string
+}
+
+// ShardedRevisionResult reports durable revision counters after an observation
+// publication. Callers use it to merge revisions into an in-flight root copy.
+type ShardedRevisionResult struct {
+	ArchiveRevision  uint64
+	TimelineRevision uint64
+	Changed          bool
 }
 
 type v2SidecarLister interface {
@@ -190,10 +200,12 @@ type v2RevisionPage[T any] struct {
 }
 
 type v2Observation struct {
-	Version  int                    `json:"version"`
-	Ordinal  uint64                 `json:"ordinal"`
-	Gap      *domain.Gap            `json:"gap,omitempty"`
-	Coverage *archiveindex.Coverage `json:"coverage,omitempty"`
+	Version                int                    `json:"version"`
+	Ordinal                uint64                 `json:"ordinal"`
+	Gap                    *domain.Gap            `json:"gap,omitempty"`
+	Coverage               *archiveindex.Coverage `json:"coverage,omitempty"`
+	ArchiveRevisionChange  bool                   `json:"archive_revision_change,omitempty"`
+	TimelineRevisionChange bool                   `json:"timeline_revision_change,omitempty"`
 }
 
 type v2ClaimDocument struct {
@@ -600,6 +612,9 @@ func (s *Store) CreateShardedRecording(header *domain.Recording) error {
 	if header == nil {
 		return ErrShardedArchiveInvalid
 	}
+	if header.FormatVersion != 0 && header.FormatVersion != ShardedArchiveFormatVersion {
+		return ErrUnsupportedRecordingFormat
+	}
 	copy := cloneRecordingHeader(header)
 	copy.FormatVersion = ShardedArchiveFormatVersion
 	if copy.ShardedArchive == nil {
@@ -616,6 +631,9 @@ func (s *Store) CreateShardedRecording(header *domain.Recording) error {
 func (s *Store) CreateShardedRecordingWithSidecar(header *domain.Recording, relativePath string, value any) error {
 	if header == nil {
 		return ErrShardedArchiveInvalid
+	}
+	if header.FormatVersion != 0 && header.FormatVersion != ShardedArchiveFormatVersion {
+		return ErrUnsupportedRecordingFormat
 	}
 	copy := cloneRecordingHeader(header)
 	copy.FormatVersion = ShardedArchiveFormatVersion
@@ -765,6 +783,9 @@ func (s *Store) PublishShardedMedia(ctx context.Context, header *domain.Recordin
 	}
 	if current.FormatVersion != ShardedArchiveFormatVersion {
 		return ErrShardedArchiveUnavailable
+	}
+	if current.ArchiveSealed {
+		return ErrArchiveSealed
 	}
 	if err := validateV2Header(header); err != nil {
 		return err
@@ -1459,16 +1480,22 @@ func (s *Store) IterateShardedManifests(ctx context.Context, id string, visit fu
 }
 
 func (s *Store) AppendShardedGap(ctx context.Context, id string, gap domain.Gap) error {
+	_, err := s.AppendShardedGapWithRevision(ctx, id, gap)
+	return err
+}
+
+func (s *Store) AppendShardedGapWithRevision(ctx context.Context, id string, gap domain.Gap) (ShardedRevisionResult, error) {
 	if err := checkV2Context(ctx); err != nil {
-		return err
+		return ShardedRevisionResult{}, err
 	}
 	if gap.TrackID == "" || gap.ToSequence < gap.FromSequence || gap.DetectedAt.IsZero() {
-		return fmt.Errorf("invalid sharded gap observation: %w", ErrShardedArchiveInvalid)
+		return ShardedRevisionResult{}, fmt.Errorf("invalid sharded gap observation: %w", ErrShardedArchiveInvalid)
 	}
-	if err := s.appendObservation(ctx, id, "gaps", v2Observation{Version: 1, Gap: &gap}); err != nil {
-		return fmt.Errorf("append sharded gap observation: %w", err)
+	result, err := s.appendObservation(ctx, id, "gaps", v2Observation{Version: 1, Gap: &gap})
+	if err != nil {
+		return ShardedRevisionResult{}, fmt.Errorf("append sharded gap observation: %w", err)
 	}
-	return nil
+	return result, nil
 }
 
 func (s *Store) IterateShardedGaps(ctx context.Context, id string, visit func(domain.Gap) error) error {
@@ -1484,11 +1511,16 @@ func (s *Store) IterateShardedGaps(ctx context.Context, id string, visit func(do
 }
 
 func (s *Store) AppendShardedCoverage(ctx context.Context, id string, coverage archiveindex.Coverage) error {
+	_, err := s.AppendShardedCoverageWithRevision(ctx, id, coverage)
+	return err
+}
+
+func (s *Store) AppendShardedCoverageWithRevision(ctx context.Context, id string, coverage archiveindex.Coverage) (ShardedRevisionResult, error) {
 	if err := checkV2Context(ctx); err != nil {
-		return err
+		return ShardedRevisionResult{}, err
 	}
 	if coverage.TrackID == "" || coverage.ToSequence < coverage.FromSequence || coverage.ObservedAt.IsZero() {
-		return ErrShardedArchiveInvalid
+		return ShardedRevisionResult{}, ErrShardedArchiveInvalid
 	}
 	return s.appendObservation(ctx, id, "coverage", v2Observation{Version: 1, Coverage: &coverage})
 }
@@ -1524,6 +1556,12 @@ func (s *Store) SaveShardedClaimSet(ctx context.Context, id string, set V2ClaimS
 	header, err := s.loadRecordingContext(ctx, id)
 	if err != nil {
 		return fmt.Errorf("load root before sharded claim publication: %w", err)
+	}
+	if header.FormatVersion != ShardedArchiveFormatVersion || header.ShardedArchive == nil {
+		return ErrShardedArchiveUnavailable
+	}
+	if header.ArchiveSealed {
+		return ErrArchiveSealed
 	}
 	_, visibleErr := s.lookupCoordinateLocked(ctx, header, set.Coordinate)
 	mediaVisible := visibleErr == nil
@@ -1809,6 +1847,9 @@ func (s *Store) ensureClaimCountLocked(ctx context.Context, id string, doc *v2Cl
 	}
 	if header.ShardedArchive.ClaimCount == intent.Base {
 		header.ShardedArchive.ClaimCount = intent.Target
+		if err := advanceV2ArchiveRevision(header); err != nil {
+			return err
+		}
 		if err := s.saveHeaderLocked(ctx, header, header); err != nil {
 			return err
 		}
@@ -1890,6 +1931,9 @@ func (s *Store) setClaimReconcilePendingLocked(ctx context.Context, id string, p
 	}
 	if header.FormatVersion != ShardedArchiveFormatVersion || header.ShardedArchive == nil {
 		return ErrShardedArchiveUnavailable
+	}
+	if header.ArchiveSealed {
+		return ErrArchiveSealed
 	}
 	if header.ShardedArchive.ClaimReconcilePending == pending {
 		return nil
@@ -2014,6 +2058,9 @@ func (s *Store) ReconcileShardedArchive(ctx context.Context, id string) error {
 	if header.FormatVersion != ShardedArchiveFormatVersion || validateV2Header(header) != nil {
 		return ErrShardedArchiveUnavailable
 	}
+	if header.ArchiveSealed {
+		return ErrArchiveSealed
+	}
 	if err := s.reconcileLivePromotionIntentLocked(ctx, id); err != nil {
 		return fmt.Errorf("reconcile live presentation promotion: %w", err)
 	}
@@ -2126,6 +2173,9 @@ func (s *Store) ReconcileShardedArchive(ctx context.Context, id string) error {
 		return err
 	}
 	if metadataCount != header.ShardedArchive.MetadataRevisionCount {
+		if err := advanceV2ArchiveRevisionBy(header, metadataCount-header.ShardedArchive.MetadataRevisionCount); err != nil {
+			return err
+		}
 		header.ShardedArchive.MetadataRevisionCount = metadataCount
 		changed = true
 	}
@@ -2134,6 +2184,9 @@ func (s *Store) ReconcileShardedArchive(ctx context.Context, id string) error {
 		return err
 	}
 	if manifestCount != header.ShardedArchive.ManifestSnapshotCount {
+		if err := advanceV2ArchiveRevisionBy(header, manifestCount-header.ShardedArchive.ManifestSnapshotCount); err != nil {
+			return err
+		}
 		header.ShardedArchive.ManifestSnapshotCount = manifestCount
 		changed = true
 	}
@@ -2152,9 +2205,15 @@ func (s *Store) ReconcileShardedArchive(ctx context.Context, id string) error {
 		}
 	}
 	if header.ShardedArchive.ClaimReconcilePending {
+		previousClaimCount := header.ShardedArchive.ClaimCount
 		claimCount, claimMarkersChanged, err := s.reconcileClaimCount(ctx, id, header)
 		if err != nil {
 			return err
+		}
+		if claimCount > previousClaimCount {
+			if err := advanceV2ArchiveRevision(header); err != nil {
+				return err
+			}
 		}
 		if err := s.clearClaimCountIntentLocked(ctx, id); err != nil {
 			return err
@@ -2183,6 +2242,17 @@ func advanceV2ReconciledRevisions(header *domain.Recording, init bool) error {
 		}
 		header.TimelineRevision++
 	}
+	return nil
+}
+
+func advanceV2ArchiveRevisionBy(header *domain.Recording, delta uint64) error {
+	if delta == 0 {
+		return nil
+	}
+	if header == nil || ^uint64(0)-header.ArchiveRevision < delta {
+		return ErrShardedArchiveInvalid
+	}
+	header.ArchiveRevision += delta
 	return nil
 }
 
@@ -2319,8 +2389,7 @@ func (s *Store) reconcileObservations(ctx context.Context, id, collection string
 		if observation.Version != 1 || observation.Ordinal != next || (collection == "gaps") != (observation.Gap != nil) || (collection == "coverage") != (observation.Coverage != nil) || observation.Gap != nil && observation.Coverage != nil {
 			return count, changed, ErrShardedArchiveInvalid
 		}
-		digestInput := observation
-		digestInput.Ordinal = 0
+		digestInput := observationDigestInput(observation)
 		data, err := json.Marshal(digestInput)
 		if err != nil {
 			return count, changed, ErrShardedArchiveInvalid
@@ -2344,6 +2413,17 @@ func (s *Store) reconcileObservations(ctx context.Context, id, collection string
 		} else {
 			return count, changed, loadErr
 		}
+		if observation.ArchiveRevisionChange {
+			if err := advanceV2ArchiveRevision(header); err != nil {
+				return count, changed, err
+			}
+		}
+		if observation.TimelineRevisionChange {
+			if header.TimelineRevision == ^uint64(0) {
+				return count, changed, ErrShardedArchiveInvalid
+			}
+			header.TimelineRevision++
+		}
 		if observation.Gap != nil {
 			if err := s.writeLiveGapSlots(ctx, id, header, *observation.Gap); err != nil {
 				return count, changed, err
@@ -2353,6 +2433,13 @@ func (s *Store) reconcileObservations(ctx context.Context, id, collection string
 		changed = true
 	}
 	return count, changed, nil
+}
+
+func observationDigestInput(observation v2Observation) v2Observation {
+	observation.Ordinal = 0
+	observation.ArchiveRevisionChange = false
+	observation.TimelineRevisionChange = false
+	return observation
 }
 
 func (s *Store) iterateArchiveOrdinal(ctx context.Context, id, trackID string, init bool, visit func(V2MediaRecord) error) error {
@@ -2423,6 +2510,9 @@ func (s *Store) appendPagedV2(ctx context.Context, id, collection string, value 
 	if header.FormatVersion != ShardedArchiveFormatVersion || validateV2Header(header) != nil {
 		return ErrShardedArchiveUnavailable
 	}
+	if header.ArchiveSealed {
+		return ErrArchiveSealed
+	}
 	count := counter(header)
 	// A shard may be durable while the following bounded root counter update
 	// failed. Reconcile a consecutive orphan suffix before assigning a new
@@ -2433,6 +2523,11 @@ func (s *Store) appendPagedV2(ctx context.Context, id, collection string, value 
 	}
 	if reconciled != *count {
 		*count = reconciled
+		if collection == "metadata" || collection == "manifests" {
+			if err := advanceV2ArchiveRevision(header); err != nil {
+				return err
+			}
+		}
 		if err := s.saveHeaderLocked(ctx, header, nil); err != nil {
 			return err
 		}
@@ -2479,7 +2574,24 @@ func (s *Store) appendPagedV2(ctx context.Context, id, collection string, value 
 		return err
 	}
 	*count = ordinal
+	if collection == "metadata" || collection == "manifests" {
+		if err := advanceV2ArchiveRevision(header); err != nil {
+			return err
+		}
+	}
 	return s.saveHeaderLocked(ctx, header, nil)
+}
+
+func advanceV2ArchiveRevision(recording *domain.Recording) error {
+	if recording == nil || recording.ArchiveRevision == ^uint64(0) {
+		return ErrShardedArchiveInvalid
+	}
+	if recording.ArchiveRevision == 0 {
+		recording.ArchiveRevision = 1
+		return nil
+	}
+	recording.ArchiveRevision++
+	return nil
 }
 
 func iteratePagedV2[T any](s *Store, ctx context.Context, id, collection string, count uint64, visit func(T) error) error {
@@ -2518,22 +2630,25 @@ func iteratePagedV2[T any](s *Store, ctx context.Context, id, collection string,
 	return nil
 }
 
-func (s *Store) appendObservation(ctx context.Context, id, collection string, value v2Observation) error {
+func (s *Store) appendObservation(ctx context.Context, id, collection string, value v2Observation) (ShardedRevisionResult, error) {
 	if collection != "gaps" && collection != "coverage" {
-		return ErrShardedArchiveInvalid
+		return ShardedRevisionResult{}, ErrShardedArchiveInvalid
 	}
 	if err := checkV2Context(ctx); err != nil {
-		return err
+		return ShardedRevisionResult{}, err
 	}
 	lock := s.v2Lock(id)
 	lock.Lock()
 	defer lock.Unlock()
 	header, err := s.loadRecordingContext(ctx, id)
 	if err != nil {
-		return err
+		return ShardedRevisionResult{}, err
 	}
 	if header.FormatVersion != ShardedArchiveFormatVersion || validateV2Header(header) != nil {
-		return ErrShardedArchiveUnavailable
+		return ShardedRevisionResult{}, ErrShardedArchiveUnavailable
+	}
+	if header.ArchiveSealed {
+		return ShardedRevisionResult{}, ErrArchiveSealed
 	}
 	counter := &header.ShardedArchive.GapCount
 	if collection == "coverage" {
@@ -2541,34 +2656,35 @@ func (s *Store) appendObservation(ctx context.Context, id, collection string, va
 	}
 	data, err := json.Marshal(value)
 	if err != nil || len(data) > archiveShardMaxBytes {
-		return ErrShardedArchiveInvalid
+		return ShardedRevisionResult{}, ErrShardedArchiveInvalid
 	}
-	digestInput := value
-	digestInput.Ordinal = 0
+	digestInput := observationDigestInput(value)
 	digestData, err := json.Marshal(digestInput)
 	if err != nil {
-		return ErrShardedArchiveInvalid
+		return ShardedRevisionResult{}, ErrShardedArchiveInvalid
 	}
 	digest := sha256.Sum256(digestData)
 	coordinatePath, err := v2ObservationCoordinatePath(collection, value, digest[:12])
 	if err != nil {
-		return fmt.Errorf("derive sharded observation identity: %w", err)
+		return ShardedRevisionResult{}, fmt.Errorf("derive sharded observation identity: %w", err)
 	}
 	var priorCoordinate v2Observation
 	coordinateErr := s.loadV2JSON(ctx, id, coordinatePath, archiveShardMaxBytes, &priorCoordinate)
+	orphanCoordinate := false
 	if coordinateErr == nil {
 		if !sameV2Observation(priorCoordinate, value) {
-			return fmt.Errorf("sharded observation coordinate reused with different value: %w", ErrShardedArchiveConflict)
+			return ShardedRevisionResult{}, fmt.Errorf("sharded observation coordinate reused with different value: %w", ErrShardedArchiveConflict)
 		}
 		if priorCoordinate.Ordinal <= *counter {
-			return nil
+			return ShardedRevisionResult{ArchiveRevision: header.ArchiveRevision, TimelineRevision: header.TimelineRevision}, nil
 		}
 		if priorCoordinate.Ordinal != *counter+1 {
-			return fmt.Errorf("sharded observation ordinal is not next: %w", ErrShardedArchiveInvalid)
+			return ShardedRevisionResult{}, fmt.Errorf("sharded observation ordinal is not next: %w", ErrShardedArchiveInvalid)
 		}
 		value = priorCoordinate
+		orphanCoordinate = true
 	} else if !errors.Is(coordinateErr, ErrNotFound) {
-		return coordinateErr
+		return ShardedRevisionResult{}, coordinateErr
 	} else {
 		value.Ordinal = *counter + 1
 	}
@@ -2576,34 +2692,300 @@ func (s *Store) appendObservation(ctx context.Context, id, collection string, va
 	ordinalPath := v2ObservationOrdinalPath(collection, next)
 	var existing v2Observation
 	if err := s.loadV2JSON(ctx, id, ordinalPath, archiveShardMaxBytes, &existing); err == nil {
-		if !sameV2Observation(existing, value) {
-			return fmt.Errorf("sharded observation ordinal reused with different value: %w", ErrShardedArchiveConflict)
+		if !sameV2Observation(existing, value) || existing.Ordinal != next {
+			return ShardedRevisionResult{}, fmt.Errorf("sharded observation ordinal reused with different value: %w", ErrShardedArchiveConflict)
 		}
 		value = existing
 	} else if !errors.Is(err, ErrNotFound) {
-		return err
+		return ShardedRevisionResult{}, err
 	} else {
+		if orphanCoordinate {
+			return ShardedRevisionResult{}, fmt.Errorf("sharded observation coordinate has no ordinal record: %w", ErrShardedArchiveInvalid)
+		}
+		archiveChanged, timelineChanged, err := s.observationRevisionChanges(ctx, id, header, collection, value)
+		if err != nil {
+			return ShardedRevisionResult{}, err
+		}
+		value.ArchiveRevisionChange = archiveChanged
+		value.TimelineRevisionChange = timelineChanged
 		if err := s.saveV2JSON(ctx, id, ordinalPath, value, archiveShardMaxBytes); err != nil {
-			return err
+			return ShardedRevisionResult{}, err
 		}
 	}
+	archiveChanged := value.ArchiveRevisionChange
+	timelineChanged := value.TimelineRevisionChange
 	if err := s.saveV2JSON(ctx, id, coordinatePath, value, archiveShardMaxBytes); err != nil {
-		return fmt.Errorf("publish sharded observation coordinate index: %w", err)
+		return ShardedRevisionResult{}, fmt.Errorf("publish sharded observation coordinate index: %w", err)
 	}
 	if value.Gap != nil {
 		if err := s.writeLiveGapSlots(ctx, id, header, *value.Gap); err != nil {
-			return fmt.Errorf("publish live gap slots: %w", err)
+			return ShardedRevisionResult{}, fmt.Errorf("publish live gap slots: %w", err)
 		}
 	}
 	*counter = next
-	if err := s.saveHeaderLocked(ctx, header, nil); err != nil {
-		return fmt.Errorf("publish sharded observation root: %w", err)
+	if archiveChanged {
+		if err := advanceV2ArchiveRevision(header); err != nil {
+			return ShardedRevisionResult{}, err
+		}
 	}
-	return nil
+	if timelineChanged {
+		if header.TimelineRevision == ^uint64(0) {
+			return ShardedRevisionResult{}, ErrShardedArchiveInvalid
+		}
+		header.TimelineRevision++
+	}
+	if err := s.saveHeaderLocked(ctx, header, nil); err != nil {
+		return ShardedRevisionResult{}, fmt.Errorf("publish sharded observation root: %w", err)
+	}
+	return ShardedRevisionResult{ArchiveRevision: header.ArchiveRevision, TimelineRevision: header.TimelineRevision, Changed: archiveChanged || timelineChanged}, nil
+}
+
+func (s *Store) observationRevisionChanges(ctx context.Context, id string, header *domain.Recording, collection string, value v2Observation) (archiveChanged, timelineChanged bool, err error) {
+	gaps := make([]domain.Gap, 0)
+	if err := s.IterateShardedGaps(ctx, id, func(gap domain.Gap) error {
+		gaps = append(gaps, gap)
+		return nil
+	}); err != nil {
+		return false, false, err
+	}
+	coverages := make([]archiveindex.Coverage, 0)
+	if err := s.IterateShardedCoverage(ctx, id, func(coverage archiveindex.Coverage) error {
+		coverages = append(coverages, coverage)
+		return nil
+	}); err != nil {
+		return false, false, err
+	}
+	var candidate archiveindex.Coverage
+	switch {
+	case collection == "gaps" && value.Gap != nil:
+		gap := value.Gap
+		candidate = archiveindex.Coverage{
+			SessionID: header.SourceSessionID, TrackID: gap.TrackID, SourceEpoch: gap.SourceEpoch,
+			DiscontinuitySequence: gap.DiscontinuitySequence, FromSequence: gap.FromSequence,
+			ToSequence: gap.ToSequence, State: archiveindex.CoverageKnownMissing,
+			ObservedAt: gap.DetectedAt, Reason: gap.Reason, Kind: archiveindex.ObjectMedia,
+		}
+	case collection == "coverage" && value.Coverage != nil:
+		candidate = *value.Coverage
+	default:
+		return false, false, ErrShardedArchiveInvalid
+	}
+	archiveChanged, err = s.coverageObservationChanges(ctx, id, header, gaps, coverages, candidate)
+	if err != nil {
+		return false, false, err
+	}
+	if collection == "gaps" && value.Gap != nil {
+		timelineChanged, err = s.gapChangesTimelineProjection(ctx, id, header, value.Gap)
+	}
+	return archiveChanged, timelineChanged, err
+}
+
+func (s *Store) coverageObservationChanges(ctx context.Context, id string, header *domain.Recording, gaps []domain.Gap, coverages []archiveindex.Coverage, candidate archiveindex.Coverage) (bool, error) {
+	if candidate.State == archiveindex.CoverageUnknown || candidate.State == "" || candidate.ToSequence < candidate.FromSequence {
+		return false, ErrShardedArchiveInvalid
+	}
+	boundaries := map[uint64]struct{}{candidate.FromSequence: {}, candidate.ToSequence: {}}
+	addBoundaries := func(from, to uint64) {
+		if to < candidate.FromSequence || from > candidate.ToSequence {
+			return
+		}
+		if from < candidate.FromSequence {
+			from = candidate.FromSequence
+		}
+		if to > candidate.ToSequence {
+			to = candidate.ToSequence
+		}
+		boundaries[from] = struct{}{}
+		boundaries[to] = struct{}{}
+		if to < candidate.ToSequence {
+			boundaries[to+1] = struct{}{}
+		}
+	}
+	if candidate.Kind == archiveindex.ObjectMedia {
+		for _, gap := range gaps {
+			if gap.TrackID == candidate.TrackID && gap.SourceEpoch == candidate.SourceEpoch && gap.DiscontinuitySequence == candidate.DiscontinuitySequence {
+				addBoundaries(gap.FromSequence, gap.ToSequence)
+			}
+		}
+	}
+	present := make(map[uint64]archiveindex.CoverageState)
+	track := header.Tracks[candidate.TrackID]
+	if track == nil {
+		return false, ErrShardedArchiveInvalid
+	}
+	if err := s.iterateArchiveOrdinal(ctx, id, candidate.TrackID, candidate.Kind == archiveindex.ObjectInit, func(record V2MediaRecord) error {
+		coordinate := record.Coordinate
+		if coordinate.SessionID != candidate.SessionID || coordinate.Kind != candidate.Kind ||
+			coordinate.SourceEpoch != candidate.SourceEpoch || coordinate.DiscontinuitySequence != candidate.DiscontinuitySequence ||
+			coordinate.Sequence < candidate.FromSequence || coordinate.Sequence > candidate.ToSequence {
+			return nil
+		}
+		state := record.ClaimState
+		if state == "" {
+			state = archiveindex.CoveragePresent
+		}
+		present[coordinate.Sequence] = state
+		addBoundaries(coordinate.Sequence, coordinate.Sequence)
+		if coordinate.Sequence < candidate.ToSequence {
+			boundaries[coordinate.Sequence+1] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	for _, coverage := range coverages {
+		if coverage.SessionID == candidate.SessionID && coverage.TrackID == candidate.TrackID && coverage.SourceEpoch == candidate.SourceEpoch && coverage.DiscontinuitySequence == candidate.DiscontinuitySequence && coverage.Kind == candidate.Kind {
+			addBoundaries(coverage.FromSequence, coverage.ToSequence)
+		}
+	}
+	sequences := make([]uint64, 0, len(boundaries))
+	for sequence := range boundaries {
+		sequences = append(sequences, sequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	for _, sequence := range sequences {
+		if state, exists := present[sequence]; exists {
+			if state == archiveindex.CoveragePresent || state == archiveindex.CoverageConflict {
+				continue
+			}
+		}
+		before := coverageStateAt(sequence, candidate, gaps, coverages, nil)
+		after := coverageStateAt(sequence, candidate, gaps, coverages, &candidate)
+		if before != after {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func coverageStateAt(sequence uint64, candidate archiveindex.Coverage, gaps []domain.Gap, coverages []archiveindex.Coverage, add *archiveindex.Coverage) archiveindex.CoverageState {
+	state := archiveindex.CoverageUnknown
+	var newest time.Time
+	consider := func(next archiveindex.CoverageState, observed time.Time) bool {
+		if next == archiveindex.CoverageConflict {
+			state = next
+			return true
+		}
+		if next == archiveindex.CoveragePresent {
+			state = next
+			return false
+		}
+		if state == archiveindex.CoveragePresent {
+			return false
+		}
+		if observed.After(newest) {
+			newest = observed
+			state = next
+		}
+		return false
+	}
+	if candidate.Kind == archiveindex.ObjectMedia {
+		for _, gap := range gaps {
+			if gap.TrackID == candidate.TrackID && gap.SourceEpoch == candidate.SourceEpoch && gap.DiscontinuitySequence == candidate.DiscontinuitySequence && sequence >= gap.FromSequence && sequence <= gap.ToSequence {
+				if consider(archiveindex.CoverageKnownMissing, gap.DetectedAt) {
+					return state
+				}
+			}
+		}
+	}
+	for _, coverage := range coverages {
+		if coverage.SessionID == candidate.SessionID && coverage.TrackID == candidate.TrackID && coverage.SourceEpoch == candidate.SourceEpoch && coverage.DiscontinuitySequence == candidate.DiscontinuitySequence && coverage.Kind == candidate.Kind && sequence >= coverage.FromSequence && sequence <= coverage.ToSequence {
+			// Acquisition failure is retry/scheduler state, not canonical archive
+			// content. It remains durable and queryable for recovery, but does not
+			// stale integrity or derivative results.
+			if coverage.State == archiveindex.CoverageUnknown || coverage.State == archiveindex.CoverageAcquisitionFailed || coverage.State == "" {
+				continue
+			}
+			if consider(coverage.State, coverage.ObservedAt) {
+				return state
+			}
+		}
+	}
+	if add != nil && add.State != archiveindex.CoverageAcquisitionFailed && sequence >= add.FromSequence && sequence <= add.ToSequence {
+		consider(add.State, add.ObservedAt)
+	}
+	return state
+}
+
+func (s *Store) gapChangesTimelineProjection(ctx context.Context, id string, header *domain.Recording, candidate *domain.Gap) (bool, error) {
+	if candidate == nil || candidate.LivePresentationOrdinal == 0 || header == nil {
+		return false, nil
+	}
+	track := header.Tracks[candidate.TrackID]
+	if track == nil || track.LivePresentation == nil || candidate.ToSequence < candidate.FromSequence {
+		return false, nil
+	}
+	span := candidate.ToSequence - candidate.FromSequence
+	if span > ^uint64(0)-candidate.LivePresentationOrdinal {
+		return false, ErrShardedArchiveInvalid
+	}
+	gapLast := candidate.LivePresentationOrdinal + span
+	last := uint64(0)
+	if track.LivePresentation.NextOrdinal > 0 {
+		last = track.LivePresentation.NextOrdinal - 1
+	}
+	if gapLast > last {
+		last = gapLast
+	}
+	first := uint64(1)
+	if last >= 12 {
+		first = last - 11
+	}
+	if track.LivePresentation.FirstPresentationOrdinal > first {
+		first = track.LivePresentation.FirstPresentationOrdinal
+	}
+	start, end := candidate.LivePresentationOrdinal, gapLast
+	if start < first {
+		start = first
+	}
+	if end > last {
+		end = last
+	}
+	if start > end {
+		return false, nil
+	}
+	for ordinal := start; ordinal <= end; ordinal++ {
+		slot, err := s.LookupShardedLiveSlot(ctx, id, candidate.TrackID, ordinal)
+		if err == nil {
+			if slot.Segment != nil {
+				continue
+			}
+			if slot.Gap == nil {
+				return true, nil
+			}
+			expected := gapAtLiveOrdinal(*candidate, ordinal)
+			if !sameV2LiveGapProjection(*slot.Gap, expected) {
+				return true, nil
+			}
+		} else if errors.Is(err, ErrNotFound) {
+			// A reserved or not-yet-published slot becomes an explicit live GAP.
+			return true, nil
+		} else {
+			return false, err
+		}
+		if ordinal == ^uint64(0) {
+			break
+		}
+	}
+	return false, nil
+}
+
+func sameV2LiveGapProjection(left, right domain.Gap) bool {
+	if left.TrackID != right.TrackID || left.SourceEpoch != right.SourceEpoch ||
+		left.DiscontinuitySequence != right.DiscontinuitySequence || left.FromSequence != right.FromSequence ||
+		left.ToSequence != right.ToSequence || left.LivePresentationOrdinal != right.LivePresentationOrdinal ||
+		left.LiveDiscontinuitySequence != right.LiveDiscontinuitySequence || left.LiveDiscontinuity != right.LiveDiscontinuity ||
+		left.LiveDuration != right.LiveDuration {
+		return false
+	}
+	if left.ProgramDateTime == nil || right.ProgramDateTime == nil {
+		return left.ProgramDateTime == nil && right.ProgramDateTime == nil
+	}
+	return left.ProgramDateTime.Equal(*right.ProgramDateTime)
 }
 
 func sameV2Observation(left, right v2Observation) bool {
-	left.Ordinal, right.Ordinal = 0, 0
+	left, right = observationDigestInput(left), observationDigestInput(right)
 	a, errA := json.Marshal(left)
 	b, errB := json.Marshal(right)
 	return errA == nil && errB == nil && bytes.Equal(a, b)
@@ -3204,6 +3586,17 @@ func (s *Store) saveHeaderLocked(ctx context.Context, supplied, known *domain.Re
 		return ErrShardedArchiveConflict
 	}
 	mergeV2HighWater(merged, known)
+	if !known.ArchiveSealed && merged.ArchiveSealed && known.ShardedArchive != nil && known.ShardedArchive.ClaimReconcilePending {
+		return ErrArchiveRecoveryPending
+	}
+	if known.ArchiveSealed && !sealedRootUpdateAllowed(known, merged) {
+		return ErrArchiveSealed
+	}
+	if !known.ArchiveSealed && merged.ArchiveSealed && !sameV2RootExcept(known, merged, func(recording *domain.Recording) {
+		recording.ArchiveSealed = known.ArchiveSealed
+	}) {
+		return ErrShardedArchiveInvalid
+	}
 	data, err := json.Marshal(merged)
 	if err != nil || len(data)+1 > archiveRootMaxBytes {
 		return ErrShardedArchiveInvalid
@@ -3215,6 +3608,34 @@ func (s *Store) saveHeaderLocked(ctx context.Context, supplied, known *domain.Re
 		return err
 	}
 	return s.StorageBackend.SaveRecording(merged)
+}
+
+// sealedRootUpdateAllowed preserves capture lifecycle independence while
+// freezing canonical archive state. After sealing, the only allowed root
+// transition is stopped -> completed; archive content, counters, revisions,
+// and the seal bit itself remain immutable.
+func sealedRootUpdateAllowed(current, next *domain.Recording) bool {
+	if current == nil || next == nil || !current.ArchiveSealed || !next.ArchiveSealed {
+		return false
+	}
+	if current.State != next.State && !(current.State == domain.StateStopped && next.State == domain.StateCompleted) {
+		return false
+	}
+	return sameV2RootExcept(current, next, func(recording *domain.Recording) {
+		recording.State = current.State
+	})
+}
+
+func sameV2RootExcept(left, right *domain.Recording, normalize func(*domain.Recording)) bool {
+	leftCopy, rightCopy := cloneRecordingHeader(left), cloneRecordingHeader(right)
+	if leftCopy == nil || rightCopy == nil {
+		return false
+	}
+	normalize(leftCopy)
+	normalize(rightCopy)
+	leftData, leftErr := json.Marshal(leftCopy)
+	rightData, rightErr := json.Marshal(rightCopy)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftData, rightData)
 }
 
 func (s *Store) loadRecordingContext(ctx context.Context, id string) (*domain.Recording, error) {

@@ -935,6 +935,10 @@ func writeLifecycleError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "recording not found")
 		return
 	}
+	if errors.Is(err, storage.ErrArchiveRecoveryPending) {
+		writeError(w, http.StatusConflict, "archive recovery must finish before sealing")
+		return
+	}
 	if errors.Is(err, acquire.ErrLifecycleConflict) || errors.Is(err, acquire.ErrActiveRecording) || errors.Is(err, acquire.ErrInvalidOwnershipToken) {
 		writeError(w, http.StatusConflict, "recording lifecycle transition conflicts with current state")
 		return

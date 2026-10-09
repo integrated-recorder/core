@@ -441,26 +441,32 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 			}
 			updated, err = s.manager.updateAtMediaGenerationWithinAuthorizedCommit(s.e, generation, func(r *domain.Recording) error {
 				if isShardedRecording(r) {
-					if err := advanceArchiveRevision(r); err != nil {
-						return err
-					}
 					if after != nil {
 						if err := after(r); err != nil {
 							return err
 						}
 					}
-					return s.manager.store.AppendShardedManifest(context.Background(), r.ID, snapshot)
-				}
-				for _, existing := range r.Snapshots {
-					if existing.StoragePath == snapshot.StoragePath {
-						if after != nil {
-							return after(r)
-						}
-						return nil
+					if err := s.manager.store.AppendShardedManifest(context.Background(), r.ID, snapshot); err != nil {
+						return err
 					}
+					// AppendShardedManifest publishes its own bounded root update,
+					// including ArchiveRevision. Keep the source/track fields applied
+					// above, but advance the in-memory revision before the enclosing
+					// update publishes that root. Refreshing here would replace those
+					// just-observed fields with the previous persisted values.
+					header, err := s.manager.store.LoadRecordingHeader(context.Background(), r.ID)
+					if err != nil {
+						return err
+					}
+					if r.ArchiveRevision < header.ArchiveRevision {
+						r.ArchiveRevision = header.ArchiveRevision
+					}
+					if r.TimelineRevision < header.TimelineRevision {
+						r.TimelineRevision = header.TimelineRevision
+					}
+					return nil
 				}
-				r.Snapshots = append(r.Snapshots, snapshot)
-				if err := advanceArchiveRevision(r); err != nil {
+				if _, err := appendLegacyManifestSnapshot(r, snapshot); err != nil {
 					return err
 				}
 				if after != nil {
@@ -516,6 +522,22 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 	return nil
 }
 
+func appendLegacyManifestSnapshot(recording *domain.Recording, snapshot domain.ManifestSnapshot) (bool, error) {
+	if recording == nil {
+		return false, errors.New("recording manifest root is nil")
+	}
+	for _, existing := range recording.Snapshots {
+		if existing.StoragePath == snapshot.StoragePath {
+			return false, nil
+		}
+	}
+	if err := advanceArchiveRevision(recording); err != nil {
+		return false, err
+	}
+	recording.Snapshots = append(recording.Snapshots, snapshot)
+	return true, nil
+}
+
 // queueRecordingCommit persists the newest in-memory root projection on the
 // storage writer. It intentionally captures no recording clone: earlier
 // queued segment commits may update the root before this operation executes.
@@ -547,7 +569,7 @@ func (s *segmentScheduler) queueRecordingCommit(previousGaps []domain.Gap) error
 			}
 			if isShardedRecording(current) {
 				pruneShardedRuntimeTail(current)
-				if err := s.manager.appendShardedGapsSince(current.ID, previousGaps, current.Gaps); err != nil {
+				if err := s.manager.appendShardedGapsSince(current.ID, previousGaps, current.Gaps, current); err != nil {
 					return newStorageStageError("persist sharded gaps", err)
 				}
 			}

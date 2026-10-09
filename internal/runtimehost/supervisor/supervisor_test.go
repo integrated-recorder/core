@@ -440,6 +440,68 @@ func TestActivateControlWithRestoresDurableTransitionWhenCandidateFails(t *testi
 	closeTestSupervisor(t, s)
 }
 
+func TestActivateControlWithAbortFailureLeavesRouteUnavailableWithoutRollback(t *testing.T) {
+	backendA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "A") }))
+	defer backendA.Close()
+	backendB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "B") }))
+	defer backendB.Close()
+	lifecycle := &fakeLifecycle{failActivate: generationB}
+	s := newTestSupervisor(t, &fakeLauncher{}, ReadinessFunc(func(context.Context, ProcessSpec, Child) error { return nil }), lifecycle)
+	if err := s.StageGeneration(context.Background(), fakeGeneration(generationA, backendA.URL)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ActivateControl(context.Background(), generationA); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StageGeneration(context.Background(), fakeGeneration(generationB, backendB.URL)); err != nil {
+		t.Fatal(err)
+	}
+
+	abortCause := errors.New("generation remains incompatible")
+	abortCalls := 0
+	err := s.ActivateControlWith(context.Background(), generationB, func() error { return nil }, func() error {
+		abortCalls++
+		return abortCause
+	})
+	if err == nil || err.Error() != "durable control activation abort failed" {
+		t.Fatalf("activation error = %v, want stable durable-abort failure", err)
+	}
+	if !errors.Is(err, abortCause) {
+		t.Fatalf("activation error %v does not preserve abort cause", err)
+	}
+	if abortCalls != 1 {
+		t.Fatalf("abort callback calls = %d, want 1", abortCalls)
+	}
+
+	snapshot := s.Snapshot()
+	if snapshot.ActiveControlGeneration != "" {
+		t.Fatalf("active route = %q, want unavailable", snapshot.ActiveControlGeneration)
+	}
+	for _, generation := range snapshot.Generations {
+		if generation.ControlActive {
+			t.Fatalf("generation %s remains marked Control active", generation.ID)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("request status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(recorder.Body.String(), "control plane unavailable") {
+		t.Fatalf("request body = %q, want unavailable response", recorder.Body.String())
+	}
+
+	lifecycle.mu.Lock()
+	steps := append([]string(nil), lifecycle.steps...)
+	lifecycle.mu.Unlock()
+	for _, step := range steps {
+		if strings.HasPrefix(step, "rollback:") {
+			t.Fatalf("handoff rollback ran after failed durable abort: %v", steps)
+		}
+	}
+	closeTestSupervisor(t, s)
+}
+
 func TestServeWithHostHandlerInterceptsOnlyItsPrefix(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "control") }))
 	defer backend.Close()

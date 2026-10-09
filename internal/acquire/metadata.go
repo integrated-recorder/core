@@ -227,6 +227,9 @@ func (m *Manager) commitMetadataObservation(e *entry, generation uint64, observe
 			if err := domain.ValidateMetadataTimeline(next.MetadataTimeline); err != nil {
 				return errors.New("recording metadata timeline is invalid")
 			}
+			if err := advanceArchiveRevision(next); err != nil {
+				return err
+			}
 			if err := m.store.SaveRecording(next); err != nil {
 				return newStorageStageError("recording metadata root commit", err)
 			}

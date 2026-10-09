@@ -78,7 +78,7 @@ type Manifest struct {
 	AdapterProtocolMaximum  int        `json:"adapter_protocol_maximum"`
 	ArchiveReadMinimum      int        `json:"archive_read_minimum"`
 	ArchiveReadMaximum      int        `json:"archive_read_maximum"`
-	ArchiveWriteEpoch       int        `json:"archive_write_epoch"`
+	ArchiveWriteFormat      int        `json:"archive_write_format"`
 	ManagementSchemaMinimum int        `json:"management_schema_minimum"`
 	ManagementSchemaMaximum int        `json:"management_schema_maximum"`
 	Platform                string     `json:"platform"`
@@ -109,7 +109,7 @@ type HostCompatibility struct {
 	EngineProtocolRange     ProtocolRange
 	AdapterProtocolRange    ProtocolRange
 	ArchiveReadRange        ProtocolRange
-	ArchiveWriteEpoch       int
+	ArchiveWriteFormat      int
 	ManagementSchemaVersion int
 }
 
@@ -137,7 +137,8 @@ func (m Manifest) Validate() error {
 		!validRange(m.AdapterProtocolMinimum, m.AdapterProtocolMaximum) ||
 		!validRange(m.ArchiveReadMinimum, m.ArchiveReadMaximum) ||
 		!validRange(m.ManagementSchemaMinimum, m.ManagementSchemaMaximum) ||
-		m.ControlProtocolVersion < 1 || m.EngineProtocolVersion < 1 || m.ArchiveWriteEpoch < 1 {
+		m.ControlProtocolVersion < 1 || m.EngineProtocolVersion < 1 || m.ArchiveWriteFormat < 1 ||
+		m.ArchiveWriteFormat < m.ArchiveReadMinimum || m.ArchiveWriteFormat > m.ArchiveReadMaximum {
 		return invalid("protocol or schema compatibility range is invalid")
 	}
 	if !validTarget(m.Platform, m.Architecture) {
@@ -238,9 +239,9 @@ func CheckCompatibility(manifest Manifest, host HostCompatibility) error {
 	if !rangesOverlap(host.AdapterProtocolRange, ProtocolRange{Minimum: manifest.AdapterProtocolMinimum, Maximum: manifest.AdapterProtocolMaximum}) {
 		return incompatible("adapter protocol ranges do not overlap")
 	}
-	if !rangeContains(manifest.ArchiveReadMinimum, manifest.ArchiveReadMaximum, host.ArchiveWriteEpoch) ||
-		!host.ArchiveReadRange.contains(manifest.ArchiveWriteEpoch) {
-		return incompatible("archive write epoch is not mutually readable")
+	if !rangeContains(manifest.ArchiveReadMinimum, manifest.ArchiveReadMaximum, host.ArchiveWriteFormat) ||
+		!host.ArchiveReadRange.contains(manifest.ArchiveWriteFormat) {
+		return incompatible("archive write format is not mutually readable")
 	}
 	if host.ManagementSchemaVersion < manifest.ManagementSchemaMinimum || host.ManagementSchemaVersion > manifest.ManagementSchemaMaximum {
 		return incompatible("management schema is outside the release range")

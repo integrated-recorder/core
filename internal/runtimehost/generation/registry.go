@@ -21,25 +21,27 @@ import (
 )
 
 const (
-	SchemaVersion  = 1
-	maxStateBytes  = 1 << 20
-	maxGenerations = 256
-	maxLeases      = 10000
+	SchemaVersion               = 1
+	CurrentArchiveFormatVersion = 2
+	maxStateBytes               = 1 << 20
+	maxGenerations              = 256
+	maxLeases                   = 10000
 	// MaxInventoryRecordings bounds one Engine inventory and the aggregate
 	// active Recording lease projection.
 	MaxInventoryRecordings = maxLeases
 )
 
 var (
-	ErrInvalidState       = errors.New("invalid generation registry state")
-	ErrInvalidTransition  = errors.New("invalid generation state transition")
-	ErrGenerationExists   = errors.New("generation already exists")
-	ErrGenerationNotFound = errors.New("generation not found")
-	ErrLeaseExists        = errors.New("recording already has a generation lease")
-	ErrLeaseNotFound      = errors.New("recording generation lease not found")
-	ErrLeaseMismatch      = errors.New("recording generation lease does not match")
-	ErrInvalidInventory   = errors.New("engine recording inventory is invalid")
-	ErrUnsafePath         = errors.New("unsafe generation registry path")
+	ErrInvalidState             = errors.New("invalid generation registry state")
+	ErrInvalidTransition        = errors.New("invalid generation state transition")
+	ErrGenerationExists         = errors.New("generation already exists")
+	ErrGenerationNotFound       = errors.New("generation not found")
+	ErrLeaseExists              = errors.New("recording already has a generation lease")
+	ErrLeaseNotFound            = errors.New("recording generation lease not found")
+	ErrLeaseMismatch            = errors.New("recording generation lease does not match")
+	ErrInvalidInventory         = errors.New("engine recording inventory is invalid")
+	ErrUnsafePath               = errors.New("unsafe generation registry path")
+	ErrArchiveFormatUnsupported = errors.New("archive format is unsupported")
 
 	// IDs are deliberately opaque and path-safe. UUIDs and 32-64 digit hex
 	// identifiers are accepted; names, slashes, and version strings are not.
@@ -92,7 +94,16 @@ type Generation struct {
 	ControlProtocol          int                `json:"control_protocol"`
 	EngineProtocol           int                `json:"engine_protocol"`
 	ArchiveReadCompatibility CompatibilityRange `json:"archive_read_compatibility"`
-	ArchiveWriteEpoch        int                `json:"archive_write_epoch"`
+	// Archive format is explicit in persisted generation capability metadata.
+	// Missing or older keys decode as zero and fail closed during registry validation.
+	ArchiveWriteFormat int `json:"archive_write_format"`
+}
+
+// SupportsCurrentArchiveFormat reports whether this generation can read and
+// write the Runtime Host's authoritative archive format. It is intentionally
+// tied to one current format rather than a generic compatibility framework.
+func (g Generation) SupportsCurrentArchiveFormat() bool {
+	return g.ArchiveWriteFormat == CurrentArchiveFormatVersion && formatReadable(g, CurrentArchiveFormatVersion)
 }
 
 // Lease is the Runtime Host's retirement reference to the Engine generation
@@ -303,6 +314,23 @@ func (r *Registry) Activate(id string) error {
 		if next.StagedGenerationID != id || candidate.State != StateReady {
 			return transition("only the ready staged generation can be activated")
 		}
+		if !supportsCurrentArchiveFormat(candidate) {
+			return ErrArchiveFormatUnsupported
+		}
+		for _, current := range next.Generations {
+			if current.State != StateActive && current.State != StateDraining {
+				continue
+			}
+			if !supportsCurrentArchiveFormat(current) {
+				return ErrArchiveFormatUnsupported
+			}
+			if current.ArchiveWriteFormat > CurrentArchiveFormatVersion {
+				return ErrArchiveFormatUnsupported
+			}
+			if !formatReadable(candidate, current.ArchiveWriteFormat) {
+				return ErrArchiveFormatUnsupported
+			}
+		}
 		next.ActivationPreviousGenerationID = next.PreviousGenerationID
 		if oldID := next.ActiveGenerationID; oldID != "" {
 			old := next.Generations[oldID]
@@ -352,6 +380,9 @@ func (r *Registry) AbortActivation(candidateID, previousID string) error {
 		if !candidateOK || !previousOK || candidate.State != StateActive || previous.State != StateDraining {
 			return transition("activation rollback generation state is invalid")
 		}
+		if !supportsCurrentArchiveFormat(candidate) || !supportsCurrentArchiveFormat(previous) {
+			return ErrArchiveFormatUnsupported
+		}
 		for _, lease := range next.Leases {
 			if lease.EngineGeneration == candidateID {
 				return transition("candidate generation already owns recordings")
@@ -386,6 +417,9 @@ func (r *Registry) Rollback() error {
 			return transition("there is no active generation to roll back")
 		}
 		current := next.Generations[currentID]
+		if !supportsCurrentArchiveFormat(current) || !supportsCurrentArchiveFormat(previous) {
+			return ErrArchiveFormatUnsupported
+		}
 		current.State = StateDraining
 		next.Generations[currentID] = current
 		previous.State = StateActive
@@ -443,6 +477,9 @@ func (r *Registry) PinRecording(lease Lease) error {
 		if !ok || g.State != StateActive {
 			return transition("recording engine generation is not active")
 		}
+		if !supportsCurrentArchiveFormat(g) {
+			return ErrArchiveFormatUnsupported
+		}
 		next.Leases[lease.RecordingID] = lease
 		return nil
 	})
@@ -482,6 +519,9 @@ func (r *Registry) TransferRecording(expected, target Lease) error {
 		if !destinationExists || target.EngineGeneration != next.ActiveGenerationID || destination.State != StateActive || destination.EngineDormant {
 			return transition("recording target generation is not the active Engine")
 		}
+		if !supportsCurrentArchiveFormat(destination) {
+			return ErrArchiveFormatUnsupported
+		}
 		if err := runtimehook.Pause(runtimehook.DuringGenerationLeaseReconcile, expected.RecordingID); err != nil {
 			return err
 		}
@@ -516,9 +556,15 @@ func (r *Registry) RollbackRecordingTransfer(expected, target Lease) error {
 		if !sourceExists || source.EngineDormant || source.State != StateActive || next.ActiveGenerationID != expected.EngineGeneration {
 			return transition("recording rollback source is not the active Engine")
 		}
+		if !supportsCurrentArchiveFormat(source) {
+			return ErrArchiveFormatUnsupported
+		}
 		destination, destinationExists := next.Generations[target.EngineGeneration]
 		if !destinationExists || destination.EngineDormant || destination.State != StateDraining || target.EngineGeneration == next.ActiveGenerationID {
 			return transition("recording rollback destination is not a live draining Engine")
+		}
+		if !supportsCurrentArchiveFormat(destination) {
+			return ErrArchiveFormatUnsupported
 		}
 		next.Leases[target.RecordingID] = target
 		return nil
@@ -604,6 +650,9 @@ func (r *Registry) ReconcileColdStart(activeGenerationID string) error {
 		if next.ActiveGenerationID != activeGenerationID || active.State != StateActive {
 			return transition("cold recovery generation is not active")
 		}
+		if !supportsCurrentArchiveFormat(active) {
+			return ErrArchiveFormatUnsupported
+		}
 
 		// Publish lease clearing and dormant attachment state together. The
 		// source snapshot remains in memory unless this complete state is durable.
@@ -653,6 +702,9 @@ func (r *Registry) ReconcileInventories(inventories []EngineInventory) error {
 			}
 			if (generation.State != StateActive && generation.State != StateDraining) || generation.EngineDormant {
 				return transition("recording inventory generation is not active or draining")
+			}
+			if !supportsCurrentArchiveFormat(generation) {
+				return ErrArchiveFormatUnsupported
 			}
 			byGeneration[inventory.EngineGeneration] = inventory
 			total += len(inventory.Recordings)
@@ -837,7 +889,7 @@ func validateGeneration(g Generation) error {
 		(g.StorageProviderSetID != "" && !storageSetIDPattern.MatchString(g.StorageProviderSetID)) ||
 		g.InstalledAt.IsZero() || !validState(g.State) || g.ControlProtocol < 1 || g.EngineProtocol < 1 ||
 		g.ArchiveReadCompatibility.Minimum < 1 || g.ArchiveReadCompatibility.Maximum < g.ArchiveReadCompatibility.Minimum ||
-		g.ArchiveWriteEpoch < 1 {
+		g.ArchiveWriteFormat < 1 || !formatReadable(g, g.ArchiveWriteFormat) {
 		return invalid("generation metadata is invalid")
 	}
 	return nil
@@ -1054,6 +1106,14 @@ func emptySnapshot() Snapshot {
 }
 
 func validID(id string) bool { return idPattern.MatchString(id) }
+
+func formatReadable(g Generation, format int) bool {
+	return format >= g.ArchiveReadCompatibility.Minimum && format <= g.ArchiveReadCompatibility.Maximum
+}
+
+func supportsCurrentArchiveFormat(g Generation) bool {
+	return g.SupportsCurrentArchiveFormat()
+}
 
 func validState(state State) bool {
 	switch state {

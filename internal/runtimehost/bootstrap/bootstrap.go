@@ -990,7 +990,7 @@ func runtimeGeneration(id string, build buildinfo.Info) generation.Generation {
 	return generation.Generation{
 		ID: id, Version: version, Commit: commit, InstalledAt: time.Now().UTC(), State: generation.StateStaging,
 		ControlProtocol: runtimeipc.ProtocolVersion, EngineProtocol: runtimeipc.ProtocolVersion,
-		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1,
+		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: generation.CurrentArchiveFormatVersion, Maximum: generation.CurrentArchiveFormatVersion}, ArchiveWriteFormat: generation.CurrentArchiveFormatVersion,
 	}
 }
 

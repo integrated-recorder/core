@@ -241,6 +241,22 @@ func TestV2ExportUsesShardedTimelineOrder(t *testing.T) {
 	if job.State != StateCompleted || !job.SourceRevisionKnown || job.SourceArchiveRevision != 4 || job.SourceTimelineRevision != 10 {
 		t.Fatalf("v2 export did not complete from captured revisions: %+v", job)
 	}
+	timelineChanged := *recording
+	timelineChanged.TimelineRevision++
+	if timelineChanged.ArchiveRevision != job.SourceArchiveRevision {
+		t.Fatalf("timeline-only fixture changed archive revision: got %d, want %d", timelineChanged.ArchiveRevision, job.SourceArchiveRevision)
+	}
+	if got := ProjectJob(job, &timelineChanged).Freshness; got != FreshnessStale {
+		t.Fatalf("v2 export freshness after timeline-only change=%q, want stale", got)
+	}
+	archiveChanged := *recording
+	archiveChanged.ArchiveRevision++
+	if archiveChanged.TimelineRevision != job.SourceTimelineRevision {
+		t.Fatalf("archive-only fixture changed timeline revision: got %d, want %d", archiveChanged.TimelineRevision, job.SourceTimelineRevision)
+	}
+	if got := ProjectJob(job, &archiveChanged).Freshness; got != FreshnessStale {
+		t.Fatalf("v2 export freshness after archive-only change=%q, want stale", got)
+	}
 	playlist, err := os.ReadFile(playlistPath)
 	if err != nil {
 		t.Fatal(err)
@@ -256,13 +272,24 @@ func TestV2ExportUsesShardedTimelineOrder(t *testing.T) {
 	}
 }
 
-func TestDiskStringSetDeduplicatesLargeRepeatedInitInput(t *testing.T) {
+func TestDiskStringSetDeduplicatesRepeatedInitInput(t *testing.T) {
+	verifyDiskStringSetDeduplication(t, 64)
+}
+
+func TestDiskStringSetDeduplicatesLargeRepeatedInitInputScale(t *testing.T) {
+	if os.Getenv("IR_RUN_SCALE_TESTS") != "1" {
+		t.Skip("set IR_RUN_SCALE_TESTS=1 to run large filesystem object-count acceptance")
+	}
+	verifyDiskStringSetDeduplication(t, 10_000)
+}
+
+func verifyDiskStringSetDeduplication(t *testing.T, count int) {
+	t.Helper()
 	root := t.TempDir()
 	set, err := newDiskStringSet(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const count = 10_000
 	for i := 0; i < count; i++ {
 		id := fmt.Sprintf("init-%05d", i)
 		seen, err := set.SeenOrAdd(id)

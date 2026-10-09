@@ -73,8 +73,12 @@ func (a *RecordingOwnerAuthority) RegisterEngine(resourceOwnerID, generationID, 
 		return ErrOwnerRegistration
 	}
 	snapshot := a.registry.Snapshot()
-	if _, ok := snapshot.Generations[generationID]; !ok {
+	generationRecord, ok := snapshot.Generations[generationID]
+	if !ok {
 		return ErrOwnerRegistration
+	}
+	if !generationRecord.SupportsCurrentArchiveFormat() {
+		return generation.ErrArchiveFormatUnsupported
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -248,6 +252,8 @@ func ownerIPCError(err error) error {
 		return resourceIPCError("recording_owner_conflict", "recording ownership does not match")
 	case errors.Is(err, generation.ErrGenerationNotFound), errors.Is(err, recordingowner.ErrNotFound):
 		return resourceIPCError("recording_owner_not_found", "recording ownership was not found")
+	case errors.Is(err, generation.ErrArchiveFormatUnsupported):
+		return resourceIPCError("archive_format_unsupported", "archive format is unsupported")
 	case errors.Is(err, recordingowner.ErrInvalidIdentity), errors.Is(err, generation.ErrInvalidState):
 		return resourceIPCError("invalid_request", "recording owner request is invalid")
 	default:

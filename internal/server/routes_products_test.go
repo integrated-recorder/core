@@ -33,6 +33,7 @@ func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	recording := writeProductRecording(t, store, strings.Repeat("a", 32), domain.StateCompleted)
+	recording.ArchiveRevision = 1
 	sourceTitle, sourceDescription := "source title sentinel", "plain source description"
 	recording.MetadataTimeline = []domain.MetadataRevision{{ObservedAt: time.Date(2026, 9, 28, 14, 0, 0, 0, time.UTC), Title: &sourceTitle, Description: &sourceDescription}}
 	if err := store.SaveRecording(recording); err != nil {
@@ -128,6 +129,127 @@ func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
 	}
 	if got := products.Audit(10); len(got) != 2 || got[0].Type != "integrity_requested" || got[1].Type != "recording_tags_updated" {
 		t.Fatalf("tag audit=%+v", got)
+	}
+}
+
+func TestStaleIntegrityIsUnknownInReadModelsAndDoesNotNotify(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordingID := strings.Repeat("c", 32)
+	recording := writeProductRecording(t, store, recordingID, domain.StateStopped)
+	recording.ArchiveRevision = 7
+	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed a completed failed result bound to revision 7. This isolates the
+	// read-model behavior from verifier scheduling and makes staleness exact.
+	verifiedAt := time.Now().UTC().Truncate(time.Second)
+	type resultRevision struct {
+		Archive  uint64 `json:"archive_revision"`
+		Timeline uint64 `json:"timeline_revision"`
+		Known    bool   `json:"known"`
+	}
+	state := struct {
+		Version         int                                `json:"version"`
+		Jobs            []integrity.Job                    `json:"jobs"`
+		Results         map[string]storage.IntegrityResult `json:"results"`
+		ResultRevisions map[string]resultRevision          `json:"result_revisions"`
+	}{
+		Version: 1,
+		Jobs:    []integrity.Job{{ID: strings.Repeat("d", 32), RecordingID: recordingID, State: integrity.StateCompleted, CreatedAt: verifiedAt, SourceArchiveRevision: 7, SourceRevisionKnown: true}},
+		Results: map[string]storage.IntegrityResult{recordingID: {
+			Status: storage.IntegrityFailed, LastVerifiedAt: verifiedAt, ObjectsTotal: 1, ObjectsCorrupt: 1,
+			Issues: []storage.IntegrityIssue{{Code: "payload_mismatch", Path: "tracks/main/00000001.ts"}},
+		}},
+		ResultRevisions: map[string]resultRevision{recordingID: {Archive: 7, Known: true}},
+	}
+	stateBytes, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobDir := filepath.Join(root, "management", "integrity-jobs")
+	if err := os.MkdirAll(jobDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobDir, "state.json"), stateBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	integrityService, err := integrity.Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer integrityService.Close(context.Background())
+	handler := NewWithOptions(manager, nil, nil, Options{Management: products, Integrity: integrityService, Storage: store})
+	verified, ok := integrityService.StatusFor(recording)
+	if !ok || verified.Status != storage.IntegrityFailed || verified.Freshness != integrity.FreshnessCurrent || verified.LastVerifiedAt.IsZero() {
+		t.Fatalf("fixture integrity result=%+v present=%v, want current failed result", verified, ok)
+	}
+
+	current, err := store.LoadRecordingReadOnly(recordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.ArchiveRevision = 8
+	if err := store.SaveRecording(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager, err = acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	handler = NewWithOptions(manager, nil, nil, Options{Management: products, Integrity: integrityService, Storage: store})
+	currentSnapshot, err := manager.Get(recordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, ok := integrityService.StatusFor(currentSnapshot)
+	if !ok || stale.Status != storage.IntegrityFailed || stale.Freshness != integrity.FreshnessStale {
+		t.Fatalf("fixture stale projection=%+v present=%v, want stale failed result", stale, ok)
+	}
+
+	detail := httptest.NewRecorder()
+	handler.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recordingID, nil))
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"state":"stopped"`) || !strings.Contains(detail.Body.String(), `"integrity":"unknown"`) {
+		t.Fatalf("detail status=%d body=%s, want stopped recording and unknown integrity", detail.Code, detail.Body.String())
+	}
+
+	dashboard := httptest.NewRecorder()
+	handler.ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/api/dashboard", nil))
+	if dashboard.Code != http.StatusOK || !strings.Contains(dashboard.Body.String(), `"integrity":{"degraded":0,"failed":0,"unknown":1,"verified":0,"verifying":0}`) {
+		t.Fatalf("dashboard status=%d body=%s, want stale failure counted as unknown", dashboard.Code, dashboard.Body.String())
+	}
+
+	events := httptest.NewRecorder()
+	handler.ServeHTTP(events, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recordingID+"/events", nil))
+	if events.Code != http.StatusOK || !strings.Contains(events.Body.String(), `"type":"integrity_completed"`) {
+		t.Fatalf("events status=%d body=%s, want historical completion event retained", events.Code, events.Body.String())
+	}
+
+	sync := httptest.NewRecorder()
+	handler.ServeHTTP(sync, httptest.NewRequest(http.MethodPost, "/api/notifications/sync", strings.NewReader(`{}`)))
+	if sync.Code != http.StatusNoContent {
+		t.Fatalf("notification sync status=%d body=%s", sync.Code, sync.Body.String())
+	}
+	for _, notification := range products.Notifications(false, 100) {
+		if notification.Type == "integrity_failure" {
+			t.Fatalf("stale failed result generated current integrity notification: %+v", notification)
+		}
 	}
 }
 

@@ -635,6 +635,48 @@ func repeatedFault(mode leaseFaultMode, count int) []leaseFaultMode {
 	return result
 }
 
+func TestPendingReleaseStaysVisibleUntilLocalResolutionCompletes(t *testing.T) {
+	service := &IngestService{
+		pendingCoordinatorReleases: map[string]pendingCoordinatorRelease{},
+		changed:                    make(chan struct{}),
+	}
+	state := &leaseReleaseState{}
+	callbackStarted := make(chan struct{})
+	finishCallback := make(chan struct{})
+	service.pendingCoordinatorReleases["lease"] = pendingCoordinatorRelease{
+		leaseID: "lease", operation: "release reservation", state: state,
+		call: func(context.Context) error { return nil }, attempts: 1,
+		onResolved: func() {
+			close(callbackStarted)
+			<-finishCallback
+		},
+	}
+
+	go service.retryPendingCoordinatorReleases(context.Background(), 1, true)
+	<-callbackStarted
+	if got := service.Snapshot().PendingCoordinatorLeases; got != 1 {
+		t.Fatalf("pending releases during local accounting callback=%d, want 1", got)
+	}
+	close(finishCallback)
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		service.mu.Lock()
+		pending := len(service.pendingCoordinatorReleases)
+		changed := service.changed
+		service.mu.Unlock()
+		if pending == 0 {
+			return
+		}
+		select {
+		case <-changed:
+		case <-deadline.C:
+			t.Fatal("pending release remained after local accounting callback completed")
+		}
+	}
+}
+
 func TestCoordinatorReservationRetriesAndPreservesLocalAccounting(t *testing.T) {
 	for _, tc := range []struct {
 		name string

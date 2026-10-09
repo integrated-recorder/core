@@ -325,6 +325,9 @@ func (c *updateController) Stage(ctx context.Context) (httpapi.Status, error) {
 		}
 		manifest, src = &fetched, fetchedSource
 	}
+	if release.CheckCompatibility(*manifest, c.compatibility) != nil || !c.archiveCompatibleWithRuntime(*manifest) {
+		return httpapi.Status{}, c.fail("release_incompatible")
+	}
 	stageCtx, cancel := context.WithTimeout(ctx, c.operationTimeout)
 	defer cancel()
 	staged, err := c.installer.Stage(stageCtx, src)
@@ -364,7 +367,7 @@ func (c *updateController) Stage(ctx context.Context) (httpapi.Status, error) {
 		InstalledAt: time.Now().UTC(), State: generation.StateStaging,
 		ControlProtocol: installed.Manifest.ControlProtocolVersion, EngineProtocol: installed.Manifest.EngineProtocolVersion,
 		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: installed.Manifest.ArchiveReadMinimum, Maximum: installed.Manifest.ArchiveReadMaximum},
-		ArchiveWriteEpoch:        installed.Manifest.ArchiveWriteEpoch,
+		ArchiveWriteFormat:       installed.Manifest.ArchiveWriteFormat,
 	}
 	if err := c.registry.Stage(newGeneration); err != nil {
 		return httpapi.Status{}, c.mapRegistryError(err, "stage_failed")
@@ -477,7 +480,10 @@ func (c *updateController) Rollback(ctx context.Context) (httpapi.Status, error)
 	if err != nil {
 		return httpapi.Status{}, c.mapInstallError(err, "rollback_unavailable")
 	}
-	if installed != nil && !c.archiveCompatibleWithRuntime(installed.Manifest) {
+	if installed != nil && !c.archiveRollbackCompatible(installed.Manifest) {
+		return httpapi.Status{}, c.fail("release_incompatible")
+	}
+	if installed == nil && !c.archiveRollbackCompatibleWithGeneration(previous) {
 		return httpapi.Status{}, c.fail("release_incompatible")
 	}
 	attachment, attached := c.engineAttachment(previousID)
@@ -2058,25 +2064,46 @@ func matchesBuild(g generation.Generation, build buildinfo.Info) bool {
 	return build.Version != "" && g.Version == build.Version && strings.EqualFold(g.Commit, build.Commit)
 }
 
-// archiveCompatibleWithRuntime applies the explicit coexistence contract to
-// every active or draining generation. A candidate must read each existing
-// writer epoch, and retained generations must be able to read objects the
-// candidate may write so rollback does not strand archives created after the
-// switch.
+// archiveCompatibleWithRuntime requires the candidate to use the current
+// authoritative archive format and to read formats still written by active
+// or draining generations.
 func (c *updateController) archiveCompatibleWithRuntime(candidate release.Manifest) bool {
 	snapshot := c.registry.Snapshot()
+	if candidate.ArchiveWriteFormat != generation.CurrentArchiveFormatVersion ||
+		!archiveFormatReadable(candidate.ArchiveReadMinimum, candidate.ArchiveReadMaximum, generation.CurrentArchiveFormatVersion) {
+		return false
+	}
 	for _, current := range snapshot.Generations {
 		if current.State != generation.StateActive && current.State != generation.StateDraining {
 			continue
 		}
-		if candidate.ArchiveReadMinimum > current.ArchiveWriteEpoch || candidate.ArchiveReadMaximum < current.ArchiveWriteEpoch {
+		if !current.SupportsCurrentArchiveFormat() {
 			return false
 		}
-		if current.ArchiveReadCompatibility.Minimum > candidate.ArchiveWriteEpoch || current.ArchiveReadCompatibility.Maximum < candidate.ArchiveWriteEpoch {
+		if current.ArchiveWriteFormat > generation.CurrentArchiveFormatVersion {
+			return false
+		}
+		if !archiveFormatReadable(candidate.ArchiveReadMinimum, candidate.ArchiveReadMaximum, current.ArchiveWriteFormat) {
 			return false
 		}
 	}
 	return true
+}
+
+func (c *updateController) archiveRollbackCompatible(candidate release.Manifest) bool {
+	return c.archiveRollbackCompatibleWithRange(candidate.ArchiveReadMinimum, candidate.ArchiveReadMaximum, candidate.ArchiveWriteFormat)
+}
+
+func (c *updateController) archiveRollbackCompatibleWithGeneration(candidate generation.Generation) bool {
+	return c.archiveRollbackCompatibleWithRange(candidate.ArchiveReadCompatibility.Minimum, candidate.ArchiveReadCompatibility.Maximum, candidate.ArchiveWriteFormat)
+}
+
+func (c *updateController) archiveRollbackCompatibleWithRange(minimum, maximum, writeFormat int) bool {
+	return writeFormat == generation.CurrentArchiveFormatVersion && archiveFormatReadable(minimum, maximum, generation.CurrentArchiveFormatVersion)
+}
+
+func archiveFormatReadable(minimum, maximum, format int) bool {
+	return format >= minimum && format <= maximum
 }
 
 func summaryFor(item generation.Generation, recordings int) httpapi.GenerationSummary {

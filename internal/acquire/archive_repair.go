@@ -600,19 +600,45 @@ func (m *Manager) SealArchive(owner OwnershipToken, id string) (returnErr error)
 	if archiveSealed(e) {
 		return m.releaseLifecycleOwner(context.Background(), e, owner)
 	}
-	if err := m.sealArchiveUnderRecoveryGate(e, &owner); err != nil {
+	if err := m.sealArchiveUnderRecoveryGate(context.Background(), e, &owner); err != nil {
 		return err
 	}
 	return m.releaseLifecycleOwner(context.Background(), e, owner)
 }
 
-func (m *Manager) sealArchiveUnderRecoveryGate(e *entry, owner *OwnershipToken) error {
+func (m *Manager) sealArchiveUnderRecoveryGate(ctx context.Context, e *entry, owner *OwnershipToken) error {
 	return m.withCanonicalMutationOwner(e, owner, true, func() error {
 		root := m.recordingSnapshotForArchive(e)
 		if root == nil {
 			return storage.ErrNotFound
 		}
 		if isShardedRecording(root) {
+			persisted, err := m.store.LoadRecordingHeader(ctx, root.ID)
+			if err != nil {
+				return err
+			}
+			if persisted.ShardedArchive.ClaimReconcilePending {
+				if err := m.store.ReconcileShardedArchive(ctx, root.ID); err != nil {
+					return err
+				}
+				persisted, err = m.store.LoadRecordingHeader(ctx, root.ID)
+				if err != nil {
+					return err
+				}
+				if persisted.ShardedArchive.ClaimReconcilePending {
+					return storage.ErrArchiveRecoveryPending
+				}
+				e.mu.Lock()
+				if e.deleted || e.recording == nil {
+					e.mu.Unlock()
+					return storage.ErrNotFound
+				}
+				if err := mergeShardedHeader(e.recording, persisted); err != nil {
+					e.mu.Unlock()
+					return err
+				}
+				e.mu.Unlock()
+			}
 			return m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
 				if recording.State == domain.StateRecording {
 					return ErrLifecycleConflict
@@ -1128,6 +1154,9 @@ func (m *Manager) recordHistoricalCoverage(e *entry, owner *OwnershipToken, term
 		if root == nil {
 			return storage.ErrNotFound
 		}
+		if root.ArchiveSealed {
+			return ErrArchiveSealed
+		}
 		coverage := recordHistoricalCoverage(coordinate, state, reason, time.Now().UTC())
 		if isShardedRecording(root) {
 			if state == archiveindex.CoverageKnownMissing {
@@ -1142,25 +1171,40 @@ func (m *Manager) recordHistoricalCoverage(e *entry, owner *OwnershipToken, term
 					return err
 				}
 			}
-			return m.store.AppendShardedCoverage(context.Background(), root.ID, coverage)
+			result, err := m.store.AppendShardedCoverageWithRevision(context.Background(), root.ID, coverage)
+			if err != nil {
+				return err
+			}
+			e.mu.Lock()
+			mergeShardedRevisionResult(e.recording, result)
+			e.mu.Unlock()
+			return nil
 		}
 		inventory, err := m.inventoryForRecording(root, false)
 		if err != nil {
 			return err
 		}
+		previousCoverageState := archiveindex.CoverageAt(inventory, coordinate)
 		if err := archiveindex.ApplyCoverage(&inventory, coverage); err != nil {
 			if isArchiveIndexCapacityError(err) {
 				return ErrArchiveIndexLimit
 			}
 			return err
 		}
+		currentCoverageState := archiveindex.CoverageAt(inventory, coordinate)
+		coverageStateChanged := currentCoverageState != previousCoverageState && currentCoverageState == archiveindex.CoverageKnownMissing
 		if state == archiveindex.CoverageKnownMissing {
 			if err := m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
 				track := recording.Tracks[coordinate.TrackID]
 				if track == nil {
 					return errors.New("main track is missing")
 				}
+				previousGapCount := len(recording.Gaps)
+				previousRevision := recording.ArchiveRevision
 				addMissingRangesDS(recording, track, coordinate.SourceEpoch, coordinate.DiscontinuitySequence, coordinate.Sequence, coordinate.Sequence, reason, capturedSequenceSetDS(track, coordinate.SourceEpoch, coordinate.DiscontinuitySequence))
+				if coverageStateChanged && len(recording.Gaps) == previousGapCount && recording.ArchiveRevision == previousRevision {
+					return advanceArchiveRevision(recording)
+				}
 				return nil
 			}); err != nil {
 				return err

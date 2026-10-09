@@ -2359,9 +2359,11 @@ func (m *Manager) updateWithinAuthorizedCommit(e *entry, fn func(*domain.Recordi
 	}
 	if isShardedRecording(next) {
 		pruneShardedRuntimeTail(next)
-		if err := m.appendShardedGapsSince(next.ID, base.Gaps, next.Gaps); err != nil {
+		if err := m.appendShardedGapsSince(next.ID, base.Gaps, next.Gaps, next); err != nil {
 			return newStorageStageError("persist sharded gaps", err)
 		}
+	} else if err := applyLegacyGapRevisions(base, next); err != nil {
+		return err
 	}
 	if err := m.saveRecordingHeader(next); err != nil {
 		return newStorageStageError("recording root commit", err)

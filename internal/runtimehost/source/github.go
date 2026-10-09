@@ -536,7 +536,7 @@ func validReleaseTarget(platform, architecture string) bool {
 		BuildTime: "2000-01-01T00:00:00Z", Channel: string(Stable), KeyID: "target-check",
 		MinimumHostProtocol: 1, MaximumHostProtocol: 1, ControlProtocolVersion: 1, EngineProtocolVersion: 1,
 		AdapterProtocolMinimum: 1, AdapterProtocolMaximum: 1,
-		ArchiveReadMinimum: 1, ArchiveReadMaximum: 1, ArchiveWriteEpoch: 1,
+		ArchiveReadMinimum: 2, ArchiveReadMaximum: 2, ArchiveWriteFormat: 2,
 		ManagementSchemaMinimum: 1, ManagementSchemaMaximum: 1,
 		Platform: platform, Architecture: architecture,
 		Artifacts: []release.Artifact{

@@ -365,8 +365,8 @@ func TestGitHubSourceFeedsSignedLocalFixtureToInstaller(t *testing.T) {
 		ControlProtocolRange: release.ProtocolRange{Minimum: 1, Maximum: 2},
 		EngineProtocolRange:  release.ProtocolRange{Minimum: 1, Maximum: 2},
 		AdapterProtocolRange: release.ProtocolRange{Minimum: 1, Maximum: 2},
-		ArchiveReadRange:     release.ProtocolRange{Minimum: 1, Maximum: 2},
-		ArchiveWriteEpoch:    1, ManagementSchemaVersion: 1,
+		ArchiveReadRange:     release.ProtocolRange{Minimum: 2, Maximum: 2},
+		ArchiveWriteFormat:   2, ManagementSchemaVersion: 1,
 	}
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
 	t.Cleanup(func() { cleanupRuntimeTree(runtimeRoot) })
@@ -472,8 +472,8 @@ func newReleaseFixtureForTarget(t *testing.T, channel Channel, architecture stri
 		ManifestSchemaVersion: 1, ReleaseVersion: "1.2.3", Commit: strings.Repeat("a", 40),
 		BuildTime: "2026-09-29T12:00:00Z", Channel: string(channel), KeyID: "fixture-key",
 		MinimumHostProtocol: 1, MaximumHostProtocol: 2, ControlProtocolVersion: 1, EngineProtocolVersion: 1,
-		AdapterProtocolMinimum: 1, AdapterProtocolMaximum: 2, ArchiveReadMinimum: 1, ArchiveReadMaximum: 2,
-		ArchiveWriteEpoch: 1, ManagementSchemaMinimum: 1, ManagementSchemaMaximum: 2,
+		AdapterProtocolMinimum: 1, AdapterProtocolMaximum: 2, ArchiveReadMinimum: 2, ArchiveReadMaximum: 2,
+		ArchiveWriteFormat: 2, ManagementSchemaMinimum: 1, ManagementSchemaMaximum: 2,
 		Platform: "linux", Architecture: architecture,
 	}
 	for i, role := range []string{release.RoleRuntimeHost, release.RoleControlPlane, release.RoleRecorderEngine, release.RoleAdapterRuntime} {

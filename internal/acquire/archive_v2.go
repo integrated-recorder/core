@@ -65,7 +65,7 @@ func shardedGapObservationIndex(gaps []domain.Gap) map[string]domain.Gap {
 	return index
 }
 
-func (m *Manager) appendShardedGapsSince(id string, previous, current []domain.Gap) error {
+func (m *Manager) appendShardedGapsSince(id string, previous, current []domain.Gap, revisionTarget ...*domain.Recording) error {
 	e, _ := m.entry(id)
 	known := make(map[string]domain.Gap, LivePlaybackWindowSize)
 	for _, gap := range previous {
@@ -81,14 +81,20 @@ func (m *Manager) appendShardedGapsSince(id string, previous, current []domain.G
 		}
 		e.mu.Unlock()
 	}
+	var target *domain.Recording
+	if len(revisionTarget) > 0 {
+		target = revisionTarget[0]
+	}
 	for _, gap := range current {
 		identity := shardedGapIdentity(gap)
 		if representedByShardedGap(known, identity, gap) {
 			continue
 		}
-		if err := m.store.AppendShardedGap(context.Background(), id, gap); err != nil {
+		result, err := m.store.AppendShardedGapWithRevision(context.Background(), id, gap)
+		if err != nil {
 			return err
 		}
+		mergeShardedRevisionResult(target, result)
 		known[identity] = gap
 	}
 	if e != nil {
@@ -105,6 +111,298 @@ func (m *Manager) appendShardedGapsSince(id string, previous, current []domain.G
 		e.mu.Unlock()
 	}
 	return nil
+}
+
+func mergeShardedRevisionResult(recording *domain.Recording, result storage.ShardedRevisionResult) {
+	if recording == nil || !isShardedRecording(recording) {
+		return
+	}
+	if recording.ArchiveRevision < result.ArchiveRevision {
+		recording.ArchiveRevision = result.ArchiveRevision
+	}
+	if recording.TimelineRevision < result.TimelineRevision {
+		recording.TimelineRevision = result.TimelineRevision
+	}
+}
+
+func gapRevisionSnapshot(recording *domain.Recording) *domain.Recording {
+	if recording == nil {
+		return nil
+	}
+	snapshot := &domain.Recording{
+		FormatVersion: recording.FormatVersion, ArchiveRevision: recording.ArchiveRevision,
+		TimelineRevision: recording.TimelineRevision, Gaps: append([]domain.Gap(nil), recording.Gaps...),
+		Tracks: make(map[string]*domain.Track, len(recording.Tracks)),
+	}
+	for id, track := range recording.Tracks {
+		if track == nil {
+			continue
+		}
+		copy := &domain.Track{
+			ID: track.ID, Segments: append([]domain.Segment(nil), track.Segments...),
+			PendingSegments:  append([]domain.PendingSequence(nil), track.PendingSegments...),
+			PendingSequences: append([]uint64(nil), track.PendingSequences...),
+		}
+		if track.LivePresentation != nil {
+			state := *track.LivePresentation
+			copy.LivePresentation = &state
+		}
+		snapshot.Tracks[id] = copy
+	}
+	return snapshot
+}
+
+// applyLegacyGapRevisions binds V1 gap-state changes to the root counters.
+// V2 gap revisions publish atomically in Store.AppendShardedGapWithRevision.
+func applyLegacyGapRevisions(base, next *domain.Recording) error {
+	if base == nil || next == nil || isShardedRecording(next) {
+		return nil
+	}
+	archiveNeedsCheck := next.ArchiveRevision == base.ArchiveRevision
+	timelineNeedsCheck := next.TimelineRevision == base.TimelineRevision
+	if !archiveNeedsCheck && !timelineNeedsCheck {
+		return nil
+	}
+	if archiveNeedsCheck && !sameCanonicalGapState(base, next) {
+		if err := advanceArchiveRevision(next); err != nil {
+			return err
+		}
+	}
+	if timelineNeedsCheck && !sameLiveGapProjection(base, next) {
+		if next.TimelineRevision == ^uint64(0) {
+			return errors.New("timeline revision overflow")
+		}
+		next.TimelineRevision++
+	}
+	return nil
+}
+
+type canonicalGapInterval struct {
+	track string
+	epoch uint64
+	disc  uint64
+	from  uint64
+	to    uint64
+}
+
+func sameCanonicalGapState(left, right *domain.Recording) bool {
+	a, b := canonicalGapIntervals(left), canonicalGapIntervals(right)
+	if len(a) != len(b) {
+		return false
+	}
+	for index := range a {
+		if a[index] != b[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalGapIntervals(recording *domain.Recording) []canonicalGapInterval {
+	if recording == nil {
+		return nil
+	}
+	type key struct {
+		track string
+		epoch uint64
+		disc  uint64
+	}
+	byKey := make(map[key][]canonicalGapInterval)
+	present := make(map[key][]uint64)
+	for trackID, track := range recording.Tracks {
+		if track == nil {
+			continue
+		}
+		for _, segment := range track.Segments {
+			if segment.IsInit {
+				continue
+			}
+			identity := key{track: trackID, epoch: segment.SourceEpoch, disc: segment.DiscontinuitySequence}
+			present[identity] = append(present[identity], segment.Sequence)
+		}
+	}
+	for _, gap := range recording.Gaps {
+		if gap.TrackID == "" || gap.ToSequence < gap.FromSequence {
+			continue
+		}
+		identity := key{track: gap.TrackID, epoch: gap.SourceEpoch, disc: gap.DiscontinuitySequence}
+		byKey[identity] = append(byKey[identity], canonicalGapInterval{
+			track: gap.TrackID, epoch: gap.SourceEpoch, disc: gap.DiscontinuitySequence,
+			from: gap.FromSequence, to: gap.ToSequence,
+		})
+	}
+	out := make([]canonicalGapInterval, 0)
+	for identity, intervals := range byKey {
+		sequences := present[identity]
+		sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+		sequences = compactUint64(sequences)
+		for _, interval := range intervals {
+			cursor := interval.from
+			exhausted := false
+			start := sort.Search(len(sequences), func(index int) bool { return sequences[index] >= interval.from })
+			for _, sequence := range sequences[start:] {
+				if sequence > interval.to {
+					break
+				}
+				if sequence > cursor {
+					part := interval
+					part.to = sequence - 1
+					out = append(out, part)
+				}
+				if sequence == ^uint64(0) {
+					exhausted = true
+					break
+				}
+				if sequence >= cursor {
+					cursor = sequence + 1
+				}
+			}
+			if !exhausted && cursor <= interval.to {
+				part := interval
+				part.from = cursor
+				out = append(out, part)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].track != out[j].track {
+			return out[i].track < out[j].track
+		}
+		if out[i].epoch != out[j].epoch {
+			return out[i].epoch < out[j].epoch
+		}
+		if out[i].disc != out[j].disc {
+			return out[i].disc < out[j].disc
+		}
+		if out[i].from != out[j].from {
+			return out[i].from < out[j].from
+		}
+		return out[i].to < out[j].to
+	})
+	merged := out[:0]
+	for _, interval := range out {
+		if len(merged) > 0 {
+			last := &merged[len(merged)-1]
+			if last.track == interval.track && last.epoch == interval.epoch && last.disc == interval.disc &&
+				(interval.from <= last.to || last.to != ^uint64(0) && interval.from == last.to+1) {
+				if interval.to > last.to {
+					last.to = interval.to
+				}
+				continue
+			}
+		}
+		merged = append(merged, interval)
+	}
+	return merged
+}
+
+func compactUint64(values []uint64) []uint64 {
+	if len(values) < 2 {
+		return values
+	}
+	write := 1
+	for read := 1; read < len(values); read++ {
+		if values[read] == values[write-1] {
+			continue
+		}
+		values[write] = values[read]
+		write++
+	}
+	return values[:write]
+}
+
+type liveGapPresentation struct {
+	discontinuity bool
+	discSequence  uint64
+	duration      float64
+	programTime   string
+}
+
+func sameLiveGapProjection(left, right *domain.Recording) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	last := maxLivePresentationOrdinal(left.Tracks["main"])
+	if rightLast := maxLivePresentationOrdinal(right.Tracks["main"]); rightLast > last {
+		last = rightLast
+	}
+	if last == 0 {
+		return true
+	}
+	first := uint64(1)
+	if last >= LivePlaybackWindowSize {
+		first = last - LivePlaybackWindowSize + 1
+	}
+	a, b := liveGapProjection(left, first, last), liveGapProjection(right, first, last)
+	if len(a) != len(b) {
+		return false
+	}
+	for ordinal, slot := range a {
+		if other, ok := b[ordinal]; !ok || other != slot {
+			return false
+		}
+	}
+	return true
+}
+
+func liveGapProjection(recording *domain.Recording, first, last uint64) map[uint64]liveGapPresentation {
+	out := make(map[uint64]liveGapPresentation)
+	if recording == nil {
+		return out
+	}
+	track := recording.Tracks["main"]
+	if track == nil {
+		return out
+	}
+	present := make(map[uint64]struct{}, len(track.Segments))
+	pending := make(map[uint64]struct{}, len(track.PendingSegments))
+	for _, segment := range track.Segments {
+		if segment.LivePresentationOrdinal >= first && segment.LivePresentationOrdinal <= last {
+			present[segment.LivePresentationOrdinal] = struct{}{}
+		}
+	}
+	for _, item := range track.PendingSegments {
+		if item.LivePresentationOrdinal >= first && item.LivePresentationOrdinal <= last {
+			pending[item.LivePresentationOrdinal] = struct{}{}
+		}
+	}
+	for _, gap := range recording.Gaps {
+		if gap.TrackID != track.ID || gap.LivePresentationOrdinal == 0 || gap.ToSequence < gap.FromSequence {
+			continue
+		}
+		span := gap.ToSequence - gap.FromSequence
+		if span > ^uint64(0)-gap.LivePresentationOrdinal {
+			continue
+		}
+		gapLast := gap.LivePresentationOrdinal + span
+		start, end := gap.LivePresentationOrdinal, gapLast
+		if start < first {
+			start = first
+		}
+		if end > last {
+			end = last
+		}
+		for ordinal := start; ordinal <= end; ordinal++ {
+			_, hasMedia := present[ordinal]
+			_, isPending := pending[ordinal]
+			if !hasMedia && !isPending {
+				programTime := ""
+				if gap.ProgramDateTime != nil {
+					programTime = gap.ProgramDateTime.UTC().Format(time.RFC3339Nano)
+				}
+				out[ordinal] = liveGapPresentation{
+					discontinuity: ordinal == gap.LivePresentationOrdinal && gap.LiveDiscontinuity,
+					discSequence:  gap.LiveDiscontinuitySequence,
+					duration:      gap.LiveDuration,
+					programTime:   programTime,
+				}
+			}
+			if ordinal == ^uint64(0) {
+				break
+			}
+		}
+	}
+	return out
 }
 
 func representedByShardedGap(known map[string]domain.Gap, identity string, candidate domain.Gap) bool {
@@ -480,6 +778,9 @@ func (m *Manager) commitShardedArchiveSegment(e *entry, owner *OwnershipToken, s
 		header := m.recordingSnapshotForArchive(e)
 		if !isShardedRecording(header) {
 			return storage.ErrShardedArchiveInvalid
+		}
+		if header.ArchiveSealed {
+			return ErrArchiveSealed
 		}
 		e.mu.Lock()
 		adapterID := e.adapterID

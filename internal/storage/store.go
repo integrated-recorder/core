@@ -908,6 +908,12 @@ func (s *Store) LoadAll() ([]*domain.Recording, error) {
 		if recording == nil || recording.FormatVersion != ShardedArchiveFormatVersion {
 			continue
 		}
+		// A sealed v2 root is an immutable recovery boundary. It is already
+		// fully canonical by construction; startup must not attempt to adopt
+		// orphan candidates into it or rewrite its archive state.
+		if recording.ArchiveSealed {
+			continue
+		}
 		if err := s.ReconcileShardedArchive(context.Background(), recording.ID); err != nil {
 			return nil, err
 		}

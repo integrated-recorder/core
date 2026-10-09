@@ -29,7 +29,7 @@ func newOwnerAuthorityTest(t *testing.T) (*RecordingOwnerAuthority, *recordingow
 		return generation.Generation{
 			ID: id, Version: "1.0.0", Commit: "test", InstalledAt: time.Now().UTC(),
 			State: generation.StateStaging, ControlProtocol: 1, EngineProtocol: 1,
-			ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1,
+			ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 2, Maximum: 2}, ArchiveWriteFormat: 2,
 		}
 	}
 	if err := registry.Stage(newGeneration(activeID)); err != nil {
@@ -96,6 +96,29 @@ func TestRecordingOwnerAuthorityAuthorizesOnlyRegisteredActiveEngine(t *testing.
 	}
 	if lease, ok := registry.Snapshot().Leases[owner.RecordingID]; !ok || lease.EngineGeneration != activeID || lease.WorkerInstance != instanceID {
 		t.Fatalf("generation lease=%+v present=%v", lease, ok)
+	}
+}
+
+func TestRecordingOwnerAuthorityRejectsEngineWithoutV2Capability(t *testing.T) {
+	authority, _, registry, _, candidateID, _ := newOwnerAuthorityTest(t)
+	// The helper stages a V2 candidate to exercise normal handover behavior.
+	// Retire that candidate before staging the deliberately unsupported V1
+	// generation because the registry permits only one staged candidate.
+	if err := registry.Fail(candidateID); err != nil {
+		t.Fatal(err)
+	}
+	legacyID := fmt.Sprintf("%032x", 303)
+	legacy := generation.Generation{
+		ID: legacyID, Version: "0.9.0", Commit: "development-only-v1", InstalledAt: time.Now().UTC(),
+		State: generation.StateStaging, ControlProtocol: 1, EngineProtocol: 1,
+		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteFormat: 1,
+	}
+	if err := registry.Stage(legacy); err != nil {
+		t.Fatal(err)
+	}
+	const resourceOwner = "e000000000000000000000000000000000-00000000000000000000000000000004"
+	if err := authority.RegisterEngine(resourceOwner, legacyID, fmt.Sprintf("%032x", 304)); !errors.Is(err, generation.ErrArchiveFormatUnsupported) {
+		t.Fatalf("RegisterEngine(v1) = %v, want unsupported archive capability", err)
 	}
 }
 

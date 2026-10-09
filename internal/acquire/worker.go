@@ -344,6 +344,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		e.mu.Unlock()
 		return false, errors.New("recording state could not be copied")
 	}
+	baseGapRevision := gapRevisionSnapshot(r)
 	priorGaps := append([]domain.Gap(nil), r.Gaps...)
 	var observedEpoch uint64
 	if err := func() error {
@@ -517,6 +518,11 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	}(); err != nil {
 		return false, err
 	}
+	if !isShardedRecording(r) {
+		if err := applyLegacyGapRevisions(baseGapRevision, r); err != nil {
+			return false, err
+		}
+	}
 	if isShardedRecording(r) {
 		pruneShardedRuntimeTail(r)
 	}
@@ -533,7 +539,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			// as this observation returns to discovery. Publish any newly
 			// reserved gap slots first so the live index never sees a hole.
 			if err := m.withCanonicalCommit(e, func() error {
-				return m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps)
+				return m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps, r)
 			}); err != nil {
 				return false, newStorageStageError("persist sharded live gap reservations", err)
 			}
@@ -559,7 +565,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	e.mu.Unlock()
 	if err := m.withCanonicalCommit(e, func() error {
 		if isShardedRecording(r) {
-			if err := m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps); err != nil {
+			if err := m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps, r); err != nil {
 				return newStorageStageError("persist sharded gaps", err)
 			}
 		}
@@ -625,9 +631,11 @@ func (m *Manager) updateAtMediaGenerationWithinAuthorizedCommit(e *entry, genera
 	}
 	if isShardedRecording(next) {
 		pruneShardedRuntimeTail(next)
-		if err := m.appendShardedGapsSince(next.ID, base.Gaps, next.Gaps); err != nil {
+		if err := m.appendShardedGapsSince(next.ID, base.Gaps, next.Gaps, next); err != nil {
 			return false, newStorageStageError("persist sharded gaps", err)
 		}
+	} else if err := applyLegacyGapRevisions(base, next); err != nil {
+		return false, err
 	}
 	if err := m.saveRecordingHeader(next); err != nil {
 		return false, newStorageStageError("recording root commit", err)

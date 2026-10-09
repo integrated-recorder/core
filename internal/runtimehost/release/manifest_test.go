@@ -104,11 +104,16 @@ func TestCheckCompatibilityUsesExplicitRanges(t *testing.T) {
 		ControlProtocolRange: ProtocolRange{Minimum: 1, Maximum: 2},
 		EngineProtocolRange:  ProtocolRange{Minimum: 1, Maximum: 2},
 		AdapterProtocolRange: ProtocolRange{Minimum: 1, Maximum: 2},
-		ArchiveReadRange:     ProtocolRange{Minimum: 1, Maximum: 2}, ArchiveWriteEpoch: 1,
+		ArchiveReadRange:     ProtocolRange{Minimum: 2, Maximum: 2}, ArchiveWriteFormat: 2,
 		ManagementSchemaVersion: 2,
 	}
 	if err := CheckCompatibility(manifest, host); err != nil {
 		t.Fatalf("compatible host rejected: %v", err)
+	}
+	legacy := manifest
+	legacy.ArchiveReadMinimum, legacy.ArchiveReadMaximum, legacy.ArchiveWriteFormat = 1, 1, 1
+	if err := CheckCompatibility(legacy, host); !errors.Is(err, ErrIncompatible) {
+		t.Fatalf("V1 release compatibility = %v, want fail-closed rejection", err)
 	}
 	tests := map[string]func(*HostCompatibility){
 		"runtime protocol":  func(h *HostCompatibility) { h.RuntimeProtocolVersion = 3 },
@@ -177,9 +182,9 @@ func validManifest() Manifest {
 		EngineProtocolVersion:   1,
 		AdapterProtocolMinimum:  1,
 		AdapterProtocolMaximum:  2,
-		ArchiveReadMinimum:      1,
-		ArchiveReadMaximum:      3,
-		ArchiveWriteEpoch:       2,
+		ArchiveReadMinimum:      2,
+		ArchiveReadMaximum:      2,
+		ArchiveWriteFormat:      2,
 		ManagementSchemaMinimum: 1,
 		ManagementSchemaMaximum: 3,
 		Platform:                "linux",

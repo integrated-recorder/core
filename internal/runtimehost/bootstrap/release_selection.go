@@ -37,6 +37,9 @@ func selectRuntimeRelease(snapshot generation.Snapshot, bundleBuild buildinfo.In
 		if !ok || active.State != generation.StateActive {
 			return runtimeRelease{}, errors.New("active runtime generation is inconsistent")
 		}
+		if !active.SupportsCurrentArchiveFormat() {
+			return runtimeRelease{}, generation.ErrArchiveFormatUnsupported
+		}
 		if active.Version == bundleBuild.Version && strings.EqualFold(active.Commit, bundleBuild.Commit) {
 			return runtimeRelease{
 				generationID: activeID, directory: bundleDir,
@@ -51,7 +54,7 @@ func selectRuntimeRelease(snapshot generation.Snapshot, bundleBuild buildinfo.In
 		if manifest.ReleaseVersion != active.Version || !strings.EqualFold(manifest.Commit, active.Commit) ||
 			manifest.ControlProtocolVersion != active.ControlProtocol || manifest.EngineProtocolVersion != active.EngineProtocol ||
 			manifest.ArchiveReadMinimum != active.ArchiveReadCompatibility.Minimum || manifest.ArchiveReadMaximum != active.ArchiveReadCompatibility.Maximum ||
-			manifest.ArchiveWriteEpoch != active.ArchiveWriteEpoch {
+			manifest.ArchiveWriteFormat != active.ArchiveWriteFormat {
 			return runtimeRelease{}, errors.New("active runtime registry does not match its signed release")
 		}
 		controlPath, err := installed.ValidateExecutableRole(release.RoleControlPlane)
@@ -86,7 +89,7 @@ func currentHostCompatibility() release.HostCompatibility {
 		ControlProtocolRange:   release.ProtocolRange{Minimum: runtimeipc.ProtocolVersion, Maximum: runtimeipc.ProtocolVersion},
 		EngineProtocolRange:    release.ProtocolRange{Minimum: runtimeipc.ProtocolVersion, Maximum: runtimeipc.ProtocolVersion},
 		AdapterProtocolRange:   release.ProtocolRange{Minimum: adapterproto.Version, Maximum: adapterproto.Version},
-		ArchiveReadRange:       release.ProtocolRange{Minimum: 1, Maximum: 1},
-		ArchiveWriteEpoch:      1, ManagementSchemaVersion: currentManagementSchema,
+		ArchiveReadRange:       release.ProtocolRange{Minimum: generation.CurrentArchiveFormatVersion, Maximum: generation.CurrentArchiveFormatVersion},
+		ArchiveWriteFormat:     generation.CurrentArchiveFormatVersion, ManagementSchemaVersion: currentManagementSchema,
 	}
 }

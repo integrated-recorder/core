@@ -1266,6 +1266,17 @@ func (s *IngestService) releaseCoordinatorLease(state *leaseReleaseState, leaseI
 }
 
 func (s *IngestService) releaseCoordinatorLeaseContext(state *leaseReleaseState, leaseID, operation string, ctx context.Context, call func(context.Context) error, onResolved func()) error {
+	return s.releaseCoordinatorLeaseContextMode(state, leaseID, operation, ctx, call, onResolved, false)
+}
+
+// releaseCoordinatorLeaseContextDeferred keeps a pending lease visible until
+// the retry loop applies its local resolution callback. PendingCoordinatorLeases
+// therefore signals that remote release and local accounting both completed.
+func (s *IngestService) releaseCoordinatorLeaseContextDeferred(state *leaseReleaseState, leaseID, operation string, ctx context.Context, call func(context.Context) error, onResolved func()) error {
+	return s.releaseCoordinatorLeaseContextMode(state, leaseID, operation, ctx, call, onResolved, true)
+}
+
+func (s *IngestService) releaseCoordinatorLeaseContextMode(state *leaseReleaseState, leaseID, operation string, ctx context.Context, call func(context.Context) error, onResolved func(), deferPendingRemoval bool) error {
 	var err error
 	if ctx == nil {
 		err = callCoordinatorRelease(operation, call)
@@ -1277,7 +1288,9 @@ func (s *IngestService) releaseCoordinatorLeaseContext(state *leaseReleaseState,
 	firstPendingAttempt := false
 	if err == nil {
 		_, wasPending = s.pendingCoordinatorReleases[leaseID]
-		delete(s.pendingCoordinatorReleases, leaseID)
+		if !deferPendingRemoval {
+			delete(s.pendingCoordinatorReleases, leaseID)
+		}
 	} else {
 		s.coordinatorErrors++
 		previous := s.pendingCoordinatorReleases[leaseID]
@@ -1288,14 +1301,29 @@ func (s *IngestService) releaseCoordinatorLeaseContext(state *leaseReleaseState,
 			onResolved: onResolved, attempts: attempts, next: time.Now().Add(coordinatorReleaseRetryDelay(attempts)),
 		}
 	}
-	s.signalLocked()
+	if err != nil || !deferPendingRemoval {
+		s.signalLocked()
+	}
 	s.mu.Unlock()
 	if firstPendingAttempt {
 		log.Printf("storage coordinator lease release pending: operation=%q", operation)
-	} else if wasPending {
+	} else if wasPending && !deferPendingRemoval {
 		log.Printf("storage coordinator lease release retry resolved: operation=%q", operation)
 	}
 	return err
+}
+
+func (s *IngestService) clearPendingCoordinatorRelease(leaseID string) {
+	s.mu.Lock()
+	pending, exists := s.pendingCoordinatorReleases[leaseID]
+	if exists {
+		delete(s.pendingCoordinatorReleases, leaseID)
+		s.signalLocked()
+	}
+	s.mu.Unlock()
+	if exists {
+		log.Printf("storage coordinator lease release retry resolved: operation=%q", pending.operation)
+	}
 }
 
 func coordinatorReleaseRetryDelay(attempt int) time.Duration {
@@ -1347,10 +1375,13 @@ func (s *IngestService) retryPendingCoordinatorReleases(ctx context.Context, lim
 			return
 		}
 		err := pending.state.releaseContext(ctx, func() error {
-			return s.releaseCoordinatorLeaseContext(pending.state, pending.leaseID, pending.operation, ctx, pending.call, pending.onResolved)
+			return s.releaseCoordinatorLeaseContextDeferred(pending.state, pending.leaseID, pending.operation, ctx, pending.call, pending.onResolved)
 		})
-		if err == nil && pending.onResolved != nil {
-			pending.onResolved()
+		if err == nil {
+			if pending.onResolved != nil {
+				pending.onResolved()
+			}
+			s.clearPendingCoordinatorRelease(pending.leaseID)
 		}
 	}
 }

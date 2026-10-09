@@ -93,7 +93,7 @@ func newControllerFixture(t *testing.T, badSignature bool) *controllerFixture {
 		t.Fatal(err)
 	}
 	initialID := strings.Repeat("a", 32)
-	initial := generation.Generation{ID: initialID, Version: "1.0.0", Commit: strings.Repeat("a", 40), InstalledAt: time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC), State: generation.StateStaging, ControlProtocol: 1, EngineProtocol: 1, AdapterSetID: emptyAdapterSet.ID, ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1}
+	initial := generation.Generation{ID: initialID, Version: "1.0.0", Commit: strings.Repeat("a", 40), InstalledAt: time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC), State: generation.StateStaging, ControlProtocol: 1, EngineProtocol: 1, AdapterSetID: emptyAdapterSet.ID, ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 2, Maximum: 2}, ArchiveWriteFormat: 2}
 	if err := registry.Stage(initial); err != nil {
 		t.Fatal(err)
 	}
@@ -667,12 +667,12 @@ func TestUpdateControllerRejectsBadSignatureWithoutChangingActiveGeneration(t *t
 	}
 }
 
-func TestUpdateControllerRejectsCandidateIncompatibleWithRunningEngineEpoch(t *testing.T) {
+func TestUpdateControllerRejectsCandidateIncompatibleWithRunningEngineFormat(t *testing.T) {
 	fixture := newControllerFixture(t, false)
 	snapshot := fixture.registry.Snapshot()
 	initial := snapshot.Generations[fixture.initialID]
-	initial.ArchiveWriteEpoch = 2
-	initial.ArchiveReadCompatibility.Maximum = 2
+	initial.ArchiveWriteFormat = 3
+	initial.ArchiveReadCompatibility.Maximum = 3
 	snapshot.Generations[fixture.initialID] = initial
 	data, err := json.Marshal(snapshot)
 	if err != nil {
@@ -689,7 +689,7 @@ func TestUpdateControllerRejectsCandidateIncompatibleWithRunningEngineEpoch(t *t
 	fixture.registry = registry
 	fixture.controller.registry = registry
 	if _, err := fixture.controller.Check(context.Background()); controllerErrorCode(err) != "release_incompatible" {
-		t.Fatalf("Check() error = %v, want release_incompatible for active Engine write epoch", err)
+		t.Fatalf("Check() error = %v, want release_incompatible for active Engine write format", err)
 	}
 	if registry.Snapshot().ActiveGenerationID != fixture.initialID || registry.Snapshot().StagedGenerationID != "" {
 		t.Fatalf("incompatible update changed generation registry: %+v", registry.Snapshot())
@@ -1101,7 +1101,7 @@ func activateSyntheticGeneration(t *testing.T, fixture *controllerFixture, id, v
 	g := generation.Generation{
 		ID: id, Version: version, Commit: commit, InstalledAt: time.Now().UTC(), State: generation.StateStaging,
 		ControlProtocol: 1, EngineProtocol: 1,
-		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1,
+		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 2, Maximum: 2}, ArchiveWriteFormat: 2,
 	}
 	for _, action := range []func() error{
 		func() error { return fixture.registry.Stage(g) },
@@ -1192,8 +1192,8 @@ func signedTestRelease(t *testing.T, private ed25519.PrivateKey) (release.Manife
 		ManifestSchemaVersion: release.ManifestSchemaVersion, ReleaseVersion: "1.1.0", Commit: strings.Repeat("c", 40),
 		BuildTime: "2026-09-30T00:00:00Z", Channel: "stable", KeyID: "test-key",
 		MinimumHostProtocol: 1, MaximumHostProtocol: 1, ControlProtocolVersion: 1, EngineProtocolVersion: 1,
-		AdapterProtocolMinimum: 1, AdapterProtocolMaximum: 2, ArchiveReadMinimum: 1, ArchiveReadMaximum: 1,
-		ArchiveWriteEpoch: 1, ManagementSchemaMinimum: 1, ManagementSchemaMaximum: 1,
+		AdapterProtocolMinimum: 1, AdapterProtocolMaximum: 2, ArchiveReadMinimum: 2, ArchiveReadMaximum: 2,
+		ArchiveWriteFormat: 2, ManagementSchemaMinimum: 1, ManagementSchemaMaximum: 1,
 		Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 	}
 	for _, role := range roles {
@@ -1214,7 +1214,7 @@ func compatibilityForTest() release.HostCompatibility {
 		ControlProtocolRange: release.ProtocolRange{Minimum: 1, Maximum: 1},
 		EngineProtocolRange:  release.ProtocolRange{Minimum: 1, Maximum: 1},
 		AdapterProtocolRange: release.ProtocolRange{Minimum: 1, Maximum: 2},
-		ArchiveReadRange:     release.ProtocolRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1,
+		ArchiveReadRange:     release.ProtocolRange{Minimum: 2, Maximum: 2}, ArchiveWriteFormat: 2,
 		ManagementSchemaVersion: 1,
 	}
 }

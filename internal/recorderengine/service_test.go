@@ -143,6 +143,13 @@ func TestResolvedStartGetStopOverIPC(t *testing.T) {
 	if stopped.State != domain.StateStopped || len(stopped.Tracks["main"].Segments) != 1 {
 		t.Fatalf("stopped recording = %#v", stopped)
 	}
+	completed, err := managerClient.CompleteRecording(context.Background(), started.ID)
+	if err != nil || completed.State != domain.StateCompleted || completed.ArchiveSealed {
+		t.Fatalf("explicit completion over IPC = %#v err=%v", completed, err)
+	}
+	if err := managerClient.SealArchiveContext(context.Background(), started.ID); err != nil {
+		t.Fatalf("explicit seal over IPC: %v", err)
+	}
 	if count, err := managerClient.ActiveRecordings(context.Background(), "generation-a"); err != nil || count != 0 {
 		t.Fatalf("active recording count after stop = %d, err=%v; want 0", count, err)
 	}
@@ -164,8 +171,8 @@ func TestResolvedStartGetStopOverIPC(t *testing.T) {
 	}
 	var persisted domain.Recording
 	data, err := os.ReadFile(filepath.Join(root, "data", "recordings", started.ID, "recording.json"))
-	if err != nil || json.Unmarshal(data, &persisted) != nil || persisted.State != domain.StateStopped {
-		t.Fatalf("canonical recording was not durably stopped: err=%v state=%q", err, persisted.State)
+	if err != nil || json.Unmarshal(data, &persisted) != nil || persisted.State != domain.StateCompleted || !persisted.ArchiveSealed {
+		t.Fatalf("canonical lifecycle was not durably published: err=%v state=%q", err, persisted.State)
 	}
 }
 

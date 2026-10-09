@@ -53,11 +53,21 @@ func TestRetentionCandidatesFilterAndRedact(t *testing.T) {
 	s, store, products, _ := newRetentionFixture(t, false)
 	now := time.Now().UTC()
 	oldID := strings.Repeat("a", 32)
+	unsealedID := strings.Repeat("0", 32)
 	recentID := strings.Repeat("b", 32)
 	interruptedID := strings.Repeat("c", 32)
 	taggedID := strings.Repeat("d", 32)
 	stoppedID := strings.Repeat("e", 32)
 	createRetentionRecording(t, store, oldID, domain.StateCompleted, now.Add(-60*24*time.Hour))
+	unsealed := &domain.Recording{
+		FormatVersion: 1, ID: unsealedID, State: domain.StateCompleted,
+		CreatedAt: now.Add(-61 * 24 * time.Hour), StartedAt: now.Add(-61 * 24 * time.Hour),
+		StoppedAt: timePointer(now.Add(-60 * 24 * time.Hour)),
+		Tracks:    map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+	}
+	if err := store.CreateRecording(unsealed); err != nil {
+		t.Fatal(err)
+	}
 	createRetentionRecording(t, store, recentID, domain.StateCompleted, now.Add(-2*24*time.Hour))
 	createRetentionRecording(t, store, interruptedID, domain.StateInterrupted, now.Add(-60*24*time.Hour))
 	createRetentionRecording(t, store, taggedID, domain.StateCompleted, now.Add(-60*24*time.Hour))
@@ -86,6 +96,9 @@ func TestRetentionCandidatesFilterAndRedact(t *testing.T) {
 	}
 	if body.Enabled || body.CandidateCount != 1 || len(body.Candidates) != 1 || body.Candidates[0].ID != oldID {
 		t.Fatalf("candidate preview = %#v", body)
+	}
+	if strings.Contains(response.Body.String(), unsealedID) {
+		t.Fatalf("unsealed completed recording appeared as retention candidate: %s", response.Body.String())
 	}
 	if strings.Contains(response.Body.String(), "source_uri") || strings.Contains(response.Body.String(), "storage_path") || strings.Contains(response.Body.String(), "private.invalid") {
 		t.Fatalf("candidate response exposed path or source: %s", response.Body.String())
@@ -327,11 +340,45 @@ func TestRetentionAgeEligibilityRequiresCompletedState(t *testing.T) {
 			t.Fatalf("state %q was eligible for retention", state)
 		}
 	}
-	if retentionAgeEligible(&domain.Recording{State: domain.StateCompleted}, cutoff) {
+	if retentionAgeEligible(&domain.Recording{State: domain.StateCompleted, ArchiveSealed: true}, cutoff) {
 		t.Fatal("completed recording without stopped_at was eligible")
 	}
-	if !retentionAgeEligible(&domain.Recording{State: domain.StateCompleted, StoppedAt: &old}, cutoff) {
-		t.Fatal("old completed recording was not eligible")
+	if retentionAgeEligible(&domain.Recording{State: domain.StateCompleted, StoppedAt: &old}, cutoff) {
+		t.Fatal("old unsealed completed recording was eligible")
+	}
+	if !retentionAgeEligible(&domain.Recording{State: domain.StateCompleted, ArchiveSealed: true, StoppedAt: &old}, cutoff) {
+		t.Fatal("old sealed completed recording was not eligible")
+	}
+}
+
+func TestRetentionDeleteRechecksArchiveSeal(t *testing.T) {
+	s, store, _, _ := newRetentionFixture(t, true)
+	id := strings.Repeat("7", 32)
+	old := time.Now().UTC().Add(-60 * 24 * time.Hour)
+	createRetentionRecording(t, store, id, domain.StateCompleted, old)
+	recording, err := store.LoadRecordingReadOnly(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording.ArchiveSealed = false
+	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.manager = manager
+
+	lock := s.productLock(id)
+	lock.Lock()
+	deleted, err := s.deleteRetentionCandidateLocked(context.Background(), id, 30)
+	lock.Unlock()
+	if err != nil || deleted {
+		t.Fatalf("unsealed retention delete deleted=%v err=%v", deleted, err)
+	}
+	if _, err := manager.Get(id); err != nil {
+		t.Fatalf("unsealed recording was deleted: %v", err)
 	}
 }
 
@@ -366,7 +413,8 @@ func createRetentionRecording(t *testing.T, store *storage.Store, id string, sta
 	created := stoppedAt.Add(-time.Hour)
 	recording := &domain.Recording{
 		FormatVersion: 1, ID: id, State: state, CreatedAt: created, StartedAt: created,
-		Tracks: map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+		ArchiveSealed: state == domain.StateCompleted,
+		Tracks:        map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
 	}
 	if state != domain.StateRecording {
 		recording.StoppedAt = &stoppedAt
@@ -376,5 +424,7 @@ func createRetentionRecording(t *testing.T, store *storage.Store, id string, sta
 	}
 	return recording
 }
+
+func timePointer(value time.Time) *time.Time { return &value }
 
 func retentionPtr[T any](value T) *T { return &value }

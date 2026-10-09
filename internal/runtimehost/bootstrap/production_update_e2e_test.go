@@ -1105,7 +1105,7 @@ func runTargetRefreshPreflightScenario(t *testing.T, artifacts runtimeUpdateArti
 	}
 	final := waitCanonicalSegmentCount(t, dataDir, recording.ID, 4, 20*time.Second)
 	if final.ID != recording.ID || final.State != domain.StateRecording || len(final.Gaps) != 0 || !equalSequenceRange(recordingSequences(final), 1, 4) {
-		t.Fatalf("successful target preflight did not continue the same Recording without a gap: id=%s state=%s sequences=%v gaps=%+v", final.ID, final.State, recordingSequences(final), final.Gaps)
+		t.Fatalf("successful target preflight did not continue the same Recording without a gap: id=%s state=%s sequences=%v gaps=%+v; fixture=%s; host=%s", final.ID, final.State, recordingSequences(final), final.Gaps, fixture.describe(stream), process.output.String())
 	}
 	verifyRuntimeRecordingSegments(t, dataDir, final, stream, 1, 4)
 	requests := fixture.segmentRequestsFor(stream)
@@ -1153,6 +1153,9 @@ func snapshotRuntimeCommittedMedia(t *testing.T, dataDir, recordingID string) []
 	recording, err := store.LoadRecordingReadOnly(recordingID)
 	if err != nil || recording == nil {
 		t.Fatalf("load recording for committed media snapshot: recording=%v err=%v", recording != nil, err)
+	}
+	if err := materializeShardedRecordingForTest(store, recording); err != nil {
+		t.Fatalf("materialize recording for committed media snapshot: %v", err)
 	}
 	type committedTrack struct {
 		Segments     []domain.Segment `json:"segments"`
@@ -1443,26 +1446,53 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 		}
 	}
 	var preCrashArchive *domain.Recording
-	if point == runtimehook.BeforeSourceRetirement {
-		store, err := storage.New(dataDir)
+	var preCrashObjects map[string]string
+	for attempt := 0; attempt < 5; attempt++ {
+		objectsBeforeRead, err := snapshotRecordingObjects(archiveDir)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("snapshot canonical archive before pre-crash read: %v", err)
 		}
-		preCrashArchive, err = store.LoadRecordingReadOnly(recording.ID)
+		if point == runtimehook.BeforeSourceRetirement {
+			store, err := storage.New(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			preCrashArchive, err = store.LoadRecordingReadOnly(recording.ID)
+			if err != nil {
+				t.Fatalf("read canonical archive while source retirement is held: %v", err)
+			}
+			if err := materializeShardedRecordingForTest(store, preCrashArchive); err != nil {
+				t.Fatalf("materialize canonical archive while source retirement is held: %v", err)
+			}
+		} else {
+			preCrashArchive = getRecording(t, client, baseURL, recording.ID)
+			store, err := storage.New(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := materializeShardedRecordingForTest(store, preCrashArchive); err != nil {
+				t.Fatalf("materialize canonical archive before cold recovery: %v", err)
+			}
+		}
+		objectsAfterRead, err := snapshotRecordingObjects(archiveDir)
 		if err != nil {
-			t.Fatalf("read canonical archive while source retirement is held: %v", err)
+			t.Fatalf("snapshot canonical archive after pre-crash read: %v", err)
 		}
-	} else {
-		preCrashArchive = getRecording(t, client, baseURL, recording.ID)
+		preCrashObjects = objectsAfterRead
+		if preCrashArchive.FormatVersion != storage.ShardedArchiveFormatVersion ||
+			(v2ManifestPageSnapshotsEqual(objectsBeforeRead, objectsAfterRead) && validateV2ManifestPages(archiveDir, objectsAfterRead, preCrashArchive.Snapshots) == nil) {
+			break
+		}
+		preCrashArchive = nil
+		preCrashObjects = nil
+	}
+	if preCrashArchive == nil || preCrashObjects == nil {
+		t.Fatal("could not capture a stable V2 manifest-page snapshot before cold recovery")
 	}
 	if !equalSequenceRange(recordingSequences(preCrashArchive), 1, lastBeforeCrash) || len(preCrashArchive.Gaps) != 0 {
 		t.Fatalf("archive at %s has unexpected source sequence/gaps: sequence=%v gaps=%+v", point, recordingSequences(preCrashArchive), preCrashArchive.Gaps)
 	}
 	verifyRuntimeRecordingSegments(t, dataDir, preCrashArchive, stream, 1, lastBeforeCrash)
-	preCrashObjects, err := snapshotRecordingObjects(archiveDir)
-	if err != nil {
-		t.Fatalf("snapshot canonical archive objects at %s: %v", point, err)
-	}
 	if err := validateManifestSnapshotReferences(preCrashArchive, preCrashObjects); err != nil {
 		t.Fatalf("pre-crash canonical manifest references are inconsistent at %s: %v", point, err)
 	}
@@ -1514,6 +1544,20 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 	if err := validateManifestSnapshotReferences(postCrash, postCrashObjects); err != nil {
 		t.Fatalf("cold recovery exposed an incomplete manifest snapshot reference: %v", err)
 	}
+	var postCrashArchive *domain.Recording
+	if preCrashArchive.FormatVersion == storage.ShardedArchiveFormatVersion {
+		store, err := storage.New(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		postCrashArchive, err = store.LoadRecordingReadOnly(recording.ID)
+		if err != nil {
+			t.Fatalf("read canonical archive after cold recovery: %v", err)
+		}
+		if err := materializeShardedRecordingForTest(store, postCrashArchive); err != nil {
+			t.Fatalf("materialize canonical archive after cold recovery: %v", err)
+		}
+	}
 	var addedArchiveObjects []string
 	for object := range postCrashObjects {
 		if _, existed := preCrashObjects[object]; !existed {
@@ -1522,23 +1566,24 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 	}
 	sort.Strings(addedArchiveObjects)
 	t.Logf("append-only canonical archive objects observed after recovery: %v", addedArchiveObjects)
-	if err := compareArchiveSnapshotsAllowingManifestAppend(preCrashObjects, postCrashObjects); err != nil {
-		t.Fatalf("cold recovery rewrote or unexpectedly added canonical archive objects: %v; before=%v after=%v", err, preCrashObjects, postCrashObjects)
+	var compareErr error
+	if postCrashArchive != nil {
+		compareErr = compareArchiveSnapshotsAllowingV2ManifestAppend(archiveDir, preCrashObjects, postCrashObjects, preCrashArchive.Snapshots, postCrashArchive.Snapshots)
+	} else {
+		compareErr = compareArchiveSnapshotsAllowingManifestAppend(preCrashObjects, postCrashObjects)
+	}
+	if compareErr != nil {
+		t.Fatalf("cold recovery rewrote or unexpectedly added canonical archive objects: %v", compareErr)
 	}
 	var metadataAfter []domain.MetadataRevision
 	if point == runtimehook.BeforeSourceRetirement {
 		// The handover fixture intentionally held both Engine inventories at
 		// the same owner transition boundary. The public recording detail omits
 		// the bounded source timeline, so compare the canonical root directly.
-		store, err := storage.New(dataDir)
-		if err != nil {
-			t.Fatal(err)
+		if postCrashArchive == nil {
+			t.Fatal("source-retirement crash did not load the post-recovery canonical archive")
 		}
-		afterArchive, err := store.LoadRecordingReadOnly(recording.ID)
-		if err != nil {
-			t.Fatalf("read canonical archive after source-retirement crash: %v", err)
-		}
-		metadataAfter = afterArchive.MetadataTimeline
+		metadataAfter = postCrashArchive.MetadataTimeline
 	} else {
 		metadataSnapshot := waitMetadataTimeline(t, ctx, client, baseURL, recording.ID, len(metadataBefore.Items), 10*time.Second)
 		metadataAfter = metadataSnapshot.Items
@@ -1625,7 +1670,11 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	defer cancel()
 	dataRoot := newRuntimeE2ETempDir(t)
 	dataDir := filepath.Join(dataRoot, "data")
+	diagnosticDir := filepath.Join(dataRoot, "child-diagnostics")
 	if err := os.Mkdir(dataDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(diagnosticDir, 0700); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { makeRuntimeE2ETreeWritable(dataDir) })
@@ -1654,8 +1703,12 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
 		"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
 		"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
+		// A known test-only hook name enables the supervisor's bounded child
+		// diagnostic capture. No arm marker is published, so no hook pauses.
+		"IR_RUNTIME_E2E_FAILPOINT=before_owner_cas",
+		"IR_RUNTIME_E2E_MARKER_DIR=" + diagnosticDir,
 	})
-	process := &runtimeHostProcess{command: command, done: make(chan struct{})}
+	process := &runtimeHostProcess{command: command, done: make(chan struct{}), diagnosticDir: diagnosticDir}
 	command.Stdout, command.Stderr = &process.output, &process.output
 	if err := command.Start(); err != nil {
 		t.Fatalf("start production Runtime Host: %v", err)
@@ -1714,7 +1767,27 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		t.Fatalf("R is pinned to generation %s, active A generation is %s", leaseA.EngineGeneration, status.DefaultEngine.ID)
 	}
 	fixture.advance(streamR, 20)
-	waitRecordingSequenceCount(t, client, baseURL, recordingR.ID, 20, 20*time.Second)
+	// The signed generation E2E runs through the production local provider child.
+	// Each canonical segment publication includes several durable object commits;
+	// this test verifies that the accepted prefix drains before handover, not a
+	// particular sub-second throughput target. Keep the source fixture stable
+	// while bounded canonical work catches up.
+	if err := waitShardedHeaderMediaCount(t, dataDir, recordingR.ID, 20, 75*time.Second); err != nil {
+		archiveSummary := "unavailable"
+		if store, openErr := storage.New(dataDir); openErr == nil {
+			if header, loadErr := store.LoadRecordingHeader(ctx, recordingR.ID); loadErr == nil && header.Tracks["main"] != nil {
+				track := header.Tracks["main"]
+				archiveSummary = fmt.Sprintf("media_count=%d media_high_water=%d next_archive_ordinal=%d claim_count=%d archive_revision=%d last_error=%q pending=%d", track.MediaCount, track.MediaHighWater, track.NextArchiveOrdinal, header.ShardedArchive.ClaimCount, header.ArchiveRevision, header.LastError, len(track.PendingSegments))
+			} else if loadErr != nil {
+				archiveSummary = fmt.Sprintf("header_error=%v", loadErr)
+			}
+		} else {
+			archiveSummary = fmt.Sprintf("store_error=%v", openErr)
+		}
+		childDiagnostics := readRuntimeE2EChildDiagnostics(process.diagnosticDir)
+		storageDiagnostic, _ := os.ReadFile(filepath.Join(dataDir, "management", "diagnostics", "recordings", recordingR.ID+".json"))
+		t.Fatalf("wait for initial live archive: %v; canonical=%s; durable storage diagnostic=%s; fixture=%s; host=%s; child diagnostics=%s", err, archiveSummary, storageDiagnostic, fixture.describe(streamR), process.output.String(), childDiagnostics)
+	}
 	baseline := getRecording(t, client, baseURL, recordingR.ID)
 	verifyRuntimeRecordingSegments(t, dataDir, baseline, streamR, 1, 20)
 	baselineSequences := recordingSequences(baseline)
@@ -1897,7 +1970,15 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	// while A is paused so drained target preflight can poll a fresh manifest
 	// and stage it before the Host's durable owner CAS.
 	fixture.advance(streamR, 1)
-	leaseAfterHandover := waitRecordingLeaseGeneration(t, dataDir, recordingR.ID, activateStatus.DefaultEngine.ID, 40*time.Second, process.output.String, func() string { return fixture.describe(streamR) })
+	leaseAfterHandover := waitRecordingLeaseGeneration(t, dataDir, recordingR.ID, activateStatus.DefaultEngine.ID, 40*time.Second, process.output.String, func() string {
+		return fmt.Sprintf("%s child diagnostics:%s", fixture.describe(streamR), readRuntimeE2EChildDiagnostics(process.diagnosticDir))
+	})
+	// The durable owner file changes before target activation completes. Require
+	// the Host's commit event as well so a transient owner-CAS window followed by
+	// a safe rollback cannot satisfy the continuity assertion.
+	if err := waitHostHandoverLogEvent(process, "recording handover_committed", recordingR.ID, 1, 40*time.Second); err != nil {
+		t.Fatalf("lease moved to B without a completed handover: lease=%+v; fixture=%s; host=%s; child diagnostics=%s", leaseAfterHandover, fixture.describe(streamR), process.output.String(), readRuntimeE2EChildDiagnostics(process.diagnosticDir))
+	}
 	if leaseAfterHandover.EngineGeneration == leaseA.EngineGeneration {
 		t.Fatalf("eligible R was not handed from Engine A to active Engine B: lease=%+v", leaseAfterHandover)
 	}
@@ -1932,7 +2013,13 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	waitRecordingSequenceCount(t, client, baseURL, recordingS.ID, 2, 15*time.Second)
 
 	fixture.advance(streamR, 28)
-	waitRecordingSequenceCount(t, client, baseURL, recordingR.ID, 60, 20*time.Second)
+	// Wait through the bounded V2 header instead of repeatedly materializing
+	// the full timeline over serialized provider IPC. The local provider E2E
+	// publishes canonical metadata serially; this budget follows that measured
+	// drain rate while keeping the source fixture stable.
+	if err := waitShardedHeaderMediaCount(t, dataDir, recordingR.ID, 60, 3*time.Minute); err != nil {
+		t.Fatal(err)
+	}
 	finalR := getRecording(t, client, baseURL, recordingR.ID)
 	if finalR.ID != recordingR.ID || finalR.Title != "Recording R" || finalR.State != domain.StateRecording || len(finalR.Gaps) != 0 {
 		t.Fatalf("R identity/title/state/gaps changed during application update: id=%s title=%q state=%s gaps=%+v", finalR.ID, finalR.Title, finalR.State, finalR.Gaps)
@@ -1961,7 +2048,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	}
 	metadataAfterActivation := waitMetadataTimeline(t, ctx, client, baseURL, recordingR.ID, 2, 40*time.Second)
 	if len(metadataAfterActivation.Items) != 2 || stringValue(metadataAfterActivation.Items[0].Title) != "Before update" || stringValue(metadataAfterActivation.Items[1].Title) != "After update title" {
-		t.Fatalf("R metadata timeline is not exactly Before→After: %+v", metadataAfterActivation.Items)
+		t.Fatalf("R metadata timeline is not exactly Before→After: %+v", metadataRevisionSummaries(metadataAfterActivation.Items))
 	}
 	metadataRequests := fixture.metadataRequestsFor(streamR)
 	if !containsTimeAfter(metadataRequests, activateFinished) {
@@ -1969,7 +2056,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	}
 	// Repeated identical metadata polling must not add semantic revisions.
 	if len(metadataAfterActivation.Items) != 2 {
-		t.Fatalf("identical metadata polling created duplicate revisions: %+v", metadataAfterActivation.Items)
+		t.Fatalf("identical metadata polling created duplicate revisions: %+v", metadataRevisionSummaries(metadataAfterActivation.Items))
 	}
 
 	status = waitRuntimeStatus(t, ctx, client, baseURL, func(s httpapi.Status) bool {
@@ -2275,6 +2362,43 @@ func mustRuntimeMap(t *testing.T, client *http.Client, baseURL, path string) map
 	return value
 }
 
+// waitShardedHeaderMediaCount observes the bounded v2 root directly in this
+// local-provider production E2E. Polling GET /api/recordings here repeatedly
+// materializes every timeline shard through the provider's serialized IPC
+// gate, which competes with the writer under test. The test performs one full
+// API read after canonical publication completes.
+func waitShardedHeaderMediaCount(t *testing.T, dataDir, id string, minimum int, timeout time.Duration) error {
+	t.Helper()
+	store, err := storage.New(dataDir)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var last int
+	started := time.Now()
+	for {
+		header, loadErr := store.LoadRecordingHeader(context.Background(), id)
+		if loadErr == nil && header != nil && header.Tracks["main"] != nil {
+			count := int(header.Tracks["main"].MediaCount)
+			if count != last {
+				last = count
+				t.Logf("v2 durable media count=%d elapsed=%s", count, time.Since(started).Round(time.Millisecond))
+			}
+			if last >= minimum {
+				return nil
+			}
+		} else if loadErr != nil && !errors.Is(loadErr, storage.ErrNotFound) {
+			return loadErr
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("recording %s did not publish %d media records (root media_count=%d)", id, minimum, last)
+		}
+		<-ticker.C
+	}
+}
+
 func getRecording(t *testing.T, client *http.Client, baseURL, id string) *domain.Recording {
 	t.Helper()
 	recording, code := getRuntimeJSON[domain.Recording](t, client, baseURL, http.MethodGet, "/api/recordings/"+id, nil)
@@ -2360,6 +2484,14 @@ func stringValue(value *string) string {
 		return "<nil>"
 	}
 	return *value
+}
+
+func metadataRevisionSummaries(items []domain.MetadataRevision) []string {
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		result = append(result, fmt.Sprintf("title=%q description=%q source_updated_at=%v", stringValue(item.Title), stringValue(item.Description), item.SourceUpdatedAt))
+	}
+	return result
 }
 
 func recordingSequences(recording *domain.Recording) []uint64 {
@@ -2476,8 +2608,23 @@ func waitCanonicalSegmentCount(t *testing.T, dataDir, recordingID string, minimu
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		recording, loadErr := store.LoadRecordingReadOnly(recordingID)
-		if loadErr == nil && recording.SegmentCount() >= minimum {
-			return recording
+		if loadErr == nil && recording != nil {
+			if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+				var count uint64
+				for _, track := range recording.Tracks {
+					if track != nil {
+						count += track.MediaCount
+					}
+				}
+				if count >= uint64(minimum) {
+					if err := materializeShardedRecordingForTest(store, recording); err != nil {
+						t.Fatalf("materialize canonical Recording after reaching %d segments: %v", minimum, err)
+					}
+					return recording
+				}
+			} else if recording.SegmentCount() >= minimum {
+				return recording
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -2485,8 +2632,64 @@ func waitCanonicalSegmentCount(t *testing.T, dataDir, recordingID string, minimu
 	if err != nil {
 		t.Fatalf("read canonical Recording after waiting for %d segments: %v", minimum, err)
 	}
+	if err := materializeShardedRecordingForTest(store, recording); err != nil {
+		t.Fatalf("materialize canonical Recording after waiting for %d segments: %v", minimum, err)
+	}
 	t.Fatalf("canonical Recording %s stopped at %d segments, want at least %d", recordingID, recording.SegmentCount(), minimum)
 	return nil
+}
+
+// materializeShardedRecordingForTest reconstructs only the archive view that
+// the production V2 iterators expose. V2 recording.json intentionally contains
+// bounded summary metadata rather than media/history slices.
+func materializeShardedRecordingForTest(store *storage.Store, recording *domain.Recording) error {
+	if store == nil || recording == nil || recording.FormatVersion != storage.ShardedArchiveFormatVersion {
+		return nil
+	}
+	trackIDs := make([]string, 0, len(recording.Tracks))
+	for trackID := range recording.Tracks {
+		trackIDs = append(trackIDs, trackID)
+	}
+	sort.Strings(trackIDs)
+	for _, trackID := range trackIDs {
+		track := recording.Tracks[trackID]
+		if track == nil {
+			return storage.ErrShardedArchiveInvalid
+		}
+		track.Segments = nil
+		if err := store.IterateShardedTimeline(context.Background(), recording.ID, trackID, func(record storage.V2MediaRecord) error {
+			track.Segments = append(track.Segments, record.Segment)
+			return nil
+		}); err != nil {
+			return err
+		}
+		track.InitSegments = nil
+		if err := store.IterateShardedInitSegments(context.Background(), recording.ID, trackID, func(record storage.V2MediaRecord) error {
+			track.InitSegments = append(track.InitSegments, record.Segment)
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	recording.Gaps = nil
+	if err := store.IterateShardedGaps(context.Background(), recording.ID, func(gap domain.Gap) error {
+		recording.Gaps = append(recording.Gaps, gap)
+		return nil
+	}); err != nil {
+		return err
+	}
+	recording.Snapshots = nil
+	if err := store.IterateShardedManifests(context.Background(), recording.ID, func(snapshot domain.ManifestSnapshot) error {
+		recording.Snapshots = append(recording.Snapshots, snapshot)
+		return nil
+	}); err != nil {
+		return err
+	}
+	recording.MetadataTimeline = nil
+	return store.IterateShardedMetadata(context.Background(), recording.ID, func(revision domain.MetadataRevision) error {
+		recording.MetadataTimeline = append(recording.MetadataTimeline, revision)
+		return nil
+	})
 }
 
 func waitLeaseAbsent(t *testing.T, dataDir, recordingID string, timeout time.Duration) {

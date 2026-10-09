@@ -2,6 +2,7 @@ package acquire
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -183,6 +184,105 @@ func TestLivePlaybackSnapshotBoundsLongHistoryAndCopiesInitByteRange(t *testing.
 	if *track.InitSegments[0].ByteRange != byteRange {
 		t.Fatal("snapshot byte-range mutation escaped into canonical root")
 	}
+}
+
+func TestShardedLiveSnapshotUsesBoundedCacheWithoutWriterLockOrStorageRead(t *testing.T) {
+	manager, entry, closeManager := newShardedLivePresentationFixture(t)
+	defer closeManager(t)
+	for sequence := uint64(1); sequence <= 4; sequence++ {
+		commitLivePresentationSegment(t, manager, entry, archiveindex.ClaimLiveOrigin, 0, 0, sequence, "")
+	}
+
+	backend := manager.store.StorageBackend
+	manager.store.StorageBackend = failingShardedRootReadBackend{StorageBackend: backend, failure: errors.New("unexpected archive root read")}
+	entry.persistMu.Lock()
+	type result struct {
+		view LivePlaybackView
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		view, err := manager.LivePlaybackSnapshot(context.Background(), entry.recording.ID)
+		done <- result{view: view, err: err}
+	}()
+	var snapshot result
+	select {
+	case snapshot = <-done:
+		entry.persistMu.Unlock()
+	case <-time.After(2 * time.Second):
+		entry.persistMu.Unlock()
+		manager.store.StorageBackend = backend
+		t.Fatal("V2 live snapshot waited for canonical writer lock")
+	}
+	manager.store.StorageBackend = backend
+	if snapshot.err != nil {
+		t.Fatalf("V2 live snapshot read archive storage: %v", snapshot.err)
+	}
+	if len(snapshot.view.Segments) != 4 || snapshot.view.Segments[3].LivePresentationOrdinal != 4 {
+		t.Fatalf("V2 live snapshot returned stale or incomplete tail: %#v", snapshot.view)
+	}
+}
+
+func TestStaleLiveGapObservationCannotReplaceRepairedMedia(t *testing.T) {
+	manager, entry, closeManager := newShardedLivePresentationFixture(t)
+	defer closeManager(t)
+	gap := domain.Gap{
+		TrackID: "main", FromSequence: 1, ToSequence: 1, Reason: "source manifest marked segment as a gap",
+		DetectedAt: time.Now().UTC(), LivePresentationOrdinal: 1, LiveDuration: 2,
+	}
+	if err := manager.update(entry, func(recording *domain.Recording) error {
+		recording.Gaps = append(recording.Gaps, gap)
+		return nil
+	}); err != nil {
+		t.Fatalf("persist source gap: %v", err)
+	}
+	manager.updateLivePlaybackGap(entry, gap)
+	segment := commitLivePresentationSegment(t, manager, entry, archiveindex.ClaimHistorical, 0, 0, 1, "")
+	if segment.ID == "" || segment.LivePresentationOrdinal != 1 {
+		t.Fatalf("historical repair did not fill the reserved presentation slot: %#v", segment)
+	}
+	// The live worker can finish processing its old manifest observation after
+	// the historical commit. Replaying that stale callback must not put the gap
+	// back into either the current root projection or the HLS live cache.
+	manager.updateLivePlaybackGap(entry, gap)
+	view, err := manager.LivePlaybackSnapshot(context.Background(), entry.recording.ID)
+	if err != nil {
+		t.Fatalf("read live snapshot after stale gap callback: %v", err)
+	}
+	if len(view.Slots) != 1 || view.Slots[0].Ordinal != 1 || view.Slots[0].Segment == nil || view.Slots[0].Unavailable {
+		t.Fatalf("stale gap replaced canonical repaired media: %#v", view.Slots)
+	}
+}
+
+func TestShardedLiveSnapshotReconcilesOnlyUnavailableSlotsFromDurableTail(t *testing.T) {
+	manager, entry, closeManager := newShardedLivePresentationFixture(t)
+	defer closeManager(t)
+	segment := commitLivePresentationSegment(t, manager, entry, archiveindex.ClaimLiveOrigin, 0, 0, 1, "")
+	entry.mu.Lock()
+	entry.livePlayback.slots[segment.LivePresentationOrdinal] = LivePlaybackSlot{
+		Ordinal: segment.LivePresentationOrdinal, Unavailable: true, Duration: segment.Duration,
+	}
+	entry.livePlayback.checkedUnavailable[segment.LivePresentationOrdinal] = true
+	entry.mu.Unlock()
+	if !manager.beginShardedLiveSlotPromotion(entry, segment) {
+		t.Fatal("known unavailable live slot did not enter promotion reconciliation")
+	}
+	view, err := manager.LivePlaybackSnapshot(context.Background(), entry.recording.ID)
+	if err != nil {
+		t.Fatalf("reconcile live snapshot: %v", err)
+	}
+	if len(view.Slots) != 1 || view.Slots[0].Segment == nil || view.Slots[0].Segment.ID != segment.ID || view.Slots[0].Unavailable {
+		t.Fatalf("durable canonical media did not repair stale unavailable cache slot: %#v", view.Slots)
+	}
+}
+
+type failingShardedRootReadBackend struct {
+	storage.StorageBackend
+	failure error
+}
+
+func (b failingShardedRootReadBackend) LoadRecordingContext(context.Context, string) (*domain.Recording, error) {
+	return nil, b.failure
 }
 
 func TestLivePresentationIdentitySurvivesManagerRestart(t *testing.T) {

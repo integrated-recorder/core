@@ -14,6 +14,29 @@ import (
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
+func TestAutomaticRecoveryLifecycleProjectionStates(t *testing.T) {
+	now := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
+	scheduler := &automaticRecoveryScheduler{
+		queued: map[string]automaticRecoveryQueueItem{},
+		now:    func() time.Time { return now },
+	}
+	if got := scheduler.stateFor("recording"); got != "idle" {
+		t.Fatalf("empty scheduler state = %q, want idle", got)
+	}
+	scheduler.queued["recording"] = automaticRecoveryQueueItem{}
+	if got := scheduler.stateFor("recording"); got != "scheduled" {
+		t.Fatalf("immediate queued state = %q, want scheduled", got)
+	}
+	scheduler.queued["recording"] = automaticRecoveryQueueItem{due: now.Add(time.Minute)}
+	if got := scheduler.stateFor("recording"); got != "backoff" {
+		t.Fatalf("future queued state = %q, want backoff", got)
+	}
+	scheduler.inFlight = "recording"
+	if got := scheduler.stateFor("recording"); got != "running" {
+		t.Fatalf("in-flight state = %q, want running", got)
+	}
+}
+
 func newSchedulerUnitFixture(ids ...string) (*Manager, map[string]*entry, *automaticRecoveryScheduler) {
 	entries := make(map[string]*entry, len(ids))
 	manager := &Manager{entries: entries}

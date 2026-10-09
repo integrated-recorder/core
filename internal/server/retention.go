@@ -247,7 +247,8 @@ func (s *Server) scanRetentionCandidates(ctx context.Context, days int) (retenti
 }
 
 func retentionAgeEligible(recording *domain.Recording, cutoff time.Time) bool {
-	return recording != nil && recording.State == domain.StateCompleted && recording.StoppedAt != nil && recording.StoppedAt.Before(cutoff)
+	return recording != nil && recording.State == domain.StateCompleted && recording.ArchiveSealed &&
+		recording.StoppedAt != nil && recording.StoppedAt.Before(cutoff)
 }
 
 func (s *Server) recordingJobInProgress(id string) bool {

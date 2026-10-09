@@ -252,6 +252,51 @@ func TestManagerRouterGenerationRoutingAndDetachAfterInventoryDrains(t *testing.
 	}
 }
 
+func TestEngineLifecycleOperationsKeepTransitionsSeparate(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	const id = "3123456789abcdef0123456789abcdef"
+	if err := store.CreateRecording(&domain.Recording{
+		FormatVersion: 1, ID: id, State: domain.StateStopped, CreatedAt: now, StartedAt: now,
+		StoppedAt: &now, Tracks: map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := recorderengine.New(manager, &adapterhost.Host{}, "engine-lifecycle", "engine-lifecycle-instance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	request, err := json.Marshal(recorderengine.RecordingIDRequest{RecordingID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedValue, err := engine.Handle(context.Background(), recorderengine.OperationComplete, request)
+	completed, _ := completedValue.(*domain.Recording)
+	if err != nil || completed.State != domain.StateCompleted || completed.ArchiveSealed {
+		t.Fatalf("complete recording=%#v err=%v", completed, err)
+	}
+	snapshotValue, err := engine.Handle(context.Background(), recorderengine.OperationLifecycleSnapshot, request)
+	snapshot, _ := snapshotValue.(acquire.LifecycleSnapshot)
+	if err != nil || snapshot.CaptureState != domain.StateCompleted || snapshot.ArchiveSealed || !snapshot.Repairable || snapshot.EngineOwns {
+		t.Fatalf("lifecycle snapshot=%#v err=%v", snapshot, err)
+	}
+	if _, err := engine.Handle(context.Background(), recorderengine.OperationSealArchive, request); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := manager.Get(id)
+	if err != nil || sealed.State != domain.StateCompleted || !sealed.ArchiveSealed {
+		t.Fatalf("seal changed capture state: recording=%#v err=%v", sealed, err)
+	}
+}
+
 func TestManagerRouterTerminalDeleteFallbackRefusesActiveArchive(t *testing.T) {
 	root := shortTempRoot(t)
 	store, err := storage.New(filepath.Join(root, "data"))

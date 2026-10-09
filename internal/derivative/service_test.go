@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/storage"
 )
@@ -43,6 +44,12 @@ func TestFakeFFmpegHelper(t *testing.T) {
 	ffmpegArgs := args[separator+1:]
 	if marker := os.Getenv("DERIVATIVE_FAKE_INVOKED"); marker != "" {
 		_ = os.WriteFile(marker, []byte("invoked"), 0600)
+	}
+	if marker := os.Getenv("DERIVATIVE_FAKE_PLAYLIST"); marker != "" {
+		playlist, err := os.ReadFile("input.m3u8")
+		if err != nil || os.WriteFile(marker, playlist, 0600) != nil {
+			os.Exit(46)
+		}
 	}
 	validArgs := contains(ffmpegArgs, "-protocol_whitelist") && containsPair(ffmpegArgs, "-c", "copy") && containsPair(ffmpegArgs, "-f", "matroska")
 	if !validArgs {
@@ -101,6 +108,9 @@ func TestExportHappyPathIsProjectionAndDownloadable(t *testing.T) {
 	if job.State != StateCompleted || job.Size != int64(len("matroska-fixture")) || job.OutputName != "recording-"+recording.ID+".mkv" {
 		t.Fatalf("unexpected completed job: %+v", job)
 	}
+	if job.SourceRevisionKnown || ProjectJob(job, recording).Freshness != FreshnessUnknown {
+		t.Fatalf("legacy revision-zero export must have unknown freshness: job=%+v projection=%+v", job, ProjectJob(job, recording))
+	}
 	f, downloaded, err := service.OpenDownload(job.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +133,180 @@ func TestExportHappyPathIsProjectionAndDownloadable(t *testing.T) {
 	_ = payload.Close()
 	if err != nil || string(canonical) != "original-segment-bytes" {
 		t.Fatalf("canonical payload changed: %q err=%v", canonical, err)
+	}
+}
+
+func TestExportFreshnessTracksCanonicalAndTimelineRevisions(t *testing.T) {
+	root, store, recording := fixtureRecording(t)
+	recording.ArchiveRevision = 4
+	recording.TimelineRevision = 10
+	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DERIVATIVE_FAKE_FFMPEG", "success")
+	service, err := Open(root, store, fakeFFmpeg(t), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := service.Close(ctx); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	first, err := service.Start(context.Background(), recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first = waitTerminal(t, service, first.ID)
+	if first.State != StateCompleted || !first.SourceRevisionKnown || first.SourceArchiveRevision != 4 || first.SourceTimelineRevision != 10 {
+		t.Fatalf("export did not bind its source revisions: %+v", first)
+	}
+	if got := ProjectJob(first, recording).Freshness; got != FreshnessCurrent {
+		t.Fatalf("fresh export freshness=%q, want current", got)
+	}
+
+	// Historical repair changes the canonical media/timeline snapshot. The
+	// completed artifact remains downloadable but is no longer current.
+	repaired := *recording
+	repaired.ArchiveRevision = 5
+	repaired.TimelineRevision = 11
+	if got := ProjectJob(first, &repaired).Freshness; got != FreshnessStale {
+		t.Fatalf("old export freshness after repair=%q, want stale", got)
+	}
+
+	second, err := service.Start(context.Background(), &repaired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second = waitTerminal(t, service, second.ID)
+	if second.State != StateCompleted || second.SourceArchiveRevision != 5 || second.SourceTimelineRevision != 11 {
+		t.Fatalf("re-export did not bind repaired revisions: %+v", second)
+	}
+	if got := ProjectJob(second, &repaired).Freshness; got != FreshnessCurrent {
+		t.Fatalf("re-export freshness=%q, want current", got)
+	}
+
+	// Metadata-only edits do not alter the media snapshot and therefore do not
+	// stale a remux derived from that snapshot.
+	metadataOnly := repaired
+	metadataOnly.Title = "Updated title"
+	if got := ProjectJob(second, &metadataOnly).Freshness; got != FreshnessCurrent {
+		t.Fatalf("metadata-only change made media export stale: %q", got)
+	}
+
+	if err := service.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Open(root, store, fakeFFmpeg(t), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service = reloaded
+	loaded, err := service.Get(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.SourceRevisionKnown || loaded.SourceArchiveRevision != 5 || loaded.SourceTimelineRevision != 11 {
+		t.Fatalf("source revisions did not survive restart: %+v", loaded)
+	}
+	if got := ProjectJob(loaded, &metadataOnly).Freshness; got != FreshnessCurrent {
+		t.Fatalf("reloaded export freshness=%q, want current", got)
+	}
+}
+
+func TestV2ExportUsesShardedTimelineOrder(t *testing.T) {
+	root, store, recording := makeShardedDerivativeRecording(t)
+	playlistPath := filepath.Join(t.TempDir(), "playlist.txt")
+	t.Setenv("DERIVATIVE_FAKE_FFMPEG", "success")
+	t.Setenv("DERIVATIVE_FAKE_PLAYLIST", playlistPath)
+	service := openService(t, root, store, fakeFFmpeg(t), 1)
+	maxInput := int64(len("init-payload") + len("archive-first") + len("timeline-first"))
+	if err := service.validateShardedSourceWithLimit(context.Background(), recording, maxInput); err != nil {
+		t.Fatalf("validation rejected exact byte ceiling with repeated init reference: %v", err)
+	}
+	if err := service.validateShardedSourceWithLimit(context.Background(), recording, maxInput-1); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("validation below exact byte ceiling err=%v, want ErrUnsupported", err)
+	}
+	staleHeader := *recording
+	staleHeader.ArchiveRevision = 2
+	staleHeader.TimelineRevision = 3
+	job, err := service.Start(context.Background(), &staleHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job = waitTerminal(t, service, job.ID)
+	if job.State != StateCompleted || !job.SourceRevisionKnown || job.SourceArchiveRevision != 4 || job.SourceTimelineRevision != 10 {
+		t.Fatalf("v2 export did not complete from captured revisions: %+v", job)
+	}
+	playlist, err := os.ReadFile(playlistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(playlist)
+	firstTimelineItem := strings.Index(text, "#EXTINF:2,\nobject-000001.mp4")
+	secondTimelineItem := strings.Index(text, "#EXTINF:3,\nobject-000002.m4s")
+	if firstTimelineItem < 0 || secondTimelineItem < 0 || firstTimelineItem > secondTimelineItem {
+		t.Fatalf("v2 export playlist did not follow timeline order:\n%s", text)
+	}
+	if strings.Count(text, "#EXT-X-MAP:") != 1 || strings.Contains(text, "source.invalid") {
+		t.Fatalf("v2 playlist init mapping or source URI safety failed:\n%s", text)
+	}
+}
+
+func TestDiskStringSetDeduplicatesLargeRepeatedInitInput(t *testing.T) {
+	root := t.TempDir()
+	set, err := newDiskStringSet(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 10_000
+	for i := 0; i < count; i++ {
+		id := fmt.Sprintf("init-%05d", i)
+		seen, err := set.SeenOrAdd(id)
+		if err != nil {
+			t.Fatalf("add %q: %v", id, err)
+		}
+		if seen {
+			t.Fatalf("new init ID %q reported as already seen", id)
+		}
+	}
+	for i := count - 1; i >= 0; i-- {
+		id := fmt.Sprintf("init-%05d", i)
+		seen, err := set.SeenOrAdd(id)
+		if err != nil {
+			t.Fatalf("repeat %q: %v", id, err)
+		}
+		if !seen {
+			t.Fatalf("repeated init ID %q reported as new", id)
+		}
+	}
+	if err := set.Close(); err != nil {
+		t.Fatalf("remove temporary membership set: %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary membership data leaked: %d entries remain", len(entries))
+	}
+}
+
+func TestOpenCleansInterruptedInitValidationSet(t *testing.T) {
+	root, store, _ := fixtureRecording(t)
+	scratch := filepath.Join(root, "exports", ".seen-init-interrupted")
+	if err := os.MkdirAll(scratch, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "marker"), []byte("init-id"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	openService(t, root, store, fakeFFmpeg(t), 1)
+	if _, err := os.Lstat(scratch); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interrupted validation scratch remains: %v", err)
 	}
 }
 
@@ -450,6 +634,78 @@ func fixtureRecordingWithData(t *testing.T, data []byte) (string, *storage.Store
 	}
 	recording := &domain.Recording{FormatVersion: 1, ID: recordingID, Title: "Fixture", State: domain.StateStopped, Tracks: map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{segment}}}}
 	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	return root, store, recording
+}
+
+func makeShardedDerivativeRecording(t *testing.T) (string, *storage.Store, *domain.Recording) {
+	t.Helper()
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const recordingID = "1123456789abcdef0123456789abcdef"
+	now := time.Now().UTC()
+	sessionID := "session-" + strings.Repeat("b", 64)
+	header := &domain.Recording{
+		FormatVersion:    2,
+		ID:               recordingID,
+		SourceSessionID:  sessionID,
+		Title:            "Sharded fixture",
+		State:            domain.StateStopped,
+		CreatedAt:        now,
+		StartedAt:        now,
+		ArchiveRevision:  4,
+		TimelineRevision: 10,
+		Tracks:           map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+		ShardedArchive:   &domain.ShardedArchiveSummary{},
+	}
+	if err := store.CreateShardedRecording(header); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	addPayload := func(path string, payload []byte) storage.PayloadResult {
+		t.Helper()
+		result, err := store.SavePayload(recordingID, path, bytes.NewReader(payload), storage.MaxObjectBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	initPath := "tracks/main/init.mp4"
+	initPayload := []byte("init-payload")
+	initObject := addPayload(initPath, initPayload)
+	initSegment := domain.Segment{ID: "init-one", TrackID: "main", Sequence: 1, SourceURI: "https://source.invalid/init.mp4", StoragePath: initPath, PayloadSize: initObject.Size, SHA256: initObject.SHA256, IsInit: true}
+	initCoordinate := archiveindex.Coordinate{SessionID: sessionID, TrackID: "main", Sequence: 1, Kind: archiveindex.ObjectInit}
+	if err := store.AppendShardedMedia(ctx, recordingID, storage.V2MediaRecord{Coordinate: initCoordinate, Segment: initSegment}); err != nil {
+		t.Fatal(err)
+	}
+	for _, media := range []struct {
+		sequence uint64
+		ordinal  uint64
+		uri      string
+		path     string
+		duration float64
+		payload  []byte
+	}{
+		{sequence: 2, ordinal: 1, uri: "https://source.invalid/second.ts?sig=secret", path: "tracks/main/segment-1.ts", duration: 3, payload: []byte("archive-first")},
+		{sequence: 1, ordinal: 2, uri: "https://source.invalid/first.mp4?sig=secret", path: "tracks/main/segment-2.mp4", duration: 2, payload: []byte("timeline-first")},
+	} {
+		object := addPayload(media.path, media.payload)
+		segment := domain.Segment{
+			ID: fmt.Sprintf("seg-%020d", media.ordinal), TrackID: "main", Sequence: media.sequence,
+			ArchiveOrdinal: media.ordinal, SourceURI: media.uri, Duration: media.duration,
+			InitSegmentID: initSegment.ID, StoragePath: media.path, PayloadSize: object.Size, SHA256: object.SHA256,
+		}
+		coordinate := archiveindex.Coordinate{SessionID: sessionID, TrackID: "main", Sequence: media.sequence, Kind: archiveindex.ObjectMedia}
+		if err := store.AppendShardedMedia(ctx, recordingID, storage.V2MediaRecord{Coordinate: coordinate, Segment: segment}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recording, err := store.LoadRecordingHeader(ctx, recordingID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	return root, store, recording

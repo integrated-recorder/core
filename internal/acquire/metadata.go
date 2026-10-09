@@ -134,13 +134,24 @@ func (m *Manager) commitMetadataObservation(e *entry, generation uint64, observe
 		return false, false, nil
 	}
 	next := clone(e.recording)
+	var previous *domain.MetadataRevision
+	if isShardedRecording(e.recording) && e.metadataLatest != nil {
+		copy := *e.metadataLatest
+		copy.Title = cloneMetadataString(e.metadataLatest.Title)
+		copy.Description = cloneMetadataString(e.metadataLatest.Description)
+		copy.SourceUpdatedAt = cloneMetadataTime(e.metadataLatest.SourceUpdatedAt)
+		previous = &copy
+	}
 	e.mu.Unlock()
 	if next == nil {
 		return false, false, errors.New("recording metadata could not be copied")
 	}
 
 	var previousTitle, previousDescription *string
-	if count := len(next.MetadataTimeline); count > 0 {
+	if isShardedRecording(next) && previous != nil {
+		previousTitle = cloneMetadataString(previous.Title)
+		previousDescription = cloneMetadataString(previous.Description)
+	} else if count := len(next.MetadataTimeline); count > 0 {
 		last := next.MetadataTimeline[count-1]
 		previousTitle = cloneMetadataString(last.Title)
 		previousDescription = cloneMetadataString(last.Description)
@@ -163,6 +174,43 @@ func (m *Manager) commitMetadataObservation(e *entry, generation uint64, observe
 	active = true
 	var adapterStateCommitFailed bool
 	if err := m.withCanonicalCommit(e, func() error {
+		if isShardedRecording(next) {
+			e.mu.Lock()
+			current := !e.deleted && e.recording != nil && e.recording.State == domain.StateRecording && e.mediaGeneration == generation
+			e.mu.Unlock()
+			if !current {
+				active = false
+				return nil
+			}
+			if changed && !next.MetadataTimelineTruncated {
+				revision := domain.MetadataRevision{
+					ObservedAt: observedAt.UTC(), Title: title, Description: description,
+					SourceUpdatedAt: cloneMetadataTime(result.SourceUpdatedAt),
+				}
+				if err := m.store.AppendShardedMetadata(context.Background(), next.ID, revision); err != nil {
+					return newStorageStageError("recording metadata shard commit", err)
+				}
+				if err := m.refreshShardedHeader(next); err != nil {
+					return newStorageStageError("refresh sharded metadata summary", err)
+				}
+				e.mu.Lock()
+				if e.deleted || e.mediaGeneration != generation || e.recording == nil || e.recording.State != domain.StateRecording {
+					e.mu.Unlock()
+					active = false
+					return nil
+				}
+				e.metadataLatest = &revision
+				e.recording = next
+				e.mu.Unlock()
+			}
+			if commit != nil {
+				if err := commit(); err != nil {
+					adapterStateCommitFailed = true
+					return errors.New("adapter metadata state could not be saved")
+				}
+			}
+			return nil
+		}
 		if changed && !next.MetadataTimelineTruncated {
 			revision := domain.MetadataRevision{
 				ObservedAt: observedAt.UTC(), Title: title, Description: description,

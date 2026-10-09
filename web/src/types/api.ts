@@ -81,7 +81,12 @@ export type RecordingDetail = {
   source_url?: string; state: RecordingState; created_at: string; started_at: string; stopped_at?: string | null;
   tracks?: Record<string, Track>; gaps?: Gap[];
   manifest_snapshots?: { storage_path?: string; size?: number; sha256?: string; captured_at?: string }[];
-  last_error?: string; statistics?: RecordingStatistics; integrity?: IntegrityStatus; preview?: PreviewSummary
+  last_error?: string; statistics?: RecordingStatistics; integrity?: IntegrityStatus; preview?: PreviewSummary;
+  archive_sealed?: boolean; archive_revision?: number; timeline_revision?: number
+}
+export type RecordingLifecycle = {
+  recording_id: string; capture_state: RecordingState; archive_sealed: boolean; repairable: boolean;
+  recovery_state: 'active' | 'idle' | 'sealed'; archive_revision: number; timeline_revision: number
 }
 export type SourceMetadataRevision = { observed_at: string; source_updated_at?: string; title?: string | null; description?: string | null }
 export type RecordingMetadata = { current?: SourceMetadataRevision; items: SourceMetadataRevision[]; truncated: boolean }
@@ -94,9 +99,10 @@ export type RecordingStatistics = {
   status?: 'complete' | 'partial'; unavailable_fields?: string[]
 }
 export type RecordingPage = { items: RecordingListItem[]; next_cursor?: string; total: number }
-export type IntegrityResult = { status: IntegrityStatus; last_verified_at?: string; objects_total?: number; objects_verified?: number; objects_missing?: number; objects_corrupt?: number; issues?: { code: string; path?: string }[] }
-export type IntegrityJob = { id: string; recording_id: string; state: 'queued' | 'running' | 'completed' | 'failed' | 'canceled'; created_at: string; started_at?: string; finished_at?: string; error_code?: string; result?: IntegrityResult }
-export type ExportJob = { id: string; recording_id: string; state: string; format?: string; output_name?: string; created_at?: string; finished_at?: string; error_code?: string }
+export type RevisionFreshness = 'unknown' | 'current' | 'stale'
+export type IntegrityResult = { status: IntegrityStatus; last_verified_at?: string; objects_total?: number; objects_verified?: number; objects_missing?: number; objects_corrupt?: number; issues?: { code: string; path?: string }[]; freshness?: RevisionFreshness; revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number }
+export type IntegrityJob = { id: string; recording_id: string; state: 'queued' | 'running' | 'completed' | 'failed' | 'canceled'; created_at: string; started_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness; result?: IntegrityResult }
+export type ExportJob = { id: string; recording_id: string; state: string; format?: string; output_name?: string; created_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness }
 export type Notification = { id: string; type: string; at: string; read: boolean; object_id?: string }
 export type WorkflowProgress = {
   workflow_id: string; adapter_id: string; state: string; resource?: ResourceRef;

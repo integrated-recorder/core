@@ -31,7 +31,7 @@ func (s *Server) thumbnailGet(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -78,7 +78,7 @@ func (s *Server) thumbnailRegenerate(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -133,7 +133,7 @@ func (s *Server) exportStart(w http.ResponseWriter, r *http.Request) {
 	}
 	lock := s.productLock(id)
 	lock.RLock()
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err != nil {
 		lock.RUnlock()
 		writeStorageError(w, err)
@@ -167,11 +167,12 @@ func (s *Server) exportList(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	if _, err := s.manager.Get(id); err != nil {
+	recording, err := s.recordingSnapshot(r.Context(), id)
+	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": s.derivatives.List(id), "available": s.derivatives.Available()})
+	writeJSON(w, http.StatusOK, map[string]any{"items": s.derivatives.ListWithFreshness(id, recording), "available": s.derivatives.Available()})
 }
 
 func (s *Server) exportGet(w http.ResponseWriter, r *http.Request) {
@@ -183,7 +184,12 @@ func (s *Server) exportGet(w http.ResponseWriter, r *http.Request) {
 		writeDerivativeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	recording, err := s.recordingSnapshot(r.Context(), job.RecordingID)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, derivative.ProjectJob(job, recording))
 }
 
 func (s *Server) exportDownload(w http.ResponseWriter, r *http.Request) {
@@ -236,7 +242,7 @@ func (s *Server) exportAvailable(w http.ResponseWriter) bool {
 		writeError(w, http.StatusNotImplemented, "remux export is unavailable")
 		return false
 	}
-	if s.manager == nil {
+	if s.manager == nil && s.storage == nil {
 		writeError(w, http.StatusServiceUnavailable, "recording manager is unavailable")
 		return false
 	}

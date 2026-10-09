@@ -854,6 +854,27 @@ func assertHandoverStillDraining(t *testing.T, e *entry) {
 
 func assertHandoverFixtureArchive(t *testing.T, store *storage.Store, recording *domain.Recording, count int) {
 	t.Helper()
+	if recording != nil && recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		track := recording.Tracks["main"]
+		if track == nil {
+			t.Fatal("main track is missing")
+		}
+		track.Segments = nil
+		if err := store.IterateShardedMedia(context.Background(), recording.ID, "main", func(record storage.V2MediaRecord) error {
+			track.Segments = append(track.Segments, record.Segment)
+			return nil
+		}); err != nil {
+			t.Fatalf("iterate sharded handover media: %v", err)
+		}
+		var gaps []domain.Gap
+		if err := store.IterateShardedGaps(context.Background(), recording.ID, func(gap domain.Gap) error {
+			gaps = append(gaps, gap)
+			return nil
+		}); err != nil {
+			t.Fatalf("iterate sharded handover gaps: %v", err)
+		}
+		recording.Gaps = gaps
+	}
 	if recording.ID != handoverRecordingID || recording.State != domain.StateRecording || recording.SegmentCount() != count || len(recording.Gaps) != 0 {
 		t.Fatalf("recording continuity failed: %#v", recording)
 	}
@@ -1595,10 +1616,31 @@ func pausedHandoverRecording(t *testing.T, fixture *handoverFixture, manifestURL
 	recording := startHandoverRecordingAtURL(t, source, owner, manifestURL)
 	waitHandover(t, func() bool { return handoverSchedulerAvailable(source, recording.ID) }, "source scheduler")
 	if waitForSegments >= 0 {
-		waitHandover(t, func() bool {
-			current, err := source.Get(recording.ID)
-			return err == nil && current.SegmentCount() == waitForSegments
-		}, "expected source segment count")
+		if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+			// V2's root keeps a bounded media count. Observe that durable counter
+			// directly instead of materializing the complete recording on every
+			// poll; this keeps race runs from starving the serial ingest writer.
+			deadline := time.NewTimer(30 * time.Second)
+			defer deadline.Stop()
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				header, err := store.LoadRecordingHeader(context.Background(), recording.ID)
+				if err == nil && header.SegmentCount() == waitForSegments {
+					break
+				}
+				select {
+				case <-ticker.C:
+				case <-deadline.C:
+					t.Fatalf("timed out waiting for expected source segment count %d", waitForSegments)
+				}
+			}
+		} else {
+			waitHandover(t, func() bool {
+				current, err := source.Get(recording.ID)
+				return err == nil && current.SegmentCount() == waitForSegments
+			}, "expected source segment count")
+		}
 	}
 	snapshot, err := source.PauseForHandover(context.Background(), recording.ID, owner)
 	if err != nil {
@@ -1624,10 +1666,20 @@ func TestHandoverTargetAdoptsAfterTransferWithoutRootRewriteAndContinuesOrdinal(
 	source := newHandoverManager(t, store, owners, fixture, false)
 	oldOwner := claimHandoverOwner(t, owners, handoverGenA, handoverWorkerA)
 	recording := startHandoverRecording(t, source, oldOwner)
+	if recording.FormatVersion != storage.ShardedArchiveFormatVersion {
+		t.Fatalf("handover fixture format=%d, want V2 format %d", recording.FormatVersion, storage.ShardedArchiveFormatVersion)
+	}
 	waitHandover(t, func() bool {
 		current, err := source.Get(recording.ID)
 		return err == nil && current.SegmentCount() == 2 && len(current.MetadataTimeline) >= 1
 	}, "initial segments and metadata")
+	fixture.mu.Lock()
+	fixture.metadata = "before transfer"
+	fixture.mu.Unlock()
+	waitHandover(t, func() bool {
+		current, err := source.Get(recording.ID)
+		return err == nil && len(current.MetadataTimeline) == 2 && current.MetadataTimeline[1].Title != nil && *current.MetadataTimeline[1].Title == "before transfer"
+	}, "metadata revision before transfer")
 	snapshot, err := source.PauseForHandover(context.Background(), recording.ID, oldOwner)
 	if err != nil {
 		t.Fatal(err)
@@ -1677,26 +1729,34 @@ func TestHandoverTargetAdoptsAfterTransferWithoutRootRewriteAndContinuesOrdinal(
 	}
 	setHandoverFixtureMax(fixture, 4)
 	fixture.mu.Lock()
-	fixture.metadata = "after"
+	fixture.metadata = "after transfer"
 	fixture.mu.Unlock()
 	waitHandover(t, func() bool {
 		current, err := target.Get(recording.ID)
-		return err == nil && current.SegmentCount() == 4 && len(current.MetadataTimeline) >= 2
+		return err == nil && current.SegmentCount() == 4 && len(current.MetadataTimeline) == 3
 	}, "target continuation and metadata")
 	if got := fixture.segmentRequests.Load() - segmentRequestsAfterPrepare; got != 1 {
 		t.Fatalf("activation fetched staged candidate again or missed next segment: extra requests=%d, want only sequence 4", got)
 	}
-	current, err := store.LoadRecordingReadOnly(recording.ID)
+	// V2 LoadRecordingReadOnly returns the bounded root. Get is the explicit
+	// full archive projection used by this assertion.
+	current, err := target.Get(recording.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.ID != recording.ID || current.State != domain.StateRecording || current.SegmentCount() != 4 || len(current.Gaps) != 0 || len(current.MetadataTimeline) != 2 {
+	if current.ID != recording.ID || current.State != domain.StateRecording || current.SegmentCount() != 4 || len(current.Gaps) != 0 || len(current.MetadataTimeline) != 3 {
 		t.Fatalf("target did not continue same archive cleanly: %#v", current)
 	}
 	track := current.Tracks["main"]
 	if len(track.Segments) != 4 || track.NextArchiveOrdinal != 5 {
 		t.Fatalf("target ordinals did not continue: next=%d segments=%#v", track.NextArchiveOrdinal, track.Segments)
 	}
+	if current.FormatVersion != storage.ShardedArchiveFormatVersion || current.ShardedArchive == nil ||
+		current.ShardedArchive.MediaCount != 4 || track.MediaHighWater != 4 || track.LivePresentation == nil ||
+		track.LivePresentation.NextOrdinal != 5 {
+		t.Fatalf("V2 root high-water did not survive handover: format=%d summary=%#v track=%#v", current.FormatVersion, current.ShardedArchive, track)
+	}
+	assertHandoverShardedTimeline(t, store, recording.ID, 4)
 	for i, segment := range track.Segments {
 		if segment.Sequence != uint64(i+1) || segment.ArchiveOrdinal != uint64(i+1) {
 			t.Fatalf("segment[%d] identity/ordinal = %d/%d", i, segment.Sequence, segment.ArchiveOrdinal)
@@ -1711,11 +1771,79 @@ func TestHandoverTargetAdoptsAfterTransferWithoutRootRewriteAndContinuesOrdinal(
 			t.Fatalf("segment payload %d = %q err=%v", i+1, data, readErr)
 		}
 	}
-	if current.MetadataTimeline[0].Title == nil || *current.MetadataTimeline[0].Title != "before" || current.MetadataTimeline[1].Title == nil || *current.MetadataTimeline[1].Title != "after" {
+	if current.MetadataTimeline[0].Title == nil || *current.MetadataTimeline[0].Title != "before" || current.MetadataTimeline[1].Title == nil || *current.MetadataTimeline[1].Title != "before transfer" || current.MetadataTimeline[2].Title == nil || *current.MetadataTimeline[2].Title != "after transfer" {
 		t.Fatalf("metadata timeline did not continue: %#v", current.MetadataTimeline)
 	}
+	// A fresh generation reads the sharded header and timeline indices after the
+	// ownership handoff, matching a restart without changing canonical root state.
+	restarted, err := NewManagerWithMode(store, &http.Client{Transport: fixture}, nil, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := restarted.Close(ctx); err != nil {
+			t.Errorf("close read-only restarted manager: %v", err)
+		}
+	})
+	restartedRecording, err := restarted.Get(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restartedRecording.FormatVersion != storage.ShardedArchiveFormatVersion || restartedRecording.Tracks["main"].NextArchiveOrdinal != 5 ||
+		restartedRecording.Tracks["main"].LivePresentation == nil || restartedRecording.Tracks["main"].LivePresentation.NextOrdinal != 5 {
+		t.Fatalf("V2 root high-water changed after restart: %#v", restartedRecording.Tracks["main"])
+	}
+	assertHandoverShardedTimeline(t, store, recording.ID, 4)
 	if err = source.CompleteHandover(recording.ID, oldOwner); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestShardedHandoverPreflightSkipsCommittedPlaylistPrefixOutsideLiveTail(t *testing.T) {
+	// The live presentation tail is 12 slots. Thirteen committed objects are
+	// enough to put a committed playlist prefix outside that bounded tail.
+	fixture := &handoverFixture{max: 13, metadata: "before"}
+	store, owners, source, owner, recording, snapshot := pausedHandoverRecording(t, fixture, "https://fixture.invalid/live.m3u8", 13)
+	defer func() {
+		resumeAndStopHandoverSource(t, source, owner, snapshot)
+	}()
+	target := newHandoverManager(t, store, owners, fixture, true)
+	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
+	setHandoverFixtureMax(fixture, 14)
+	if err := target.PrepareHandoverTarget(context.Background(), snapshot, identity); err != nil {
+		t.Fatalf("prepare V2 target from a playlist retaining its committed prefix: %v", err)
+	}
+	target.mu.RLock()
+	prepared, ok := target.prepared[recording.ID]
+	target.mu.RUnlock()
+	if !ok || prepared.continuation == nil {
+		t.Fatal("target did not retain the staged continuation candidate")
+	}
+	if got := prepared.continuation.source.Sequence; got != 14 {
+		t.Fatalf("V2 target staged sequence %d from an already committed prefix, want first continuation sequence 14", got)
+	}
+	if got := fixture.segmentRequests.Load(); got != 14 {
+		t.Fatalf("target candidate fetch count=%d, want exactly one fetch beyond the 13 committed objects", got)
+	}
+}
+
+func assertHandoverShardedTimeline(t *testing.T, store *storage.Store, recordingID string, want int) {
+	t.Helper()
+	ordinal := uint64(0)
+	err := store.IterateShardedTimeline(context.Background(), recordingID, "main", func(record storage.V2MediaRecord) error {
+		ordinal++
+		if record.Segment.TimelineOrdinal != ordinal || record.Segment.ArchiveOrdinal != ordinal || record.Segment.LivePresentationOrdinal != ordinal {
+			return fmt.Errorf("timeline entry %d has archive=%d timeline=%d live=%d", ordinal, record.Segment.ArchiveOrdinal, record.Segment.TimelineOrdinal, record.Segment.LivePresentationOrdinal)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterate V2 handover timeline: %v", err)
+	}
+	if ordinal != uint64(want) {
+		t.Fatalf("V2 timeline yielded %d entries, want %d", ordinal, want)
 	}
 }
 

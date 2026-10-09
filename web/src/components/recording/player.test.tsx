@@ -53,6 +53,18 @@ describe('RecordingPlayer lifecycle', () => {
     view.unmount()
   })
 
+  it('reloads terminal VOD when its timeline revision changes', async () => {
+    const view = render(<RecordingPlayer recordingId="rec-repair" timelineRevision={4} />)
+    await waitFor(() => expect(hlsState.loadSource).toHaveBeenCalledWith('/api/recordings/rec-repair/play/master.m3u8?timeline_revision=4'))
+    const video = view.container.querySelector('video')!
+    vi.spyOn(video, 'pause').mockImplementation(() => undefined)
+    vi.spyOn(video, 'load').mockImplementation(() => undefined)
+    view.rerender(<RecordingPlayer recordingId="rec-repair" timelineRevision={5} />)
+    await waitFor(() => expect(hlsState.loadSource).toHaveBeenCalledWith('/api/recordings/rec-repair/play/master.m3u8?timeline_revision=5'))
+    expect(hlsState.destroy).toHaveBeenCalledTimes(1)
+    view.unmount()
+  })
+
   it('destroys hls.js and clears the media element when unmounted', async () => {
     const onVideoRef = vi.fn()
     const view = render(<RecordingPlayer recordingId="rec-1" onVideoRef={onVideoRef} />)

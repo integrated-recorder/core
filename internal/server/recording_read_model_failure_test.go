@@ -67,6 +67,16 @@ func (b *readModelStorageBackend) LoadSidecar(id, relativePath string, maxBytes 
 	return reader.LoadSidecar(id, relativePath, maxBytes, output)
 }
 
+func (b *readModelStorageBackend) ListSidecarsContext(ctx context.Context, id, prefix, cursor string, limit int) (storage.V2SidecarPage, error) {
+	lister, ok := b.StorageBackend.(interface {
+		ListSidecarsContext(context.Context, string, string, string, int) (storage.V2SidecarPage, error)
+	})
+	if !ok {
+		return storage.V2SidecarPage{}, storage.ErrSidecarReadUnsupported
+	}
+	return lister.ListSidecarsContext(ctx, id, prefix, cursor, limit)
+}
+
 func TestRecordingDetailDegradesArchiveSizeFailure(t *testing.T) {
 	store, _, recording := readModelFixture(t, strings.Repeat("e", 32), domain.StateRecording)
 	backend := &readModelStorageBackend{StorageBackend: store.StorageBackend, failID: recording.ID}
@@ -228,7 +238,7 @@ func TestActiveRecordingContinuesCommittingDuringPartialStatisticsReads(t *testi
 		StorageBackend: store.StorageBackend,
 		failID:         recording.ID,
 		afterSaveRecording: func(recording *domain.Recording) {
-			if recording.SegmentCount() > 0 {
+			if recording.FormatVersion == storage.ShardedArchiveFormatVersion && recording.Tracks["main"] != nil && recording.Tracks["main"].MediaHighWater > 0 {
 				select {
 				case segmentCommitted <- struct{}{}:
 				default:
@@ -261,12 +271,26 @@ func TestActiveRecordingContinuesCommittingDuringPartialStatisticsReads(t *testi
 	case <-time.After(5 * time.Second):
 		t.Fatal("live segment was not committed while partial statistics were served")
 	}
-	current, getErr := manager.Get(recording.ID)
-	if getErr != nil {
-		t.Fatalf("read recording after segment commit: %v", getErr)
-	}
-	if count := current.SegmentCount(); count == 0 {
-		t.Fatal("committed segment is not visible in manager state")
+	deadline := time.NewTimer(5 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	var current *domain.Recording
+	for {
+		var getErr error
+		current, getErr = manager.Get(recording.ID)
+		if getErr != nil {
+			t.Fatalf("read recording after segment commit: %v", getErr)
+		}
+		if current.SegmentCount() > 0 {
+			break
+		}
+		select {
+		case <-deadline.C:
+			track := current.Tracks["main"]
+			t.Fatalf("committed segment is not visible in manager state: format=%d media_count=%d media_high_water=%d live_slots=%d", current.FormatVersion, current.ShardedArchive.MediaCount, track.MediaHighWater, track.LiveSlotHighWater)
+		case <-ticker.C:
+		}
 	}
 	result := requestDetail()
 	if result.SegmentCount == 0 {
@@ -362,8 +386,29 @@ func (m *fixedRecordingManager) ListForManagement(context.Context, int) ([]*doma
 	return m.List(), nil
 }
 
+func (m *fixedRecordingManager) LifecycleSnapshot(_ context.Context, id string) (acquire.LifecycleSnapshot, error) {
+	recording, err := m.Get(id)
+	if err != nil {
+		return acquire.LifecycleSnapshot{}, err
+	}
+	return acquire.LifecycleSnapshot{
+		RecordingID: recording.ID, CaptureState: recording.State,
+		ArchiveSealed: recording.ArchiveSealed, Repairable: !recording.ArchiveSealed,
+		RecoveryState: "idle", TimelineRevision: recording.TimelineRevision,
+		ArchiveRevision: recording.ArchiveRevision,
+	}, nil
+}
+
 func (m *fixedRecordingManager) Stop(string) (*domain.Recording, error) {
 	return nil, errors.New("not implemented")
+}
+
+func (m *fixedRecordingManager) CompleteRecording(context.Context, string) (*domain.Recording, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m *fixedRecordingManager) SealArchiveContext(context.Context, string) error {
+	return errors.New("not implemented")
 }
 
 func (m *fixedRecordingManager) Delete(string) error { return errors.New("not implemented") }

@@ -161,6 +161,7 @@ func TestSegmentFullGETRemains200AndRemoteRangeUsesOpenRange(t *testing.T) {
 
 	tracked.mu.Lock()
 	tracked.openCalls = 0
+	tracked.openKeys = nil
 	tracked.rangeCalls = nil
 	tracked.mu.Unlock()
 	partial := httptest.NewRecorder()
@@ -172,10 +173,22 @@ func TestSegmentFullGETRemains200AndRemoteRangeUsesOpenRange(t *testing.T) {
 	}
 	tracked.mu.Lock()
 	defer tracked.mu.Unlock()
+	payloadKey := "recordings/" + playbackRangeRecordingID + "/tracks/main/segment.m4s"
 	if tracked.openCalls != 0 {
-		t.Fatalf("remote range fell back to full Open %d times", tracked.openCalls)
+		t.Fatalf("remote range performed full Open calls: %#v", tracked.openKeys)
 	}
-	if len(tracked.rangeCalls) != 1 || tracked.rangeCalls[0].Offset != 3 || tracked.rangeCalls[0].Length != 3 {
+	for _, key := range tracked.openKeys {
+		if key == payloadKey {
+			t.Fatalf("remote payload range fell back to full Open for %q", key)
+		}
+	}
+	var payloadRanges []playbackPhysicalRangeCall
+	for _, call := range tracked.rangeCalls {
+		if call.Key == payloadKey {
+			payloadRanges = append(payloadRanges, call)
+		}
+	}
+	if len(payloadRanges) != 1 || payloadRanges[0].Offset != 3 || payloadRanges[0].Length != 3 {
 		t.Fatalf("remote OpenRange calls=%#v", tracked.rangeCalls)
 	}
 }
@@ -184,10 +197,12 @@ type rangeTrackingObjects struct {
 	mu         sync.Mutex
 	objects    map[string][]byte
 	openCalls  int
+	openKeys   []string
 	rangeCalls []playbackPhysicalRangeCall
 }
 
 type playbackPhysicalRangeCall struct {
+	Key    string
 	Offset int64
 	Length int64
 }
@@ -222,6 +237,7 @@ func (s *rangeTrackingObjects) Open(ctx context.Context, key string) (io.ReadClo
 		return nil, storage.PhysicalObjectInfo{}, storage.ErrObjectNotFound
 	}
 	s.openCalls++
+	s.openKeys = append(s.openKeys, key)
 	return io.NopCloser(bytes.NewReader(append([]byte(nil), data...))), s.infoLocked(key), nil
 }
 
@@ -238,7 +254,7 @@ func (s *rangeTrackingObjects) OpenRange(ctx context.Context, key string, offset
 	if offset < 0 || length <= 0 || offset > int64(len(data))-length {
 		return nil, storage.PhysicalObjectInfo{}, errors.New("invalid object range")
 	}
-	s.rangeCalls = append(s.rangeCalls, playbackPhysicalRangeCall{Offset: offset, Length: length})
+	s.rangeCalls = append(s.rangeCalls, playbackPhysicalRangeCall{Key: key, Offset: offset, Length: length})
 	return io.NopCloser(bytes.NewReader(append([]byte(nil), data[offset:offset+length]...))), s.infoLocked(key), nil
 }
 

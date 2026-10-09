@@ -63,6 +63,9 @@ type segmentTask struct {
 	preloaded               bool
 	stagedInitPayload       *storage.IngestPayload
 	stagedMediaPayload      *storage.IngestPayload
+	bufferedPayload         *storage.IngestPayload
+	bufferedSegment         domain.Segment
+	bufferedInit            *initFlight
 }
 
 type initFlight struct {
@@ -74,8 +77,9 @@ type initFlight struct {
 }
 
 var (
-	errPersistQueued = errors.New("canonical payload persistence queued")
-	errStorageCommit = errors.New("canonical storage commit failed")
+	errPersistQueued   = errors.New("canonical payload persistence queued")
+	errPayloadBuffered = errors.New("canonical payload buffered for ordered submission")
+	errStorageCommit   = errors.New("canonical storage commit failed")
 )
 
 // storageCommitFailure keeps storage classification and the internal failure
@@ -258,9 +262,20 @@ func newSegmentScheduler(parent context.Context, manager *Manager, e *entry) (*s
 		e.handoverCandidate = nil
 	}
 	e.mu.Unlock()
+	e.mu.Lock()
+	v2Recording := isShardedRecording(e.recording)
+	e.mu.Unlock()
 	s.mu.Lock()
 	for worker := 0; worker < minSegmentWorkers; worker++ {
 		s.spawnLocked(false)
+	}
+	// V2 live media is submitted to the single canonical writer in manifest
+	// order. Fetch workers only acquire and buffer complete payloads; one
+	// scheduler-owned dispatcher submits the next ready task. This keeps HTTP
+	// parallelism independent from canonical publication order.
+	if v2Recording {
+		s.wg.Add(1)
+		go s.submitBufferedInOrder()
 	}
 	s.mu.Unlock()
 	e.mu.Lock()
@@ -425,6 +440,17 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 				return err
 			}
 			updated, err = s.manager.updateAtMediaGenerationWithinAuthorizedCommit(s.e, generation, func(r *domain.Recording) error {
+				if isShardedRecording(r) {
+					if err := advanceArchiveRevision(r); err != nil {
+						return err
+					}
+					if after != nil {
+						if err := after(r); err != nil {
+							return err
+						}
+					}
+					return s.manager.store.AppendShardedManifest(context.Background(), r.ID, snapshot)
+				}
 				for _, existing := range r.Snapshots {
 					if existing.StoragePath == snapshot.StoragePath {
 						if after != nil {
@@ -434,6 +460,9 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 					}
 				}
 				r.Snapshots = append(r.Snapshots, snapshot)
+				if err := advanceArchiveRevision(r); err != nil {
+					return err
+				}
 				if after != nil {
 					return after(r)
 				}
@@ -490,7 +519,7 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 // queueRecordingCommit persists the newest in-memory root projection on the
 // storage writer. It intentionally captures no recording clone: earlier
 // queued segment commits may update the root before this operation executes.
-func (s *segmentScheduler) queueRecordingCommit() error {
+func (s *segmentScheduler) queueRecordingCommit(previousGaps []domain.Gap) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -516,8 +545,24 @@ func (s *segmentScheduler) queueRecordingCommit() error {
 			if current == nil {
 				return errors.New("recording state could not be copied")
 			}
-			if err := s.manager.store.SaveRecording(current); err != nil {
+			if isShardedRecording(current) {
+				pruneShardedRuntimeTail(current)
+				if err := s.manager.appendShardedGapsSince(current.ID, previousGaps, current.Gaps); err != nil {
+					return newStorageStageError("persist sharded gaps", err)
+				}
+			}
+			if err := s.manager.saveRecordingHeader(current); err != nil {
 				return newStorageStageError("recording root commit", err)
+			}
+			if isShardedRecording(current) {
+				if err := s.manager.refreshShardedHeader(current); err != nil {
+					return newStorageStageError("refresh sharded root summary", err)
+				}
+				s.e.mu.Lock()
+				if !s.e.deleted {
+					s.e.recording = current
+				}
+				s.e.mu.Unlock()
 			}
 			return nil
 		})
@@ -824,7 +869,7 @@ func (s *segmentScheduler) worker(burst bool) {
 			s.mu.Unlock()
 			continue
 		}
-		if errors.Is(err, errPersistQueued) {
+		if errors.Is(err, errPersistQueued) || errors.Is(err, errPayloadBuffered) {
 			s.signalLocked()
 			s.mu.Unlock()
 			continue
@@ -913,6 +958,97 @@ func (s *segmentScheduler) worker(burst bool) {
 		s.signalLocked()
 		s.mu.Unlock()
 		go s.retryTimer(timerCtx, timerCancel, task, token, delay)
+	}
+}
+
+// submitBufferedInOrder is the V2 media publication lane. It submits only the
+// earliest discovered task once its complete source object is buffered. Fetch
+// workers can therefore continue acquiring later segments while canonical
+// publication remains ordered.
+func (s *segmentScheduler) submitBufferedInOrder() {
+	defer s.wg.Done()
+	for {
+		s.mu.Lock()
+		if s.closed || s.ctx.Err() != nil {
+			s.mu.Unlock()
+			return
+		}
+		var first *segmentTask
+		for _, candidate := range s.tasks {
+			if first == nil || candidate.ordinal < first.ordinal {
+				first = candidate
+			}
+		}
+		if first == nil || first.state != segmentTaskBuffered || first.bufferedPayload == nil {
+			changed := s.changed
+			s.mu.Unlock()
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-changed:
+			}
+			continue
+		}
+		task := first
+		payload := task.bufferedPayload
+		segment := task.bufferedSegment
+		initDependency := task.bufferedInit
+		// Reserve the task before dropping the lock so there can be only one
+		// submission attempt for this payload. The local variable owns the
+		// payload until SubmitWithKind accepts it.
+		task.bufferedPayload = nil
+		task.state = segmentTaskPersisting
+		s.wg.Add(1)
+		s.mu.Unlock()
+
+		err := s.manager.ingest.SubmitWithKind(s.ctx, payload, storage.IngestJobKindMediaPayload, func(data []byte) (storage.PayloadResult, error) {
+			return s.persistSegment(segment, initDependency, data)
+		}, func(_ storage.PayloadResult, persistErr error) {
+			defer s.wg.Done()
+			if persistErr != nil {
+				if errors.Is(persistErr, storage.ErrIngestCoordinatorUnavailable) {
+					s.retryCoordinatorTask(task)
+					return
+				}
+				s.failStorage("media payload commit", persistErr)
+				return
+			}
+			s.mu.Lock()
+			if s.tasks[task.key] == task {
+				delete(s.tasks, task.key)
+				s.signalLocked()
+			}
+			s.mu.Unlock()
+		})
+		if err == nil {
+			s.mu.Lock()
+			s.signalLocked()
+			s.mu.Unlock()
+			continue
+		}
+		s.wg.Done()
+		if errors.Is(err, storage.ErrIngestCoordinatorUnavailable) {
+			s.mu.Lock()
+			if !s.closed && s.ctx.Err() == nil && s.tasks[task.key] == task {
+				task.bufferedPayload = payload
+				task.bufferedSegment = segment
+				task.bufferedInit = initDependency
+				s.mu.Unlock()
+				s.retryCoordinatorTask(task)
+				continue
+			}
+			s.mu.Unlock()
+			payload.Release()
+			return
+		}
+		payload.Release()
+		if errors.Is(err, storage.ErrIngestClosed) || s.ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			s.removeTask(task)
+			return
+		}
+		s.removeTask(task)
+		s.failStorage("media payload queue submission", newStorageCommitFailure("media payload queue submission", err))
+		return
 	}
 }
 
@@ -1053,9 +1189,13 @@ func (s *segmentScheduler) retryCoordinatorTimer(ctx context.Context, cancel con
 		return
 	}
 	task.retryCancel = nil
-	task.state = segmentTaskQueued
-	s.ready = append(s.ready, task)
-	s.growIfSaturatedLocked()
+	if task.bufferedPayload != nil {
+		task.state = segmentTaskBuffered
+	} else {
+		task.state = segmentTaskQueued
+		s.ready = append(s.ready, task)
+		s.growIfSaturatedLocked()
+	}
 	s.signalLocked()
 }
 
@@ -1142,12 +1282,27 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 	}
 	result := payload.Result()
 	segment.PayloadSize, segment.SHA256 = result.Size, result.SHA256
-	s.mu.Lock()
-	if s.tasks[task.key] == task {
+	s.e.mu.Lock()
+	v2Recording := isShardedRecording(s.e.recording)
+	s.e.mu.Unlock()
+	if v2Recording {
+		s.mu.Lock()
+		if s.tasks[task.key] != task || s.closed || s.ctx.Err() != nil {
+			s.mu.Unlock()
+			payload.Release()
+			return context.Canceled
+		}
+		task.bufferedPayload = payload
+		task.bufferedSegment = segment
+		task.bufferedInit = initDependency
 		task.state = segmentTaskBuffered
 		s.signalLocked()
+		s.mu.Unlock()
+		// Return the fetch worker immediately. The bounded IngestService buffer
+		// owns the memory reservation while the ordered dispatcher waits for an
+		// earlier task; network workers remain available for later segments.
+		return errPayloadBuffered
 	}
-	s.mu.Unlock()
 	s.wg.Add(1)
 	err = s.manager.ingest.SubmitWithKind(s.ctx, payload, storage.IngestJobKindMediaPayload, func(data []byte) (storage.PayloadResult, error) {
 		return s.persistSegment(segment, initDependency, data)
@@ -1378,6 +1533,30 @@ func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epo
 		}
 		return id, nil, nil
 	}
+	if isShardedRecording(recording) {
+		stored, lookupErr := s.manager.store.LookupShardedMediaByID(s.ctx, recording.ID, id)
+		if lookupErr == nil {
+			canonical := stored.Segment
+			if !canonical.IsInit || canonical.ID != id || canonical.TrackID != asset.TrackID ||
+				canonical.SourceEpoch != epoch || canonical.DiscontinuitySequence != segment.DiscontinuitySequence ||
+				canonical.SourceURI != source.URI || !sameByteRange(canonical.ByteRange, asset.ByteRange) {
+				if stagedPayload != nil {
+					stagedPayload.Release()
+				}
+				return "", nil, storage.ErrShardedArchiveInvalid
+			}
+			if stagedPayload != nil {
+				stagedPayload.Release()
+			}
+			return id, nil, nil
+		}
+		if !errors.Is(lookupErr, storage.ErrNotFound) {
+			if stagedPayload != nil {
+				stagedPayload.Release()
+			}
+			return "", nil, lookupErr
+		}
+	}
 	s.mu.Lock()
 	if flight := s.init[key]; flight != nil {
 		s.mu.Unlock()
@@ -1444,6 +1623,13 @@ func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epo
 	s.signalLocked()
 	s.mu.Unlock()
 	return id, flight, nil
+}
+
+func sameByteRange(left, right *domain.ByteRange) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func initExists(recording *domain.Recording, id string) bool {
@@ -1634,6 +1820,10 @@ func (s *segmentScheduler) close() error {
 		if task.stagedMediaPayload != nil {
 			staged = append(staged, task.stagedMediaPayload)
 			task.stagedMediaPayload = nil
+		}
+		if task.bufferedPayload != nil {
+			staged = append(staged, task.bufferedPayload)
+			task.bufferedPayload = nil
 		}
 	}
 	s.tasks = make(map[segmentTaskKey]*segmentTask)

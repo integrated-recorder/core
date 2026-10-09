@@ -255,6 +255,36 @@ func (m *ManagerClient) GetContext(ctx context.Context, id string) (*domain.Reco
 	return &recording, nil
 }
 
+// LifecycleSnapshot requests a bounded lifecycle projection from this Engine.
+func (m *ManagerClient) LifecycleSnapshot(ctx context.Context, id string) (acquire.LifecycleSnapshot, error) {
+	var snapshot acquire.LifecycleSnapshot
+	if err := m.client.Call(ctx, OperationLifecycleSnapshot, RecordingIDRequest{RecordingID: id}, &snapshot); err != nil {
+		return acquire.LifecycleSnapshot{}, normalizeEngineError(err)
+	}
+	if err := validateLifecycleSnapshot(snapshot, id); err != nil {
+		return acquire.LifecycleSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+func validateLifecycleSnapshot(snapshot acquire.LifecycleSnapshot, id string) error {
+	if snapshot.RecordingID != id || snapshot.Repairable == snapshot.ArchiveSealed {
+		return errors.New("recorder engine lifecycle snapshot is invalid")
+	}
+	if snapshot.ArchiveSealed {
+		if snapshot.RecoveryState != "sealed" {
+			return errors.New("recorder engine lifecycle snapshot is invalid")
+		}
+		return nil
+	}
+	switch snapshot.RecoveryState {
+	case "idle", "scheduled", "backoff", "running":
+		return nil
+	default:
+		return errors.New("recorder engine lifecycle snapshot is invalid")
+	}
+}
+
 // LivePlaybackSnapshot reads only the bounded active live tail from this
 // generation. The Engine IPC operation avoids transferring a full recording
 // root for browser playlist reloads.
@@ -344,6 +374,31 @@ func (m *ManagerClient) StopContext(ctx context.Context, id string) (*domain.Rec
 	return &recording, nil
 }
 
+// CompleteRecording marks a stopped capture completed through its owning
+// Engine. Completion does not seal the archive.
+func (m *ManagerClient) CompleteRecording(ctx context.Context, id string) (*domain.Recording, error) {
+	var recording domain.Recording
+	if err := m.client.Call(ctx, OperationComplete, RecordingIDRequest{RecordingID: id}, &recording); err != nil {
+		return nil, normalizeEngineError(err)
+	}
+	return &recording, nil
+}
+
+// SealArchiveContext explicitly ends repairability through the Engine's
+// recovery gate and canonical owner fence.
+func (m *ManagerClient) SealArchiveContext(ctx context.Context, id string) error {
+	var result struct {
+		Sealed bool `json:"sealed"`
+	}
+	if err := m.client.Call(ctx, OperationSealArchive, RecordingIDRequest{RecordingID: id}, &result); err != nil {
+		return normalizeEngineError(err)
+	}
+	if !result.Sealed {
+		return errors.New("recorder engine did not confirm archive sealing")
+	}
+	return nil
+}
+
 func (m *ManagerClient) Delete(id string) error {
 	return m.DeleteContext(context.Background(), id)
 }
@@ -390,12 +445,20 @@ func normalizeEngineError(err error) error {
 		return storage.ErrNotFound
 	case "active_recording":
 		return acquire.ErrActiveRecording
+	case "lifecycle_conflict":
+		return acquire.ErrLifecycleConflict
+	case "read_failed":
+		return errors.New("recording lifecycle could not be read")
 	case "list_too_large", "inventory_too_large":
 		return acquire.ErrListLimit
 	case "start_failed":
 		return errors.New("recording could not be started")
 	case "stop_failed":
 		return errors.New("recording could not be stopped")
+	case "complete_failed":
+		return errors.New("recording could not be completed")
+	case "seal_failed":
+		return errors.New("archive could not be sealed")
 	case "delete_failed":
 		return errors.New("recording could not be deleted")
 	default:
@@ -413,5 +476,8 @@ var _ interface {
 	List() []*domain.Recording
 	ListForManagement(context.Context, int) ([]*domain.Recording, error)
 	Stop(string) (*domain.Recording, error)
+	LifecycleSnapshot(context.Context, string) (acquire.LifecycleSnapshot, error)
+	CompleteRecording(context.Context, string) (*domain.Recording, error)
+	SealArchiveContext(context.Context, string) error
 	Delete(string) error
 } = (*ManagerClient)(nil)

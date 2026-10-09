@@ -46,18 +46,28 @@ type LivePlaybackSlot struct {
 }
 
 type livePlaybackProjection struct {
-	slots map[uint64]LivePlaybackSlot
-	inits map[string]domain.Segment
+	slots              map[uint64]LivePlaybackSlot
+	inits              map[string]domain.Segment
+	checkedUnavailable map[uint64]bool
+	pendingPromotions  map[uint64]bool
 }
 
 func newLivePlaybackProjection() *livePlaybackProjection {
-	return &livePlaybackProjection{slots: make(map[uint64]LivePlaybackSlot, LivePlaybackWindowSize), inits: make(map[string]domain.Segment)}
+	return &livePlaybackProjection{
+		slots:              make(map[uint64]LivePlaybackSlot, LivePlaybackWindowSize),
+		inits:              make(map[string]domain.Segment),
+		checkedUnavailable: make(map[uint64]bool, LivePlaybackWindowSize),
+		pendingPromotions:  make(map[uint64]bool, LivePlaybackWindowSize),
+	}
 }
 
 // LivePlaybackSnapshot copies only the bounded active live tail and init maps
 // referenced by it. The canonical recording root remains available through
 // Get; live playlist reloads do not clone or sort its full segment history.
 func (m *Manager) LivePlaybackSnapshot(ctx context.Context, id string) (LivePlaybackView, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return LivePlaybackView{}, err
@@ -66,6 +76,38 @@ func (m *Manager) LivePlaybackSnapshot(ctx context.Context, id string) (LivePlay
 	e, ok := m.entry(id)
 	if !ok {
 		return LivePlaybackView{}, storage.ErrNotFound
+	}
+	// V2 runtime state and its live projection are updated together under e.mu.
+	// Read that bounded cache directly so a browser playlist reload never waits
+	// for the canonical writer or performs provider I/O.
+	e.mu.Lock()
+	if e.deleted || e.recording == nil {
+		e.mu.Unlock()
+		return LivePlaybackView{}, storage.ErrNotFound
+	}
+	if isShardedRecording(e.recording) {
+		view := shardedLivePlaybackSnapshotLocked(id, e)
+		e.mu.Unlock()
+		return m.reconcileUnavailableShardedLiveSlots(ctx, e, view)
+	}
+	e.mu.Unlock()
+
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
+	e.mu.Lock()
+	if e.deleted || e.recording == nil {
+		e.mu.Unlock()
+		return LivePlaybackView{}, storage.ErrNotFound
+	}
+	recording := clone(e.recording)
+	e.mu.Unlock()
+	if recording == nil {
+		return LivePlaybackView{}, errors.New("recording state could not be copied")
+	}
+	if recording.State == domain.StateRecording && isShardedRecording(recording) {
+		if err := m.refreshShardedRuntimeTail(recording); err != nil {
+			return LivePlaybackView{}, err
+		}
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -78,6 +120,20 @@ func (m *Manager) LivePlaybackSnapshot(ctx context.Context, id string) (LivePlay
 	}
 	if view.State != domain.StateRecording {
 		return view, nil
+	}
+	if isShardedRecording(recording) {
+		for trackID, refreshed := range recording.Tracks {
+			track := e.recording.Tracks[trackID]
+			if track == nil || refreshed == nil {
+				continue
+			}
+			track.Segments = refreshed.Segments
+			track.InitSegments = refreshed.InitSegments
+			track.PendingSegments = refreshed.PendingSegments
+			track.PendingSequences = refreshed.PendingSequences
+		}
+		e.recording.Gaps = recording.Gaps
+		e.livePlayback = buildLivePlaybackProjection(recording)
 	}
 	track := e.recording.Tracks["main"]
 	if track == nil {
@@ -107,6 +163,21 @@ func (m *Manager) LivePlaybackSnapshot(ctx context.Context, id string) (LivePlay
 		// Active starts and handover adoption initialize this cache before the
 		// worker starts. Do not rebuild it from the full archive on a request.
 		e.livePlayback = newLivePlaybackProjection()
+	}
+	if isShardedRecording(e.recording) {
+		// The bounded runtime tail is the canonical source for selected media.
+		// Heal a stale unavailable cache slot after a historical repair publishes
+		// media into a previously reserved live ordinal.
+		for _, segment := range track.Segments {
+			ordinal := segment.LivePresentationOrdinal
+			if ordinal < firstOrdinal || ordinal > lastOrdinal {
+				continue
+			}
+			e.livePlayback.slots[ordinal] = mediaLivePlaybackSlot(segment)
+			delete(e.livePlayback.checkedUnavailable, ordinal)
+		}
+		pruneLivePlaybackSlots(e.livePlayback, lastOrdinal)
+		refreshLivePlaybackInits(e.livePlayback, track)
 	}
 	view.InitSegments = make(map[string]domain.Segment, len(e.livePlayback.inits))
 	for ordinal := firstOrdinal; ordinal <= lastOrdinal; ordinal++ {
@@ -141,6 +212,138 @@ func (m *Manager) LivePlaybackSnapshot(ctx context.Context, id string) (LivePlay
 	return view, nil
 }
 
+func (m *Manager) reconcileUnavailableShardedLiveSlots(ctx context.Context, e *entry, view LivePlaybackView) (LivePlaybackView, error) {
+	if m.store == nil || e == nil || view.State != domain.StateRecording {
+		return view, nil
+	}
+	ordinals := make([]uint64, 0, len(view.Slots))
+	e.mu.Lock()
+	if e.deleted || e.recording == nil || !isShardedRecording(e.recording) || e.livePlayback == nil {
+		e.mu.Unlock()
+		return view, nil
+	}
+	for _, slot := range view.Slots {
+		promoting := e.livePlayback.pendingPromotions[slot.Ordinal]
+		if slot.Segment != nil || !slot.Unavailable || slot.Pending || e.livePlayback.checkedUnavailable[slot.Ordinal] && !promoting {
+			continue
+		}
+		ordinals = append(ordinals, slot.Ordinal)
+	}
+	e.mu.Unlock()
+	if len(ordinals) == 0 {
+		return view, nil
+	}
+	for _, ordinal := range ordinals {
+		if err := ctx.Err(); err != nil {
+			return LivePlaybackView{}, err
+		}
+		durable, err := m.store.LookupShardedLiveSlot(ctx, view.RecordingID, "main", ordinal)
+		if err != nil {
+			if ctx.Err() != nil {
+				return LivePlaybackView{}, ctx.Err()
+			}
+			continue
+		}
+		e.mu.Lock()
+		if !e.deleted && e.recording != nil && e.recording.State == domain.StateRecording && e.livePlayback != nil {
+			current, exists := e.livePlayback.slots[ordinal]
+			if exists && current.Segment == nil && current.Unavailable && !current.Pending {
+				switch {
+				case durable.Segment != nil:
+					e.livePlayback.slots[ordinal] = mediaLivePlaybackSlot(*durable.Segment)
+					delete(e.livePlayback.checkedUnavailable, ordinal)
+					delete(e.livePlayback.pendingPromotions, ordinal)
+					refreshLivePlaybackInits(e.livePlayback, e.recording.Tracks["main"])
+				case durable.Gap != nil:
+					insertLivePlaybackGap(e.livePlayback, *durable.Gap, LivePlaybackWindowSize)
+					if !e.livePlayback.pendingPromotions[ordinal] {
+						e.livePlayback.checkedUnavailable[ordinal] = true
+					}
+				}
+			}
+		}
+		e.mu.Unlock()
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.deleted || e.recording == nil || e.recording.State != domain.StateRecording || !isShardedRecording(e.recording) {
+		return LivePlaybackView{}, storage.ErrNotFound
+	}
+	return shardedLivePlaybackSnapshotLocked(view.RecordingID, e), nil
+}
+
+func shardedLivePlaybackSnapshotLocked(id string, e *entry) LivePlaybackView {
+	view := LivePlaybackView{
+		RecordingID: id, State: e.recording.State,
+		TimelineRevision: e.recording.TimelineRevision,
+	}
+	if view.State != domain.StateRecording {
+		return view
+	}
+	track := e.recording.Tracks["main"]
+	if track == nil {
+		return view
+	}
+	view.TrackFound = true
+	view.TrackID = track.ID
+	view.Bandwidth = track.Bandwidth
+	state := track.LivePresentation
+	if state == nil || state.NextOrdinal == 0 {
+		return view
+	}
+	lastOrdinal := state.NextOrdinal - 1
+	firstOrdinal := uint64(1)
+	if lastOrdinal >= LivePlaybackWindowSize {
+		firstOrdinal = lastOrdinal - LivePlaybackWindowSize + 1
+	}
+	if state.FirstPresentationOrdinal > firstOrdinal {
+		firstOrdinal = state.FirstPresentationOrdinal
+	}
+	if firstOrdinal > lastOrdinal {
+		return view
+	}
+	if e.livePlayback == nil {
+		e.livePlayback = newLivePlaybackProjection()
+	}
+	// e.recording holds only the bounded V2 runtime tail. It heals an
+	// unavailable slot after historical repair without rereading the archive.
+	for _, segment := range track.Segments {
+		ordinal := segment.LivePresentationOrdinal
+		if ordinal >= firstOrdinal && ordinal <= lastOrdinal {
+			e.livePlayback.slots[ordinal] = mediaLivePlaybackSlot(segment)
+			delete(e.livePlayback.checkedUnavailable, ordinal)
+		}
+	}
+	pruneLivePlaybackSlots(e.livePlayback, lastOrdinal)
+	refreshLivePlaybackInits(e.livePlayback, track)
+	view.InitSegments = make(map[string]domain.Segment, len(e.livePlayback.inits))
+	for ordinal := firstOrdinal; ordinal <= lastOrdinal; ordinal++ {
+		slot, ok := e.livePlayback.slots[ordinal]
+		if !ok || slot.Pending && slot.Segment == nil || slot.Segment == nil && !slot.Unavailable {
+			break
+		}
+		if slot.Segment != nil {
+			segment := clonePlaybackSegment(*slot.Segment)
+			slot.Segment = &segment
+			view.Segments = append(view.Segments, segment)
+			if segment.InitSegmentID != "" {
+				if init, found := e.livePlayback.inits[segment.InitSegmentID]; found {
+					view.InitSegments[init.ID] = clonePlaybackSegment(init)
+				}
+			}
+		}
+		if slot.ProgramDateTime != nil {
+			value := *slot.ProgramDateTime
+			slot.ProgramDateTime = &value
+		}
+		view.Slots = append(view.Slots, slot)
+		if ordinal == ^uint64(0) {
+			break
+		}
+	}
+	return view
+}
+
 func buildLivePlaybackProjection(recording *domain.Recording) *livePlaybackProjection {
 	projection := newLivePlaybackProjection()
 	if recording == nil {
@@ -163,6 +366,7 @@ func buildLivePlaybackProjection(recording *domain.Recording) *livePlaybackProje
 			continue
 		}
 		projection.slots[segment.LivePresentationOrdinal] = mediaLivePlaybackSlot(segment)
+		delete(projection.checkedUnavailable, segment.LivePresentationOrdinal)
 	}
 	for _, gap := range recording.Gaps {
 		insertLivePlaybackGapInWindow(projection, gap, firstOrdinal, lastOrdinal)
@@ -225,6 +429,7 @@ func insertLivePlaybackGapInWindow(projection *livePlaybackProjection, gap domai
 		if current, ok := projection.slots[ordinal]; ok && current.Segment != nil {
 			continue
 		}
+		delete(projection.checkedUnavailable, ordinal)
 		projection.slots[ordinal] = LivePlaybackSlot{
 			Ordinal: ordinal, Unavailable: true,
 			LiveDiscontinuity:         offset == 0 && gap.LiveDiscontinuity,
@@ -244,6 +449,7 @@ func insertLivePlaybackPending(projection *livePlaybackProjection, pending domai
 	if current, ok := projection.slots[pending.LivePresentationOrdinal]; ok && current.Segment != nil {
 		return
 	}
+	delete(projection.checkedUnavailable, pending.LivePresentationOrdinal)
 	var programTime *time.Time
 	if pending.ProgramDateTime != nil {
 		value := *pending.ProgramDateTime
@@ -269,6 +475,8 @@ func pruneLivePlaybackSlots(projection *livePlaybackProjection, lastOrdinal uint
 	for ordinal := range projection.slots {
 		if ordinal < first || ordinal > lastOrdinal {
 			delete(projection.slots, ordinal)
+			delete(projection.checkedUnavailable, ordinal)
+			delete(projection.pendingPromotions, ordinal)
 		}
 	}
 }
@@ -296,11 +504,15 @@ func refreshLivePlaybackInits(projection *livePlaybackProjection, track *domain.
 }
 
 func (m *Manager) updateLivePlaybackProjection(e *entry, segment domain.Segment) {
-	if e == nil || !segment.IsInit && segment.LivePresentationOrdinal == 0 {
+	if e == nil {
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	m.updateLivePlaybackProjectionLocked(e, segment)
+}
+
+func (m *Manager) updateLivePlaybackProjectionLocked(e *entry, segment domain.Segment) {
 	if e.deleted || e.recording == nil {
 		return
 	}
@@ -330,6 +542,58 @@ func (m *Manager) updateLivePlaybackProjection(e *entry, segment domain.Segment)
 	e.livePlayback.slots[segment.LivePresentationOrdinal] = mediaLivePlaybackSlot(segment)
 	pruneLivePlaybackSlots(e.livePlayback, maxLivePresentationOrdinal(track))
 	refreshLivePlaybackInits(e.livePlayback, track)
+	delete(e.livePlayback.pendingPromotions, segment.LivePresentationOrdinal)
+}
+
+// beginShardedLiveSlotPromotion makes a cached known gap eligible for durable
+// recheck while historical media publication is in flight. The V2 root can
+// become visible before the in-memory live projection refreshes.
+func (m *Manager) beginShardedLiveSlotPromotion(e *entry, segment domain.Segment) bool {
+	if e == nil || segment.IsInit || segment.LivePresentationOrdinal == 0 {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.deleted || e.recording == nil || e.livePlayback == nil {
+		return false
+	}
+	slot, ok := e.livePlayback.slots[segment.LivePresentationOrdinal]
+	if !ok || slot.Segment != nil || !slot.Unavailable || slot.Pending {
+		return false
+	}
+	e.livePlayback.pendingPromotions[segment.LivePresentationOrdinal] = true
+	return true
+}
+
+func (m *Manager) reconcileShardedLiveSlotPromotion(e *entry, recordingID string, ordinal uint64) {
+	if m.store == nil || e == nil || ordinal == 0 {
+		return
+	}
+	durable, err := m.store.LookupShardedLiveSlot(context.Background(), recordingID, "main", ordinal)
+	if err != nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.deleted || e.recording == nil || e.recording.State != domain.StateRecording || e.livePlayback == nil {
+		return
+	}
+	current, ok := e.livePlayback.slots[ordinal]
+	if !ok || current.Segment != nil {
+		delete(e.livePlayback.pendingPromotions, ordinal)
+		return
+	}
+	switch {
+	case durable.Segment != nil:
+		e.livePlayback.slots[ordinal] = mediaLivePlaybackSlot(*durable.Segment)
+		delete(e.livePlayback.checkedUnavailable, ordinal)
+		delete(e.livePlayback.pendingPromotions, ordinal)
+		refreshLivePlaybackInits(e.livePlayback, e.recording.Tracks["main"])
+	case durable.Gap != nil:
+		insertLivePlaybackGap(e.livePlayback, *durable.Gap, LivePlaybackWindowSize)
+		delete(e.livePlayback.pendingPromotions, ordinal)
+		e.livePlayback.checkedUnavailable[ordinal] = true
+	}
 }
 
 func (m *Manager) updateLivePlaybackPending(e *entry, pending domain.PendingSequence) {
@@ -357,23 +621,50 @@ func (m *Manager) updateLivePlaybackGap(e *entry, gap domain.Gap) {
 	if e.deleted || e.recording == nil || e.recording.Tracks["main"] == nil {
 		return
 	}
+	track := e.recording.Tracks["main"]
 	if e.livePlayback == nil {
 		e.livePlayback = newLivePlaybackProjection()
 	}
-	insertLivePlaybackGap(e.livePlayback, gap, LivePlaybackWindowSize)
-	pruneLivePlaybackSlots(e.livePlayback, maxLivePresentationOrdinal(e.recording.Tracks["main"]))
+	// markGap publishes the canonical root before it updates this in-memory
+	// projection. A historical commit may repair that gap in between those two
+	// steps, so the argument can be stale by the time this lock is acquired.
+	// Heal any repaired media from the current bounded runtime tail first.
+	for _, segment := range track.Segments {
+		if segment.LivePresentationOrdinal == 0 || segment.TrackID != gap.TrackID ||
+			segment.SourceEpoch != gap.SourceEpoch || segment.DiscontinuitySequence != gap.DiscontinuitySequence ||
+			segment.Sequence < gap.FromSequence || segment.Sequence > gap.ToSequence {
+			continue
+		}
+		e.livePlayback.slots[segment.LivePresentationOrdinal] = mediaLivePlaybackSlot(segment)
+		delete(e.livePlayback.checkedUnavailable, segment.LivePresentationOrdinal)
+	}
+	// Insert only the still-canonical part of the gap. An observation copied
+	// before a repair must never reintroduce a GAP marker over committed bytes.
+	for _, current := range e.recording.Gaps {
+		if current.TrackID != gap.TrackID || current.SourceEpoch != gap.SourceEpoch ||
+			current.DiscontinuitySequence != gap.DiscontinuitySequence || current.LivePresentationOrdinal == 0 ||
+			current.ToSequence < gap.FromSequence || current.FromSequence > gap.ToSequence {
+			continue
+		}
+		insertLivePlaybackGap(e.livePlayback, current, LivePlaybackWindowSize)
+	}
+	pruneLivePlaybackSlots(e.livePlayback, maxLivePresentationOrdinal(track))
+	refreshLivePlaybackInits(e.livePlayback, track)
 }
 
 func (m *Manager) refreshLivePlaybackObservation(e *entry, recording *domain.Recording, playlist []hls.MediaSegment, epoch uint64) {
-	if e == nil || recording == nil || recording.Tracks["main"] == nil {
+	if e == nil || recording == nil {
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.deleted || e.recording == nil || e.livePlayback == nil {
+	if e.deleted || e.recording == nil || e.recording.Tracks["main"] == nil || e.livePlayback == nil {
 		return
 	}
-	track := recording.Tracks["main"]
+	// The poll snapshot may predate a media commit queued by the async writer.
+	// Use the current root cursor/tail for pruning and coordinate lookup so a
+	// late observation cannot delete a newer committed live slot.
+	track := e.recording.Tracks["main"]
 	lastOrdinal := maxLivePresentationOrdinal(track)
 	state := track.LivePresentation
 	if state == nil {
@@ -395,6 +686,7 @@ func (m *Manager) refreshLivePlaybackObservation(e *entry, recording *domain.Rec
 		if captured, found := findTrackSegmentCoordinate(track, key); found {
 			if captured.LivePresentationOrdinal != 0 {
 				e.livePlayback.slots[ordinal] = mediaLivePlaybackSlot(captured)
+				delete(e.livePlayback.checkedUnavailable, ordinal)
 			}
 			continue
 		}
@@ -409,7 +701,7 @@ func (m *Manager) refreshLivePlaybackObservation(e *entry, recording *domain.Rec
 		}
 		insertLivePlaybackPending(e.livePlayback, pending)
 	}
-	for _, gap := range recording.Gaps {
+	for _, gap := range e.recording.Gaps {
 		insertLivePlaybackGap(e.livePlayback, gap, LivePlaybackWindowSize)
 	}
 	pruneLivePlaybackSlots(e.livePlayback, lastOrdinal)

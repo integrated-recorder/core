@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -180,6 +182,142 @@ func compareArchiveSnapshotsAllowingManifestAppend(before, after map[string]stri
 		}
 	}
 	return nil
+}
+
+// compareArchiveSnapshotsAllowingV2ManifestAppend permits bounded V2 manifest
+// page replacement only when the decoded canonical manifest history is a
+// strict append. V2's current final page is an atomic bounded page, so adding
+// a snapshot may replace that page while preserving all prior entries.
+func compareArchiveSnapshotsAllowingV2ManifestAppend(root string, before, after map[string]string, beforeSnapshots, afterSnapshots []domain.ManifestSnapshot) error {
+	if len(afterSnapshots) < len(beforeSnapshots) {
+		return fmt.Errorf("V2 manifest history shrank from %d to %d entries", len(beforeSnapshots), len(afterSnapshots))
+	}
+	for index := range beforeSnapshots {
+		if !equalManifestSnapshot(beforeSnapshots[index], afterSnapshots[index]) {
+			oldSnapshot, newSnapshot := beforeSnapshots[index], afterSnapshots[index]
+			beforeSource := sha256.Sum256([]byte(oldSnapshot.SourceURI))
+			afterSource := sha256.Sum256([]byte(newSnapshot.SourceURI))
+			pageName := fmt.Sprintf("archive/v2/manifests/%020d.json", index/64)
+			return fmt.Errorf("V2 manifest history changed existing entry %d/%d: path=%t track=%t source_uri_sha256=%x->%x time_equal=%t digest=%t size=%t page_digest_same=%t", index, len(beforeSnapshots), oldSnapshot.StoragePath == newSnapshot.StoragePath, oldSnapshot.TrackID == newSnapshot.TrackID, beforeSource[:8], afterSource[:8], oldSnapshot.FetchedAt.Equal(newSnapshot.FetchedAt), oldSnapshot.SHA256 == newSnapshot.SHA256, oldSnapshot.Size == newSnapshot.Size, before[pageName] == after[pageName])
+		}
+	}
+
+	filteredBefore := make(map[string]string, len(before))
+	for object, digest := range before {
+		if isV2ManifestPagePath(object) {
+			current, exists := after[object]
+			if !exists {
+				return fmt.Errorf("pre-crash V2 manifest page %q was removed", object)
+			}
+			if current != digest {
+				page, _ := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(object, "archive/v2/manifests/"), ".json"), 10, 64)
+				lastBeforePage := uint64(0)
+				canAppendLastPage := len(beforeSnapshots) > 0 && len(beforeSnapshots)%64 != 0 && len(afterSnapshots) > len(beforeSnapshots)
+				if canAppendLastPage {
+					lastBeforePage = uint64((len(beforeSnapshots) - 1) / 64)
+				}
+				if !canAppendLastPage || page != lastBeforePage {
+					return fmt.Errorf("V2 manifest page %q changed outside an append to the partial final page", object)
+				}
+			}
+			continue
+		}
+		filteredBefore[object] = digest
+	}
+	filteredAfter := make(map[string]string, len(after))
+	for object, digest := range after {
+		if isV2ManifestPagePath(object) {
+			continue
+		}
+		if strings.HasPrefix(object, "archive/v2/manifests/") {
+			return fmt.Errorf("invalid V2 manifest page path %q", object)
+		}
+		filteredAfter[object] = digest
+	}
+	if err := compareArchiveSnapshotsAllowingManifestAppend(filteredBefore, filteredAfter); err != nil {
+		return err
+	}
+	return validateV2ManifestPages(root, after, afterSnapshots)
+}
+
+func equalManifestSnapshot(left, right domain.ManifestSnapshot) bool {
+	return left.TrackID == right.TrackID && left.SourceURI == right.SourceURI && left.StoragePath == right.StoragePath && left.FetchedAt.Equal(right.FetchedAt) && left.SHA256 == right.SHA256 && left.Size == right.Size
+}
+
+func isV2ManifestPagePath(object string) bool {
+	const prefix = "archive/v2/manifests/"
+	if !strings.HasPrefix(object, prefix) || !strings.HasSuffix(object, ".json") {
+		return false
+	}
+	page := strings.TrimSuffix(strings.TrimPrefix(object, prefix), ".json")
+	if len(page) != 20 {
+		return false
+	}
+	_, err := strconv.ParseUint(page, 10, 64)
+	return err == nil
+}
+
+func validateV2ManifestPages(root string, objects map[string]string, snapshots []domain.ManifestSnapshot) error {
+	const pageEntries = 64
+	pageCount := (len(snapshots) + pageEntries - 1) / pageEntries
+	for pageNumber := 0; pageNumber < pageCount; pageNumber++ {
+		name := fmt.Sprintf("archive/v2/manifests/%020d.json", pageNumber)
+		if _, exists := objects[name]; !exists {
+			return fmt.Errorf("V2 manifest page %q is missing", name)
+		}
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			return fmt.Errorf("read V2 manifest page %q: %w", name, err)
+		}
+		digest := sha256.Sum256(data)
+		if hex.EncodeToString(digest[:]) != objects[name] {
+			return fmt.Errorf("V2 manifest page %q digest does not match its snapshot", name)
+		}
+		var page struct {
+			Version int                       `json:"version"`
+			Number  uint64                    `json:"number"`
+			Entries []domain.ManifestSnapshot `json:"entries"`
+		}
+		if err := json.Unmarshal(data, &page); err != nil {
+			return fmt.Errorf("decode V2 manifest page %q: %w", name, err)
+		}
+		start := pageNumber * pageEntries
+		end := start + pageEntries
+		if end > len(snapshots) {
+			end = len(snapshots)
+		}
+		if page.Version != 1 || page.Number != uint64(pageNumber) || !reflect.DeepEqual(page.Entries, snapshots[start:end]) {
+			return fmt.Errorf("V2 manifest page %q does not match append-only canonical history", name)
+		}
+	}
+	for object := range objects {
+		if strings.HasPrefix(object, "archive/v2/manifests/") {
+			if !isV2ManifestPagePath(object) {
+				return fmt.Errorf("invalid V2 manifest page path %q", object)
+			}
+			pageName := strings.TrimSuffix(strings.TrimPrefix(object, "archive/v2/manifests/"), ".json")
+			pageNumber, _ := strconv.ParseUint(pageName, 10, 64)
+			if pageNumber >= uint64(pageCount) {
+				return fmt.Errorf("unreferenced V2 manifest page %q", object)
+			}
+		}
+	}
+	return nil
+}
+
+func v2ManifestPageSnapshotsEqual(left, right map[string]string) bool {
+	const prefix = "archive/v2/manifests/"
+	for object, digest := range left {
+		if strings.HasPrefix(object, prefix) && right[object] != digest {
+			return false
+		}
+	}
+	for object, digest := range right {
+		if strings.HasPrefix(object, prefix) && left[object] != digest {
+			return false
+		}
+	}
+	return true
 }
 
 func validateManifestSnapshotReferences(recording *domain.Recording, objects map[string]string) error {

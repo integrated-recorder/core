@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -410,7 +411,11 @@ func TestStaleManifestResponseIsDiscardedAfterSegmentRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolver.calls.Load() != 1 || oldManifests.Load() != 2 || oldSegments.Load() != 1 || newManifests.Load() != 1 || freshSegments.Load() != 1 || staleSegments.Load() != 0 {
+	// The scheduler may legitimately reload the refreshed live manifest again
+	// while this slow fixture is completing. The contract is that the new
+	// source is observed and only its media is committed, not an exact poll
+	// count.
+	if resolver.calls.Load() != 1 || oldManifests.Load() != 2 || oldSegments.Load() != 1 || newManifests.Load() < 1 || freshSegments.Load() != 1 || staleSegments.Load() != 0 {
 		t.Fatalf("refresh=%d old manifests=%d old segments=%d fresh manifests=%d fresh segments=%d stale segments=%d", resolver.calls.Load(), oldManifests.Load(), oldSegments.Load(), newManifests.Load(), freshSegments.Load(), staleSegments.Load())
 	}
 	if len(stopped.Tracks["main"].Segments) != 1 || stopped.Tracks["main"].Segments[0].SourceURI != server.URL+"/fresh.ts" {
@@ -632,6 +637,235 @@ func TestProactiveRefreshAtExpiryWithZeroLead(t *testing.T) {
 	if due, _ := proactiveRefreshDue(media, now.Add(-time.Second)); due {
 		t.Fatal("source was refreshed before its zero-lead expiry")
 	}
+}
+
+func TestExplicitCompletionAndSealAreSeparateIdempotentTransitions(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	const id = "a123456789abcdef0123456789abcdef"
+	if err := store.CreateRecording(&domain.Recording{
+		FormatVersion: 1, ID: id, State: domain.StateStopped, CreatedAt: now, StartedAt: now,
+		StoppedAt: &now, Tracks: map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+
+	completed, err := manager.CompleteRecording(context.Background(), id)
+	if err != nil || completed.State != domain.StateCompleted || completed.ArchiveSealed {
+		t.Fatalf("completion should preserve repairability: recording=%#v err=%v", completed, err)
+	}
+	snapshot, err := manager.LifecycleSnapshot(context.Background(), id)
+	if err != nil || snapshot.CaptureState != domain.StateCompleted || snapshot.ArchiveSealed || !snapshot.Repairable || snapshot.RecoveryState != "idle" {
+		t.Fatalf("lifecycle snapshot=%#v err=%v", snapshot, err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.LifecycleSnapshot(canceled, id); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled lifecycle snapshot error=%v", err)
+	}
+	retried, err := manager.CompleteRecording(context.Background(), id)
+	if err != nil || retried.State != domain.StateCompleted || retried.ArchiveSealed {
+		t.Fatalf("completion retry changed state: recording=%#v err=%v", retried, err)
+	}
+	if err := manager.SealArchiveContext(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SealArchiveContext(context.Background(), id); err != nil {
+		t.Fatalf("seal retry was not idempotent: %v", err)
+	}
+	sealed, err := manager.Get(id)
+	if err != nil || sealed.State != domain.StateCompleted || !sealed.ArchiveSealed {
+		t.Fatalf("seal changed capture state: recording=%#v err=%v", sealed, err)
+	}
+	snapshot, err = manager.LifecycleSnapshot(context.Background(), id)
+	if err != nil || snapshot.CaptureState != domain.StateCompleted || !snapshot.ArchiveSealed || snapshot.Repairable || snapshot.RecoveryState != "sealed" {
+		t.Fatalf("sealed lifecycle snapshot=%#v err=%v", snapshot, err)
+	}
+}
+
+func TestSealDoesNotCompleteCaptureAndCompletionAllowsSealedArchive(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	const id = "b123456789abcdef0123456789abcdef"
+	if err := store.CreateRecording(&domain.Recording{
+		FormatVersion: 1, ID: id, State: domain.StateStopped, CreatedAt: now, StartedAt: now,
+		StoppedAt: &now, Tracks: map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	if err := manager.SealArchiveContext(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := manager.Get(id)
+	if err != nil || sealed.State != domain.StateStopped || !sealed.ArchiveSealed {
+		t.Fatalf("sealing changed capture state: recording=%#v err=%v", sealed, err)
+	}
+	completed, err := manager.CompleteRecording(context.Background(), id)
+	if err != nil || completed.State != domain.StateCompleted || !completed.ArchiveSealed {
+		t.Fatalf("completion after seal state=%#v err=%v", completed, err)
+	}
+}
+
+func TestSealWaitsForRecoveryGateBeforeOwnerClaimAndCanonicalFence(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	const id = "c123456789abcdef0123456789abcdef"
+	root := &domain.Recording{
+		FormatVersion: 1, ID: id, State: domain.StateStopped, CreatedAt: now, StartedAt: now,
+		StoppedAt: &now, Tracks: map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+	}
+	if err := store.CreateRecording(root); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManagerWithMode(store, nil, nil, nil, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventsMu sync.Mutex
+	var events []string
+	appendEvent := func(event string) {
+		eventsMu.Lock()
+		events = append(events, event)
+		eventsMu.Unlock()
+	}
+	fence := lifecycleTestFence{event: func() { appendEvent("fence") }}
+	if err := manager.ConfigureCanonicalCommitFence(fence); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureTerminalOwnerRelease(func(context.Context, OwnershipToken) error {
+		appendEvent("release")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	owner := OwnershipToken{RecordingID: id, EngineGeneration: strings.Repeat("a", 32), WorkerInstance: strings.Repeat("b", 32), Epoch: 1}
+	if err := manager.ConfigureAutomaticArchiveRecovery(func(context.Context, string) (OwnershipToken, error) {
+		appendEvent("claim")
+		return owner, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	manager.entries[id] = &entry{recording: root, done: closedChannel()}
+	manager.mu.Unlock()
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	e, ok := manager.entry(id)
+	if !ok {
+		t.Fatal("fixture entry is missing")
+	}
+	if err := acquireArchiveRecoveryGate(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	blockedCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	blocked := make(chan error, 1)
+	go func() { blocked <- manager.SealArchiveContext(blockedCtx, id) }()
+	if err := <-blocked; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("seal did not wait at recovery gate: %v", err)
+	}
+	eventsMu.Lock()
+	if len(events) != 0 {
+		t.Fatalf("owner/canonical work ran before recovery gate: %v", events)
+	}
+	eventsMu.Unlock()
+	releaseArchiveRecoveryGate(e)
+	if err := manager.SealArchiveContext(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	eventsMu.Lock()
+	got := append([]string(nil), events...)
+	eventsMu.Unlock()
+	if want := []string{"claim", "fence", "release"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("lifecycle owner order=%v want=%v", got, want)
+	}
+}
+
+func TestLegacySealRetryReleasesOnlyRequestedOwner(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	const id = "d123456789abcdef0123456789abcdef"
+	root := &domain.Recording{
+		FormatVersion: 1, ID: id, State: domain.StateStopped, CreatedAt: now, StartedAt: now,
+		StoppedAt: &now, Tracks: map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+	}
+	if err := store.CreateRecording(root); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManagerWithMode(store, nil, nil, nil, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var released []OwnershipToken
+	if err := manager.ConfigureCanonicalCommitFence(lifecycleTestFence{event: func() {}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureTerminalOwnerRelease(func(_ context.Context, owner OwnershipToken) error {
+		released = append(released, owner)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	manager.entries[id] = &entry{recording: root, done: closedChannel()}
+	manager.mu.Unlock()
+	defer manager.Close(context.Background())
+	oldOwner := ownerForRepair(id, 7)
+	if err := manager.SealArchive(oldOwner, id); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := manager.entry(id)
+	newOwner := ownerForRepair(id, 8)
+	e.mu.Lock()
+	e.ownership = &newOwner
+	e.mu.Unlock()
+	if err := manager.SealArchive(oldOwner, id); err != nil {
+		t.Fatalf("idempotent old-owner seal: %v", err)
+	}
+	if len(released) != 2 || released[0] != oldOwner || released[1] != oldOwner {
+		t.Fatalf("release tokens=%#v; want old owner twice", released)
+	}
+	e.mu.Lock()
+	localOwner := e.ownership
+	e.mu.Unlock()
+	if localOwner == nil || *localOwner != newOwner {
+		t.Fatalf("retry cleared or changed newer local owner: %#v", localOwner)
+	}
+}
+
+type lifecycleTestFence struct {
+	event func()
+}
+
+func (f lifecycleTestFence) WithCommit(_ OwnershipToken, commit func() error) error {
+	f.event()
+	return commit()
+}
+
+func (f lifecycleTestFence) WithUnownedCommit(_ string, commit func() error) error {
+	f.event()
+	return commit()
 }
 
 func TestProactiveRefreshWithStillDueExpiryIsBounded(t *testing.T) {

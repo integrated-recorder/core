@@ -6,9 +6,38 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
 )
+
+func TestLifecycleSnapshotAcceptsAutomaticRecoveryStates(t *testing.T) {
+	for _, state := range []string{"idle", "scheduled", "backoff", "running"} {
+		snapshot := acquire.LifecycleSnapshot{
+			RecordingID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Repairable: true,
+			RecoveryState: state,
+		}
+		if err := validateLifecycleSnapshot(snapshot, snapshot.RecordingID); err != nil {
+			t.Errorf("recovery state %q rejected: %v", state, err)
+		}
+	}
+	sealed := acquire.LifecycleSnapshot{
+		RecordingID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ArchiveSealed: true,
+		RecoveryState: "sealed",
+	}
+	if err := validateLifecycleSnapshot(sealed, sealed.RecordingID); err != nil {
+		t.Fatalf("sealed lifecycle rejected: %v", err)
+	}
+	for _, state := range []string{"", "unknown", "sealed"} {
+		snapshot := acquire.LifecycleSnapshot{
+			RecordingID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Repairable: true,
+			RecoveryState: state,
+		}
+		if err := validateLifecycleSnapshot(snapshot, snapshot.RecordingID); err == nil {
+			t.Errorf("invalid unsealed recovery state %q accepted", state)
+		}
+	}
+}
 
 func TestManagerClientHandoverAcknowledgementChecksRecordingAndEngineIdentity(t *testing.T) {
 	owner := recordingowner.Owner{

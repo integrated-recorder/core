@@ -467,7 +467,7 @@ func (s *Server) recordingTagsGet(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(r.PathValue("id"))
 	lock.RLock()
 	defer lock.RUnlock()
-	if _, err := s.manager.Get(r.PathValue("id")); err != nil {
+	if _, err := s.recordingSnapshot(r.Context(), r.PathValue("id")); err != nil {
 		writeStorageError(w, err)
 		return
 	}
@@ -494,7 +494,7 @@ func (s *Server) recordingTagsPut(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(r.PathValue("id"))
 	lock.RLock()
 	defer lock.RUnlock()
-	if _, err := s.manager.Get(r.PathValue("id")); err != nil {
+	if _, err := s.recordingSnapshot(r.Context(), r.PathValue("id")); err != nil {
 		writeStorageError(w, err)
 		return
 	}
@@ -565,9 +565,21 @@ func (s *Server) archiveIndex(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	recording, err := s.manager.Get(id)
+	if r.Context().Err() != nil {
+		return
+	}
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err != nil {
 		writeStorageError(w, err)
+		return
+	}
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		entries, err := s.shardedArchiveIndex(r.Context(), recording)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "archive index is unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"recording_id": id, "entries": entries})
 		return
 	}
 	entries, err := s.storage.ArchiveIndex(recording)
@@ -580,7 +592,8 @@ func (s *Server) archiveIndex(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) integrityGet(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, err := s.manager.Get(id); err != nil {
+	recording, err := s.recordingSnapshot(r.Context(), id)
+	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
@@ -588,9 +601,12 @@ func (s *Server) integrityGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "integrity verification is unavailable")
 		return
 	}
-	result, ok := s.integrity.Status(id)
+	result, ok := s.integrity.StatusFor(recording)
 	if !ok {
-		result = storage.IntegrityResult{Status: storage.IntegrityUnknown, Issues: []storage.IntegrityIssue{}}
+		result = integrity.ResultProjection{
+			IntegrityResult: storage.IntegrityResult{Status: storage.IntegrityUnknown, Issues: []storage.IntegrityIssue{}},
+			Freshness:       integrity.FreshnessUnknown,
+		}
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -603,7 +619,7 @@ func (s *Server) integrityStart(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	lock := s.productLock(id)
 	lock.RLock()
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err == nil && recording.State == domain.StateRecording {
 		err = acquire.ErrActiveRecording
 	}
@@ -640,7 +656,12 @@ func (s *Server) integrityJobGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "integrity job not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	recording, err := s.recordingSnapshot(r.Context(), job.RecordingID)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, integrity.ProjectJob(job, recording))
 }
 
 func (s *Server) integrityJobCancel(w http.ResponseWriter, r *http.Request) {
@@ -945,7 +966,7 @@ func (s *Server) recordingEvents(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -955,17 +976,65 @@ func (s *Server) recordingEvents(w http.ResponseWriter, r *http.Request) {
 		events = append(events, management.RecordingEvent{ID: stableRecordingEventID(id, kind, at, count), RecordingID: id, Type: kind, At: at, Count: count, Message: message})
 	}
 	add("recording_started", recording.StartedAt, 0, "")
-	if len(recording.Snapshots) > 0 {
+	var firstManifestAt time.Time
+	manifestCount := 0
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		if s.storage == nil {
+			writeError(w, http.StatusServiceUnavailable, "recording history is unavailable")
+			return
+		}
+		err = s.storage.IterateShardedManifests(r.Context(), id, func(snapshot domain.ManifestSnapshot) error {
+			if manifestCount == 0 || snapshot.FetchedAt.Before(firstManifestAt) {
+				firstManifestAt = snapshot.FetchedAt
+			}
+			if manifestCount < int(^uint(0)>>1) {
+				manifestCount++
+			}
+			return nil
+		})
+	} else if len(recording.Snapshots) > 0 {
 		first := recording.Snapshots[0]
 		for _, snapshot := range recording.Snapshots[1:] {
 			if snapshot.FetchedAt.Before(first.FetchedAt) {
 				first = snapshot
 			}
 		}
-		add("manifest_observed", first.FetchedAt, len(recording.Snapshots), "manifest observed")
+		firstManifestAt = first.FetchedAt
+		manifestCount = len(recording.Snapshots)
 	}
-	if len(recording.Gaps) > 0 {
-		add("gap_detected", recording.Gaps[0].DetectedAt, len(recording.Gaps), "gap detected")
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if manifestCount > 0 {
+		add("manifest_observed", firstManifestAt, manifestCount, "manifest observed")
+	}
+	var firstGapAt time.Time
+	gapCount := 0
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		if s.storage == nil {
+			writeError(w, http.StatusServiceUnavailable, "recording history is unavailable")
+			return
+		}
+		err = s.storage.IterateShardedGaps(r.Context(), id, func(gap domain.Gap) error {
+			if gapCount == 0 || gap.DetectedAt.Before(firstGapAt) {
+				firstGapAt = gap.DetectedAt
+			}
+			if gapCount < int(^uint(0)>>1) {
+				gapCount++
+			}
+			return nil
+		})
+	} else if len(recording.Gaps) > 0 {
+		firstGapAt = recording.Gaps[0].DetectedAt
+		gapCount = len(recording.Gaps)
+	}
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if gapCount > 0 {
+		add("gap_detected", firstGapAt, gapCount, "gap detected")
 	}
 	if recording.StoppedAt != nil {
 		kind, message := "recording_stopped", "recording stopped"
@@ -1044,23 +1113,47 @@ func (s *Server) recordingMetadataGet(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	recording, err := s.manager.Get(id)
+	recording, err := s.recordingSnapshot(r.Context(), id)
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
-	items := make([]domain.MetadataRevision, 0, len(recording.MetadataTimeline))
-	items = append(items, recording.MetadataTimeline...)
+	items := make([]domain.MetadataRevision, 0, min(metadataTimelineAPILimit, len(recording.MetadataTimeline)))
 	truncated := recording.MetadataTimelineTruncated
-	if len(items) > metadataTimelineAPILimit {
-		items = items[len(items)-metadataTimelineAPILimit:]
-		truncated = true
+	var current *domain.MetadataRevision
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		if s.storage == nil {
+			writeError(w, http.StatusServiceUnavailable, "recording metadata history is unavailable")
+			return
+		}
+		err = s.storage.IterateShardedMetadata(r.Context(), id, func(revision domain.MetadataRevision) error {
+			latest := revision
+			current = &latest
+			if len(items) == metadataTimelineAPILimit {
+				copy(items, items[1:])
+				items = items[:len(items)-1]
+				truncated = true
+			}
+			items = append(items, revision)
+			return nil
+		})
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+	} else {
+		items = append(items, recording.MetadataTimeline...)
+		if len(items) > metadataTimelineAPILimit {
+			items = items[len(items)-metadataTimelineAPILimit:]
+			truncated = true
+		}
+		if len(recording.MetadataTimeline) > 0 {
+			latest := recording.MetadataTimeline[len(recording.MetadataTimeline)-1]
+			current = &latest
+		}
 	}
 	response := recordingMetadataResponse{Items: items, Truncated: truncated}
-	if len(recording.MetadataTimeline) > 0 {
-		current := recording.MetadataTimeline[len(recording.MetadataTimeline)-1]
-		response.Current = &current
-	}
+	response.Current = current
 	writeJSON(w, http.StatusOK, response)
 }
 

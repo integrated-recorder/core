@@ -20,7 +20,6 @@ import (
 func TestActiveLivePlaylistsAreBoundedSafeArchiveViews(t *testing.T) {
 	const count = 14
 	handler, manager, recordingID := newLivePlaybackFixture(t, count)
-	defer closeLivePlaybackFixture(t, manager)
 
 	master := requestLivePlaylist(handler, "/api/recordings/"+recordingID+"/play/live/master.m3u8")
 	if master.Code != http.StatusOK {
@@ -157,7 +156,11 @@ func TestLivePlaylistProtocolIdentitySurvivesAutomaticHistoricalPrefixAndWindowS
 	case <-time.After(5 * time.Second):
 		t.Fatal("automatic historical scheduler did not request the declared manifest")
 	}
-	waitLiveFixture(t, manager, started.ID, 13)
+	// The source playlist has one explicit gap. Twelve committed media objects
+	// are sufficient to exercise the bounded live tail while that gap is
+	// pending repair; waiting for the thirteenth would couple this test to the
+	// source worker's completion timing for the newest advertised segment.
+	waitLiveFixture(t, manager, started.ID, 12)
 	handler := New(manager, nil, nil)
 	first := requestLivePlaylist(handler, "/api/recordings/"+started.ID+"/play/live/tracks/main/playlist.m3u8")
 	if first.Code != http.StatusOK {
@@ -192,11 +195,53 @@ func TestLivePlaylistProtocolIdentitySurvivesAutomaticHistoricalPrefixAndWindowS
 		}
 	}
 	if repairedGap.ID == "" || postRepairMapping["/api/recordings/"+started.ID+"/play/segments/"+repairedGap.ID] != 8 {
-		t.Fatalf("historically repaired live slot did not retain HLS sequence 8: segment=%#v mapping=%v", repairedGap, postRepairMapping)
+		view, viewErr := manager.LivePlaybackSnapshot(context.Background(), started.ID)
+		durableSlot := "not found"
+		if store := manager.Store(); store != nil {
+			_ = store.IterateShardedLiveSlots(context.Background(), started.ID, "main", acquire.LivePlaybackWindowSize, func(slot storage.V2LiveSlot) error {
+				if slot.Ordinal == 9 {
+					switch {
+					case slot.Segment != nil:
+						durableSlot = fmt.Sprintf("media id=%s sequence=%d", slot.Segment.ID, slot.Segment.Sequence)
+					case slot.Gap != nil:
+						durableSlot = fmt.Sprintf("gap sequence=%d", slot.Gap.FromSequence)
+					default:
+						durableSlot = "empty"
+					}
+				}
+				return nil
+			})
+		}
+		runtimeContainsRepair, runtimeContainsGap := false, false
+		var runtimeRepairOrdinal uint64
+		for _, runtime := range manager.List() {
+			if runtime.ID == started.ID && runtime.Tracks["main"] != nil {
+				for _, segment := range runtime.Tracks["main"].Segments {
+					if segment.ID == repairedGap.ID {
+						runtimeContainsRepair = true
+						runtimeRepairOrdinal = segment.LivePresentationOrdinal
+					}
+				}
+				for _, gap := range runtime.Gaps {
+					runtimeContainsGap = runtimeContainsGap || gap.TrackID == "main" && gap.FromSequence <= 108 && gap.ToSequence >= 108
+				}
+			}
+		}
+		var repairedSlot any
+		for _, slot := range view.Slots {
+			if slot.Ordinal == 9 {
+				if slot.Segment != nil {
+					repairedSlot = fmt.Sprintf("media id=%s live_ordinal=%d", slot.Segment.ID, slot.Segment.LivePresentationOrdinal)
+				} else {
+					repairedSlot = slot
+				}
+			}
+		}
+		t.Fatalf("historically repaired live slot did not retain HLS sequence 8: segment=%s live_ordinal=%d mapping=%v slot=%#v durable_slot=%s runtime_contains_repair=%t runtime_repair_ordinal=%d runtime_contains_gap=%t view_error=%v playlist=%s", repairedGap.ID, repairedGap.LivePresentationOrdinal, postRepairMapping, repairedSlot, durableSlot, runtimeContainsRepair, runtimeRepairOrdinal, runtimeContainsGap, viewErr, second.Body.String())
 	}
 
 	transport.setLive(numberedLiveManifest(102, 116))
-	waitLiveFixture(t, manager, started.ID, 27)
+	waitLiveFixtureLiveMedia(t, manager, started.ID, acquire.LivePlaybackWindowSize)
 	third := requestLivePlaylist(handler, "/api/recordings/"+started.ID+"/play/live/tracks/main/playlist.m3u8")
 	if third.Code != http.StatusOK {
 		t.Fatalf("slid live playlist status=%d body=%s", third.Code, third.Body.String())
@@ -302,9 +347,13 @@ func numberedHistoricalManifest(first, last uint64) string {
 
 func waitLiveFixture(t *testing.T, manager *acquire.Manager, recordingID string, count int) {
 	t.Helper()
-	deadline := time.NewTimer(8 * time.Second)
+	// This exercises production ingestion against a multi-object live/history
+	// manifest. Keep the predicate on canonical state, but poll sparsely so the
+	// fixture does not repeatedly materialize the archive while other package
+	// tests are running under the full suite.
+	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		recording, err := manager.Get(recordingID)
@@ -320,6 +369,34 @@ func waitLiveFixture(t *testing.T, manager *acquire.Manager, recordingID string,
 		select {
 		case <-deadline.C:
 			t.Fatalf("recording has %d segments, want at least %d", len(recording.Tracks["main"].Segments), count)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitLiveFixtureLiveMedia(t *testing.T, manager *acquire.Manager, recordingID string, count int) {
+	t.Helper()
+	// Historical commits also increase total canonical segment count. Wait for
+	// the exact bounded live projection this assertion reads, not a total-history
+	// threshold that can be satisfied before the new live tail is visible.
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		view, err := manager.LivePlaybackSnapshot(context.Background(), recordingID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if view.State != domain.StateRecording {
+			t.Fatalf("fixture recording became terminal: state=%s", view.State)
+		}
+		if len(view.Slots) == count && len(view.Segments) == count {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("live projection has %d media in %d slots, want %d", len(view.Segments), len(view.Slots), count)
 		case <-ticker.C:
 		}
 	}
@@ -365,8 +442,7 @@ func sameSequenceMapping(left, right map[string]uint64) bool {
 }
 
 func TestLivePlaylistBeforeFirstSegmentReturnsConflict(t *testing.T) {
-	handler, manager, recordingID := newLivePlaybackFixture(t, 0)
-	defer closeLivePlaybackFixture(t, manager)
+	handler, _, recordingID := newLivePlaybackFixture(t, 0)
 	for _, path := range []string{
 		"/api/recordings/" + recordingID + "/play/live/master.m3u8",
 		"/api/recordings/" + recordingID + "/play/live/tracks/main/playlist.m3u8",
@@ -438,6 +514,7 @@ func newLivePlaybackFixture(t *testing.T, segmentCount int) (http.Handler, *acqu
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { closeLivePlaybackFixture(t, manager) })
 	started, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{
 		Type:        "hls",
 		ManifestURL: "https://source.invalid/live.m3u8?access_token=source-secret",
@@ -445,19 +522,25 @@ func newLivePlaybackFixture(t *testing.T, segmentCount int) (http.Handler, *acqu
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
 	for time.Now().Before(deadline) {
-		recording, getErr := manager.Get(started.ID)
-		if getErr != nil {
-			t.Fatal(getErr)
+		header, headerErr := store.LoadRecordingHeader(context.Background(), started.ID)
+		if headerErr != nil {
+			t.Fatal(headerErr)
 		}
-		if len(recording.Tracks["main"].Segments) >= segmentCount {
+		track := header.Tracks["main"]
+		if track == nil {
+			t.Fatal("live fixture header has no main track")
+		}
+		if int(track.MediaCount) >= segmentCount {
 			break
 		}
-		if recording.State != domain.StateRecording {
-			t.Fatalf("fixture recording became terminal before all segments were committed: state=%s err=%s", recording.State, recording.LastError)
+		if header.State != domain.StateRecording {
+			t.Fatalf("fixture recording became terminal before all segments were committed: state=%s err=%s", header.State, header.LastError)
 		}
-		time.Sleep(10 * time.Millisecond)
+		<-ticker.C
 	}
 	recording, err := manager.Get(started.ID)
 	if err != nil {

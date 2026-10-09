@@ -29,9 +29,12 @@ const (
 	OperationBeginDrain             = "begin_drain"
 	OperationActiveCount            = "active_recordings"
 	OperationGet                    = "get"
+	OperationLifecycleSnapshot      = "lifecycle_snapshot"
 	OperationLivePlaybackSnapshot   = "live_playback_snapshot"
 	OperationList                   = "list"
 	OperationStop                   = "stop"
+	OperationComplete               = "complete_recording"
+	OperationSealArchive            = "seal_archive"
 	OperationDelete                 = "delete"
 	OperationDeleteTerminal         = "delete_terminal_archive"
 	OperationInventory              = "inventory"
@@ -370,6 +373,19 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 			return nil, publicError("read_failed", "recording could not be read")
 		}
 		return result, nil
+	case OperationLifecycleSnapshot:
+		var request RecordingIDRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {
+			return nil, publicError("invalid_request", "recording identity is invalid")
+		}
+		result, err := e.manager.LifecycleSnapshot(ctx, request.RecordingID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, publicError("not_found", "recording was not found")
+			}
+			return nil, publicError("read_failed", "recording lifecycle could not be read")
+		}
+		return result, nil
 	case OperationLivePlaybackSnapshot:
 		var request RecordingIDRequest
 		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {
@@ -419,6 +435,39 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 			return nil, publicError("stop_failed", "recording could not be stopped")
 		}
 		return result, nil
+	case OperationComplete:
+		var request RecordingIDRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {
+			return nil, publicError("invalid_request", "recording identity is invalid")
+		}
+		result, err := e.manager.CompleteRecording(ctx, request.RecordingID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, publicError("not_found", "recording was not found")
+			}
+			if errors.Is(err, acquire.ErrLifecycleConflict) || errors.Is(err, acquire.ErrInvalidOwnershipToken) || errors.Is(err, recordingowner.ErrStaleOwner) {
+				return nil, publicError("lifecycle_conflict", "recording cannot be completed in its current state")
+			}
+			return nil, publicError("complete_failed", "recording could not be completed")
+		}
+		return result, nil
+	case OperationSealArchive:
+		var request RecordingIDRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {
+			return nil, publicError("invalid_request", "recording identity is invalid")
+		}
+		if err := e.manager.SealArchiveContext(ctx, request.RecordingID); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, publicError("not_found", "recording was not found")
+			}
+			if errors.Is(err, acquire.ErrLifecycleConflict) || errors.Is(err, acquire.ErrInvalidOwnershipToken) || errors.Is(err, recordingowner.ErrStaleOwner) {
+				return nil, publicError("lifecycle_conflict", "archive cannot be sealed in its current state")
+			}
+			return nil, publicError("seal_failed", "archive could not be sealed")
+		}
+		return struct {
+			Sealed bool `json:"sealed"`
+		}{Sealed: true}, nil
 	case OperationDelete:
 		var request RecordingIDRequest
 		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {

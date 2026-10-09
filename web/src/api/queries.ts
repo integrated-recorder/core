@@ -5,7 +5,7 @@ export const qk = {
   session: ['auth', 'session'] as const, installation: ['installation', 'status'] as const, dashboard: ['dashboard'] as const, storage: ['system', 'storage'] as const, info: ['system', 'info'] as const,
   storagePools: ['storage', 'pools'] as const, storageMetrics: (poolId: string, window: StorageMetricWindow) => ['storage', 'pool', poolId, 'metrics', window] as const,
   settings: ['settings'] as const, runtimeUpdate: ['runtime-update'] as const, recordings: (query: RecordingQuery) => ['recordings', query] as const,
-  recording: (id: string) => ['recording', id] as const, tags: (id: string) => ['recording', id, 'tags'] as const,
+  recording: (id: string) => ['recording', id] as const, lifecycle: (id: string) => ['recording', id, 'lifecycle'] as const, tags: (id: string) => ['recording', id, 'tags'] as const,
   previews: (id: string, query: PreviewQuery) => ['recording', id, 'previews', query] as const,
   archive: (id: string) => ['recording', id, 'archive'] as const, events: (id: string) => ['recording', id, 'events'] as const,
   metadata: (id: string) => ['recording', id, 'metadata'] as const,
@@ -56,6 +56,7 @@ export const watchQuery = (id: string) => queryOptions({
 export const watchRecordingsQuery = (id: string) => queryOptions({ queryKey: qk.watchRecordings(id), queryFn: () => watchesAPI.recordings(id), staleTime: 10_000 })
 export const watchEventsQuery = (id: string) => queryOptions({ queryKey: qk.watchEvents(id), queryFn: () => watchesAPI.events(id), staleTime: 10_000 })
 export const recordingQuery = (id: string) => queryOptions({ queryKey: qk.recording(id), queryFn: () => recordingsAPI.get(id) })
+export const recordingLifecycleQuery = (id: string) => queryOptions({ queryKey: qk.lifecycle(id), queryFn: () => recordingsAPI.lifecycle(id), staleTime: 0 })
 export const previewsQuery = (id: string, query: PreviewQuery, active = false) => queryOptions({
   queryKey: qk.previews(id, query), queryFn: () => recordingsAPI.previews(id, query), staleTime: 0,
   refetchInterval: queryState => {

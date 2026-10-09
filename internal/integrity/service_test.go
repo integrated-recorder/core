@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/storage"
 )
@@ -20,6 +21,11 @@ import (
 func TestVerificationCompletesPersistsAndReloads(t *testing.T) {
 	root := t.TempDir()
 	store, recording := makeIntegrityArchive(t, root, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", []byte("original"))
+	recording.ArchiveRevision = 7
+	recording.TimelineRevision = 3
+	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
 	service, err := Open(root, store, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -31,6 +37,12 @@ func TestVerificationCompletesPersistsAndReloads(t *testing.T) {
 	completed := waitJobState(t, service, job.ID, StateCompleted)
 	if completed.Result == nil || completed.Result.Status != storage.IntegrityVerified || completed.Result.ObjectsTotal != 1 || completed.Result.ObjectsVerified != 1 {
 		t.Fatalf("unexpected completed verification: %#v", completed)
+	}
+	if !completed.SourceRevisionKnown || completed.SourceArchiveRevision != 7 || completed.SourceTimelineRevision != 3 {
+		t.Fatalf("job did not retain source revisions: %+v", completed)
+	}
+	if projected := ProjectJob(completed, recording); projected.Freshness != FreshnessCurrent || projected.State != StateCompleted {
+		t.Fatalf("completed job projection=%+v, want current without state change", projected)
 	}
 	assertPrivateMode(t, filepath.Join(root, "management"), 0700)
 	assertPrivateMode(t, filepath.Join(root, "management", "integrity-jobs"), 0700)
@@ -54,6 +66,77 @@ func TestVerificationCompletesPersistsAndReloads(t *testing.T) {
 	result, ok := reloaded.Status(recording.ID)
 	if !ok || result.Status != storage.IntegrityVerified || result.ObjectsVerified != 1 {
 		t.Fatalf("latest result did not reload: %#v, present=%t", result, ok)
+	}
+	current, ok := reloaded.StatusFor(recording)
+	if !ok || current.Freshness != FreshnessCurrent || !current.RevisionKnown || current.SourceArchiveRevision != 7 || current.SourceTimelineRevision != 3 {
+		t.Fatalf("reloaded result freshness=%+v present=%t, want current at source revisions", current, ok)
+	}
+	changed := *recording
+	changed.ArchiveRevision++
+	stale, ok := reloaded.StatusFor(&changed)
+	if !ok || stale.Freshness != FreshnessStale || stale.Status != storage.IntegrityVerified {
+		t.Fatalf("archive revision change should preserve verified result but mark it stale: %+v present=%t", stale, ok)
+	}
+	projected := ProjectJob(reloadedJob, &changed)
+	if projected.Freshness != FreshnessStale || projected.State != StateCompleted {
+		t.Fatalf("job projection after archive revision change=%+v, want stale completed job", projected)
+	}
+}
+
+func TestLegacyIntegrityResultFreshnessIsUnknown(t *testing.T) {
+	root := t.TempDir()
+	store, recording := makeIntegrityArchive(t, root, "abababababababababababababababab", []byte("original"))
+	service, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeService(t, service)
+	result := storage.IntegrityResult{Status: storage.IntegrityVerified, ObjectsTotal: 1, ObjectsVerified: 1, Issues: []storage.IntegrityIssue{}}
+	service.mu.Lock()
+	service.results[recording.ID] = result
+	service.mu.Unlock()
+	service.mu.Lock()
+	err = service.persistLocked()
+	service.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeService(t, reloaded)
+	projection, ok := reloaded.StatusFor(recording)
+	if !ok || projection.Freshness != FreshnessUnknown || projection.RevisionKnown {
+		t.Fatalf("unbound legacy result freshness=%+v present=%t, want unknown", projection, ok)
+	}
+}
+
+func TestLegacyRecordingVerificationRemainsFreshnessUnknown(t *testing.T) {
+	root := t.TempDir()
+	store, recording := makeIntegrityArchive(t, root, "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", []byte("original"))
+	if recording.ArchiveRevision != 0 {
+		t.Fatalf("fixture ArchiveRevision=%d, want legacy zero", recording.ArchiveRevision)
+	}
+	service, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeService(t, service)
+	job, err := service.Start(context.Background(), recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := waitJobState(t, service, job.ID, StateCompleted)
+	if completed.SourceRevisionKnown {
+		t.Fatalf("legacy verification job incorrectly claims known revision: %+v", completed)
+	}
+	if projected := ProjectJob(completed, recording); projected.Freshness != FreshnessUnknown {
+		t.Fatalf("legacy job projection freshness=%q, want unknown", projected.Freshness)
+	}
+	projection, ok := service.StatusFor(recording)
+	if !ok || projection.Freshness != FreshnessUnknown {
+		t.Fatalf("legacy verification freshness=%+v present=%t, want unknown", projection, ok)
 	}
 }
 
@@ -91,6 +174,43 @@ func TestVerificationReportsModifiedAndMissingPayload(t *testing.T) {
 				t.Fatalf("unexpected verification result: %#v", completed)
 			}
 		})
+	}
+}
+
+func TestV2IntegrityStreamsShardedMediaInitAndManifest(t *testing.T) {
+	root := t.TempDir()
+	store, header, mediaPath := makeShardedIntegrityArchive(t, root, "abababababababababababababababab")
+	service, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeService(t, service)
+
+	staleHeader := *header
+	staleHeader.ArchiveRevision = 2
+	staleHeader.TimelineRevision = 1
+	job, err := service.Start(context.Background(), &staleHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.SourceRevisionKnown || job.SourceArchiveRevision != 7 || job.SourceTimelineRevision != 3 {
+		t.Fatalf("v2 integrity job did not capture current header revisions: %+v", job)
+	}
+	completed := waitJobState(t, service, job.ID, StateCompleted)
+	if completed.Result == nil || completed.Result.Status != storage.IntegrityVerified || completed.Result.ObjectsTotal != 3 || completed.Result.ObjectsVerified != 3 {
+		t.Fatalf("v2 verification result=%+v, want three verified objects", completed.Result)
+	}
+
+	if _, err := store.SavePayload(header.ID, mediaPath, bytes.NewReader([]byte("modified")), storage.MaxObjectBytes); err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Start(context.Background(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	degraded := waitJobState(t, service, second.ID, StateCompleted)
+	if degraded.Result == nil || degraded.Result.Status != storage.IntegrityDegraded || degraded.Result.ObjectsTotal != 3 || degraded.Result.ObjectsVerified != 2 || degraded.Result.ObjectsCorrupt != 1 || len(degraded.Result.Issues) != 1 || degraded.Result.Issues[0].Code != "payload_mismatch" {
+		t.Fatalf("v2 corrupted payload result=%+v", degraded.Result)
 	}
 }
 
@@ -454,7 +574,7 @@ func TestJobSerializationDoesNotExposeURIsPathsOrRawErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	serialized := string(encoded)
-	for _, secret := range []string{"password", "credential", "cdn.invalid", store.Root(), "source"} {
+	for _, secret := range []string{"password", "credential", "cdn.invalid", store.Root(), "https://user", "https://cdn"} {
 		if strings.Contains(serialized, secret) {
 			t.Fatalf("job serialization leaked %q: %s", secret, serialized)
 		}
@@ -545,6 +665,67 @@ func makeIntegrityArchive(t *testing.T, root, id string, payload []byte) (*stora
 		t.Fatal(err)
 	}
 	return store, recording
+}
+
+func makeShardedIntegrityArchive(t *testing.T, root, id string) (*storage.Store, *domain.Recording, string) {
+	t.Helper()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	sessionID := "session-" + strings.Repeat("a", 64)
+	header := &domain.Recording{
+		FormatVersion:    2,
+		ID:               id,
+		SourceSessionID:  sessionID,
+		State:            domain.StateStopped,
+		CreatedAt:        now,
+		StartedAt:        now,
+		ArchiveRevision:  7,
+		TimelineRevision: 3,
+		Tracks:           map[string]*domain.Track{"main": {ID: "main", Segments: []domain.Segment{}}},
+		ShardedArchive:   &domain.ShardedArchiveSummary{},
+	}
+	if err := store.CreateShardedRecording(header); err != nil {
+		t.Fatal(err)
+	}
+	addObject := func(path string, data []byte) storage.PayloadResult {
+		t.Helper()
+		result, err := store.SavePayload(id, path, bytes.NewReader(data), storage.MaxObjectBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	initPath := "tracks/main/init.mp4"
+	initPayload := []byte("init-payload")
+	initObject := addObject(initPath, initPayload)
+	initSegment := domain.Segment{ID: "init-one", TrackID: "main", Sequence: 1, SourceURI: "https://source.invalid/init.mp4", StoragePath: initPath, PayloadSize: initObject.Size, SHA256: initObject.SHA256, IsInit: true}
+	initCoordinate := archiveindex.Coordinate{SessionID: sessionID, TrackID: "main", Sequence: 1, Kind: archiveindex.ObjectInit}
+	if err := store.AppendShardedMedia(ctx, id, storage.V2MediaRecord{Coordinate: initCoordinate, Segment: initSegment}); err != nil {
+		t.Fatal(err)
+	}
+	mediaPath := "tracks/main/segment.ts"
+	mediaPayload := []byte("media-payload")
+	mediaObject := addObject(mediaPath, mediaPayload)
+	mediaSegment := domain.Segment{ID: "seg-00000000000000000001", TrackID: "main", Sequence: 1, ArchiveOrdinal: 1, SourceURI: "https://source.invalid/segment.ts", Duration: 2, InitSegmentID: initSegment.ID, StoragePath: mediaPath, PayloadSize: mediaObject.Size, SHA256: mediaObject.SHA256}
+	mediaCoordinate := archiveindex.Coordinate{SessionID: sessionID, TrackID: "main", Sequence: 1, Kind: archiveindex.ObjectMedia}
+	if err := store.AppendShardedMedia(ctx, id, storage.V2MediaRecord{Coordinate: mediaCoordinate, Segment: mediaSegment}); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := "manifests/main/manifest.m3u8"
+	manifestPayload := []byte("#EXTM3U\n")
+	manifestObject := addObject(manifestPath, manifestPayload)
+	if err := store.AppendShardedManifest(ctx, id, domain.ManifestSnapshot{TrackID: "main", SourceURI: "https://source.invalid/playlist.m3u8", StoragePath: manifestPath, FetchedAt: now, SHA256: manifestObject.SHA256, Size: manifestObject.Size}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadRecordingHeader(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, loaded, mediaPath
 }
 
 func waitJobState(t *testing.T, service *Service, id string, want State) Job {

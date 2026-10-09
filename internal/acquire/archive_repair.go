@@ -3,6 +3,7 @@ package acquire
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
@@ -27,6 +28,22 @@ type historicalRecoveryWork struct {
 	coordinate archiveindex.Coordinate
 	epoch      uint64
 	gap        bool
+}
+
+type historicalSourceCoordinate struct {
+	discontinuity uint64
+	sequence      uint64
+}
+
+type historicalSourceTarget struct {
+	index    int
+	sequence uint64
+}
+
+type shardedHistoricalInitKey struct {
+	epoch         uint64
+	discontinuity uint64
+	sourceURI     string
 }
 
 type retryableHistoricalError struct{ cause error }
@@ -201,17 +218,30 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 	if playlist.EndList {
 		// EndList describes the source window; it does not seal the archive.
 	}
-	inventory, err := m.ArchiveInventory(id)
-	if err != nil {
-		return err
-	}
 	trackID := "main"
 	rootTrack := root.Tracks[trackID]
 	if rootTrack == nil {
 		return errors.New("main track is missing")
 	}
-	candidates := make([]historicalRecoveryWork, 0, min(len(playlist.Segments), maxHistoricalRecoveryWorkPerPass))
+	var inventory archiveindex.Inventory
+	var shardedEpochs []uint64
+	var shardedStates []archiveindex.CoverageState
 	selected := historicalAvailabilitySelection(media.HistoricalAvailability, playlist.Segments, time.Now())
+	if isShardedRecording(root) {
+		shardedEpochs, shardedStates, err = m.resolveShardedRecoveryCoordinates(ctx, id, rootTrack, playlist.Segments, selected)
+		if err != nil {
+			return err
+		}
+		if err := m.populateShardedHistoricalInitIdentities(ctx, id, rootTrack, playlist.Segments, selected, shardedEpochs); err != nil {
+			return err
+		}
+	} else {
+		inventory, err = m.ArchiveInventory(id)
+		if err != nil {
+			return err
+		}
+	}
+	candidates := make([]historicalRecoveryWork, 0, min(len(playlist.Segments), maxHistoricalRecoveryWorkPerPass))
 	work := 0
 	plannedInit := make(map[string]struct{})
 	for index, source := range playlist.Segments {
@@ -219,12 +249,23 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 			continue
 		}
 		epoch := historicalSourceEpoch(root, source)
+		state := archiveindex.CoverageUnknown
+		if isShardedRecording(root) {
+			epoch = shardedEpochs[index]
+			state = shardedStates[index]
+		} else {
+			coordinate := archiveindex.Coordinate{
+				SessionID: identity.ID, TrackID: trackID, SourceEpoch: epoch,
+				DiscontinuitySequence: source.DiscontinuitySequence, Sequence: source.Sequence,
+				Kind: archiveindex.ObjectMedia,
+			}
+			state = archiveindex.CoverageAt(inventory, coordinate)
+		}
 		coordinate := archiveindex.Coordinate{
 			SessionID: identity.ID, TrackID: trackID, SourceEpoch: epoch,
 			DiscontinuitySequence: source.DiscontinuitySequence, Sequence: source.Sequence,
 			Kind: archiveindex.ObjectMedia,
 		}
-		state := archiveindex.CoverageAt(inventory, coordinate)
 		if state == archiveindex.CoveragePresent || state == archiveindex.CoverageConflict {
 			continue
 		}
@@ -395,13 +436,17 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				if root == nil {
 					return storage.ErrNotFound
 				}
-				rootTrack = root.Tracks[trackID]
-				if rootTrack == nil {
-					return errors.New("main track is missing")
+				if !isShardedRecording(root) {
+					rootTrack = root.Tracks[trackID]
+					if rootTrack == nil {
+						return errors.New("main track is missing")
+					}
 				}
-				inventory, err = m.ArchiveInventory(id)
-				if err != nil {
-					return err
+				if !isShardedRecording(root) {
+					inventory, err = m.ArchiveInventory(id)
+					if err != nil {
+						return err
+					}
 				}
 			}
 			return nil
@@ -541,26 +586,40 @@ func (m *Manager) SealArchive(owner OwnershipToken, id string) (returnErr error)
 	if !ok {
 		return storage.ErrNotFound
 	}
-	e.mu.Lock()
-	active := e.recording != nil && e.recording.State == domain.StateRecording
-	e.mu.Unlock()
-	if active {
-		return ErrActiveRecording
+	if err := acquireArchiveRecoveryGate(context.Background(), e); err != nil {
+		return err
 	}
-	ownerAdopted := false
-	defer func() {
-		if !ownerAdopted {
-			return
-		}
-		if releaseErr := m.releaseRepairOwner(context.Background(), e, owner); returnErr == nil && releaseErr != nil {
-			returnErr = releaseErr
-		}
-	}()
-	err := m.withCanonicalMutationOwner(e, &owner, true, func() error {
-		ownerAdopted = true
+	defer releaseArchiveRecoveryGate(e)
+	state, err := terminalLifecycleState(e)
+	if err != nil {
+		return err
+	}
+	if state == domain.StateRecording {
+		return ErrLifecycleConflict
+	}
+	if archiveSealed(e) {
+		return m.releaseLifecycleOwner(context.Background(), e, owner)
+	}
+	if err := m.sealArchiveUnderRecoveryGate(e, &owner); err != nil {
+		return err
+	}
+	return m.releaseLifecycleOwner(context.Background(), e, owner)
+}
+
+func (m *Manager) sealArchiveUnderRecoveryGate(e *entry, owner *OwnershipToken) error {
+	return m.withCanonicalMutationOwner(e, owner, true, func() error {
 		root := m.recordingSnapshotForArchive(e)
 		if root == nil {
 			return storage.ErrNotFound
+		}
+		if isShardedRecording(root) {
+			return m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
+				if recording.State == domain.StateRecording {
+					return ErrLifecycleConflict
+				}
+				recording.ArchiveSealed = true
+				return nil
+			})
 		}
 		inventory, err := m.inventoryForRecording(root, false)
 		if err != nil {
@@ -574,16 +633,12 @@ func (m *Manager) SealArchive(owner OwnershipToken, id string) (returnErr error)
 		}
 		return m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
 			if recording.State == domain.StateRecording {
-				return ErrActiveRecording
+				return ErrLifecycleConflict
 			}
 			recording.ArchiveSealed = true
 			return nil
 		})
 	})
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func (m *Manager) repairMediaContext(e *entry, owner OwnershipToken) (adapterproto.MediaSource, uint64, bool, error) {
@@ -782,6 +837,199 @@ func historicalSourceEpoch(root *domain.Recording, source hls.MediaSegment) uint
 	return bestEpoch
 }
 
+// resolveShardedRecoveryCoordinates streams durable media, gap, and coverage
+// records once. It retains state only for coordinates in the source playlist.
+func (m *Manager) resolveShardedRecoveryCoordinates(ctx context.Context, id string, track *domain.Track, sources []hls.MediaSegment, selected []bool) ([]uint64, []archiveindex.CoverageState, error) {
+	if track == nil {
+		return nil, nil, errors.New("main track is missing")
+	}
+	targetsByCoordinate := make(map[historicalSourceCoordinate][]int)
+	targetsByDiscontinuity := make(map[uint64][]historicalSourceTarget)
+	for index, source := range sources {
+		if !selected[index] {
+			continue
+		}
+		key := historicalSourceCoordinate{discontinuity: source.DiscontinuitySequence, sequence: source.Sequence}
+		targetsByCoordinate[key] = append(targetsByCoordinate[key], index)
+		targetsByDiscontinuity[key.discontinuity] = append(targetsByDiscontinuity[key.discontinuity], historicalSourceTarget{index: index, sequence: key.sequence})
+	}
+	for discontinuity := range targetsByDiscontinuity {
+		sort.Slice(targetsByDiscontinuity[discontinuity], func(i, j int) bool {
+			left, right := targetsByDiscontinuity[discontinuity][i], targetsByDiscontinuity[discontinuity][j]
+			if left.sequence != right.sequence {
+				return left.sequence < right.sequence
+			}
+			return left.index < right.index
+		})
+	}
+	epochs := make([]uint64, len(sources))
+	states := make([]archiveindex.CoverageState, len(sources))
+	exactMedia := make([]bool, len(sources))
+	exactMediaEpoch := make([]uint64, len(sources))
+	exactGap := make([]bool, len(sources))
+	exactGapEpoch := make([]uint64, len(sources))
+	bestDistance := make([]uint64, len(sources))
+	bestEpoch := make([]uint64, len(sources))
+	newestCoverage := make([]time.Time, len(sources))
+	for index := range sources {
+		epochs[index] = track.SourceEpoch
+		states[index] = archiveindex.CoverageUnknown
+		bestDistance[index] = ^uint64(0)
+	}
+
+	if err := m.store.IterateShardedMedia(ctx, id, track.ID, func(record storage.V2MediaRecord) error {
+		coordinate := record.Coordinate
+		if coordinate.Kind == archiveindex.ObjectInit {
+			return nil
+		}
+		if indices := targetsByCoordinate[historicalSourceCoordinate{discontinuity: coordinate.DiscontinuitySequence, sequence: coordinate.Sequence}]; len(indices) != 0 {
+			for _, index := range indices {
+				if !exactMedia[index] {
+					exactMedia[index] = true
+					exactMediaEpoch[index] = coordinate.SourceEpoch
+				}
+			}
+		}
+		refs := targetsByDiscontinuity[coordinate.DiscontinuitySequence]
+		position := sort.Search(len(refs), func(i int) bool { return refs[i].sequence >= coordinate.Sequence })
+		for _, targetPosition := range []int{position - 1, position} {
+			if targetPosition < 0 || targetPosition >= len(refs) {
+				continue
+			}
+			sequence := refs[targetPosition].sequence
+			start := targetPosition
+			for start > 0 && refs[start-1].sequence == sequence {
+				start--
+			}
+			end := targetPosition + 1
+			for end < len(refs) && refs[end].sequence == sequence {
+				end++
+			}
+			distance := coordinate.Sequence
+			if distance < sequence {
+				distance = sequence - distance
+			} else {
+				distance -= sequence
+			}
+			for _, target := range refs[start:end] {
+				if distance < bestDistance[target.index] {
+					bestDistance[target.index] = distance
+					bestEpoch[target.index] = coordinate.SourceEpoch
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, newStorageStageError("iterate sharded recovery media", err)
+	}
+	if err := m.store.IterateShardedGaps(ctx, id, func(gap domain.Gap) error {
+		if gap.TrackID != track.ID {
+			return nil
+		}
+		refs := targetsByDiscontinuity[gap.DiscontinuitySequence]
+		start := sort.Search(len(refs), func(i int) bool { return refs[i].sequence >= gap.FromSequence })
+		for _, target := range refs[start:] {
+			if target.sequence > gap.ToSequence {
+				break
+			}
+			if !exactGap[target.index] {
+				exactGap[target.index] = true
+				exactGapEpoch[target.index] = gap.SourceEpoch
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, newStorageStageError("iterate sharded recovery gaps", err)
+	}
+	for index := range sources {
+		if !selected[index] {
+			continue
+		}
+		switch {
+		case exactGap[index]:
+			epochs[index] = exactGapEpoch[index]
+		case exactMedia[index]:
+			epochs[index] = exactMediaEpoch[index]
+		case bestDistance[index] != ^uint64(0):
+			epochs[index] = bestEpoch[index]
+		}
+		if exactMedia[index] && exactMediaEpoch[index] == epochs[index] {
+			states[index] = archiveindex.CoveragePresent
+		}
+	}
+	if err := m.store.IterateShardedCoverage(ctx, id, func(coverage archiveindex.Coverage) error {
+		if coverage.TrackID != track.ID || coverage.Kind == archiveindex.ObjectInit {
+			return nil
+		}
+		refs := targetsByDiscontinuity[coverage.DiscontinuitySequence]
+		start := sort.Search(len(refs), func(i int) bool { return refs[i].sequence >= coverage.FromSequence })
+		for _, target := range refs[start:] {
+			if target.sequence > coverage.ToSequence {
+				break
+			}
+			if epochs[target.index] != coverage.SourceEpoch {
+				continue
+			}
+			state := states[target.index]
+			if state == archiveindex.CoverageConflict {
+				continue
+			}
+			if coverage.State == archiveindex.CoverageConflict {
+				states[target.index] = archiveindex.CoverageConflict
+				continue
+			}
+			if state == archiveindex.CoveragePresent {
+				continue
+			}
+			if coverage.State == archiveindex.CoveragePresent {
+				states[target.index] = archiveindex.CoveragePresent
+				continue
+			}
+			if coverage.ObservedAt.After(newestCoverage[target.index]) {
+				newestCoverage[target.index] = coverage.ObservedAt
+				states[target.index] = coverage.State
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, newStorageStageError("iterate sharded recovery coverage", err)
+	}
+	return epochs, states, nil
+}
+
+func (m *Manager) populateShardedHistoricalInitIdentities(ctx context.Context, id string, track *domain.Track, sources []hls.MediaSegment, selected []bool, epochs []uint64) error {
+	if track == nil {
+		return errors.New("main track is missing")
+	}
+	wanted := make(map[shardedHistoricalInitKey]struct{})
+	for index, source := range sources {
+		if !selected[index] || source.Init == nil {
+			continue
+		}
+		wanted[shardedHistoricalInitKey{epoch: epochs[index], discontinuity: source.DiscontinuitySequence, sourceURI: sourceURIIdentity(source.Init.URI)}] = struct{}{}
+	}
+	found := make(map[shardedHistoricalInitKey]struct{})
+	for _, segment := range track.InitSegments {
+		key := shardedHistoricalInitKey{epoch: segment.SourceEpoch, discontinuity: segment.DiscontinuitySequence, sourceURI: sourceURIIdentity(segment.SourceURI)}
+		found[key] = struct{}{}
+	}
+	if err := m.store.IterateShardedInitSegments(ctx, id, track.ID, func(record storage.V2MediaRecord) error {
+		segment := record.Segment
+		key := shardedHistoricalInitKey{epoch: segment.SourceEpoch, discontinuity: segment.DiscontinuitySequence, sourceURI: sourceURIIdentity(segment.SourceURI)}
+		if _, ok := wanted[key]; !ok {
+			return nil
+		}
+		if _, exists := found[key]; !exists {
+			track.InitSegments = append(track.InitSegments, segment)
+			found[key] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		return newStorageStageError("iterate sharded recovery init media", err)
+	}
+	return nil
+}
+
 func historicalInitIdentity(track *domain.Track, source hls.MediaSegment, epoch uint64) string {
 	if source.Init == nil {
 		return ""
@@ -808,6 +1056,7 @@ func (m *Manager) acquireHistoricalInit(ctx context.Context, e *entry, owner Own
 	}
 	coordinate := coordinateForSegment(sessionID, asset)
 	if existing, ok := findRootSegment(m.recordingSnapshotForArchive(e), coordinate); ok {
+		rememberShardedHistoricalInit(track, existing)
 		return existing.ID, nil
 	}
 	id := initSegmentID(hls.Map{URI: source.Init.URI, ByteRange: source.Init.ByteRange}, epoch, source.DiscontinuitySequence)
@@ -828,7 +1077,20 @@ func (m *Manager) acquireHistoricalInit(ctx context.Context, e *entry, owner Own
 	if err := m.commitHistoricalPayload(ctx, e, owner, terminal, asset, payload); err != nil {
 		return "", err
 	}
+	rememberShardedHistoricalInit(track, asset)
 	return asset.ID, nil
+}
+
+func rememberShardedHistoricalInit(track *domain.Track, segment domain.Segment) {
+	if track == nil || !segment.IsInit {
+		return
+	}
+	for _, existing := range track.InitSegments {
+		if existing.ID == segment.ID {
+			return
+		}
+	}
+	track.InitSegments = append(track.InitSegments, segment)
 }
 
 func (m *Manager) commitHistoricalPayload(ctx context.Context, e *entry, owner OwnershipToken, terminal bool, segment domain.Segment, payload *storage.IngestPayload) error {
@@ -866,11 +1128,26 @@ func (m *Manager) recordHistoricalCoverage(e *entry, owner *OwnershipToken, term
 		if root == nil {
 			return storage.ErrNotFound
 		}
+		coverage := recordHistoricalCoverage(coordinate, state, reason, time.Now().UTC())
+		if isShardedRecording(root) {
+			if state == archiveindex.CoverageKnownMissing {
+				if err := m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
+					track := recording.Tracks[coordinate.TrackID]
+					if track == nil {
+						return errors.New("main track is missing")
+					}
+					addMissingRangesDS(recording, track, coordinate.SourceEpoch, coordinate.DiscontinuitySequence, coordinate.Sequence, coordinate.Sequence, reason, capturedSequenceSetDS(track, coordinate.SourceEpoch, coordinate.DiscontinuitySequence))
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			return m.store.AppendShardedCoverage(context.Background(), root.ID, coverage)
+		}
 		inventory, err := m.inventoryForRecording(root, false)
 		if err != nil {
 			return err
 		}
-		coverage := recordHistoricalCoverage(coordinate, state, reason, time.Now().UTC())
 		if err := archiveindex.ApplyCoverage(&inventory, coverage); err != nil {
 			if isArchiveIndexCapacityError(err) {
 				return ErrArchiveIndexLimit

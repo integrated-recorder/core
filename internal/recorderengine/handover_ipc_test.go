@@ -231,7 +231,7 @@ func TestHandoverResumeAcceptsUnchangedAbortAndNewerRollbackOwner(t *testing.T) 
 }
 
 func TestHandoverTargetActivationRequiresTransferredHostOwner(t *testing.T) {
-	source, _, owners, archive := newManagedEngineFixture(t, fixtureTransport{})
+	source, sourceManager, owners, archive := newManagedEngineFixture(t, fixtureTransport{})
 	media := adapterproto.MediaSource{Type: "hls", ManifestURL: "https://fixture.example/live.m3u8"}
 	if _, err := source.Handle(context.Background(), recorderengine.OperationStartResolved, managedStartPayload(t, generatedRecordingID, media)); err != nil {
 		t.Fatal(err)
@@ -244,6 +244,11 @@ func TestHandoverTargetActivationRequiresTransferredHostOwner(t *testing.T) {
 	targetIdentity := acquire.HandoverTargetIdentity{EngineGeneration: "dddddddddddddddddddddddddddddddd", WorkerInstance: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
 	target := newTargetManagedEngine(t, owners, archive, targetIdentity.EngineGeneration, targetIdentity.WorkerInstance)
 
+	// The source-boundary assertion below requires the target's only advertised
+	// continuation segment to already be canonical. StartResolved can return
+	// before the asynchronous first media commit, so wait for that observable
+	// boundary before pausing the source.
+	waitForSegment(t, sourceManager, generatedRecordingID)
 	_ = waitForHandoverSnapshot(t, source, generatedRecordingID, oldOwner)
 	snapshot, err := callEngine[recorderengine.HandoverSnapshotResult](t, source, recorderengine.OperationHandoverPause, recorderengine.HandoverOwnerRequest{RecordingID: generatedRecordingID, Owner: oldOwner})
 	if err != nil {

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/hls"
 	"github.com/integrated-recorder/core/internal/runtimehook"
@@ -343,6 +344,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		e.mu.Unlock()
 		return false, errors.New("recording state could not be copied")
 	}
+	priorGaps := append([]domain.Gap(nil), r.Gaps...)
 	var observedEpoch uint64
 	if err := func() error {
 		t := r.Tracks["main"]
@@ -515,6 +517,9 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	}(); err != nil {
 		return false, err
 	}
+	if isShardedRecording(r) {
+		pruneShardedRuntimeTail(r)
+	}
 	e.mu.Lock()
 	if e.deleted || e.mediaGeneration != generation {
 		e.mu.Unlock()
@@ -522,23 +527,49 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	}
 	asyncCommit := scheduler != nil && !scheduler.directMode
 	if asyncCommit {
+		e.mu.Unlock()
+		if isShardedRecording(r) {
+			// Live media jobs may publish higher presentation ordinals as soon
+			// as this observation returns to discovery. Publish any newly
+			// reserved gap slots first so the live index never sees a hole.
+			if err := m.withCanonicalCommit(e, func() error {
+				return m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps)
+			}); err != nil {
+				return false, newStorageStageError("persist sharded live gap reservations", err)
+			}
+		}
 		// Publish only the in-memory observation before discovery. The queued
 		// writer persists the latest root projection after any earlier segment
 		// commit, keeping the network poller independent from filesystem latency.
+		e.mu.Lock()
+		if e.deleted || e.mediaGeneration != generation {
+			e.mu.Unlock()
+			return false, nil
+		}
 		e.recording = r
 		e.mu.Unlock()
 		e.persistMu.Unlock()
 		persistLocked = false
 		m.refreshLivePlaybackObservation(e, r, playlist.Segments, observedEpoch)
-		if err := scheduler.queueRecordingCommit(); err != nil {
+		if err := scheduler.queueRecordingCommit(priorGaps); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
 	e.mu.Unlock()
 	if err := m.withCanonicalCommit(e, func() error {
-		if err := m.store.SaveRecording(r); err != nil {
+		if isShardedRecording(r) {
+			if err := m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps); err != nil {
+				return newStorageStageError("persist sharded gaps", err)
+			}
+		}
+		if err := m.saveRecordingHeader(r); err != nil {
 			return newStorageStageError("recording root commit", err)
+		}
+		if isShardedRecording(r) {
+			if err := m.refreshShardedHeader(r); err != nil {
+				return newStorageStageError("refresh sharded root summary", err)
+			}
 		}
 		e.mu.Lock()
 		defer e.mu.Unlock()
@@ -579,6 +610,7 @@ func (m *Manager) updateAtMediaGenerationWithinAuthorizedCommit(e *entry, genera
 		return false, nil
 	}
 	next := clone(e.recording)
+	base := clone(e.recording)
 	e.mu.Unlock()
 	if next == nil {
 		e.mu.Lock()
@@ -591,8 +623,19 @@ func (m *Manager) updateAtMediaGenerationWithinAuthorizedCommit(e *entry, genera
 	if err := fn(next); err != nil {
 		return false, err
 	}
-	if err := m.store.SaveRecording(next); err != nil {
+	if isShardedRecording(next) {
+		pruneShardedRuntimeTail(next)
+		if err := m.appendShardedGapsSince(next.ID, base.Gaps, next.Gaps); err != nil {
+			return false, newStorageStageError("persist sharded gaps", err)
+		}
+	}
+	if err := m.saveRecordingHeader(next); err != nil {
 		return false, newStorageStageError("recording root commit", err)
+	}
+	if isShardedRecording(next) {
+		if err := m.refreshShardedHeader(next); err != nil {
+			return false, newStorageStageError("refresh sharded root summary", err)
+		}
 	}
 	e.mu.Lock()
 	if e.deleted || e.mediaGeneration != generation {
@@ -1829,17 +1872,35 @@ func (m *Manager) hasSequence(e *entry, epoch, sequence uint64) bool {
 
 func (m *Manager) hasSequenceCoordinate(e *entry, epoch, discontinuitySequence, sequence uint64) bool {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	track := e.recording.Tracks["main"]
+	if e.deleted || e.recording == nil {
+		e.mu.Unlock()
+		return false
+	}
+	recording := e.recording
+	track := recording.Tracks["main"]
 	if track == nil {
+		e.mu.Unlock()
 		return false
 	}
 	for _, s := range track.Segments {
 		if s.SourceEpoch == epoch && s.DiscontinuitySequence == discontinuitySequence && s.Sequence == sequence {
+			e.mu.Unlock()
 			return true
 		}
 	}
-	return false
+	if !isShardedRecording(recording) {
+		e.mu.Unlock()
+		return false
+	}
+	id, sessionID := recording.ID, recording.SourceSessionID
+	e.mu.Unlock()
+	coordinate := archiveindex.Coordinate{
+		SessionID: sessionID, TrackID: "main", SourceEpoch: epoch,
+		DiscontinuitySequence: discontinuitySequence, Sequence: sequence,
+		Kind: archiveindex.ObjectMedia,
+	}
+	_, err := m.store.LookupShardedMediaByCoordinate(context.Background(), id, coordinate)
+	return err == nil || !errors.Is(err, storage.ErrNotFound)
 }
 func (m *Manager) markPending(e *entry, epoch, discontinuitySequence, seq uint64, err error) error {
 	updateErr := m.update(e, func(r *domain.Recording) error {

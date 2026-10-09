@@ -273,7 +273,35 @@ func TestBlockedHeadDoesNotBlockNewerSegmentsAndKeepsArchiveOrder(t *testing.T) 
 		waitSignal(t, fastStarted[sequence], fmt.Sprintf("sequence %d before head release", sequence))
 	}
 	waitSignal(t, secondPoll, "manifest repoll while sequence 100 is blocked")
-	waitForSegmentCount(t, manager, recording.ID, 5)
+	waitUntil(t, 5*time.Second, func() bool {
+		e, ok := manager.entry(recording.ID)
+		if !ok {
+			return false
+		}
+		e.mu.Lock()
+		scheduler := e.scheduler
+		e.mu.Unlock()
+		if scheduler == nil {
+			return false
+		}
+		scheduler.mu.Lock()
+		defer scheduler.mu.Unlock()
+		buffered := 0
+		for key, task := range scheduler.tasks {
+			if key.sequence >= 101 && key.sequence <= 105 && task.state == segmentTaskBuffered && task.bufferedPayload != nil {
+				buffered++
+			}
+		}
+		return buffered == 5
+	}, "newer complete segments buffered while head fetch is blocked")
+	current, getErr := manager.Get(recording.ID)
+	if getErr != nil || current == nil || current.SegmentCount() != 0 {
+		count := 0
+		if current != nil {
+			count = current.SegmentCount()
+		}
+		t.Fatalf("later media was published before the manifest head: segments=%d err=%v", count, getErr)
+	}
 	if got := counts[100].Load(); got != 1 {
 		t.Fatalf("sequence 100 duplicated during in-flight/retry rediscovery: requests=%d", got)
 	}
@@ -1329,13 +1357,32 @@ func TestEpochDiscontinuityMarkerFollowsEarliestCapturedOrdinalAndSidecars(t *te
 	waitForSegmentCount(t, manager, recording.ID, 1)
 	waitSignal(t, zeroStarted, "earlier sequence in reset epoch")
 	waitSignal(t, oneStarted, "later sequence in reset epoch")
-	waitForSegmentCount(t, manager, recording.ID, 2)
+	waitUntil(t, 5*time.Second, func() bool {
+		e, ok := manager.entry(recording.ID)
+		if !ok {
+			return false
+		}
+		e.mu.Lock()
+		scheduler := e.scheduler
+		e.mu.Unlock()
+		if scheduler == nil {
+			return false
+		}
+		scheduler.mu.Lock()
+		defer scheduler.mu.Unlock()
+		for key, task := range scheduler.tasks {
+			if key.epoch == 1 && key.sequence == 1 && task.state == segmentTaskBuffered && task.bufferedPayload != nil {
+				return true
+			}
+		}
+		return false
+	}, "later reset-epoch segment buffered while earlier segment is blocked")
 	current, err := manager.Get(recording.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(current.Tracks["main"].Segments) != 2 || !current.Tracks["main"].Segments[1].Discontinuity {
-		t.Fatalf("first completed epoch-1 segment did not receive marker: %#v", current.Tracks["main"].Segments)
+	if len(current.Tracks["main"].Segments) != 1 {
+		t.Fatalf("later reset-epoch segment published before earlier blocked segment: %#v", current.Tracks["main"].Segments)
 	}
 	releaseOnce.Do(func() { close(releaseZero) })
 	waitForSegmentCount(t, manager, recording.ID, 3)
@@ -1348,16 +1395,12 @@ func TestEpochDiscontinuityMarkerFollowsEarliestCapturedOrdinalAndSidecars(t *te
 		t.Fatalf("ordinal-based epoch marker=%#v", segments)
 	}
 	for _, segment := range segments[1:] {
-		data, readErr := os.ReadFile(filepath.Join(store.Root(), "recordings", recording.ID, filepath.FromSlash(segment.StoragePath)+".json"))
+		record, readErr := store.LookupShardedMediaByArchiveOrdinal(context.Background(), recording.ID, "main", segment.ArchiveOrdinal)
 		if readErr != nil {
 			t.Fatal(readErr)
 		}
-		var sidecar domain.Segment
-		if readErr = json.Unmarshal(data, &sidecar); readErr != nil {
-			t.Fatal(readErr)
-		}
-		if sidecar.Discontinuity != segment.Discontinuity {
-			t.Fatalf("sidecar marker disagrees with root for ordinal %d: sidecar=%v root=%v", segment.ArchiveOrdinal, sidecar.Discontinuity, segment.Discontinuity)
+		if record.Segment.Discontinuity != segment.Discontinuity {
+			t.Fatalf("sharded media marker disagrees with materialized recording for ordinal %d: shard=%v root=%v", segment.ArchiveOrdinal, record.Segment.Discontinuity, segment.Discontinuity)
 		}
 	}
 }

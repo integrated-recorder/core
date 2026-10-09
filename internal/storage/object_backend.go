@@ -162,6 +162,14 @@ func validateArchiveRecording(recording *domain.Recording) error {
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return errors.New("invalid recording")
 	}
+	if err := validateRecordingFormat(recording.FormatVersion); err != nil {
+		return err
+	}
+	if recording.FormatVersion == ShardedArchiveFormatVersion {
+		if err := validateV2Header(recording); err != nil {
+			return err
+		}
+	}
 	if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
 		return errors.New("invalid recording metadata timeline")
 	}
@@ -183,7 +191,7 @@ func (b *ObjectStoreArchiveBackend) LoadAll() ([]*domain.Recording, error) {
 		return nil, errors.New("recording deletion state is unavailable")
 	}
 	roots := make(map[string]struct{})
-	err = b.walkPages(context.Background(), "recordings/", maxArchiveEnumeration, func(item PhysicalObjectInfo) error {
+	err = b.walkPagesUnbounded(context.Background(), "recordings/", func(item PhysicalObjectInfo) error {
 		const suffix = "/recording.json"
 		if !strings.HasPrefix(item.Key, "recordings/") || !strings.HasSuffix(item.Key, suffix) {
 			return nil
@@ -209,15 +217,29 @@ func (b *ObjectStoreArchiveBackend) LoadAll() ([]*domain.Recording, error) {
 		recording, readErr := b.loadRecordingForRecovery(context.Background(), id)
 		if readErr != nil {
 			code := "metadata_invalid"
+			message := "recording metadata is unavailable; object data was preserved"
 			if isObjectNotFound(readErr) {
 				code = "metadata_missing"
 			}
-			b.addRecoveryIssue(RecoveryIssue{ID: id, Code: code, Message: "recording metadata is unavailable; object data was preserved"})
+			if errors.Is(readErr, ErrUnsupportedRecordingFormat) {
+				code = "metadata_format_unsupported"
+				message = "recording format is unsupported; object data was preserved"
+			}
+			b.addRecoveryIssue(RecoveryIssue{ID: id, Code: code, Message: message})
 			continue
 		}
-		changed, recErr := b.reconcileRecording(recording)
-		if recErr != nil {
-			b.addRecoveryIssue(RecoveryIssue{ID: id, Code: "reconciliation_incomplete", Message: "recording payload reconciliation was incomplete"})
+		changed := false
+		if recording.FormatVersion == ShardedArchiveFormatVersion {
+			if err := validateV2Header(recording); err != nil {
+				b.addRecoveryIssue(RecoveryIssue{ID: id, Code: "metadata_invalid", Message: "sharded recording header is invalid; archive data was preserved"})
+				continue
+			}
+		} else {
+			var recErr error
+			changed, recErr = b.reconcileRecording(recording)
+			if recErr != nil {
+				b.addRecoveryIssue(RecoveryIssue{ID: id, Code: "reconciliation_incomplete", Message: "recording payload reconciliation was incomplete"})
+			}
 		}
 		invalidTrack := false
 		for _, track := range recording.Tracks {
@@ -291,7 +313,7 @@ func (b *ObjectStoreArchiveBackend) loadAllReadOnly(max int, bounded bool) ([]*d
 		return nil, errors.New("recording deletion state is unavailable")
 	}
 	roots := map[string]struct{}{}
-	err = b.walkPages(context.Background(), "recordings/", maxArchiveEnumeration, func(item PhysicalObjectInfo) error {
+	err = b.walkPagesUnbounded(context.Background(), "recordings/", func(item PhysicalObjectInfo) error {
 		if strings.HasPrefix(item.Key, "recordings/") && strings.HasSuffix(item.Key, "/recording.json") {
 			id := strings.TrimSuffix(strings.TrimPrefix(item.Key, "recordings/"), "/recording.json")
 			if recordingIDPattern.MatchString(id) {
@@ -363,6 +385,14 @@ func (b *ObjectStoreArchiveBackend) loadRecordingWithTimelineValidation(ctx cont
 	var recording domain.Recording
 	if err := json.Unmarshal(data, &recording); err != nil || recording.ID != id {
 		return nil, errors.New("recording metadata is invalid")
+	}
+	if err := validateRecordingFormat(recording.FormatVersion); err != nil {
+		return nil, err
+	}
+	if recording.FormatVersion == ShardedArchiveFormatVersion {
+		if err := validateV2Header(&recording); err != nil {
+			return nil, err
+		}
 	}
 	if validateTimeline && domain.ValidateMetadataTimeline(recording.MetadataTimeline) != nil {
 		return nil, errors.New("recording metadata timeline is invalid")
@@ -475,11 +505,40 @@ func (b *ObjectStoreArchiveBackend) stageAndPut(ctx context.Context, key string,
 }
 
 func (b *ObjectStoreArchiveBackend) putBytes(ctx context.Context, key string, data []byte, limit int64) error {
-	if int64(len(data)) > limit || int64(len(data)) > MaxObjectBytes {
+	if limit <= 0 || limit > MaxObjectBytes {
+		limit = MaxObjectBytes
+	}
+	if ValidateObjectKey(key) != nil || int64(len(data)) > limit {
 		return errors.New("storage object exceeds size limit")
 	}
-	_, err := b.stageAndPut(ctx, key, bytes.NewReader(data), limit, int64(len(data)))
-	return err
+	// Sidecars and roots are already bounded, complete in-memory documents.
+	// Staging each one through a temporary file adds a local fsync before the
+	// provider's own atomic durable Put, multiplying serialized provider IPC
+	// commits on the canonical metadata path. Hash the bounded bytes in memory
+	// and rely on the Storage Provider contract that Put atomically publishes a
+	// complete object, then verify the provider's returned digest. Payload
+	// streams still use stageAndPut so their size/hash are established while
+	// consuming an untrusted source reader.
+	digest := sha256.Sum256(data)
+	hexdigest := hex.EncodeToString(digest[:])
+	callCtx, cancel := objectContext(ctx)
+	info, putErr := b.objects.Put(callCtx, key, bytes.NewReader(data), int64(len(data)))
+	cancel()
+	if putErr == nil {
+		if !validPutInfo(info, key, int64(len(data)), hexdigest) {
+			b.telemetry.recordError()
+			return errors.New("physical object publication was not verified")
+		}
+		return nil
+	}
+	// An IPC/transport error can happen after the provider atomically published
+	// the object. Accept that uncertain outcome only after independently
+	// confirming exact size and digest, as with streamed payload publication.
+	if confirmErr := b.confirmObject(ctx, key, int64(len(data)), hexdigest); confirmErr == nil {
+		return nil
+	}
+	b.telemetry.recordError()
+	return errors.New("physical object publication failed")
 }
 
 func (b *ObjectStoreArchiveBackend) recordingKey(id, relative string) (string, error) {
@@ -848,12 +907,38 @@ func (b *ObjectStoreArchiveBackend) walkPages(parent context.Context, prefix str
 	return errors.New("archive object listing exceeds page limit")
 }
 
-func (b *ObjectStoreArchiveBackend) readObject(ctx context.Context, key string, limit int64) ([]byte, PhysicalObjectInfo, error) {
-	info, err := b.stat(ctx, key)
-	if err != nil {
-		return nil, PhysicalObjectInfo{}, err
+// walkPagesUnbounded traverses a provider prefix with bounded page memory and
+// no archive-wide object-count ceiling. Provider page size remains bounded.
+func (b *ObjectStoreArchiveBackend) walkPagesUnbounded(parent context.Context, prefix string, visit func(PhysicalObjectInfo) error) error {
+	if visit == nil {
+		return errors.New("invalid archive listing visitor")
 	}
-	if limit <= 0 || limit > MaxObjectBytes || info.Size > limit {
+	cursor := ""
+	for {
+		if err := parentContextOrBackground(parent).Err(); err != nil {
+			return err
+		}
+		page, err := b.listPage(parent, prefix, cursor, maxObjectPageSize)
+		if err != nil {
+			return err
+		}
+		for _, item := range page.Items {
+			if err := visit(item); err != nil {
+				return err
+			}
+		}
+		if page.NextCursor == "" {
+			return nil
+		}
+		if page.NextCursor <= cursor {
+			return errors.New("physical object cursor did not advance")
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func (b *ObjectStoreArchiveBackend) readObject(ctx context.Context, key string, limit int64) ([]byte, PhysicalObjectInfo, error) {
+	if limit <= 0 || limit > MaxObjectBytes {
 		return nil, PhysicalObjectInfo{}, errors.New("archive document exceeds size limit")
 	}
 	reader, opened, cancel, err := b.open(ctx, key)
@@ -862,14 +947,20 @@ func (b *ObjectStoreArchiveBackend) readObject(ctx context.Context, key string, 
 	}
 	defer cancel()
 	defer reader.Close()
-	if opened.Size != info.Size {
-		return nil, PhysicalObjectInfo{}, errors.New("archive object changed during read")
+	if opened.Size > limit {
+		return nil, PhysicalObjectInfo{}, errors.New("archive document exceeds size limit")
 	}
 	data, err := io.ReadAll(io.LimitReader(contextReader{ctx: parentContextOrBackground(ctx), reader: reader}, limit+1))
-	if err != nil || int64(len(data)) != info.Size || int64(len(data)) > limit {
+	if err != nil || int64(len(data)) != opened.Size || int64(len(data)) > limit {
 		return nil, PhysicalObjectInfo{}, errors.New("archive object read is incomplete")
 	}
-	return data, info, nil
+	if opened.SHA256 != "" {
+		digest := sha256.Sum256(data)
+		if hex.EncodeToString(digest[:]) != opened.SHA256 {
+			return nil, PhysicalObjectInfo{}, errors.New("archive object integrity check failed")
+		}
+	}
+	return data, opened, nil
 }
 
 func (b *ObjectStoreArchiveBackend) putJSON(ctx context.Context, key string, value any, limit int64) error {
@@ -945,17 +1036,27 @@ func (b *ObjectStoreArchiveBackend) DeleteRecordingData(id string) error {
 
 func (b *ObjectStoreArchiveBackend) deleteRecordingObjects(id string) error {
 	prefix := "recordings/" + id + "/"
-	items, err := b.listAll(context.Background(), prefix, maxObjectEnumeration)
-	if err != nil {
-		return err
-	}
-	for _, item := range items {
-		if !strings.HasPrefix(item.Key, prefix) || ValidateObjectKey(item.Key) != nil {
-			return errors.New("recording object listing is invalid")
-		}
-		if err := b.delete(context.Background(), item.Key); err != nil {
+	cursor := ""
+	for {
+		page, err := b.listPage(context.Background(), prefix, cursor, maxObjectPageSize)
+		if err != nil {
 			return err
 		}
+		for _, item := range page.Items {
+			if !strings.HasPrefix(item.Key, prefix) || ValidateObjectKey(item.Key) != nil {
+				return errors.New("recording object listing is invalid")
+			}
+			if err := b.delete(context.Background(), item.Key); err != nil {
+				return err
+			}
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		if page.NextCursor <= cursor {
+			return errors.New("recording object cursor did not advance")
+		}
+		cursor = page.NextCursor
 	}
 	remaining, err := b.listPage(context.Background(), prefix, "", 1)
 	if err != nil || len(remaining.Items) != 0 {
@@ -1073,19 +1174,19 @@ func (b *ObjectStoreArchiveBackend) RecordingDirectoryBytesContext(ctx context.C
 	if !recordingIDPattern.MatchString(id) {
 		return 0, errors.New("invalid recording id")
 	}
-	items, err := b.listAll(ctx, "recordings/"+id+"/", maxObjectEnumeration)
-	if err != nil {
-		return 0, errors.New("recording archive listing is unavailable")
-	}
 	var total int64
-	for _, item := range items {
+	listErr := b.walkPagesUnbounded(ctx, "recordings/"+id+"/", func(item PhysicalObjectInfo) error {
 		if item.Size < 0 {
-			return 0, errors.New("recording archive contains an invalid object size")
+			return errors.New("recording archive contains an invalid object size")
 		}
 		if total > math.MaxInt64-item.Size {
-			return 0, ErrArchiveSizeOverflow
+			return ErrArchiveSizeOverflow
 		}
 		total += item.Size
+		return nil
+	})
+	if listErr != nil {
+		return 0, errors.New("recording archive listing is unavailable")
 	}
 	return total, nil
 }
@@ -1201,7 +1302,7 @@ func (b *ObjectStoreArchiveBackend) StorageStats() (StorageStats, error) {
 		return StorageStats{}, errors.New("recording deletion state is unavailable")
 	}
 	roots := map[string]struct{}{}
-	err = b.walkPages(context.Background(), "recordings/", maxArchiveEnumeration, func(item PhysicalObjectInfo) error {
+	err = b.walkPagesUnbounded(context.Background(), "recordings/", func(item PhysicalObjectInfo) error {
 		id := ""
 		if strings.HasPrefix(item.Key, "recordings/") {
 			parts := strings.SplitN(strings.TrimPrefix(item.Key, "recordings/"), "/", 2)
@@ -1233,6 +1334,16 @@ func (b *ObjectStoreArchiveBackend) StorageStats() (StorageStats, error) {
 			return StorageStats{}, errors.New("canonical recording metadata unavailable")
 		}
 		stats.RecordingCount++
+		if recording.FormatVersion == ShardedArchiveFormatVersion {
+			maxInt := uint64(^uint(0) >> 1)
+			if recording.ShardedArchive.ManifestSnapshotCount > maxInt || recording.ShardedArchive.MediaCount > maxInt || recording.ShardedArchive.InitCount > maxInt {
+				return StorageStats{}, errors.New("recording statistics overflow")
+			}
+			stats.ManifestCount += int(recording.ShardedArchive.ManifestSnapshotCount)
+			stats.SegmentCount += int(recording.ShardedArchive.MediaCount)
+			stats.InitSegmentCount += int(recording.ShardedArchive.InitCount)
+			continue
+		}
 		stats.ManifestCount += len(recording.Snapshots)
 		for _, track := range recording.Tracks {
 			if track == nil {

@@ -25,6 +25,8 @@ type memoryPhysicalObjects struct {
 	modified           map[string]time.Time
 	putKeys            []string
 	listCalls          int
+	statCalls          int
+	openCalls          int
 	maxPutRead         int
 	failPutBefore      bool
 	failPutAfterCommit bool
@@ -148,6 +150,7 @@ func (m *memoryPhysicalObjects) Open(ctx context.Context, key string) (io.ReadCl
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.openCalls++
 	value, ok := m.objects[key]
 	if !ok {
 		return nil, PhysicalObjectInfo{}, ErrObjectNotFound
@@ -184,10 +187,79 @@ func (m *memoryPhysicalObjects) Stat(ctx context.Context, key string) (PhysicalO
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.statCalls++
 	if _, ok := m.objects[key]; !ok {
 		return PhysicalObjectInfo{}, ErrObjectNotFound
 	}
 	return m.infoLocked(key), nil
+}
+
+func TestLoadSidecarUsesOneOpenAndValidatesReturnedDigest(t *testing.T) {
+	objects := newMemoryPhysicalObjects()
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "0123456789abcdef0123456789abcdef"
+	if err := store.SaveSidecar(id, "archive/v2/test", map[string]string{"state": "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	objects.mu.Lock()
+	objects.statCalls, objects.openCalls = 0, 0
+	objects.mu.Unlock()
+	var got map[string]string
+	if err := store.LoadSidecar(id, "archive/v2/test", 1024, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["state"] != "ready" {
+		t.Fatalf("loaded sidecar = %#v", got)
+	}
+	objects.mu.Lock()
+	stats, opens := objects.statCalls, objects.openCalls
+	objects.mu.Unlock()
+	if stats != 0 || opens != 1 {
+		t.Fatalf("sidecar read operations = stat:%d open:%d, want stat:0 open:1", stats, opens)
+	}
+}
+
+func TestPutBytesPublishesBoundedSidecarDirectlyAndConfirmsUncertainSuccess(t *testing.T) {
+	objects := newMemoryPhysicalObjects()
+	store, err := NewWithObjectStore(t.TempDir(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := store.StorageBackend.(*ObjectStoreArchiveBackend)
+	const id = "1123456789abcdef0123456789abcdef"
+	value := map[string]string{"state": "ready"}
+
+	if err := backend.SaveSidecar(id, "archive/v2/sidecar", value); err != nil {
+		t.Fatal(err)
+	}
+	objects.mu.Lock()
+	putsAfterDirect, statsAfterDirect, opensAfterDirect := len(objects.putKeys), objects.statCalls, objects.openCalls
+	objects.failPutAfterCommit = true
+	objects.mu.Unlock()
+	if putsAfterDirect != 1 || statsAfterDirect != 0 || opensAfterDirect != 0 {
+		t.Fatalf("successful bounded Put used unexpected follow-up operations: put=%d stat=%d open=%d", putsAfterDirect, statsAfterDirect, opensAfterDirect)
+	}
+
+	// The provider commits atomically but loses its response. Core may accept
+	// this only after exact size+SHA confirmation, and must not issue a second
+	// Put with a different object identity.
+	value["state"] = "updated"
+	if err := backend.SaveSidecar(id, "archive/v2/sidecar", value); err != nil {
+		t.Fatalf("confirmed ambiguous Put failed: %v", err)
+	}
+	objects.mu.Lock()
+	puts, stats, opens := len(objects.putKeys), objects.statCalls, objects.openCalls
+	objects.mu.Unlock()
+	if puts != 2 || stats != 1 || opens != 1 {
+		t.Fatalf("uncertain publication verification calls: put=%d stat=%d open=%d, want 2/1/1", puts, stats, opens)
+	}
+	var got map[string]string
+	if err := backend.LoadSidecar(id, "archive/v2/sidecar", 1024, &got); err != nil || got["state"] != "updated" {
+		t.Fatalf("stored sidecar=%#v err=%v", got, err)
+	}
 }
 
 func (m *memoryPhysicalObjects) List(ctx context.Context, prefix, cursor string, limit int) (PhysicalObjectPage, error) {

@@ -200,10 +200,37 @@ type permanentSegmentRootBackend struct {
 }
 
 func (b *permanentSegmentRootBackend) SaveRecording(recording *domain.Recording) error {
-	if track := recording.Tracks["main"]; track != nil && len(track.Segments) == b.segments && b.failed.CompareAndSwap(false, true) {
+	if recording != nil && recording.SegmentCount() == b.segments && b.failed.CompareAndSwap(false, true) {
 		return b.cause
 	}
 	return b.StorageBackend.SaveRecording(recording)
+}
+
+func (b *permanentSegmentRootBackend) SaveRecordingContext(ctx context.Context, recording *domain.Recording) error {
+	if recording != nil && recording.SegmentCount() == b.segments && b.failed.CompareAndSwap(false, true) {
+		return b.cause
+	}
+	return b.StorageBackend.SaveRecording(recording)
+}
+
+func (b *permanentSegmentRootBackend) LoadRecordingContext(ctx context.Context, id string) (*domain.Recording, error) {
+	return b.StorageBackend.LoadRecordingReadOnly(id)
+}
+
+func (b *permanentSegmentRootBackend) RecordingFormatVersion(ctx context.Context, id string) (int, error) {
+	return backendRecordingFormatVersion(b.StorageBackend, ctx, id)
+}
+
+func (b *permanentSegmentRootBackend) SaveSidecarContext(ctx context.Context, id, relativePath string, value any) error {
+	return b.StorageBackend.SaveSidecar(id, relativePath, value)
+}
+
+func (b *permanentSegmentRootBackend) LoadSidecarContext(ctx context.Context, id, relativePath string, maxBytes int64, output any) error {
+	return b.LoadSidecar(id, relativePath, maxBytes, output)
+}
+
+func (b *permanentSegmentRootBackend) ListSidecarsContext(ctx context.Context, id, prefix, cursor string, limit int) (storage.V2SidecarPage, error) {
+	return backendListV2Sidecars(b.StorageBackend, ctx, id, prefix, cursor, limit)
 }
 
 func (b *permanentSegmentRootBackend) LoadSidecar(id, relativePath string, maxBytes int64, output any) error {
@@ -227,10 +254,61 @@ func (b *permanentSegmentRootBackend) CreateRecordingWithSidecar(recording *doma
 }
 
 func (b *transientSegmentRootBackend) SaveRecording(recording *domain.Recording) error {
-	if track := recording.Tracks["main"]; track != nil && len(track.Segments) > 0 && b.failures.CompareAndSwap(0, 1) {
+	if recording != nil && recording.SegmentCount() > 0 && b.failures.CompareAndSwap(0, 1) {
 		return errors.New("temporary root metadata write failure")
 	}
 	return b.StorageBackend.SaveRecording(recording)
+}
+
+func (b *transientSegmentRootBackend) SaveRecordingContext(ctx context.Context, recording *domain.Recording) error {
+	if recording != nil && recording.SegmentCount() > 0 && b.failures.CompareAndSwap(0, 1) {
+		return errors.New("temporary root metadata write failure")
+	}
+	return b.StorageBackend.SaveRecording(recording)
+}
+
+func (b *transientSegmentRootBackend) LoadRecordingContext(ctx context.Context, id string) (*domain.Recording, error) {
+	return b.StorageBackend.LoadRecordingReadOnly(id)
+}
+
+func (b *transientSegmentRootBackend) RecordingFormatVersion(ctx context.Context, id string) (int, error) {
+	return backendRecordingFormatVersion(b.StorageBackend, ctx, id)
+}
+
+func (b *transientSegmentRootBackend) SaveSidecarContext(ctx context.Context, id, relativePath string, value any) error {
+	return b.StorageBackend.SaveSidecar(id, relativePath, value)
+}
+
+func (b *transientSegmentRootBackend) LoadSidecarContext(ctx context.Context, id, relativePath string, maxBytes int64, output any) error {
+	return b.LoadSidecar(id, relativePath, maxBytes, output)
+}
+
+func (b *transientSegmentRootBackend) ListSidecarsContext(ctx context.Context, id, prefix, cursor string, limit int) (storage.V2SidecarPage, error) {
+	return backendListV2Sidecars(b.StorageBackend, ctx, id, prefix, cursor, limit)
+}
+
+func backendRecordingFormatVersion(backend storage.StorageBackend, ctx context.Context, id string) (int, error) {
+	reader, ok := backend.(interface {
+		RecordingFormatVersion(context.Context, string) (int, error)
+	})
+	if !ok {
+		recording, err := backend.LoadRecordingReadOnly(id)
+		if err != nil {
+			return 0, err
+		}
+		return recording.FormatVersion, nil
+	}
+	return reader.RecordingFormatVersion(ctx, id)
+}
+
+func backendListV2Sidecars(backend storage.StorageBackend, ctx context.Context, id, prefix, cursor string, limit int) (storage.V2SidecarPage, error) {
+	lister, ok := backend.(interface {
+		ListSidecarsContext(context.Context, string, string, string, int) (storage.V2SidecarPage, error)
+	})
+	if !ok {
+		return storage.V2SidecarPage{}, storage.ErrShardedArchiveUnavailable
+	}
+	return lister.ListSidecarsContext(ctx, id, prefix, cursor, limit)
 }
 
 func (b *transientSegmentRootBackend) LoadSidecar(id, relativePath string, maxBytes int64, output any) error {
@@ -397,7 +475,7 @@ func TestPermanentRootCommitFailureRetainsInternalCauseAndSanitizesPublicError(t
 	if !errors.Is(diagnostic, errStorageCommit) || !errors.Is(diagnostic, backendFailure) {
 		t.Fatalf("diagnostic lost classification or backend cause: %v", diagnostic)
 	}
-	if !strings.Contains(diagnostic.Error(), "media payload commit") || !strings.Contains(diagnostic.Error(), "recording root commit") {
+	if !strings.Contains(diagnostic.Error(), "media payload commit") || !strings.Contains(diagnostic.Error(), "publish sharded media") {
 		t.Fatalf("diagnostic lost commit stage: %v", diagnostic)
 	}
 	var retryFailure interface{ Attempts() int }
@@ -1080,8 +1158,12 @@ func TestCanceledAcquisitionPersistsCompletedPayloadAfterQueueUnblocks(t *testin
 	go func() { acquireDone <- scheduler.acquire(task) }()
 	waitUntil(t, time.Second, func() bool {
 		scheduler.mu.Lock()
-		defer scheduler.mu.Unlock()
-		return task.state == segmentTaskBuffered && manager.ingest.Snapshot().BufferUsedBytes > 0
+		state := task.state
+		scheduler.mu.Unlock()
+		// Legacy v1 submission remains inside acquire while the bounded queue is
+		// full; v2 stores the complete payload on the ordered dispatcher task.
+		// In either case a reservation proves the one source body was fully read.
+		return (state == segmentTaskInFlight || state == segmentTaskBuffered || state == segmentTaskPersisting) && manager.ingest.Snapshot().BufferUsedBytes > 0
 	}, "complete segment body buffered while queue is full")
 	if segmentRequests.Load() != 1 {
 		t.Fatalf("segment request count=%d want=1", segmentRequests.Load())

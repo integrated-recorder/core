@@ -179,6 +179,26 @@ func (s *automaticRecoveryScheduler) signal() {
 	}
 }
 
+// stateFor returns a bounded read-model of one Recording's scheduler slot.
+// It does not inspect archive history or expose the queued owner token.
+func (s *automaticRecoveryScheduler) stateFor(id string) string {
+	if s == nil {
+		return "idle"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id == s.inFlight {
+		return "running"
+	}
+	if item, ok := s.queued[id]; ok {
+		if !item.due.IsZero() && s.now().Before(item.due) {
+			return "backoff"
+		}
+		return "scheduled"
+	}
+	return "idle"
+}
+
 func (s *automaticRecoveryScheduler) run() {
 	defer close(s.done)
 	for {

@@ -5,9 +5,11 @@ package integrity
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -56,53 +58,113 @@ const (
 // Job deliberately contains no path, URI, or raw error. ErrorCode is a
 // closed set of stable values and Result comes from storage's redacted model.
 type Job struct {
-	ID          string                   `json:"id"`
-	RecordingID string                   `json:"recording_id"`
-	State       State                    `json:"state"`
-	CreatedAt   time.Time                `json:"created_at"`
-	StartedAt   *time.Time               `json:"started_at,omitempty"`
-	FinishedAt  *time.Time               `json:"finished_at,omitempty"`
-	ErrorCode   string                   `json:"error_code,omitempty"`
-	Result      *storage.IntegrityResult `json:"result,omitempty"`
+	ID                     string                   `json:"id"`
+	RecordingID            string                   `json:"recording_id"`
+	State                  State                    `json:"state"`
+	CreatedAt              time.Time                `json:"created_at"`
+	StartedAt              *time.Time               `json:"started_at,omitempty"`
+	FinishedAt             *time.Time               `json:"finished_at,omitempty"`
+	ErrorCode              string                   `json:"error_code,omitempty"`
+	SourceArchiveRevision  uint64                   `json:"source_archive_revision,omitempty"`
+	SourceTimelineRevision uint64                   `json:"source_timeline_revision,omitempty"`
+	SourceRevisionKnown    bool                     `json:"source_revision_known,omitempty"`
+	Result                 *storage.IntegrityResult `json:"result,omitempty"`
 }
 
 type diskState struct {
-	Version int                                `json:"version"`
-	Jobs    []Job                              `json:"jobs"`
-	Results map[string]storage.IntegrityResult `json:"results"`
+	Version         int                                `json:"version"`
+	Jobs            []Job                              `json:"jobs"`
+	Results         map[string]storage.IntegrityResult `json:"results"`
+	ResultRevisions map[string]sourceRevision          `json:"result_revisions,omitempty"`
+}
+
+type sourceRevision struct {
+	Archive  uint64 `json:"archive_revision"`
+	Timeline uint64 `json:"timeline_revision"`
+	Known    bool   `json:"known"`
+}
+
+type Freshness string
+
+const (
+	FreshnessUnknown Freshness = "unknown"
+	FreshnessCurrent Freshness = "current"
+	FreshnessStale   Freshness = "stale"
+)
+
+// ResultProjection binds a saved integrity result to the recording snapshot
+// it verified. Freshness is computed only against an explicitly supplied
+// current recording snapshot.
+type ResultProjection struct {
+	storage.IntegrityResult
+	SourceArchiveRevision   uint64    `json:"source_archive_revision,omitempty"`
+	SourceTimelineRevision  uint64    `json:"source_timeline_revision,omitempty"`
+	CurrentArchiveRevision  uint64    `json:"current_archive_revision,omitempty"`
+	CurrentTimelineRevision uint64    `json:"current_timeline_revision,omitempty"`
+	RevisionKnown           bool      `json:"revision_known"`
+	Freshness               Freshness `json:"freshness"`
+}
+
+// JobProjection adds an on-demand freshness comparison without persisting a
+// derived current/stale state into the durable job record.
+type JobProjection struct {
+	Job
+	CurrentArchiveRevision  uint64    `json:"current_archive_revision,omitempty"`
+	CurrentTimelineRevision uint64    `json:"current_timeline_revision,omitempty"`
+	Freshness               Freshness `json:"freshness"`
+}
+
+// ProjectJob compares a captured verification snapshot with an explicitly
+// supplied current recording snapshot. Missing/legacy revisions remain
+// unknown; freshness never changes verification job state.
+func ProjectJob(job Job, current *domain.Recording) JobProjection {
+	projection := JobProjection{Job: cloneJob(job), Freshness: FreshnessUnknown}
+	if current == nil || current.ID != job.RecordingID || !job.SourceRevisionKnown {
+		return projection
+	}
+	projection.CurrentArchiveRevision = current.ArchiveRevision
+	projection.CurrentTimelineRevision = current.TimelineRevision
+	projection.Freshness = FreshnessCurrent
+	if job.SourceArchiveRevision != current.ArchiveRevision || job.SourceTimelineRevision != current.TimelineRevision {
+		projection.Freshness = FreshnessStale
+	}
+	return projection
 }
 
 type jobControl struct {
-	snapshot *domain.Recording
-	ctx      context.Context
-	cancel   context.CancelFunc
-	stopCall func() bool
-	previous *storage.IntegrityResult
+	snapshot         *domain.Recording
+	ctx              context.Context
+	cancel           context.CancelFunc
+	stopCall         func() bool
+	previous         *storage.IntegrityResult
+	previousRevision *sourceRevision
 }
 
 // Service owns a fixed worker set and a bounded queue. State transitions and
 // persistence are serialized by mu; verification itself always runs unlocked.
 type Service struct {
-	mu        sync.Mutex
-	dir       string
-	statePath string
-	verify    func(context.Context, *domain.Recording) storage.IntegrityResult
-	jobs      map[string]Job
-	order     []string
-	results   map[string]storage.IntegrityResult
-	active    map[string]string // recording ID -> queued/running job ID
-	controls  map[string]*jobControl
-	queue     chan string
-	ctx       context.Context
-	cancel    context.CancelFunc
-	workers   sync.WaitGroup
-	done      chan struct{}
-	closed    bool
-	closeOnce sync.Once
-	closeErr  error
-	lastErr   error
-	running   int
-	changed   chan struct{}
+	mu              sync.Mutex
+	dir             string
+	statePath       string
+	store           *storage.Store
+	verify          func(context.Context, *domain.Recording) storage.IntegrityResult
+	jobs            map[string]Job
+	order           []string
+	results         map[string]storage.IntegrityResult
+	resultRevisions map[string]sourceRevision
+	active          map[string]string // recording ID -> queued/running job ID
+	controls        map[string]*jobControl
+	queue           chan string
+	ctx             context.Context
+	cancel          context.CancelFunc
+	workers         sync.WaitGroup
+	done            chan struct{}
+	closed          bool
+	closeOnce       sync.Once
+	closeErr        error
+	lastErr         error
+	running         int
+	changed         chan struct{}
 }
 
 // Open loads persisted history, marks work left by a prior process as failed,
@@ -141,16 +203,20 @@ func Open(root string, store *storage.Store, concurrency int) (*Service, error) 
 	s := &Service{
 		dir:       jobDir,
 		statePath: filepath.Join(jobDir, "state.json"),
-		verify:    store.VerifyRecordingContext,
-		jobs:      make(map[string]Job),
-		results:   make(map[string]storage.IntegrityResult),
-		active:    make(map[string]string),
-		controls:  make(map[string]*jobControl),
-		queue:     make(chan string, maxActiveJobs),
-		changed:   make(chan struct{}),
-		ctx:       ctx,
-		cancel:    cancel,
-		done:      make(chan struct{}),
+		store:     store,
+		verify: func(ctx context.Context, recording *domain.Recording) storage.IntegrityResult {
+			return verifyRecording(ctx, store, recording)
+		},
+		jobs:            make(map[string]Job),
+		results:         make(map[string]storage.IntegrityResult),
+		resultRevisions: make(map[string]sourceRevision),
+		active:          make(map[string]string),
+		controls:        make(map[string]*jobControl),
+		queue:           make(chan string, maxActiveJobs),
+		changed:         make(chan struct{}),
+		ctx:             ctx,
+		cancel:          cancel,
+		done:            make(chan struct{}),
 	}
 	if err = s.load(); err != nil {
 		cancel()
@@ -184,6 +250,16 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 	if recording == nil || !recordingIDRE.MatchString(recording.ID) {
 		return Job{}, errors.New("invalid recording")
 	}
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		header, err := s.store.LoadRecordingHeader(ctx, recording.ID)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return Job{}, err
+			}
+			return Job{}, errors.New("invalid recording snapshot")
+		}
+		recording = header
+	}
 	snapshot, err := cloneRecording(recording)
 	if err != nil {
 		return Job{}, errors.New("invalid recording snapshot")
@@ -194,7 +270,12 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 	}
 	jobCtx, cancel := context.WithCancel(s.ctx)
 	now := time.Now().UTC()
-	job := Job{ID: id, RecordingID: snapshot.ID, State: StateQueued, CreatedAt: now}
+	job := Job{
+		ID: id, RecordingID: snapshot.ID, State: StateQueued, CreatedAt: now,
+		SourceArchiveRevision:  snapshot.ArchiveRevision,
+		SourceTimelineRevision: snapshot.TimelineRevision,
+		SourceRevisionKnown:    snapshot.ArchiveRevision != 0,
+	}
 
 	s.mu.Lock()
 	if s.closed {
@@ -337,6 +418,65 @@ func (s *Service) Status(recordingID string) (storage.IntegrityResult, bool) {
 	return storage.IntegrityResult{}, false
 }
 
+// StatusFor returns the latest integrity projection together with freshness
+// relative to an explicitly supplied current recording snapshot. Older
+// persisted results that predate revision binding report FreshnessUnknown.
+func (s *Service) StatusFor(recording *domain.Recording) (ResultProjection, bool) {
+	if recording == nil || !recordingIDRE.MatchString(recording.ID) {
+		return ResultProjection{}, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, exists := s.results[recording.ID]
+	var revision sourceRevision
+	if exists {
+		result = cloneResult(result)
+		revision = s.resultRevisions[recording.ID]
+	}
+	if jobID := s.active[recording.ID]; jobID != "" {
+		if exists {
+			result.Status = storage.IntegrityVerifying
+		} else {
+			result = storage.IntegrityResult{Status: storage.IntegrityVerifying, Issues: []storage.IntegrityIssue{}}
+			if job, ok := s.jobs[jobID]; ok && job.SourceRevisionKnown {
+				revision = sourceRevision{Archive: job.SourceArchiveRevision, Timeline: job.SourceTimelineRevision, Known: true}
+			}
+		}
+		return projectResult(result, revision, recording), true
+	}
+	if exists {
+		return projectResult(result, revision, recording), true
+	}
+	for index := len(s.order) - 1; index >= 0; index-- {
+		job, ok := s.jobs[s.order[index]]
+		if ok && job.RecordingID == recording.ID && job.State == StateFailed {
+			return projectResult(storage.IntegrityResult{Status: storage.IntegrityFailed, Issues: []storage.IntegrityIssue{}}, sourceRevision{}, recording), true
+		}
+	}
+	return ResultProjection{}, false
+}
+
+func projectResult(result storage.IntegrityResult, source sourceRevision, current *domain.Recording) ResultProjection {
+	projection := ResultProjection{
+		IntegrityResult:         result,
+		SourceArchiveRevision:   source.Archive,
+		SourceTimelineRevision:  source.Timeline,
+		CurrentArchiveRevision:  current.ArchiveRevision,
+		CurrentTimelineRevision: current.TimelineRevision,
+		RevisionKnown:           source.Known,
+		Freshness:               FreshnessUnknown,
+	}
+	if source.Known {
+		projection.Freshness = FreshnessCurrent
+		if source.Archive != current.ArchiveRevision || source.Timeline != current.TimelineRevision {
+			projection.Freshness = FreshnessStale
+		}
+	}
+	return projection
+}
+
 // InProgress reports whether verification currently owns a queued/running job
 // for the validated recording ID. It is useful to serialize deletion with a
 // verification route's own recording lock.
@@ -458,6 +598,10 @@ func (s *Service) run(id string) {
 	if previous, ok := s.results[job.RecordingID]; ok {
 		copy := cloneResult(previous)
 		control.previous = &copy
+		if revision, found := s.resultRevisions[job.RecordingID]; found {
+			revisionCopy := revision
+			control.previousRevision = &revisionCopy
+		}
 		previous.Status = storage.IntegrityVerifying
 		s.results[job.RecordingID] = previous
 	} else {
@@ -502,14 +646,25 @@ func (s *Service) run(id string) {
 	job.Result = resultPointer(result)
 	s.jobs[id] = job
 	s.results[job.RecordingID] = cloneResult(result)
+	s.resultRevisions[job.RecordingID] = sourceRevision{
+		Archive:  job.SourceArchiveRevision,
+		Timeline: job.SourceTimelineRevision,
+		Known:    job.SourceRevisionKnown,
+	}
 	s.finishLocked(id)
 	if err := s.persistLocked(); err != nil {
 		// Do not report an unpersisted result as durable. Restore the prior
 		// result and record only a fixed failure code in memory if possible.
 		if control.previous == nil {
 			delete(s.results, job.RecordingID)
+			delete(s.resultRevisions, job.RecordingID)
 		} else {
 			s.results[job.RecordingID] = cloneResult(*control.previous)
+			if control.previousRevision == nil {
+				delete(s.resultRevisions, job.RecordingID)
+			} else {
+				s.resultRevisions[job.RecordingID] = *control.previousRevision
+			}
 		}
 		job.State = StateFailed
 		job.ErrorCode = ErrorPersistenceFailed
@@ -613,6 +768,9 @@ func (s *Service) load() error {
 	if disk.Results == nil {
 		disk.Results = make(map[string]storage.IntegrityResult)
 	}
+	if disk.ResultRevisions == nil {
+		disk.ResultRevisions = make(map[string]sourceRevision)
+	}
 	for _, job := range disk.Jobs {
 		if !validJob(job) {
 			return errors.New("integrity job state is invalid")
@@ -628,6 +786,15 @@ func (s *Service) load() error {
 			return errors.New("integrity job state is invalid")
 		}
 		s.results[recordingID] = cloneResult(result)
+	}
+	for recordingID, revision := range disk.ResultRevisions {
+		if !recordingIDRE.MatchString(recordingID) || (revision.Known && revision.Archive == 0) {
+			return errors.New("integrity job state is invalid")
+		}
+		if _, exists := s.results[recordingID]; !exists {
+			return errors.New("integrity job state is invalid")
+		}
+		s.resultRevisions[recordingID] = revision
 	}
 	sort.SliceStable(s.order, func(i, j int) bool {
 		left, right := s.jobs[s.order[i]], s.jobs[s.order[j]]
@@ -675,7 +842,11 @@ func (s *Service) persistLocked() error {
 	for id, result := range s.results {
 		results[id] = cloneResult(result)
 	}
-	data, err := json.Marshal(diskState{Version: 1, Jobs: jobs, Results: results})
+	resultRevisions := make(map[string]sourceRevision, len(s.resultRevisions))
+	for id, revision := range s.resultRevisions {
+		resultRevisions[id] = revision
+	}
+	data, err := json.Marshal(diskState{Version: 1, Jobs: jobs, Results: results, ResultRevisions: resultRevisions})
 	if err != nil {
 		return err
 	}
@@ -745,6 +916,29 @@ func makePrivateChild(parent, name string) error {
 }
 
 func cloneRecording(recording *domain.Recording) (*domain.Recording, error) {
+	if recording == nil {
+		return nil, errors.New("invalid recording")
+	}
+	// Format-v2 roots carry bounded summaries. Discard any expanded projections
+	// a caller supplied so jobs retain only the root needed by shard iterators.
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		header := *recording
+		header.Gaps = nil
+		header.Snapshots = nil
+		header.MetadataTimeline = nil
+		header.Tracks = make(map[string]*domain.Track, len(recording.Tracks))
+		for id, track := range recording.Tracks {
+			if track == nil {
+				header.Tracks[id] = nil
+				continue
+			}
+			trackHeader := *track
+			trackHeader.Segments = nil
+			trackHeader.InitSegments = nil
+			header.Tracks[id] = &trackHeader
+		}
+		recording = &header
+	}
 	data, err := json.Marshal(recording)
 	if err != nil {
 		return nil, err
@@ -781,8 +975,180 @@ func safeVerify(verify func(context.Context, *domain.Recording) storage.Integrit
 	return cloneResult(result), false
 }
 
+func verifyRecording(ctx context.Context, store *storage.Store, recording *domain.Recording) storage.IntegrityResult {
+	if recording != nil && recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		return verifyShardedRecording(ctx, store, recording)
+	}
+	return store.VerifyRecordingContext(ctx, recording)
+}
+
+var errVerificationCanceled = errors.New("integrity verification canceled")
+
+// verifyShardedRecording walks bounded v2 metadata records and streams each
+// payload through SHA-256. It retains no archive-sized object list.
+func verifyShardedRecording(ctx context.Context, store *storage.Store, recording *domain.Recording) storage.IntegrityResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := storage.IntegrityResult{Status: storage.IntegrityVerified, LastVerifiedAt: time.Now().UTC(), Issues: []storage.IntegrityIssue{}}
+	if store == nil || recording == nil || recording.FormatVersion != storage.ShardedArchiveFormatVersion || !recordingIDRE.MatchString(recording.ID) {
+		result.Status = storage.IntegrityFailed
+		result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "invalid_recording"})
+		return result
+	}
+
+	canceled := false
+	add := func(path, expectedPrefix string, expectedSize int64, expectedHash string) {
+		if ctx.Err() != nil {
+			canceled = true
+			return
+		}
+		result.ObjectsTotal++
+		issuePath := ""
+		if validIntegrityReference(path, expectedPrefix) {
+			issuePath = path
+		} else {
+			result.ObjectsCorrupt++
+			result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "invalid_reference"})
+			return
+		}
+		info, err := store.StatPayload(recording.ID, path)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, storage.ErrObjectNotFound) {
+			result.ObjectsMissing++
+			result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "missing_payload", Path: issuePath})
+			return
+		}
+		if err != nil || !info.Regular || expectedSize < 0 {
+			result.ObjectsCorrupt++
+			result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "unavailable_payload", Path: issuePath})
+			return
+		}
+		digest, err := hex.DecodeString(expectedHash)
+		if err != nil || len(digest) != sha256.Size {
+			result.ObjectsCorrupt++
+			result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "invalid_integrity_metadata", Path: issuePath})
+			return
+		}
+		reader, err := store.OpenPayloadReader(recording.ID, path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, storage.ErrObjectNotFound) {
+				result.ObjectsMissing++
+				result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "missing_payload", Path: issuePath})
+			} else {
+				result.ObjectsCorrupt++
+				result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "unavailable_payload", Path: issuePath})
+			}
+			return
+		}
+		hash := sha256.New()
+		size, copyErr := io.Copy(hash, integrityContextReader{ctx: ctx, reader: reader})
+		closeErr := reader.Close()
+		if ctx.Err() != nil || errors.Is(copyErr, context.Canceled) || errors.Is(copyErr, context.DeadlineExceeded) {
+			canceled = true
+			return
+		}
+		if copyErr != nil || closeErr != nil || size != expectedSize || !equalIntegrityDigest(hash.Sum(nil), digest) {
+			result.ObjectsCorrupt++
+			result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "payload_mismatch", Path: issuePath})
+			return
+		}
+		result.ObjectsVerified++
+	}
+
+	visitManifest := func(snapshot domain.ManifestSnapshot) error {
+		if err := ctx.Err(); err != nil || canceled {
+			return errVerificationCanceled
+		}
+		add(snapshot.StoragePath, "manifests/", snapshot.Size, snapshot.SHA256)
+		if ctx.Err() != nil || canceled {
+			return errVerificationCanceled
+		}
+		return nil
+	}
+	if err := store.IterateShardedManifests(ctx, recording.ID, visitManifest); err != nil {
+		return incompleteShardedResult(result, ctx, err)
+	}
+
+	trackIDs := make([]string, 0, len(recording.Tracks))
+	for id := range recording.Tracks {
+		trackIDs = append(trackIDs, id)
+	}
+	sort.Strings(trackIDs)
+	for _, trackID := range trackIDs {
+		track := recording.Tracks[trackID]
+		if track == nil || track.ID != trackID {
+			result.ObjectsCorrupt++
+			result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "invalid_track_metadata"})
+			continue
+		}
+		visit := func(record storage.V2MediaRecord) error {
+			if err := ctx.Err(); err != nil || canceled {
+				return errVerificationCanceled
+			}
+			segment := record.Segment
+			add(segment.StoragePath, "tracks/", segment.PayloadSize, segment.SHA256)
+			if ctx.Err() != nil || canceled {
+				return errVerificationCanceled
+			}
+			return nil
+		}
+		if err := store.IterateShardedMedia(ctx, recording.ID, trackID, visit); err != nil {
+			return incompleteShardedResult(result, ctx, err)
+		}
+		if err := store.IterateShardedInitSegments(ctx, recording.ID, trackID, visit); err != nil {
+			return incompleteShardedResult(result, ctx, err)
+		}
+	}
+	if len(result.Issues) > 0 {
+		result.Status = storage.IntegrityDegraded
+	}
+	return result
+}
+
+func incompleteShardedResult(result storage.IntegrityResult, ctx context.Context, err error) storage.IntegrityResult {
+	if errors.Is(err, errVerificationCanceled) || ctx.Err() != nil {
+		return storage.IntegrityResult{Status: storage.IntegrityUnknown, Issues: []storage.IntegrityIssue{}}
+	}
+	result.Status = storage.IntegrityFailed
+	return result
+}
+
+func validIntegrityReference(path, prefix string) bool {
+	if !strings.HasPrefix(path, prefix) || len(path) <= len(prefix) || filepath.IsAbs(path) || filepath.VolumeName(path) != "" || strings.Contains(path, "\\") || strings.ContainsRune(path, '\x00') {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(path))
+	return clean == path && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
+}
+
+type integrityContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r integrityContextReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(buffer)
+}
+
+func equalIntegrityDigest(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	var difference byte
+	for index := range left {
+		difference |= left[index] ^ right[index]
+	}
+	return difference == 0
+}
+
 func validJob(job Job) bool {
 	if !jobIDRE.MatchString(job.ID) || !recordingIDRE.MatchString(job.RecordingID) || job.CreatedAt.IsZero() {
+		return false
+	}
+	if job.SourceRevisionKnown && job.SourceArchiveRevision == 0 {
 		return false
 	}
 	switch job.State {

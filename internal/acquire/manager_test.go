@@ -249,9 +249,38 @@ func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var persistedSourceMetadata strings.Builder
+	persistedSourceMetadata.Write(recordingMetadata)
+	for _, iterate := range []func(func(storage.V2MediaRecord) error) error{
+		func(visit func(storage.V2MediaRecord) error) error {
+			return store.IterateShardedMedia(context.Background(), recording.ID, "main", visit)
+		},
+		func(visit func(storage.V2MediaRecord) error) error {
+			return store.IterateShardedInitSegments(context.Background(), recording.ID, "main", visit)
+		},
+	} {
+		if err := iterate(func(record storage.V2MediaRecord) error {
+			persistedSourceMetadata.WriteString(record.Segment.SourceURI)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var privateAcquisitionContext struct {
+		SchemaVersion int                      `json:"schema_version"`
+		Media         adapterproto.MediaSource `json:"media"`
+	}
+	if err = store.LoadSidecar(recording.ID, "archive-index/acquisition-context", 64<<10, &privateAcquisitionContext); err != nil {
+		t.Fatal(err)
+	}
+	privateContextJSON, err := json.Marshal(privateAcquisitionContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedSourceMetadata.Write(privateContextJSON)
 	for _, credential := range []string{manifestCredential, playlistCredential, initCredential, segmentCredential} {
-		if !strings.Contains(string(recordingMetadata), credential) {
-			t.Fatalf("canonical recording metadata lost original URI credential %q", credential)
+		if !strings.Contains(persistedSourceMetadata.String(), credential) {
+			t.Fatalf("canonical v2 source metadata lost original URI credential %q", credential)
 		}
 	}
 	api := newIPv4TestServer(t, server.New(reloaded, nil, nil))

@@ -97,12 +97,16 @@ type entry struct {
 	media           adapterproto.MediaSource
 	mediaGeneration uint64
 	livePlayback    *livePlaybackProjection
-	refreshGate     chan struct{}
-	scheduler       *segmentScheduler
-	adapterID       string
-	resource        *adapterproto.ResourceRef
-	ownership       *OwnershipToken
-	terminalErr     error
+	metadataLatest  *domain.MetadataRevision
+	// shardedGapObservations tracks only the bounded runtime gap projection.
+	// It prevents each metadata poll from appending the same gap observation.
+	shardedGapObservations map[string]domain.Gap
+	refreshGate            chan struct{}
+	scheduler              *segmentScheduler
+	adapterID              string
+	resource               *adapterproto.ResourceRef
+	ownership              *OwnershipToken
+	terminalErr            error
 	// storageFailureDiagnostic retains the first internal storage error chain.
 	// Public state and Stop errors continue to use sanitized terminalErr.
 	storageFailureDiagnostic             error
@@ -306,14 +310,28 @@ func NewManagerWithFencedRecovery(store *storage.Store, client *http.Client, res
 		_ = m.Close(context.Background())
 		return nil, err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	entries := make(map[string]*entry, len(loaded))
 	for _, recording := range loaded {
-		m.entries[recording.ID] = &entry{
-			recording: recording, done: closedChannel(), livePlayback: buildLivePlaybackProjection(recording),
+		var metadataLatest *domain.MetadataRevision
+		if isShardedRecording(recording) {
+			if err := m.loadShardedRuntimeTail(recording); err != nil {
+				return nil, err
+			}
+			var metadataErr error
+			metadataLatest, metadataErr = m.latestShardedMetadata(recording.ID)
+			if metadataErr != nil {
+				return nil, metadataErr
+			}
+		}
+		entries[recording.ID] = &entry{
+			recording: recording, done: closedChannel(), livePlayback: buildLivePlaybackProjection(recording), metadataLatest: metadataLatest,
+			shardedGapObservations: shardedGapObservationIndex(recording.Gaps),
 		}
 	}
+	m.mu.Lock()
+	m.entries = entries
 	m.freshGeneration = false
+	m.mu.Unlock()
 	return m, nil
 }
 
@@ -346,7 +364,13 @@ func newManagerWithMode(store *storage.Store, client *http.Client, resolver Reso
 				return nil, migrationErr
 			}
 			if migrated {
-				if saveErr := store.SaveRecording(recording); saveErr != nil {
+				var saveErr error
+				if isShardedRecording(recording) {
+					saveErr = store.SaveRecordingHeader(context.Background(), shardedHeaderCopy(recording))
+				} else {
+					saveErr = store.SaveRecording(recording)
+				}
+				if saveErr != nil {
 					return nil, saveErr
 				}
 			}
@@ -373,8 +397,19 @@ func newManagerWithMode(store *storage.Store, client *http.Client, resolver Reso
 		freshGeneration: mode == FreshGeneration, startsDone: make(chan struct{}),
 	}
 	for _, recording := range loaded {
+		var metadataLatest *domain.MetadataRevision
+		if isShardedRecording(recording) {
+			if err := m.loadShardedRuntimeTail(recording); err != nil {
+				return nil, err
+			}
+			metadataLatest, err = m.latestShardedMetadata(recording.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
 		m.entries[recording.ID] = &entry{
-			recording: recording, done: closedChannel(), livePlayback: buildLivePlaybackProjection(recording),
+			recording: recording, done: closedChannel(), livePlayback: buildLivePlaybackProjection(recording), metadataLatest: metadataLatest,
+			shardedGapObservations: shardedGapObservationIndex(recording.Gaps),
 		}
 	}
 	return m, nil
@@ -782,6 +817,14 @@ func (m *Manager) PrepareHandoverTargetWithSourceState(ctx context.Context, snap
 		}
 		return ErrHandoverUnavailable
 	}
+	if isShardedRecording(recording) {
+		if err := m.loadShardedRuntimeTail(recording); err != nil {
+			if preparedExists {
+				m.discardPreparedHandoverLocked(validated.RecordingID)
+			}
+			return ErrHandoverUnavailable
+		}
+	}
 	if preparedExists {
 		if sameHandoverSnapshot(existing.snapshot, validated) && existing.rootFingerprint == rootFingerprint {
 			return nil
@@ -894,7 +937,10 @@ func (m *Manager) probeHandoverContinuation(ctx context.Context, snapshot Handov
 			}
 			return adapterproto.MediaSource{}, nil, nil, ErrHandoverUnavailable
 		}
-		epoch, source, ok := findHandoverCandidate(recording, playlist)
+		epoch, source, ok, candidateErr := m.findHandoverCandidateForArchive(ctx, recording, playlist)
+		if candidateErr != nil {
+			return adapterproto.MediaSource{}, nil, nil, ErrHandoverUnavailable
+		}
 		if !ok || source.URI == "" {
 			if !playlist.EndList {
 				if !sourceDrained {
@@ -928,6 +974,49 @@ func (m *Manager) probeHandoverContinuation(ctx context.Context, snapshot Handov
 		}
 		return media, refreshCommit, candidate, nil
 	}
+}
+
+// findHandoverCandidateForArchive preserves the v1 in-memory lookup and uses
+// V2's bounded source high-water plus coordinate index for sharded recordings.
+// A V2 handover snapshot contains only the live tail; the source playlist may
+// retain a much longer prefix. Treating media outside that tail as absent
+// would stage an already committed object and make activation fail after the
+// Host has transferred the owner token.
+func (m *Manager) findHandoverCandidateForArchive(ctx context.Context, recording *domain.Recording, playlist hls.MediaPlaylist) (uint64, hls.MediaSegment, bool, error) {
+	epoch, candidate, ok := findHandoverCandidate(recording, playlist)
+	if !ok || !isShardedRecording(recording) {
+		return epoch, candidate, ok, nil
+	}
+	track := recording.Tracks["main"]
+	if track == nil {
+		return 0, hls.MediaSegment{}, false, storage.ErrShardedArchiveInvalid
+	}
+	for _, source := range playlist.Segments {
+		if source.Gap || gapCoversCoordinate(recording, "main", epoch, source.DiscontinuitySequence, source.Sequence) {
+			continue
+		}
+		// In the current source epoch, the monotonic observed-sequence high-water
+		// excludes the potentially large committed prefix without reading it.
+		// Source-identity resets are already detected by findHandoverCandidate
+		// against the bounded live tail and use a new epoch here.
+		if epoch == track.SourceEpoch && track.HasLastObservedSequence && source.Sequence <= track.LastObservedSequence {
+			continue
+		}
+		coordinate := archiveindex.Coordinate{
+			SessionID: recording.SourceSessionID, TrackID: track.ID,
+			SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence,
+			Sequence: source.Sequence, Kind: archiveindex.ObjectMedia,
+		}
+		_, lookupErr := m.store.LookupShardedMediaByCoordinate(ctx, recording.ID, coordinate)
+		if lookupErr == nil {
+			continue
+		}
+		if errors.Is(lookupErr, storage.ErrNotFound) {
+			return epoch, cloneHandoverMediaSegment(source), true, nil
+		}
+		return 0, hls.MediaSegment{}, false, lookupErr
+	}
+	return 0, hls.MediaSegment{}, false, nil
 }
 
 func waitHandoverManifestRetry(ctx context.Context, playlist hls.MediaPlaylist) error {
@@ -1071,6 +1160,12 @@ func handoverRootFingerprint(recording *domain.Recording) ([32]byte, error) {
 	if recording == nil {
 		return [32]byte{}, ErrHandoverUnavailable
 	}
+	if isShardedRecording(recording) {
+		recording = shardedHeaderCopy(recording)
+		if recording == nil {
+			return [32]byte{}, ErrHandoverUnavailable
+		}
+	}
 	encoded, err := json.Marshal(recording)
 	if err != nil {
 		return [32]byte{}, err
@@ -1178,11 +1273,27 @@ func handoverSourceIdentityChanged(captured *domain.Segment, incoming hls.MediaS
 
 // ActivatePreparedHandover adopts an existing archive only after the Host has
 // durably transferred its owner token to this target Engine.
-func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) error {
+func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) (result error) {
+	stage := "validate_owner"
+	causeType := ""
+	defer func() {
+		if result == nil {
+			return
+		}
+		if causeType == "" {
+			causeType = fmt.Sprintf("%T", result)
+		}
+		// Keep the production handover diagnostic useful without logging an
+		// arbitrary error message, which may contain provider paths or source
+		// material. The stage and Go error type are bounded and safe.
+		log.Printf("recording handover target activation failed: recording_id=%s stage=%s cause_class=%s", owner.RecordingID, stage, causeType)
+	}()
 	if !validOwnershipToken(owner) {
 		return ErrInvalidOwnershipToken
 	}
+	stage = "begin_start"
 	if err := m.beginStart(&owner); err != nil {
+		causeType = fmt.Sprintf("%T", err)
 		return err
 	}
 	defer m.starts.Done()
@@ -1191,10 +1302,12 @@ func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) error {
 	m.mu.Lock()
 	prepared, ok := m.prepared[owner.RecordingID]
 	if !ok || prepared.active || prepared.target.EngineGeneration != owner.EngineGeneration || prepared.target.WorkerInstance != owner.WorkerInstance {
+		stage = "prepared_candidate"
 		m.mu.Unlock()
 		return ErrHandoverTargetInvalid
 	}
 	if _, exists := m.entries[owner.RecordingID]; exists {
+		stage = "existing_entry"
 		m.mu.Unlock()
 		return ErrHandoverConflict
 	}
@@ -1203,45 +1316,108 @@ func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) error {
 	m.mu.Unlock()
 
 	var recording *domain.Recording
+	var metadataLatest *domain.MetadataRevision
 	err := m.withOwnershipCommit(&owner, func() error {
+		stage = "read_recording"
 		var loadErr error
 		recording, loadErr = m.store.LoadRecordingReadOnly(owner.RecordingID)
 		if loadErr != nil || recording == nil || recording.ID != owner.RecordingID || recording.State != domain.StateRecording {
+			if loadErr != nil {
+				causeType = fmt.Sprintf("%T", loadErr)
+			} else {
+				causeType = "recording_precondition"
+			}
 			return ErrHandoverUnavailable
 		}
+		stage = "root_fingerprint"
 		fingerprint, fingerprintErr := handoverRootFingerprint(recording)
 		if fingerprintErr != nil || fingerprint != prepared.rootFingerprint || prepared.continuation == nil {
+			if fingerprintErr != nil {
+				causeType = fmt.Sprintf("%T", fingerprintErr)
+			} else {
+				causeType = "fingerprint_or_continuation_mismatch"
+			}
 			return ErrHandoverUnavailable
 		}
+		if isShardedRecording(recording) {
+			stage = "read_live_tail"
+			if err := m.loadShardedRuntimeTail(recording); err != nil {
+				causeType = fmt.Sprintf("%T", err)
+				return ErrHandoverUnavailable
+			}
+			stage = "read_latest_metadata"
+			var metadataErr error
+			metadataLatest, metadataErr = m.latestShardedMetadata(recording.ID)
+			if metadataErr != nil {
+				causeType = fmt.Sprintf("%T", metadataErr)
+				return ErrHandoverUnavailable
+			}
+		}
 		entrySnapshot := &entry{recording: recording}
+		stage = "next_archive_ordinal"
 		nextOrdinal, ordinalErr := nextArchiveOrdinal(entrySnapshot)
 		if ordinalErr != nil || nextOrdinal != prepared.continuation.ordinal {
+			if ordinalErr != nil {
+				causeType = fmt.Sprintf("%T", ordinalErr)
+			} else {
+				causeType = "archive_ordinal_mismatch"
+			}
 			return ErrHandoverUnavailable
 		}
 		track := recording.Tracks["main"]
 		if track == nil {
+			stage = "main_track"
+			causeType = "missing_track"
 			return ErrHandoverUnavailable
 		}
-		for _, segment := range track.Segments {
-			if segment.SourceEpoch == prepared.continuation.epoch && segment.Sequence == prepared.continuation.source.Sequence {
+		if isShardedRecording(recording) {
+			stage = "continuation_coordinate_lookup"
+			coordinate := archiveindex.Coordinate{
+				SessionID: recording.SourceSessionID, TrackID: track.ID,
+				SourceEpoch:           prepared.continuation.epoch,
+				DiscontinuitySequence: prepared.continuation.source.DiscontinuitySequence,
+				Sequence:              prepared.continuation.source.Sequence, Kind: archiveindex.ObjectMedia,
+			}
+			if _, lookupErr := m.store.LookupShardedMediaByCoordinate(context.Background(), recording.ID, coordinate); lookupErr == nil || !errors.Is(lookupErr, storage.ErrNotFound) {
+				if lookupErr != nil {
+					causeType = fmt.Sprintf("%T", lookupErr)
+				} else {
+					causeType = "continuation_coordinate_already_present"
+				}
 				return ErrHandoverUnavailable
+			}
+		} else {
+			for _, segment := range track.Segments {
+				if segment.SourceEpoch == prepared.continuation.epoch && segment.Sequence == prepared.continuation.source.Sequence {
+					stage = "continuation_coordinate_lookup"
+					causeType = "continuation_coordinate_already_present"
+					return ErrHandoverUnavailable
+				}
 			}
 		}
 		if prepared.refreshStateCommit != nil {
+			stage = "refresh_state_commit"
 			if err := prepared.refreshStateCommit(); err != nil {
+				causeType = fmt.Sprintf("%T", err)
 				return ErrHandoverUnavailable
 			}
 		}
+		stage = "live_presentation_migration"
 		migrated, migrationErr := migrateLivePresentation(recording)
 		if migrationErr != nil {
+			causeType = fmt.Sprintf("%T", migrationErr)
 			return ErrHandoverUnavailable
 		}
 		if migrated {
-			if saveErr := m.store.SaveRecording(recording); saveErr != nil {
+			stage = "publish_recording_header"
+			if saveErr := m.saveRecordingHeader(recording); saveErr != nil {
+				causeType = fmt.Sprintf("%T", saveErr)
 				return ErrHandoverUnavailable
 			}
+			stage = "refresh_root_fingerprint"
 			fingerprint, fingerprintErr = handoverRootFingerprint(recording)
 			if fingerprintErr != nil {
+				causeType = fmt.Sprintf("%T", fingerprintErr)
 				return ErrHandoverUnavailable
 			}
 			prepared.rootFingerprint = fingerprint
@@ -1253,13 +1429,17 @@ func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) error {
 		return nil
 	})
 	if err != nil {
+		if causeType == "" {
+			stage = "owner_fence"
+			causeType = fmt.Sprintf("%T", err)
+		}
 		m.discardPreparedHandoverLocked(owner.RecordingID)
 		return err
 	}
 	ownerCopy := owner
 	workerCtx, cancel := context.WithCancel(context.Background())
 	e := &entry{
-		recording: recording, cancel: cancel, done: make(chan struct{}), livePlayback: buildLivePlaybackProjection(recording),
+		recording: recording, cancel: cancel, done: make(chan struct{}), livePlayback: buildLivePlaybackProjection(recording), metadataLatest: metadataLatest,
 		media: cloneMediaSource(prepared.media), refreshGate: make(chan struct{}, 1),
 		adapterID: prepared.snapshot.AdapterID, resource: cloneResourceRef(prepared.snapshot.Resource), ownership: &ownerCopy,
 		handoverGate: make(chan struct{}, 1), handoverWake: make(chan struct{}, 1),
@@ -1269,11 +1449,13 @@ func (m *Manager) ActivatePreparedHandover(owner OwnershipToken) error {
 	e.handoverGate <- struct{}{}
 	m.mu.Lock()
 	if m.closed || m.entries[owner.RecordingID] != nil {
+		stage = "publish_active_entry"
 		m.mu.Unlock()
 		cancel()
 		m.discardPreparedHandoverLocked(owner.RecordingID)
 		return ErrHandoverConflict
 	}
+	stage = "activate_worker"
 	m.entries[owner.RecordingID] = e
 	delete(m.prepared, owner.RecordingID)
 	m.mu.Unlock()
@@ -1611,7 +1793,7 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 	}
 	now := time.Now().UTC()
 	classification := media.SourceURIClassification()
-	recording := &domain.Recording{FormatVersion: 1, ID: id, SourceSessionID: sessionIdentity.ID, Title: title, AdapterID: adapterID, Adapter: archiveProvenance(provenance), Resource: archiveResource(resource), SourceURIClassification: classification, State: domain.StateRecording, CreatedAt: now, StartedAt: now, Tracks: map[string]*domain.Track{
+	recording := &domain.Recording{FormatVersion: storage.ShardedArchiveFormatVersion, ShardedArchive: &domain.ShardedArchiveSummary{}, ID: id, SourceSessionID: sessionIdentity.ID, Title: title, AdapterID: adapterID, Adapter: archiveProvenance(provenance), Resource: archiveResource(resource), SourceURIClassification: classification, State: domain.StateRecording, CreatedAt: now, StartedAt: now, ArchiveRevision: 1, Tracks: map[string]*domain.Track{
 		"main": {ID: "main", SourcePlaylistURL: media.ManifestURL, NextArchiveOrdinal: 1, LivePresentation: &domain.LivePresentationState{NextOrdinal: 1}, Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
 	}}
 	if err = m.withOwnershipCommit(owner, func() error {
@@ -1620,7 +1802,7 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 		} else if !errors.Is(loadErr, storage.ErrNotFound) {
 			return errors.New("recording storage is unavailable")
 		}
-		return m.store.CreateRecordingWithSidecar(recording, acquisitionContextPath, contextDoc)
+		return m.store.CreateShardedRecordingWithSidecar(recording, acquisitionContextPath, contextDoc)
 	}); err != nil {
 		return nil, errors.New("recording storage could not be initialized")
 	}
@@ -1749,6 +1931,13 @@ func (m *Manager) StopContext(ctx context.Context, id string) (*domain.Recording
 	recording, err := m.Get(id)
 	e.mu.Lock()
 	terminalErr := e.terminalErr
+	if terminalErr != nil && recording == nil && e.recording != nil {
+		// A failed terminal root write leaves the last durable/in-memory
+		// recording state authoritative. Preserve that snapshot for the caller
+		// even when a simultaneous read of the damaged storage path cannot
+		// materialize it; the persistence error remains returned below.
+		recording = clone(e.recording)
+	}
 	e.mu.Unlock()
 	if terminalErr != nil {
 		return recording, terminalErr
@@ -1954,15 +2143,22 @@ func (m *Manager) Get(id string) (*domain.Recording, error) {
 	e, ok := m.entry(id)
 	if !ok {
 		if m.freshGeneration {
-			return m.store.LoadRecordingReadOnly(id)
+			recording, err := m.store.LoadRecordingReadOnly(id)
+			if err != nil || !isShardedRecording(recording) {
+				return recording, err
+			}
+			return m.materializeShardedRecording(recording)
 		}
 		return nil, storage.ErrNotFound
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	copy := clone(e.recording)
+	e.mu.Unlock()
 	if copy == nil {
 		return nil, errors.New("recording state could not be copied")
+	}
+	if isShardedRecording(copy) {
+		return m.materializeShardedRecording(copy)
 	}
 	return copy, nil
 }
@@ -2147,6 +2343,7 @@ func (m *Manager) updateWithinAuthorizedCommit(e *entry, fn func(*domain.Recordi
 		e.mu.Unlock()
 		return errors.New("recording was deleted")
 	}
+	base := clone(e.recording)
 	next := clone(e.recording)
 	e.mu.Unlock()
 	if next == nil {
@@ -2160,8 +2357,19 @@ func (m *Manager) updateWithinAuthorizedCommit(e *entry, fn func(*domain.Recordi
 	if err := fn(next); err != nil {
 		return err
 	}
-	if err := m.store.SaveRecording(next); err != nil {
+	if isShardedRecording(next) {
+		pruneShardedRuntimeTail(next)
+		if err := m.appendShardedGapsSince(next.ID, base.Gaps, next.Gaps); err != nil {
+			return newStorageStageError("persist sharded gaps", err)
+		}
+	}
+	if err := m.saveRecordingHeader(next); err != nil {
 		return newStorageStageError("recording root commit", err)
+	}
+	if isShardedRecording(next) {
+		if err := m.refreshShardedHeader(next); err != nil {
+			return newStorageStageError("refresh sharded root summary", err)
+		}
 	}
 	e.mu.Lock()
 	e.recording = next

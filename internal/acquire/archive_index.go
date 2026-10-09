@@ -41,10 +41,19 @@ var (
 // claim/coverage format. Claim shards are derived by logical coordinate and
 // coverage is kept in one bounded, non-canonical sidecar.
 type archiveIndexManifest struct {
-	SchemaVersion int                          `json:"schema_version"`
-	RecordingID   string                       `json:"recording_id"`
-	Session       archiveindex.SessionIdentity `json:"session"`
-	ClaimShards   []string                     `json:"claim_shards,omitempty"`
+	SchemaVersion   int                          `json:"schema_version"`
+	RecordingID     string                       `json:"recording_id"`
+	Session         archiveindex.SessionIdentity `json:"session"`
+	ClaimShards     []string                     `json:"claim_shards,omitempty"`
+	PendingRevision *archiveRevisionIntent       `json:"pending_revision,omitempty"`
+}
+
+// archiveRevisionIntent makes claim publication retryable across the gap
+// between durable claim-shard write and recording-root revision write.
+type archiveRevisionIntent struct {
+	Revision   uint64                  `json:"revision"`
+	ClaimID    string                  `json:"claim_id"`
+	Coordinate archiveindex.Coordinate `json:"coordinate"`
 }
 
 type archiveClaimShard struct {
@@ -235,6 +244,9 @@ func (m *Manager) ArchiveInventory(id string) (archiveindex.Inventory, error) {
 		if err != nil {
 			return archiveindex.Inventory{}, err
 		}
+		if isShardedRecording(recording) {
+			return m.shardedArchiveInventory(recording)
+		}
 		return m.inventoryForRecording(recording, false)
 	}
 	e.persistMu.Lock()
@@ -243,7 +255,126 @@ func (m *Manager) ArchiveInventory(id string) (archiveindex.Inventory, error) {
 	if recording == nil {
 		return archiveindex.Inventory{}, storage.ErrNotFound
 	}
+	if isShardedRecording(recording) {
+		return m.shardedArchiveInventory(recording)
+	}
 	return m.inventoryForRecording(recording, false)
+}
+
+// shardedArchiveInventory is the explicit cold inventory projection. Mutating
+// v2 acquisition paths use coordinate lookups and never call this full walk.
+func (m *Manager) shardedArchiveInventory(header *domain.Recording) (archiveindex.Inventory, error) {
+	const maxMaterializedSegments = uint64(archiveindex.MaxSegments)
+	var materializedCount uint64
+	for _, track := range header.Tracks {
+		if track == nil {
+			return archiveindex.Inventory{}, archiveindex.ErrInvalidInventory
+		}
+		for _, count := range []uint64{track.MediaCount, track.InitCount} {
+			if count > maxMaterializedSegments-materializedCount {
+				return archiveindex.Inventory{}, ErrArchiveIndexLimit
+			}
+			materializedCount += count
+		}
+	}
+	full, err := m.materializeShardedRecording(header)
+	if err != nil {
+		return archiveindex.Inventory{}, err
+	}
+	inventory, err := archiveindex.FromRecording(full, false)
+	if err != nil {
+		if isArchiveIndexCapacityError(err) {
+			return archiveindex.Inventory{}, ErrArchiveIndexLimit
+		}
+		return archiveindex.Inventory{}, err
+	}
+	applyInlineClaims := func(iterator func(func(storage.V2MediaRecord) error) error) error {
+		return iterator(func(record storage.V2MediaRecord) error {
+			if record.SelectedClaim == nil {
+				return nil
+			}
+			input := claimInputForStoredClaim(record.Coordinate, *record.SelectedClaim, record.Segment)
+			if _, err := archiveindex.ApplyClaim(&inventory, input); err != nil {
+				return err
+			}
+			preferPersistedSelectedClaim(&inventory, record.Coordinate, *record.SelectedClaim)
+			return nil
+		})
+	}
+	trackIDs := make([]string, 0, len(header.Tracks))
+	for trackID := range header.Tracks {
+		trackIDs = append(trackIDs, trackID)
+	}
+	sort.Strings(trackIDs)
+	for _, trackID := range trackIDs {
+		if err := applyInlineClaims(func(visit func(storage.V2MediaRecord) error) error {
+			return m.store.IterateShardedMedia(context.Background(), header.ID, trackID, visit)
+		}); err != nil {
+			return archiveindex.Inventory{}, newStorageStageError("iterate inline media provenance", err)
+		}
+		if err := applyInlineClaims(func(visit func(storage.V2MediaRecord) error) error {
+			return m.store.IterateShardedInitSegments(context.Background(), header.ID, trackID, visit)
+		}); err != nil {
+			return archiveindex.Inventory{}, newStorageStageError("iterate inline init provenance", err)
+		}
+	}
+	if err := m.store.IterateShardedClaimSets(context.Background(), header.ID, func(set storage.V2ClaimSet) error {
+		var selected *archiveindex.Segment
+		for i := range inventory.Segments {
+			if inventory.Segments[i].Coordinate == set.Coordinate {
+				selected = &inventory.Segments[i]
+				break
+			}
+		}
+		if selected == nil {
+			return nil
+		}
+		stored, lookupErr := m.store.LookupShardedMediaByCoordinate(context.Background(), header.ID, set.Coordinate)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		for _, claim := range set.Claims {
+			input := claimInputForStoredClaim(set.Coordinate, claim, stored.Segment)
+			if _, err := archiveindex.ApplyClaim(&inventory, input); err != nil {
+				return err
+			}
+			preferPersistedSelectedClaim(&inventory, set.Coordinate, claim)
+		}
+		selected = nil
+		for i := range inventory.Segments {
+			if inventory.Segments[i].Coordinate == set.Coordinate {
+				selected = &inventory.Segments[i]
+				break
+			}
+		}
+		if selected == nil || selected.SelectedClaimID != set.SelectedClaimID || selected.State != set.State {
+			return archiveindex.ErrInvalidInventory
+		}
+		return nil
+	}); err != nil {
+		if isArchiveIndexCapacityError(err) {
+			return archiveindex.Inventory{}, ErrArchiveIndexLimit
+		}
+		return archiveindex.Inventory{}, newStorageStageError("load sharded archive claims", err)
+	}
+	if err := m.store.IterateShardedCoverage(context.Background(), header.ID, func(coverage archiveindex.Coverage) error {
+		if err := archiveindex.ApplyCoverage(&inventory, coverage); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		if isArchiveIndexCapacityError(err) {
+			return archiveindex.Inventory{}, ErrArchiveIndexLimit
+		}
+		return archiveindex.Inventory{}, newStorageStageError("load sharded archive coverage", err)
+	}
+	if err := inventory.Validate(); err != nil {
+		if isArchiveIndexCapacityError(err) {
+			return archiveindex.Inventory{}, ErrArchiveIndexLimit
+		}
+		return archiveindex.Inventory{}, err
+	}
+	return inventory, nil
 }
 
 // inventoryForCoordinate keeps the live hot path bounded to the one claim
@@ -277,6 +408,9 @@ func (m *Manager) loadArchiveInventory(recording *domain.Recording, allowRootOnl
 	if manifestErr == nil {
 		if manifest.SchemaVersion != archiveindex.SchemaVersion || manifest.RecordingID != recording.ID || manifest.Session.ID != inventory.Session.ID {
 			return archiveindex.Inventory{}, fmt.Errorf("%w: archive index identity mismatch", ErrArchiveIndexUnavailable)
+		}
+		if manifest.PendingRevision != nil && (!validArchiveRevisionIntent(manifest.PendingRevision) || manifest.PendingRevision.Coordinate.SessionID != inventory.Session.ID) {
+			return archiveindex.Inventory{}, fmt.Errorf("%w: archive revision intent is invalid", ErrArchiveIndexUnavailable)
 		}
 		if len(manifest.ClaimShards) > archiveindex.MaxSegments {
 			return archiveindex.Inventory{}, ErrArchiveIndexLimit
@@ -418,6 +552,203 @@ func (m *Manager) persistClaimShard(recordingID string, inventory archiveindex.I
 	// walking canonical root segments. Do not append it to a growing manifest
 	// on every live segment: that would rewrite O(n) metadata per commit.
 	return nil
+}
+
+func validArchiveRevisionIntent(intent *archiveRevisionIntent) bool {
+	if intent == nil || intent.Revision == 0 || intent.ClaimID == "" || len(intent.ClaimID) > archiveindex.MaxClaimIDBytes {
+		return false
+	}
+	_, err := archiveindex.SegmentIdentity(intent.Coordinate)
+	return err == nil
+}
+
+func nextArchiveRevisionValue(current uint64) (uint64, error) {
+	if current == ^uint64(0) {
+		return 0, ErrArchiveRevisionOverflow
+	}
+	if current == 0 {
+		return 1, nil
+	}
+	return current + 1, nil
+}
+
+func (m *Manager) beginArchiveRevisionIntent(recordingID string, inventory archiveindex.Inventory, intent archiveRevisionIntent) error {
+	if !validArchiveRevisionIntent(&intent) {
+		return ErrArchiveIndexUnavailable
+	}
+	if err := m.ensureArchiveIndexManifest(recordingID, inventory); err != nil {
+		return err
+	}
+	manifest, err := m.loadArchiveIndexManifest(recordingID, inventory.Session)
+	if err != nil {
+		return newStorageStageError("load archive index manifest", err)
+	}
+	if manifest.PendingRevision != nil {
+		return fmt.Errorf("%w: unresolved archive revision intent", ErrArchiveIndexUnavailable)
+	}
+	manifest.PendingRevision = &intent
+	if err := m.store.SaveSidecar(recordingID, archiveIndexManifestPath, manifest); err != nil {
+		return newStorageStageError("persist archive revision intent", err)
+	}
+	return nil
+}
+
+func (m *Manager) loadArchiveIndexManifest(recordingID string, session archiveindex.SessionIdentity) (archiveIndexManifest, error) {
+	var manifest archiveIndexManifest
+	if err := m.store.LoadSidecar(recordingID, archiveIndexManifestPath, archiveIndexMaxBytes, &manifest); err != nil {
+		return archiveIndexManifest{}, err
+	}
+	if manifest.SchemaVersion != archiveindex.SchemaVersion || manifest.RecordingID != recordingID || manifest.Session.ID != session.ID ||
+		manifest.PendingRevision != nil && (!validArchiveRevisionIntent(manifest.PendingRevision) || manifest.PendingRevision.Coordinate.SessionID != session.ID) {
+		return archiveIndexManifest{}, ErrArchiveIndexUnavailable
+	}
+	return manifest, nil
+}
+
+func (m *Manager) finishArchiveRevisionIntent(e *entry, recordingID string, session archiveindex.SessionIdentity, revision uint64) error {
+	if err := m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
+		if recording.ArchiveRevision < revision {
+			recording.ArchiveRevision = revision
+		}
+		return nil
+	}); err != nil {
+		return newStorageStageError("persist archive revision", err)
+	}
+	return m.clearArchiveRevisionIntent(recordingID, session, revision)
+}
+
+func (m *Manager) clearArchiveRevisionIntent(recordingID string, session archiveindex.SessionIdentity, revision uint64) error {
+	manifest, err := m.loadArchiveIndexManifest(recordingID, session)
+	if err != nil {
+		return newStorageStageError("load archive revision intent", err)
+	}
+	if manifest.PendingRevision == nil {
+		return nil
+	}
+	if manifest.PendingRevision.Revision != revision {
+		return ErrArchiveIndexUnavailable
+	}
+	manifest.PendingRevision = nil
+	if err := m.store.SaveSidecar(recordingID, archiveIndexManifestPath, manifest); err != nil {
+		return newStorageStageError("clear archive revision intent", err)
+	}
+	return nil
+}
+
+func (m *Manager) reconcileArchiveRevisionIntent(e *entry, recording *domain.Recording, session archiveindex.SessionIdentity, inventory archiveindex.Inventory, inventoryComplete bool) (*domain.Recording, error) {
+	manifest, err := m.loadArchiveIndexManifest(recording.ID, session)
+	if err != nil {
+		if isMissingArchiveSidecar(err) || errors.Is(err, storage.ErrSidecarReadUnsupported) {
+			return recording, nil
+		}
+		return nil, err
+	}
+	intent := manifest.PendingRevision
+	if intent == nil {
+		return recording, nil
+	}
+	if isShardedRecording(recording) {
+		return m.reconcileShardedArchiveRevisionIntent(e, recording, session, manifest)
+	}
+	if !inventoryComplete {
+		return nil, ErrArchiveIndexUnavailable
+	}
+
+	if recording.ArchiveRevision < intent.Revision {
+		_, exists := findRootSegment(recording, intent.Coordinate)
+		if exists {
+			claimPersisted := false
+			for _, item := range inventory.Segments {
+				if item.Coordinate != intent.Coordinate {
+					continue
+				}
+				for _, claim := range item.Claims {
+					if claim.ID == intent.ClaimID {
+						claimPersisted = true
+						break
+					}
+				}
+				break
+			}
+			if claimPersisted {
+				if err := m.updateWithinAuthorizedCommit(e, func(current *domain.Recording) error {
+					if current.ArchiveRevision < intent.Revision {
+						current.ArchiveRevision = intent.Revision
+					}
+					return nil
+				}); err != nil {
+					return nil, newStorageStageError("reconcile archive revision", err)
+				}
+				recording = m.recordingSnapshotForArchive(e)
+				if recording == nil {
+					return nil, storage.ErrNotFound
+				}
+			}
+		}
+	}
+
+	if err := m.clearArchiveRevisionIntent(recording.ID, session, intent.Revision); err != nil {
+		return nil, err
+	}
+	return recording, nil
+}
+
+func (m *Manager) reconcileShardedArchiveRevisionIntent(e *entry, recording *domain.Recording, session archiveindex.SessionIdentity, manifest archiveIndexManifest) (*domain.Recording, error) {
+	intent := manifest.PendingRevision
+	if intent == nil {
+		return recording, nil
+	}
+	selected, err := m.store.LookupShardedMediaByCoordinate(context.Background(), recording.ID, intent.Coordinate)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, newStorageStageError("lookup pending sharded archive revision", err)
+	}
+	claimPersisted := false
+	if err == nil {
+		set, claimErr := m.store.LoadShardedClaimSetByCoordinate(context.Background(), recording.ID, selected.Coordinate)
+		if claimErr != nil && !errors.Is(claimErr, storage.ErrNotFound) {
+			return nil, newStorageStageError("load pending sharded claim set", claimErr)
+		}
+		if claimErr == nil {
+			for _, claim := range set.Claims {
+				if claim.ID == intent.ClaimID {
+					claimPersisted = true
+					break
+				}
+			}
+		}
+	}
+	if claimPersisted && recording.ArchiveRevision < intent.Revision {
+		if e == nil {
+			return nil, ErrArchiveIndexUnavailable
+		}
+		if err := m.updateWithinAuthorizedCommit(e, func(current *domain.Recording) error {
+			if current.ArchiveRevision < intent.Revision {
+				current.ArchiveRevision = intent.Revision
+			}
+			return nil
+		}); err != nil {
+			return nil, newStorageStageError("reconcile sharded archive revision", err)
+		}
+		recording = m.recordingSnapshotForArchive(e)
+		if recording == nil {
+			return nil, storage.ErrNotFound
+		}
+	}
+	if err := m.clearArchiveRevisionIntent(recording.ID, session, intent.Revision); err != nil {
+		return nil, err
+	}
+	return recording, nil
+}
+
+func (m *Manager) reconcilePendingShardedRevision(e *entry, recording *domain.Recording, session archiveindex.SessionIdentity) (*domain.Recording, error) {
+	manifest, err := m.loadArchiveIndexManifest(recording.ID, session)
+	if err != nil {
+		if isMissingArchiveSidecar(err) || errors.Is(err, storage.ErrSidecarReadUnsupported) {
+			return recording, nil
+		}
+		return nil, newStorageStageError("load pending sharded archive revision", err)
+	}
+	return m.reconcileShardedArchiveRevisionIntent(e, recording, session, manifest)
 }
 
 func (m *Manager) ensureArchiveIndexManifest(recordingID string, inventory archiveindex.Inventory) error {
@@ -583,6 +914,20 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 		return result, nil, errors.New("ingested media identity changed before commit")
 	}
 	result = storage.PayloadResult{Size: int64(len(data)), SHA256: actualHash}
+	if recording := m.recordingSnapshotForArchive(e); isShardedRecording(recording) {
+		marker, err := m.commitShardedArchiveSegment(e, owner, segment, source, data, result, allowTerminalAdoption)
+		if err != nil {
+			var staged interface{ Stage() string }
+			if !errors.As(err, &staged) {
+				err = newStorageStageError("canonical ownership validation", err)
+			}
+			return storage.PayloadResult{}, nil, err
+		}
+		if source == archiveindex.ClaimLiveOrigin {
+			m.signalAutomaticArchiveRecovery(recordingID(e))
+		}
+		return result, marker, nil
+	}
 
 	commitErr := m.withCanonicalMutationOwner(e, owner, allowTerminalAdoption, func() error {
 		rootSnapshot := m.recordingSnapshotForArchive(e)
@@ -609,6 +954,14 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 		if inventoryErr != nil && !capacityExceeded {
 			return newStorageStageError("load archive inventory", inventoryErr)
 		}
+		rootSnapshot, err = m.reconcileArchiveRevisionIntent(e, rootSnapshot, identity, inventory, !capacityExceeded)
+		if err != nil {
+			return newStorageStageError("reconcile archive revision", err)
+		}
+		if rootSnapshot == nil {
+			return storage.ErrNotFound
+		}
+		rootSnapshot.SourceSessionID = identity.ID
 
 		existing, exists := findRootSegment(rootSnapshot, coordinate)
 		if exists && existing.SHA256 == result.SHA256 && existing.PayloadSize == result.Size {
@@ -635,7 +988,9 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			}
 		}
 		var disposition archiveindex.ClaimDisposition
+		claimChanged := false
 		if !capacityExceeded {
+			priorRevision := inventory.Revision
 			disposition, err = archiveindex.ApplyClaim(&inventory, input)
 			if err != nil {
 				if isArchiveIndexCapacityError(err) {
@@ -644,6 +999,7 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 					return newStorageStageError("apply archive claim", err)
 				}
 			}
+			claimChanged = inventory.Revision != priorRevision
 		}
 		if capacityExceeded {
 			if source != archiveindex.ClaimLiveOrigin || exists && existing.SHA256 != result.SHA256 {
@@ -674,8 +1030,24 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 
 		if exists && existing.SHA256 == result.SHA256 && existing.PayloadSize == result.Size {
 			if !capacityExceeded {
+				revision := rootSnapshot.ArchiveRevision
+				if claimChanged {
+					revision, err = nextArchiveRevisionValue(revision)
+					if err != nil {
+						return err
+					}
+					intent := archiveRevisionIntent{Revision: revision, ClaimID: input.ClaimID, Coordinate: coordinate}
+					if err := m.beginArchiveRevisionIntent(rootSnapshot.ID, inventory, intent); err != nil {
+						return err
+					}
+				}
 				if err := m.persistClaimShard(rootSnapshot.ID, inventory, segmentID, coordinate, existing.ID); err != nil {
 					return err
+				}
+				if claimChanged {
+					if err := m.finishArchiveRevisionIntent(e, rootSnapshot.ID, identity, revision); err != nil {
+						return err
+					}
 				}
 			}
 			if source == archiveindex.ClaimLiveOrigin && existing.LivePresentationOrdinal == 0 {
@@ -713,8 +1085,24 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			if err := m.store.SaveSidecar(rootSnapshot.ID, segment.StoragePath, segment); err != nil {
 				return newStorageStageError("persist segment sidecar", err)
 			}
+			revision := rootSnapshot.ArchiveRevision
+			if claimChanged {
+				revision, err = nextArchiveRevisionValue(revision)
+				if err != nil {
+					return err
+				}
+				intent := archiveRevisionIntent{Revision: revision, ClaimID: input.ClaimID, Coordinate: coordinate}
+				if err := m.beginArchiveRevisionIntent(rootSnapshot.ID, inventory, intent); err != nil {
+					return err
+				}
+			}
 			if err := m.persistClaimShard(rootSnapshot.ID, inventory, segmentID, coordinate, existing.ID); err != nil {
 				return err
+			}
+			if claimChanged {
+				if err := m.finishArchiveRevisionIntent(e, rootSnapshot.ID, identity, revision); err != nil {
+					return err
+				}
 			}
 			return nil // Playback keeps the prior selected root claim.
 		}
@@ -800,6 +1188,10 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 				return err
 			}
 		}
+		revision, err := nextArchiveRevisionValue(rootSnapshot.ArchiveRevision)
+		if err != nil {
+			return err
+		}
 		if err := m.saveImmutablePayload(rootSnapshot.ID, segment.StoragePath, data, result); err != nil {
 			return newStorageStageError("persist immutable archive payload", err)
 		}
@@ -812,12 +1204,18 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			return newStorageStageError("persist segment sidecar", err)
 		}
 		if !capacityExceeded {
+			if !claimChanged {
+				return fmt.Errorf("%w: new archive object has no new claim", ErrArchiveIndexUnavailable)
+			}
 			if err := m.persistClaimShard(rootSnapshot.ID, inventory, segmentID, coordinate, segment.ID); err != nil {
 				return err
 			}
 		}
 
 		if err := m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
+			if recording.ArchiveRevision < revision {
+				recording.ArchiveRevision = revision
+			}
 			recording.SourceSessionID = identity.ID
 			track := recording.Tracks[segment.TrackID]
 			if track == nil {

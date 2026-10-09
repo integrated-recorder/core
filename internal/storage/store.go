@@ -26,6 +26,11 @@ import (
 
 var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
+const (
+	legacyRecordingFormatVersion  = 0
+	currentRecordingFormatVersion = 1
+)
+
 const maxSidecarReadBytes int64 = 16 << 20
 
 // ErrPayloadSizeMismatch marks a complete source response whose byte count
@@ -40,6 +45,11 @@ var ErrArchiveSizeOverflow = errors.New("recording archive size overflow")
 // ErrReadOnlyListLimit marks a read-only archive snapshot that exceeds its
 // caller's count bound.
 var ErrReadOnlyListLimit = errors.New("read-only recording list exceeds limit")
+
+// ErrUnsupportedRecordingFormat marks a canonical root format this Core
+// cannot safely interpret. Unknown roots must remain untouched so a newer
+// format's fields cannot be lost by decoding and re-encoding an older model.
+var ErrUnsupportedRecordingFormat = errors.New("unsupported recording format version")
 
 // ErrSidecarReadUnsupported marks a backend that does not expose the optional
 // read-only sidecar capability. It is intentionally safe to return to callers.
@@ -90,6 +100,7 @@ type StorageBackend interface {
 type Store struct {
 	StorageBackend
 	root             string // internal/test compatibility only; never part of API models
+	v2Locks          [64]sync.Mutex
 	ingestMu         sync.RWMutex
 	ingest           *IngestService
 	ingestOptions    IngestOptions
@@ -143,6 +154,19 @@ func (s *Store) CreateRecordingWithSidecar(recording *domain.Recording, relative
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) || !validInitialSidecarPath(relativePath) || value == nil {
 		return errors.New("invalid recording sidecar initialization")
 	}
+	root := recording
+	if recording.FormatVersion == ShardedArchiveFormatVersion {
+		root = cloneRecordingHeader(recording)
+		if root == nil {
+			return ErrShardedArchiveInvalid
+		}
+		if root.ShardedArchive == nil {
+			root.ShardedArchive = &domain.ShardedArchiveSummary{}
+		}
+		if err := validateV2Header(root); err != nil {
+			return err
+		}
+	}
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil || int64(len(data)+1) > maxSidecarReadBytes {
 		return errors.New("recording sidecar initialization exceeds size limit")
@@ -153,7 +177,7 @@ func (s *Store) CreateRecordingWithSidecar(recording *domain.Recording, relative
 	if !ok {
 		return ErrAtomicRecordingCreationUnsupported
 	}
-	return creator.CreateRecordingWithSidecar(recording, relativePath, value)
+	return creator.CreateRecordingWithSidecar(root, relativePath, value)
 }
 
 func validateSidecarRead(id, relativePath string, maxBytes int64, output any) error {
@@ -571,6 +595,14 @@ func (s *LocalFilesystemBackend) createRecording(recording *domain.Recording, si
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return fmt.Errorf("invalid recording")
 	}
+	if err := validateRecordingFormat(recording.FormatVersion); err != nil {
+		return err
+	}
+	if recording.FormatVersion == ShardedArchiveFormatVersion {
+		if err := validateV2Header(recording); err != nil {
+			return err
+		}
+	}
 	if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
 		return fmt.Errorf("invalid recording metadata timeline")
 	}
@@ -657,6 +689,16 @@ func (s *LocalFilesystemBackend) SaveRecording(recording *domain.Recording) erro
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return fmt.Errorf("invalid recording")
 	}
+	if err := validateRecordingFormat(recording.FormatVersion); err != nil {
+		s.telemetry.recordError()
+		return err
+	}
+	if recording.FormatVersion == ShardedArchiveFormatVersion {
+		if err := validateV2Header(recording); err != nil {
+			s.telemetry.recordError()
+			return err
+		}
+	}
 	if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
 		return fmt.Errorf("invalid recording metadata timeline")
 	}
@@ -720,11 +762,25 @@ func (s *LocalFilesystemBackend) LoadAll() ([]*domain.Recording, error) {
 		}
 		id := entry.Name()
 		recordingDir := filepath.Join(base, id)
-		if err = tightenRecordingTree(recordingDir); err != nil {
+		dirInfo, dirErr := os.Lstat(recordingDir)
+		if dirErr != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
 			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "permissions_unavailable", Message: "recording could not be restricted safely"})
 			continue
 		}
 		path := filepath.Join(recordingDir, "recording.json")
+		fileInfo, fileErr := os.Lstat(path)
+		if fileErr != nil {
+			code := "metadata_unavailable"
+			if errors.Is(fileErr, os.ErrNotExist) {
+				code = "metadata_missing"
+			}
+			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: code, Message: "recording metadata is unavailable; directory data was preserved"})
+			continue
+		}
+		if !fileInfo.Mode().IsRegular() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Size() < 0 || fileInfo.Size() > 64<<20 {
+			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "metadata_unavailable", Message: "recording metadata is unavailable; directory data was preserved"})
+			continue
+		}
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
 			code := "metadata_unavailable"
@@ -743,6 +799,23 @@ func (s *LocalFilesystemBackend) LoadAll() ([]*domain.Recording, error) {
 			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "metadata_id_mismatch", Message: "recording metadata identity does not match its directory"})
 			continue
 		}
+		if recording.FormatVersion == ShardedArchiveFormatVersion {
+			if err := os.Chmod(recordingDir, 0700); err != nil {
+				s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "permissions_unavailable", Message: "recording could not be restricted safely"})
+				continue
+			}
+			if err := os.Chmod(path, 0600); err != nil {
+				s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "permissions_unavailable", Message: "recording metadata could not be restricted safely"})
+				continue
+			}
+		} else if err := tightenRecordingTree(recordingDir); err != nil {
+			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "permissions_unavailable", Message: "recording could not be restricted safely"})
+			continue
+		}
+		if err := validateRecordingFormat(recording.FormatVersion); err != nil {
+			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "metadata_format_unsupported", Message: "recording format is unsupported; archive data was preserved"})
+			continue
+		}
 		changed := false
 		if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
 			// Preserve the media archive if a source-controlled projection is
@@ -756,10 +829,17 @@ func (s *LocalFilesystemBackend) LoadAll() ([]*domain.Recording, error) {
 		if recording.Tracks == nil {
 			recording.Tracks = map[string]*domain.Track{}
 		}
-		reconcileChanged, reconcileErr := s.reconcileRecording(&recording)
-		changed = changed || reconcileChanged
-		if reconcileErr != nil {
-			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "reconciliation_incomplete", Message: "recording payload reconciliation was incomplete"})
+		if recording.FormatVersion == ShardedArchiveFormatVersion {
+			if err := validateV2Header(&recording); err != nil {
+				s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "metadata_invalid", Message: "sharded recording header is invalid; archive data was preserved"})
+				continue
+			}
+		} else {
+			reconcileChanged, reconcileErr := s.reconcileRecording(&recording)
+			changed = changed || reconcileChanged
+			if reconcileErr != nil {
+				s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "reconciliation_incomplete", Message: "recording payload reconciliation was incomplete"})
+			}
 		}
 		invalidTrack := false
 		for _, track := range recording.Tracks {
@@ -811,6 +891,31 @@ func (s *LocalFilesystemBackend) LoadAll() ([]*domain.Recording, error) {
 			}
 		}
 		recordings = append(recordings, &recording)
+	}
+	return recordings, nil
+}
+
+// LoadAll adds bounded v2 shard reconciliation to the backend's legacy
+// startup recovery. Backends return v2 header documents without materializing
+// archive history; this facade reconciles orphan publication candidates and
+// refreshes returned headers.
+func (s *Store) LoadAll() ([]*domain.Recording, error) {
+	recordings, err := s.StorageBackend.LoadAll()
+	if err != nil {
+		return nil, err
+	}
+	for _, recording := range recordings {
+		if recording == nil || recording.FormatVersion != ShardedArchiveFormatVersion {
+			continue
+		}
+		if err := s.ReconcileShardedArchive(context.Background(), recording.ID); err != nil {
+			return nil, err
+		}
+		header, err := s.LoadRecordingHeader(context.Background(), recording.ID)
+		if err != nil {
+			return nil, err
+		}
+		*recording = *header
 	}
 	return recordings, nil
 }
@@ -905,13 +1010,70 @@ func (s *LocalFilesystemBackend) LoadRecordingReadOnly(id string) (*domain.Recor
 	if !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("recording metadata is not a regular file")
 	}
+	data, err := readRecordingRootSnapshot(path, pathInfo)
+	if err != nil {
+		return nil, err
+	}
+	var recording domain.Recording
+	if err := json.Unmarshal(data, &recording); err != nil {
+		return nil, errors.New("recording metadata is invalid")
+	}
+	if recording.ID != id {
+		return nil, errors.New("recording metadata identity mismatch")
+	}
+	if err := validateRecordingFormat(recording.FormatVersion); err != nil {
+		return nil, err
+	}
+	if recording.FormatVersion == ShardedArchiveFormatVersion {
+		if err := validateV2Header(&recording); err != nil {
+			return nil, err
+		}
+	}
+	if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
+		return nil, errors.New("recording metadata timeline is invalid")
+	}
+	if recording.Tracks == nil {
+		recording.Tracks = map[string]*domain.Track{}
+	}
+	for _, track := range recording.Tracks {
+		if track == nil {
+			return nil, errors.New("recording contains an invalid track")
+		}
+		sortTrack(track)
+	}
+	return &recording, nil
+}
+
+// readRecordingRootSnapshot reads from one already-open file descriptor. A
+// concurrent atomic root replacement can make the path refer to a different
+// regular file between Lstat and Open; the descriptor still provides a stable
+// old-or-new snapshot, so inode mismatch alone is not an error. Recheck the
+// path after opening to preserve explicit symlink/non-regular rejection.
+func readRecordingRootSnapshot(path string, observed os.FileInfo) ([]byte, error) {
+	if observed == nil || !observed.Mode().IsRegular() || observed.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("recording metadata is not a regular file")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 	openedInfo, err := file.Stat()
-	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
+	if err != nil || !openedInfo.Mode().IsRegular() {
+		return nil, errors.New("recording metadata is not a regular file")
+	}
+	currentInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !currentInfo.Mode().IsRegular() || currentInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("recording metadata is not a regular file")
+	}
+	if !os.SameFile(observed, openedInfo) && !os.SameFile(currentInfo, openedInfo) {
+		// More than one replacement raced this open, or the opened file did not
+		// belong to either the observed or current regular root. Refuse an
+		// ambiguous snapshot while allowing one atomic publication in either
+		// direction.
 		return nil, errors.New("recording metadata changed during read")
 	}
 	// Canonical roots may grow with segment metadata. Keep this read bounded;
@@ -928,26 +1090,14 @@ func (s *LocalFilesystemBackend) LoadRecordingReadOnly(id string) (*domain.Recor
 	if len(data) > maxRecordingDocumentBytes {
 		return nil, errors.New("recording metadata exceeds read limit")
 	}
-	var recording domain.Recording
-	if err := json.Unmarshal(data, &recording); err != nil {
-		return nil, errors.New("recording metadata is invalid")
+	return data, nil
+}
+
+func validateRecordingFormat(version int) error {
+	if version == legacyRecordingFormatVersion || version == currentRecordingFormatVersion || version == ShardedArchiveFormatVersion {
+		return nil
 	}
-	if recording.ID != id {
-		return nil, errors.New("recording metadata identity mismatch")
-	}
-	if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
-		return nil, errors.New("recording metadata timeline is invalid")
-	}
-	if recording.Tracks == nil {
-		recording.Tracks = map[string]*domain.Track{}
-	}
-	for _, track := range recording.Tracks {
-		if track == nil {
-			return nil, errors.New("recording contains an invalid track")
-		}
-		sortTrack(track)
-	}
-	return &recording, nil
+	return ErrUnsupportedRecordingFormat
 }
 
 func (s *LocalFilesystemBackend) reconcileRecording(recording *domain.Recording) (bool, error) {

@@ -266,6 +266,62 @@ func (r *ManagerRouter) GetContext(ctx context.Context, id string) (*domain.Reco
 	return nil, storage.ErrNotFound
 }
 
+// LifecycleSnapshot reads bounded lifecycle fields. Owner hints select a
+// terminal recovery Engine without cloning the archive root.
+func (r *ManagerRouter) LifecycleSnapshot(ctx context.Context, id string) (acquire.LifecycleSnapshot, error) {
+	r.mutation.RLock()
+	defer r.mutation.RUnlock()
+	clients, activeID := r.clientsAndActive()
+	type snapshotResult struct {
+		client   attachedClient
+		snapshot acquire.LifecycleSnapshot
+	}
+	results := make([]snapshotResult, 0, len(clients))
+	var firstReadErr error
+	for _, attached := range clients {
+		snapshot, err := attached.client.LifecycleSnapshot(ctx, id)
+		if err != nil {
+			if !errors.Is(err, storage.ErrNotFound) && firstReadErr == nil {
+				firstReadErr = err
+			}
+			continue
+		}
+		results = append(results, snapshotResult{client: attached, snapshot: snapshot})
+	}
+	if len(results) == 0 {
+		if firstReadErr != nil {
+			return acquire.LifecycleSnapshot{}, firstReadErr
+		}
+		return acquire.LifecycleSnapshot{}, storage.ErrNotFound
+	}
+	var owner *snapshotResult
+	for i := range results {
+		candidate := &results[i]
+		if !candidate.snapshot.EngineOwns {
+			continue
+		}
+		if owner == nil || candidate.snapshot.OwnerEpoch > owner.snapshot.OwnerEpoch {
+			owner = candidate
+			continue
+		}
+		if candidate.snapshot.OwnerEpoch == owner.snapshot.OwnerEpoch {
+			return acquire.LifecycleSnapshot{}, ErrMultipleRecordingOwners
+		}
+	}
+	if owner != nil {
+		return owner.snapshot, nil
+	}
+	for _, candidate := range results {
+		if candidate.client.generationID == activeID {
+			return candidate.snapshot, nil
+		}
+	}
+	if firstReadErr != nil {
+		return acquire.LifecycleSnapshot{}, firstReadErr
+	}
+	return results[0].snapshot, nil
+}
+
 // LivePlaybackSnapshot routes to the generation that owns the live worker and
 // returns only its bounded live-tail projection. Terminal recordings have no
 // active owner; in that case return only state so the HTTP layer can preserve
@@ -422,6 +478,58 @@ func (r *ManagerRouter) StopContext(ctx context.Context, id string) (*domain.Rec
 	return nil, storage.ErrNotFound
 }
 
+// CompleteRecording routes the explicit stopped-to-completed transition to
+// the Engine that owns the canonical archive. Completion does not seal it.
+func (r *ManagerRouter) CompleteRecording(ctx context.Context, id string) (*domain.Recording, error) {
+	r.mutation.Lock()
+	defer r.mutation.Unlock()
+	clients := r.clientsSnapshot()
+	if len(clients) == 0 {
+		return nil, ErrGenerationNotAttached
+	}
+	ordered, err := r.prioritizeLifecycleOwner(ctx, id, clients)
+	if err != nil {
+		return nil, err
+	}
+	for _, attached := range ordered {
+		recording, callErr := attached.client.CompleteRecording(ctx, id)
+		if callErr == nil {
+			return recording, nil
+		}
+		if errors.Is(callErr, storage.ErrNotFound) {
+			continue
+		}
+		return nil, callErr
+	}
+	return nil, storage.ErrNotFound
+}
+
+// SealArchiveContext explicitly closes repair admission for a terminal
+// archive through its owning Engine.
+func (r *ManagerRouter) SealArchiveContext(ctx context.Context, id string) error {
+	r.mutation.Lock()
+	defer r.mutation.Unlock()
+	clients := r.clientsSnapshot()
+	if len(clients) == 0 {
+		return ErrGenerationNotAttached
+	}
+	ordered, err := r.prioritizeLifecycleOwner(ctx, id, clients)
+	if err != nil {
+		return err
+	}
+	for _, attached := range ordered {
+		callErr := attached.client.SealArchiveContext(ctx, id)
+		if callErr == nil {
+			return nil
+		}
+		if errors.Is(callErr, storage.ErrNotFound) {
+			continue
+		}
+		return callErr
+	}
+	return storage.ErrNotFound
+}
+
 func (r *ManagerRouter) Delete(id string) error {
 	return r.DeleteContext(context.Background(), id)
 }
@@ -574,6 +682,34 @@ func (r *ManagerRouter) prioritizeOwner(ctx context.Context, recordingID string,
 	return orderByOwner(clients, owners[recordingID])
 }
 
+func (r *ManagerRouter) prioritizeLifecycleOwner(ctx context.Context, recordingID string, clients []attachedClient) ([]attachedClient, error) {
+	var ownerID string
+	var ownerEpoch uint64
+	for _, attached := range clients {
+		snapshot, err := attached.client.LifecycleSnapshot(ctx, recordingID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				continue
+			}
+			return r.prioritizeOwner(ctx, recordingID, clients)
+		}
+		if !snapshot.EngineOwns {
+			continue
+		}
+		if ownerID == "" || snapshot.OwnerEpoch > ownerEpoch {
+			ownerID, ownerEpoch = attached.generationID, snapshot.OwnerEpoch
+			continue
+		}
+		if snapshot.OwnerEpoch == ownerEpoch {
+			return nil, ErrMultipleRecordingOwners
+		}
+	}
+	if ownerID != "" {
+		return orderByOwner(clients, ownerID)
+	}
+	return r.prioritizeOwner(ctx, recordingID, clients)
+}
+
 func orderByOwner(clients []attachedClient, ownerID string) ([]attachedClient, error) {
 	if ownerID == "" {
 		return clients, nil
@@ -608,5 +744,8 @@ var _ interface {
 	List() []*domain.Recording
 	ListForManagement(context.Context, int) ([]*domain.Recording, error)
 	Stop(string) (*domain.Recording, error)
+	LifecycleSnapshot(context.Context, string) (acquire.LifecycleSnapshot, error)
+	CompleteRecording(context.Context, string) (*domain.Recording, error)
+	SealArchiveContext(context.Context, string) error
 	Delete(string) error
 } = (*ManagerRouter)(nil)

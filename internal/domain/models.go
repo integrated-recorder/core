@@ -44,6 +44,29 @@ type Recording struct {
 	// TimelineRevision advances whenever the playback projection is rebuilt.
 	// Archive ordinals remain append-only storage/preview identities.
 	TimelineRevision uint64 `json:"timeline_revision,omitempty"`
+	// ArchiveRevision advances when canonical archive content changes. It is
+	// independent from TimelineRevision: init objects, manifest snapshots, and
+	// claims can change archive contents without changing playback order.
+	ArchiveRevision uint64 `json:"archive_revision,omitempty"`
+	// ShardedArchive is present only on format-v2 roots. It contains bounded
+	// counters for histories stored in archive/v2/ shards; it never contains
+	// per-object references.
+	ShardedArchive *ShardedArchiveSummary `json:"sharded_archive,omitempty"`
+}
+
+// ShardedArchiveSummary is the bounded root summary for a format-v2 archive.
+// Counts are high-water summaries; canonical records live in bounded shards.
+type ShardedArchiveSummary struct {
+	MediaCount               uint64  `json:"media_count,omitempty"`
+	InitCount                uint64  `json:"init_count,omitempty"`
+	GapCount                 uint64  `json:"gap_count,omitempty"`
+	ManifestSnapshotCount    uint64  `json:"manifest_snapshot_count,omitempty"`
+	MetadataRevisionCount    uint64  `json:"metadata_revision_count,omitempty"`
+	ClaimCount               uint64  `json:"claim_count,omitempty"`
+	CoverageObservationCount uint64  `json:"coverage_observation_count,omitempty"`
+	ClaimReconcilePending    bool    `json:"claim_reconcile_pending,omitempty"`
+	PayloadBytes             uint64  `json:"payload_bytes,omitempty"`
+	DurationSeconds          float64 `json:"duration_seconds,omitempty"`
 }
 
 // MetadataRevision records a canonical snapshot of the known source title and
@@ -65,9 +88,18 @@ type Track struct {
 	// LivePresentation stores the append-only identity cursor used only by the
 	// active browser-facing live HLS projection. It is independent of both
 	// ArchiveOrdinal and the revisionable VOD TimelineOrdinal.
-	LivePresentation        *LivePresentationState `json:"live_presentation,omitempty"`
-	HasLastObservedSequence bool                   `json:"has_last_observed_sequence,omitempty"`
-	LastObservedSequence    uint64                 `json:"last_observed_sequence,omitempty"`
+	LivePresentation *LivePresentationState `json:"live_presentation,omitempty"`
+	// LiveSlotHighWater is the last fully published presentation slot. It is
+	// the root visibility marker for the separate bounded live-tail index.
+	LiveSlotHighWater uint64 `json:"live_slot_high_water,omitempty"`
+	// Format-v2 bounded summaries. They remain scalar as media shards grow.
+	MediaCount              uint64  `json:"media_count,omitempty"`
+	InitCount               uint64  `json:"init_count,omitempty"`
+	MediaHighWater          uint64  `json:"media_high_water,omitempty"`
+	PayloadBytes            uint64  `json:"payload_bytes,omitempty"`
+	DurationSeconds         float64 `json:"duration_seconds,omitempty"`
+	HasLastObservedSequence bool    `json:"has_last_observed_sequence,omitempty"`
+	LastObservedSequence    uint64  `json:"last_observed_sequence,omitempty"`
 	// PendingSequences is retained for legacy recordings where source epoch was
 	// implicitly zero. Newer recordings use PendingSegments.
 	PendingSequences []uint64          `json:"pending_sequences,omitempty"`
@@ -191,6 +223,12 @@ type ManifestSnapshot struct {
 }
 
 func (r *Recording) SegmentCount() int {
+	if r != nil && r.FormatVersion == 2 && r.ShardedArchive != nil {
+		if r.ShardedArchive.MediaCount > uint64(^uint(0)>>1) {
+			return int(^uint(0) >> 1)
+		}
+		return int(r.ShardedArchive.MediaCount)
+	}
 	count := 0
 	for _, track := range r.Tracks {
 		count += len(track.Segments)
@@ -199,6 +237,9 @@ func (r *Recording) SegmentCount() int {
 }
 
 func (r *Recording) Duration() float64 {
+	if r != nil && r.FormatVersion == 2 && r.ShardedArchive != nil {
+		return r.ShardedArchive.DurationSeconds
+	}
 	var duration float64
 	for _, track := range r.Tracks {
 		for _, segment := range track.Segments {

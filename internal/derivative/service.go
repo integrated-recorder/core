@@ -3,6 +3,7 @@
 package derivative
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -18,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,16 +66,36 @@ const (
 // Job is safe to return from the management API. It contains no paths,
 // commands, source URIs, adapter state, or process output.
 type Job struct {
-	ID          string     `json:"id"`
-	RecordingID string     `json:"recording_id"`
-	Kind        string     `json:"kind"`
-	State       State      `json:"state"`
-	CreatedAt   time.Time  `json:"created_at"`
-	StartedAt   *time.Time `json:"started_at,omitempty"`
-	FinishedAt  *time.Time `json:"finished_at,omitempty"`
-	OutputName  string     `json:"output_name,omitempty"`
-	Size        int64      `json:"size,omitempty"`
-	ErrorCode   string     `json:"error_code,omitempty"`
+	ID                     string     `json:"id"`
+	RecordingID            string     `json:"recording_id"`
+	Kind                   string     `json:"kind"`
+	State                  State      `json:"state"`
+	CreatedAt              time.Time  `json:"created_at"`
+	StartedAt              *time.Time `json:"started_at,omitempty"`
+	FinishedAt             *time.Time `json:"finished_at,omitempty"`
+	OutputName             string     `json:"output_name,omitempty"`
+	Size                   int64      `json:"size,omitempty"`
+	ErrorCode              string     `json:"error_code,omitempty"`
+	SourceArchiveRevision  uint64     `json:"source_archive_revision,omitempty"`
+	SourceTimelineRevision uint64     `json:"source_timeline_revision,omitempty"`
+	SourceRevisionKnown    bool       `json:"source_revision_known,omitempty"`
+}
+
+type Freshness string
+
+const (
+	FreshnessUnknown Freshness = "unknown"
+	FreshnessCurrent Freshness = "current"
+	FreshnessStale   Freshness = "stale"
+)
+
+// JobProjection adds an on-demand freshness comparison without persisting a
+// derived current/stale state into the durable job record.
+type JobProjection struct {
+	Job
+	CurrentArchiveRevision  uint64    `json:"current_archive_revision,omitempty"`
+	CurrentTimelineRevision uint64    `json:"current_timeline_revision,omitempty"`
+	Freshness               Freshness `json:"freshness"`
 }
 
 type persistedState struct {
@@ -193,16 +216,27 @@ func (s *Service) Available() bool { return s != nil && s.ffmpegPath != "" }
 // Start enqueues one HLS source-native Matroska remux. The recording metadata
 // is cloned before it is retained. Active exports coalesce by recording ID.
 func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, error) {
-	if ctx != nil {
-		if err := ctx.Err(); err != nil {
-			return Job{}, err
-		}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Job{}, err
 	}
 	if !s.Available() {
 		return Job{}, ErrUnavailable
 	}
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return Job{}, ErrInvalid
+	}
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		header, err := s.store.LoadRecordingHeader(ctx, recording.ID)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return Job{}, err
+			}
+			return Job{}, fmt.Errorf("%w: canonical source is unavailable", ErrUnsupported)
+		}
+		recording = header
 	}
 	if recording.State == domain.StateRecording {
 		return Job{}, ErrActive
@@ -214,7 +248,14 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 	if err != nil {
 		return Job{}, ErrInvalid
 	}
-	if _, err := s.sourceObjects(copyRecording); err != nil {
+	if copyRecording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		if err := s.validateShardedSource(ctx, copyRecording); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return Job{}, err
+			}
+			return Job{}, fmt.Errorf("%w: canonical source is unavailable", ErrUnsupported)
+		}
+	} else if _, err := s.sourceObjects(copyRecording); err != nil {
 		return Job{}, fmt.Errorf("%w: canonical source is unavailable", ErrUnsupported)
 	}
 
@@ -236,7 +277,13 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 	if err != nil {
 		return Job{}, fmt.Errorf("create export job: %w", err)
 	}
-	job := Job{ID: id, RecordingID: recording.ID, Kind: jobKindExport, State: StateQueued, CreatedAt: time.Now().UTC(), OutputName: "recording-" + recording.ID + ".mkv"}
+	job := Job{
+		ID: id, RecordingID: recording.ID, Kind: jobKindExport, State: StateQueued,
+		CreatedAt: time.Now().UTC(), OutputName: "recording-" + recording.ID + ".mkv",
+		SourceArchiveRevision:  copyRecording.ArchiveRevision,
+		SourceTimelineRevision: copyRecording.TimelineRevision,
+		SourceRevisionKnown:    copyRecording.ArchiveRevision != 0,
+	}
 	s.jobs[id] = job
 	s.activeByRec[recording.ID] = id
 	s.notifyLocked()
@@ -287,6 +334,32 @@ func (s *Service) List(recordingID string) []Job {
 		return jobs[i].CreatedAt.After(jobs[j].CreatedAt)
 	})
 	return jobs
+}
+
+// ListWithFreshness projects recent jobs against a caller-owned current
+// recording snapshot. A nil or mismatched snapshot yields unknown freshness.
+func (s *Service) ListWithFreshness(recordingID string, current *domain.Recording) []JobProjection {
+	jobs := s.List(recordingID)
+	projections := make([]JobProjection, 0, len(jobs))
+	for _, job := range jobs {
+		projections = append(projections, ProjectJob(job, current))
+	}
+	return projections
+}
+
+// ProjectJob computes freshness without changing durable export state.
+func ProjectJob(job Job, current *domain.Recording) JobProjection {
+	projection := JobProjection{Job: cloneJob(job), Freshness: FreshnessUnknown}
+	if current == nil || current.ID != job.RecordingID || !job.SourceRevisionKnown {
+		return projection
+	}
+	projection.CurrentArchiveRevision = current.ArchiveRevision
+	projection.CurrentTimelineRevision = current.TimelineRevision
+	projection.Freshness = FreshnessCurrent
+	if job.SourceArchiveRevision != current.ArchiveRevision || job.SourceTimelineRevision != current.TimelineRevision {
+		projection.Freshness = FreshnessStale
+	}
+	return projection
 }
 
 // InProgress reports whether a recording has a queued or running export.
@@ -552,6 +625,9 @@ func contextErrorCode(err error) string {
 }
 
 func (s *Service) export(ctx context.Context, id string, recording *domain.Recording) (string, int64) {
+	if recording != nil && recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		return s.exportSharded(ctx, id, recording)
+	}
 	if err := ctx.Err(); err != nil {
 		return "canceled", 0
 	}
@@ -628,6 +704,466 @@ func (s *Service) export(ctx context.Context, id string, recording *domain.Recor
 		return "artifact_sync_failed", 0
 	}
 	return "", info.Size()
+}
+
+// exportSharded traverses the revisionable v2 playback projection directly.
+// It keeps segment metadata on disk in the temporary playlist body.
+func (s *Service) exportSharded(ctx context.Context, id string, recording *domain.Recording) (string, int64) {
+	if err := ctx.Err(); err != nil {
+		return contextErrorCode(err), 0
+	}
+	trackID, _, err := primaryTrackHeader(recording)
+	if err != nil {
+		return "unsupported_media", 0
+	}
+	jobDir := filepath.Join(s.jobsDir, id)
+	if err := os.Mkdir(jobDir, 0700); err != nil {
+		return "staging_failed", 0
+	}
+	workDir := filepath.Join(jobDir, ".work")
+	if err := os.Mkdir(workDir, 0700); err != nil {
+		_ = os.RemoveAll(jobDir)
+		return "staging_failed", 0
+	}
+	if err := s.prepareShardedInputs(ctx, recording, trackID, workDir); err != nil {
+		_ = os.RemoveAll(jobDir)
+		if errors.Is(err, context.Canceled) {
+			return "canceled", 0
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "timeout", 0
+		}
+		if errors.Is(err, ErrUnsupported) {
+			return "unsupported_media", 0
+		}
+		return "source_unavailable", 0
+	}
+	command := exec.CommandContext(ctx, s.ffmpegPath,
+		"-nostdin", "-hide_banner", "-loglevel", "error",
+		"-protocol_whitelist", "file", "-i", "input.m3u8",
+		"-map", "0", "-c", "copy", "-f", "matroska", "output.mkv")
+	command.Dir = workDir
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	if err := command.Run(); err != nil {
+		_ = os.RemoveAll(jobDir)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return "canceled", 0
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return "timeout", 0
+		}
+		return "ffmpeg_failed", 0
+	}
+	output := filepath.Join(workDir, "output.mkv")
+	info, err := os.Lstat(output)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
+		_ = os.RemoveAll(jobDir)
+		return "invalid_output", 0
+	}
+	if err := os.Chmod(output, 0600); err != nil {
+		_ = os.RemoveAll(jobDir)
+		return "artifact_sync_failed", 0
+	}
+	f, err := os.OpenFile(output, os.O_RDWR, 0600)
+	if err != nil {
+		_ = os.RemoveAll(jobDir)
+		return "invalid_output", 0
+	}
+	err = f.Sync()
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		_ = os.RemoveAll(jobDir)
+		return "artifact_sync_failed", 0
+	}
+	return "", info.Size()
+}
+
+func (s *Service) validateShardedSource(ctx context.Context, recording *domain.Recording) error {
+	return s.validateShardedSourceWithLimit(ctx, recording, maxInputBytes)
+}
+
+func (s *Service) validateShardedSourceWithLimit(ctx context.Context, recording *domain.Recording, maxBytes int64) (returnErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if maxBytes < 0 {
+		return ErrUnsupported
+	}
+	trackID, _, err := primaryTrackHeader(recording)
+	if err != nil {
+		return err
+	}
+	seenInit, err := newDiskStringSet(s.jobsDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cleanupErr := seenInit.Close(); returnErr == nil {
+			returnErr = cleanupErr
+		}
+	}()
+	var total int64
+	var count int
+	err = s.store.IterateShardedTimeline(ctx, recording.ID, trackID, func(record storage.V2MediaRecord) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		segment := record.Segment
+		if !validShardedSegment(segment, trackID, false) {
+			return ErrUnsupported
+		}
+		if segment.TimelineOrdinal != uint64(count+1) {
+			return ErrUnsupported
+		}
+		if segment.PayloadSize > maxBytes-total {
+			return ErrUnsupported
+		}
+		total += segment.PayloadSize
+		count++
+		if segment.InitSegmentID == "" {
+			return nil
+		}
+		seen, setErr := seenInit.SeenOrAdd(segment.InitSegmentID)
+		if setErr != nil {
+			return setErr
+		}
+		if seen {
+			return nil
+		}
+		initRecord, lookupErr := s.store.LookupShardedMediaByID(ctx, recording.ID, segment.InitSegmentID)
+		if lookupErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return ErrUnsupported
+		}
+		if initRecord.Segment.ID != segment.InitSegmentID || !validShardedSegment(initRecord.Segment, trackID, true) {
+			return ErrUnsupported
+		}
+		if initRecord.Segment.PayloadSize > maxBytes-total {
+			return ErrUnsupported
+		}
+		total += initRecord.Segment.PayloadSize
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrUnsupported
+	}
+	return nil
+}
+
+// diskStringSet keeps exact membership state on disk so validation memory does
+// not grow with the number of distinct init segments. Hash collisions are
+// resolved by checking the stored value and probing a suffix, preserving exact
+// string equality rather than treating a digest match as a duplicate.
+type diskStringSet struct {
+	root string
+}
+
+func newDiskStringSet(parent string) (*diskStringSet, error) {
+	root, err := os.MkdirTemp(parent, ".seen-init-")
+	if err != nil {
+		return nil, err
+	}
+	return &diskStringSet{root: root}, nil
+}
+
+func (s *diskStringSet) Close() error {
+	if s == nil || s.root == "" {
+		return nil
+	}
+	return os.RemoveAll(s.root)
+}
+
+// SeenOrAdd reports whether value was already present, adding it when new.
+// Files are sharded by the first digest byte to keep directory fanout bounded.
+func (s *diskStringSet) SeenOrAdd(value string) (bool, error) {
+	digest := sha256.Sum256([]byte(value))
+	shard := filepath.Join(s.root, hex.EncodeToString(digest[:1]))
+	if err := os.MkdirAll(shard, 0700); err != nil {
+		return false, err
+	}
+	base := hex.EncodeToString(digest[:])
+	for collision := uint64(0); ; collision++ {
+		name := base
+		if collision != 0 {
+			name += "-" + strconv.FormatUint(collision, 10)
+		}
+		path := filepath.Join(shard, name)
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			_, writeErr := io.WriteString(file, value)
+			closeErr := file.Close()
+			if writeErr != nil {
+				_ = os.Remove(path)
+				return false, writeErr
+			}
+			if closeErr != nil {
+				_ = os.Remove(path)
+				return false, closeErr
+			}
+			return false, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return false, err
+		}
+		stored, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return false, readErr
+		}
+		if string(stored) == value {
+			return true, nil
+		}
+		if collision == ^uint64(0) {
+			return false, errors.New("init ID collision space exhausted")
+		}
+	}
+}
+
+func (s *Service) prepareShardedInputs(ctx context.Context, recording *domain.Recording, trackID, workDir string) error {
+	bodyPath := filepath.Join(workDir, "playlist-body.tmp")
+	body, err := os.OpenFile(bodyPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	bodyWriter := bufio.NewWriter(body)
+	var maxDuration float64
+	var totalBytes int64
+	var index int
+	var count int
+	lastInitID := "\x00"
+	err = s.store.IterateShardedTimeline(ctx, recording.ID, trackID, func(record storage.V2MediaRecord) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		segment := record.Segment
+		if !validShardedSegment(segment, trackID, false) {
+			return ErrUnsupported
+		}
+		if segment.TimelineOrdinal != uint64(count+1) {
+			return ErrUnsupported
+		}
+		if segment.Duration > maxDuration {
+			maxDuration = segment.Duration
+		}
+		if segment.Discontinuity {
+			if _, err := io.WriteString(bodyWriter, "#EXT-X-DISCONTINUITY\n"); err != nil {
+				return err
+			}
+		}
+		if segment.InitSegmentID != lastInitID {
+			if segment.InitSegmentID != "" {
+				initRecord, lookupErr := s.store.LookupShardedMediaByID(ctx, recording.ID, segment.InitSegmentID)
+				if lookupErr != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					return ErrUnsupported
+				}
+				if initRecord.Segment.ID != segment.InitSegmentID || !validShardedSegment(initRecord.Segment, trackID, true) {
+					return ErrUnsupported
+				}
+				initName, copied, copyErr := s.copyShardedInput(ctx, recording.ID, initRecord.Segment, workDir, 0, true)
+				if copyErr != nil {
+					return copyErr
+				}
+				if copied {
+					if initRecord.Segment.PayloadSize > maxInputBytes-totalBytes {
+						return ErrUnsupported
+					}
+					totalBytes += initRecord.Segment.PayloadSize
+				}
+				if _, err := fmt.Fprintf(bodyWriter, "#EXT-X-MAP:URI=\"%s\"\n", initName); err != nil {
+					return err
+				}
+			}
+			lastInitID = segment.InitSegmentID
+		}
+		if segment.PayloadSize > maxInputBytes-totalBytes {
+			return ErrUnsupported
+		}
+		index++
+		mediaName, _, copyErr := s.copyShardedInput(ctx, recording.ID, segment, workDir, index, false)
+		if copyErr != nil {
+			return copyErr
+		}
+		totalBytes += segment.PayloadSize
+		if _, err := fmt.Fprintf(bodyWriter, "#EXTINF:%s,\n%s\n", strconv.FormatFloat(segment.Duration, 'f', -1, 64), mediaName); err != nil {
+			return err
+		}
+		count++
+		return nil
+	})
+	flushErr := bodyWriter.Flush()
+	syncErr := body.Sync()
+	closeErr := body.Close()
+	if err != nil {
+		return err
+	}
+	if flushErr != nil {
+		return flushErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if count == 0 {
+		return ErrUnsupported
+	}
+	if maxDuration <= 0 || math.IsNaN(maxDuration) || math.IsInf(maxDuration, 0) {
+		return ErrUnsupported
+	}
+	targetDuration := int64(math.Ceil(maxDuration))
+	if targetDuration < 1 {
+		targetDuration = 1
+	}
+	playlistPath := filepath.Join(workDir, "input.m3u8")
+	playlist, err := os.OpenFile(playlistPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err = fmt.Fprintf(playlist, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:0\n", targetDuration); err == nil {
+		var source *os.File
+		source, err = os.Open(bodyPath)
+		if err == nil {
+			_, err = io.Copy(playlist, source)
+			closeErr = source.Close()
+			if err == nil {
+				err = closeErr
+			}
+		}
+	}
+	if err == nil {
+		_, err = io.WriteString(playlist, "#EXT-X-ENDLIST\n")
+	}
+	if err == nil {
+		err = playlist.Sync()
+	}
+	closeErr = playlist.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Remove(bodyPath)
+}
+
+func (s *Service) copyShardedInput(ctx context.Context, recordingID string, segment domain.Segment, workDir string, index int, init bool) (string, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !validShardedSegment(segment, segment.TrackID, init) {
+		return "", false, ErrUnsupported
+	}
+	extension := ".mp4"
+	if !init {
+		extension = safeMediaExtension(segment.SourceURI)
+		if segment.InitSegmentID != "" && extension == ".ts" {
+			extension = ".m4s"
+		}
+	}
+	name := fmt.Sprintf("object-%06d%s", index, extension)
+	if init {
+		pathHash := sha256.Sum256([]byte(segment.StoragePath))
+		name = fmt.Sprintf("init-%x%s", pathHash[:], extension)
+		if exists, err := verifyExistingShardedInput(filepath.Join(workDir, name), segment); err != nil {
+			return "", false, err
+		} else if exists {
+			return name, false, nil
+		}
+	}
+	if segment.PayloadSize < 0 || segment.PayloadSize > storage.MaxObjectBytes {
+		return "", false, ErrUnsupported
+	}
+	file, err := s.store.OpenPayloadReader(recordingID, segment.StoragePath)
+	if err != nil {
+		return "", false, err
+	}
+	destination, err := os.OpenFile(filepath.Join(workDir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		_ = file.Close()
+		return "", false, err
+	}
+	hash := sha256.New()
+	size, copyErr := io.Copy(io.MultiWriter(destination, hash), contextReader{ctx: ctx, r: file})
+	closeSourceErr := file.Close()
+	if copyErr == nil {
+		copyErr = destination.Sync()
+	}
+	closeDestinationErr := destination.Close()
+	if copyErr != nil {
+		return "", false, copyErr
+	}
+	if closeSourceErr != nil || closeDestinationErr != nil || size != segment.PayloadSize || hex.EncodeToString(hash.Sum(nil)) != segment.SHA256 {
+		return "", false, errors.New("source integrity mismatch")
+	}
+	return name, true, nil
+}
+
+func verifyExistingShardedInput(path string, segment domain.Segment) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Size() != segment.PayloadSize {
+		return false, errors.New("source integrity mismatch")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	hash := sha256.New()
+	size, copyErr := io.Copy(hash, file)
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil || size != segment.PayloadSize || hex.EncodeToString(hash.Sum(nil)) != segment.SHA256 {
+		return false, errors.New("source integrity mismatch")
+	}
+	return true, nil
+}
+
+func primaryTrackHeader(recording *domain.Recording) (string, *domain.Track, error) {
+	if recording == nil || recording.FormatVersion != storage.ShardedArchiveFormatVersion || len(recording.Tracks) == 0 {
+		return "", nil, ErrUnsupported
+	}
+	if main := recording.Tracks["main"]; main != nil && main.ID == "main" {
+		return "main", main, nil
+	}
+	if len(recording.Tracks) != 1 {
+		return "", nil, ErrUnsupported
+	}
+	for id, track := range recording.Tracks {
+		if track == nil || track.ID == "" || track.ID != id {
+			return "", nil, ErrUnsupported
+		}
+		return id, track, nil
+	}
+	return "", nil, ErrUnsupported
+}
+
+func validShardedSegment(segment domain.Segment, trackID string, init bool) bool {
+	if segment.ID == "" || segment.TrackID != trackID || segment.IsInit != init || !validShardedObjectPath(segment.StoragePath) || segment.PayloadSize < 0 || segment.PayloadSize > storage.MaxObjectBytes {
+		return false
+	}
+	if !init && (math.IsNaN(segment.Duration) || math.IsInf(segment.Duration, 0) || segment.Duration <= 0) {
+		return false
+	}
+	digest, err := hex.DecodeString(segment.SHA256)
+	return err == nil && len(digest) == sha256.Size && hex.EncodeToString(digest) == segment.SHA256
+}
+
+func validShardedObjectPath(path string) bool {
+	if !strings.HasPrefix(path, "tracks/") || len(path) <= len("tracks/") || len(path) > 1024 || filepath.IsAbs(path) || filepath.VolumeName(path) != "" || strings.Contains(path, "\\") || strings.ContainsRune(path, '\x00') {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(path))
+	return clean == path && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
 }
 
 func (s *Service) publish(id string) string {
@@ -842,6 +1378,12 @@ func (s *Service) cleanupOrphanDirectories() error {
 	}
 	for _, entry := range entries {
 		id := entry.Name()
+		if strings.HasPrefix(id, ".seen-init-") {
+			if err := os.RemoveAll(filepath.Join(s.jobsDir, id)); err != nil {
+				return errors.New("interrupted source validation cleanup failed")
+			}
+			continue
+		}
 		if !jobIDPattern.MatchString(id) {
 			continue
 		}
@@ -911,6 +1453,29 @@ func cloneJob(job Job) Job {
 }
 
 func cloneRecording(recording *domain.Recording) (*domain.Recording, error) {
+	if recording == nil {
+		return nil, ErrInvalid
+	}
+	// Format-v2 roots carry bounded summaries. Discard expanded projections so
+	// queued jobs retain only the header needed by shard iterators.
+	if recording.FormatVersion == 2 {
+		header := *recording
+		header.Gaps = nil
+		header.Snapshots = nil
+		header.MetadataTimeline = nil
+		header.Tracks = make(map[string]*domain.Track, len(recording.Tracks))
+		for id, track := range recording.Tracks {
+			if track == nil {
+				header.Tracks[id] = nil
+				continue
+			}
+			trackHeader := *track
+			trackHeader.Segments = nil
+			trackHeader.InitSegments = nil
+			header.Tracks[id] = &trackHeader
+		}
+		recording = &header
+	}
 	data, err := json.Marshal(recording)
 	if err != nil {
 		return nil, err

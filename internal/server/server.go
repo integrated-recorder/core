@@ -81,7 +81,10 @@ type recordingManager interface {
 	Get(string) (*domain.Recording, error)
 	List() []*domain.Recording
 	ListForManagement(context.Context, int) ([]*domain.Recording, error)
+	LifecycleSnapshot(context.Context, string) (acquire.LifecycleSnapshot, error)
 	Stop(string) (*domain.Recording, error)
+	CompleteRecording(context.Context, string) (*domain.Recording, error)
+	SealArchiveContext(context.Context, string) error
 	Delete(string) error
 }
 
@@ -197,6 +200,9 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 	s.mux.HandleFunc("GET /api/recordings/{id}", s.get)
 	s.mux.HandleFunc("GET /api/recordings/{id}/diagnostics/storage", s.storageFailureDiagnostic)
 	s.mux.HandleFunc("POST /api/recordings/{id}/stop", s.stop)
+	s.mux.HandleFunc("POST /api/recordings/{id}/complete", s.completeRecording)
+	s.mux.HandleFunc("POST /api/recordings/{id}/seal", s.sealRecordingArchive)
+	s.mux.HandleFunc("GET /api/recordings/{id}/lifecycle", s.recordingLifecycle)
 	s.registerWatchRoutes()
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/master.m3u8", s.masterPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/tracks/{track}/playlist.m3u8", s.trackPlaylist)
@@ -861,10 +867,88 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, detail(recording))
 }
 
+func (s *Server) completeRecording(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRecordingPathID(id) {
+		writeError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	recording, err := s.manager.CompleteRecording(r.Context(), id)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	s.appendRecordingEvent(id, "recording_completed", time.Now().UTC(), 0, "recording marked completed")
+	writeJSON(w, http.StatusOK, detail(recording))
+}
+
+func (s *Server) sealRecordingArchive(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRecordingPathID(id) {
+		writeError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	if err := s.manager.SealArchiveContext(r.Context(), id); err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	s.appendRecordingEvent(id, "archive_sealed", time.Now().UTC(), 0, "archive sealed")
+	writeJSON(w, http.StatusOK, map[string]any{"sealed": true})
+}
+
+type recordingLifecycleView struct {
+	RecordingID      string                `json:"recording_id"`
+	CaptureState     domain.RecordingState `json:"capture_state"`
+	ArchiveSealed    bool                  `json:"archive_sealed"`
+	Repairable       bool                  `json:"repairable"`
+	RecoveryState    string                `json:"recovery_state"`
+	TimelineRevision uint64                `json:"timeline_revision"`
+	ArchiveRevision  uint64                `json:"archive_revision"`
+}
+
+func recordingLifecycleProjection(snapshot acquire.LifecycleSnapshot) recordingLifecycleView {
+	view := recordingLifecycleView{
+		RecordingID: snapshot.RecordingID, CaptureState: snapshot.CaptureState,
+		ArchiveSealed: snapshot.ArchiveSealed, Repairable: snapshot.Repairable,
+		TimelineRevision: snapshot.TimelineRevision, ArchiveRevision: snapshot.ArchiveRevision,
+		RecoveryState: snapshot.RecoveryState,
+	}
+	return view
+}
+
+func (s *Server) recordingLifecycle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRecordingPathID(id) {
+		writeError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	snapshot, err := s.manager.LifecycleSnapshot(r.Context(), id)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, recordingLifecycleProjection(snapshot))
+}
+
+func writeLifecycleError(w http.ResponseWriter, err error) {
+	if errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	if errors.Is(err, acquire.ErrLifecycleConflict) || errors.Is(err, acquire.ErrActiveRecording) || errors.Is(err, acquire.ErrInvalidOwnershipToken) {
+		writeError(w, http.StatusConflict, "recording lifecycle transition conflicts with current state")
+		return
+	}
+	writeStorageError(w, err)
+}
+
 func (s *Server) masterPlaylist(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(r.PathValue("id"))
 	lock.RLock()
 	defer lock.RUnlock()
+	if s.serveShardedVODMasterPlaylist(w, r) {
+		return
+	}
 	recording, err := s.playableRecording(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
@@ -895,6 +979,9 @@ func (s *Server) trackPlaylist(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(r.PathValue("id"))
 	lock.RLock()
 	defer lock.RUnlock()
+	if s.serveShardedVODTrackPlaylist(w, r) {
+		return
+	}
 	recording, err := s.playableRecording(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
@@ -1171,6 +1258,9 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(r.PathValue("id"))
 	lock.RLock()
 	defer lock.RUnlock()
+	if s.serveShardedSegment(w, r) {
+		return
+	}
 	recording, err := s.manager.Get(r.PathValue("id"))
 	if err != nil {
 		writeStorageError(w, err)

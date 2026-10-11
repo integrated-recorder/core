@@ -209,7 +209,8 @@ func permissionForRequest(r *http.Request) authn.Permission {
 	}
 	unclassified := authn.Permission("permission.unclassified")
 	if path == "/api/auth/logout" && r.Method == http.MethodPost {
-		return authn.PermissionSettingsManage
+		// Any authenticated user may revoke their own current session.
+		return authn.PermissionUserPreferences
 	}
 	if path == "/api/user/preferences" && (method == http.MethodGet || method == http.MethodPut) {
 		return authn.PermissionUserPreferences
@@ -332,7 +333,8 @@ func watchPermission(method, path string) (authn.Permission, bool) {
 
 func adapterPermission(method, path string) (authn.Permission, bool) {
 	if path == "/api/adapters" && method == http.MethodGet {
-		return authn.PermissionPluginManage, true
+		// Recording control needs the active source list to start a capture.
+		return authn.PermissionRecordingControl, true
 	}
 	if !strings.HasPrefix(path, "/api/adapters/") {
 		return "", false
@@ -343,7 +345,13 @@ func adapterPermission(method, path string) (authn.Permission, bool) {
 	}
 	if len(parts) == 2 && parts[0] != "" {
 		switch {
-		case method == http.MethodGet && (parts[1] == "icon" || parts[1] == "schema" || parts[1] == "config" || parts[1] == "resources"):
+		case method == http.MethodGet && parts[1] == "schema":
+			// The source input schema is part of the recording wizard, while
+			// configuration reads remain an owner-only plugin-management API.
+			return authn.PermissionRecordingControl, true
+		case method == http.MethodGet && parts[1] == "resources":
+			return authn.PermissionRecordingControl, true
+		case method == http.MethodGet && (parts[1] == "icon" || parts[1] == "config"):
 			return authn.PermissionPluginManage, true
 		case method == http.MethodPut && parts[1] == "config":
 			return authn.PermissionPluginManage, true
@@ -352,7 +360,7 @@ func adapterPermission(method, path string) (authn.Permission, bool) {
 		}
 	}
 	if len(parts) == 3 && parts[0] != "" && method == http.MethodGet && parts[1] == "resources" && parts[2] == "search" {
-		return authn.PermissionPluginManage, true
+		return authn.PermissionRecordingControl, true
 	}
 	return "", false
 }

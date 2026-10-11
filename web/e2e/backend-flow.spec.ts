@@ -865,12 +865,230 @@ test('actual Go backend: account password, sessions, and owner user management',
   await expect(page).toHaveURL('/login')
 })
 
+test('actual Go backend: member login, recording permissions, and owner isolation', async ({ page, browser }) => {
+  test.setTimeout(180_000)
+  const memberLogin = 'browser-multi-member'
+  const memberPassword = 'browser-multi-member-password'
+
+  // The legacy password-only owner flow remains the first-run-compatible path.
+  await login(page)
+  const initialOwner = await getJSON<{ user_id: string; login: string; role: string }>(page, '/api/user')
+  expect(initialOwner).toMatchObject({ login: 'owner', role: 'owner' })
+  await saveUserPreferences(page, { locale: 'ko-KR', theme: 'dark', timezone: 'Asia/Seoul' })
+
+  await page.goto('/settings')
+  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await page.getByLabel(/Login name|로그인 이름/).fill(memberLogin)
+  await page.getByLabel(/Initial password|초기 비밀번호/).fill(memberPassword)
+  await page.getByLabel(/Confirm new password|새 비밀번호 확인/).last().fill(memberPassword)
+  await page.getByRole('button', { name: /Create user|사용자 생성/ }).click()
+  const memberRow = page.getByRole('listitem').filter({ hasText: memberLogin })
+  await expect(memberRow).toContainText(/Member|멤버/)
+  await logoutFromApplication(page)
+
+  const memberContext = await browser.newContext({ locale: 'ko-KR' })
+  const memberPage = await memberContext.newPage()
+  await loginAs(memberPage, memberLogin, memberPassword)
+  const member = await getJSON<{ user_id: string; login: string; role: string; status: string }>(memberPage, '/api/user')
+  expect(member).toMatchObject({ login: memberLogin, role: 'member', status: 'active' })
+  await memberPage.goto('/settings')
+  await memberPage.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await expect(memberPage.getByRole('heading', { name: /Account information|계정 정보/ })).toBeVisible()
+  await expect(memberPage.getByText(memberLogin, { exact: true })).toBeVisible()
+  await expect(memberPage.getByText('Member', { exact: true })).toBeVisible()
+  await expect(memberPage.getByRole('heading', { name: /User management|사용자 관리/ })).toHaveCount(0)
+  for (const ownerTab of ['Storage', 'Updates', 'Logs', 'Audit log']) {
+    await expect(memberPage.getByRole('tab', { name: ownerTab, exact: true })).toHaveCount(0)
+  }
+  expect((await memberPage.request.get('/api/user')).status()).toBe(200)
+  expect((await memberPage.request.get('/api/user/preferences')).status()).toBe(200)
+  expect((await memberPage.request.get('/api/user/sessions')).status()).toBe(200)
+
+  // Preferences are saved through the member UI and remain bound to this user.
+  await memberPage.getByRole('tab', { name: /Preferences|사용자 환경/ }).click()
+  await memberPage.locator('#user-locale').selectOption('en-US')
+  await memberPage.locator('#user-theme').selectOption('light')
+  await memberPage.locator('#user-timezone').fill('America/Los_Angeles')
+  await memberPage.getByRole('button', { name: /Save preferences|환경 설정 저장/ }).click()
+  await expect(memberPage.locator('html')).toHaveAttribute('lang', 'en-US')
+  const memberPreferences = await getJSON<UserPreferencesWire>(memberPage, '/api/user/preferences')
+  expect(memberPreferences).toEqual({ locale: 'en-US', theme: 'light', timezone: 'America/Los_Angeles' })
+
+  const recordingsRead = await memberPage.request.get('/api/v2/recordings?limit=10')
+  expect(recordingsRead.status()).toBe(200)
+  const adapterCatalog = await memberPage.request.get('/api/adapters')
+  expect(adapterCatalog.status()).toBe(200)
+  expect(await adapterCatalog.json()).toEqual(expect.arrayContaining([
+    expect.objectContaining({ status: expect.objectContaining({ id: 'hls' }) }),
+  ]))
+  expect((await memberPage.request.get('/api/adapters/hls/schema')).status()).toBe(200)
+  expect((await memberPage.request.get('/api/adapters/hls/config')).status()).toBe(403)
+
+  // Exercise recording control through the browser, not only an authorization probe.
+  const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
+  await memberPage.goto('/new')
+  await memberPage.getByRole('button', { name: /HLS/ }).click()
+  await memberPage.getByRole('button', { name: /Input settings|입력 설정|Next|다음/ }).click()
+  await memberPage.getByLabel('HLS manifest URL').fill(`${sourceURL}/hls/stream.m3u8`)
+  await memberPage.getByLabel(/Recording title|녹화 제목/).fill('Member controlled recording')
+  const previewToggle = memberPage.getByRole('checkbox', { name: /Generate scene previews|장면 미리보기 생성/ })
+  if (await previewToggle.isVisible() && await previewToggle.isChecked()) await previewToggle.uncheck()
+  await memberPage.getByRole('button', { name: /Confirm inputs|입력 확인|Next|다음/ }).click()
+  await memberPage.getByRole('button', { name: /Start recording|녹화 시작/ }).click()
+  await expect(memberPage).toHaveURL(/\/recordings\/[^/]+$/)
+  const memberRecordingID = memberPage.url().split('/').at(-1)!
+  await expect.poll(async () => segmentCount(await getJSON<RecordingWire>(memberPage, `/api/recordings/${memberRecordingID}`))).toBeGreaterThan(0)
+  await memberPage.getByRole('button', { name: /Stop|중지/, exact: true }).click()
+  await memberPage.getByRole('alertdialog').getByRole('button', { name: /Stop|중지/, exact: true }).click()
+  await expect.poll(async () => (await getJSON<RecordingWire>(memberPage, `/api/recordings/${memberRecordingID}`)).state).toBe('stopped')
+
+  const session = await getJSON<{ csrf_token: string }>(memberPage, '/api/auth/session')
+  const forbiddenReads = [
+    '/api/settings',
+    '/api/system/storage',
+    '/api/storage/pools',
+    '/api/adapters/hls',
+    '/api/adapters/hls/config',
+    '/api/runtime/plugins',
+    '/api/runtime/storage/provider',
+    '/api/runtime/update',
+    '/api/audit',
+    '/api/users',
+  ]
+  for (const path of forbiddenReads) {
+    const response = await memberPage.request.get(path)
+    expect(response.status(), `member GET ${path}`).toBe(403)
+  }
+  const pluginMutation = await memberPage.request.post('/api/adapters/hls/disable', {
+    headers: { 'X-CSRF-Token': session.csrf_token }, data: {},
+  })
+  expect(pluginMutation.status()).toBe(403)
+  const updateMutation = await memberPage.request.post('/api/runtime/update/check', {
+    headers: { 'X-CSRF-Token': session.csrf_token }, data: {},
+  })
+  expect(updateMutation.status()).toBe(403)
+  const recordingDelete = await memberPage.request.delete(`/api/recordings/${memberRecordingID}`, {
+    headers: { 'X-CSRF-Token': session.csrf_token },
+  })
+  expect(recordingDelete.status()).toBe(403)
+
+  // Keep owner and member sessions live together and prove identity, session,
+  // and preference records do not cross user boundaries.
+  const ownerContext = await browser.newContext({ locale: 'ko-KR' })
+  const ownerPage = await ownerContext.newPage()
+  await loginAs(ownerPage, 'owner', 'browser-e2e-strong-password')
+  const owner = await getJSON<{ user_id: string; login: string; role: string }>(ownerPage, '/api/user')
+  expect(owner).toMatchObject({ user_id: initialOwner.user_id, login: 'owner', role: 'owner' })
+  const ownerPreferences = await getJSON<UserPreferencesWire>(ownerPage, '/api/user/preferences')
+  expect(ownerPreferences).toEqual({ locale: 'ko-KR', theme: 'dark', timezone: 'Asia/Seoul' })
+  expect(await getJSON<UserPreferencesWire>(memberPage, '/api/user/preferences')).toEqual(memberPreferences)
+
+  const memberSecondContext = await browser.newContext({ locale: 'en-US' })
+  const memberSecondPage = await memberSecondContext.newPage()
+  await loginAs(memberSecondPage, memberLogin, memberPassword)
+  const ownerSessions = await getJSON<{ items: { id: string; current: boolean }[] }>(ownerPage, '/api/user/sessions')
+  const memberSessions = await getJSON<{ items: { id: string; current: boolean }[] }>(memberPage, '/api/user/sessions')
+  const memberSecondSessions = await getJSON<{ items: { id: string; current: boolean }[] }>(memberSecondPage, '/api/user/sessions')
+  expect(ownerSessions.items).toHaveLength(1)
+  expect(memberSessions.items).toHaveLength(2)
+  expect(memberSecondSessions.items).toHaveLength(2)
+  const ownerSessionID = ownerSessions.items[0]!.id
+  const memberSessionIDs = memberSessions.items.map(item => item.id)
+  expect(new Set([ownerSessionID, ...memberSessionIDs]).size).toBe(3)
+  expect(memberSessions.items.find(item => item.current)?.id).not.toBe(ownerSessionID)
+  expect(memberSecondSessions.items.find(item => item.current)?.id).not.toBe(ownerSessionID)
+
+  const memberSessionForRevoke = await getJSON<{ csrf_token: string }>(memberPage, '/api/auth/session')
+  const revokeOtherMemberSessions = await memberPage.request.post('/api/user/sessions/revoke-others', {
+    headers: { 'X-CSRF-Token': memberSessionForRevoke.csrf_token }, data: {},
+  })
+  expect(revokeOtherMemberSessions.status()).toBe(200)
+  expect(await revokeOtherMemberSessions.json()).toMatchObject({ revoked_count: 1 })
+  expect((await getJSON<{ authenticated: boolean }>(memberSecondPage, '/api/auth/session')).authenticated).toBe(false)
+  expect((await getJSON<{ authenticated: boolean }>(ownerPage, '/api/auth/session')).authenticated).toBe(true)
+
+  await logoutFromApplication(ownerPage)
+  expect((await getJSON<{ authenticated: boolean }>(memberPage, '/api/auth/session')).authenticated).toBe(true)
+  await logoutFromApplication(memberPage)
+  expect((await getJSON<{ authenticated: boolean }>(memberSecondPage, '/api/auth/session')).authenticated).toBe(false)
+
+  // Owner's password-only compatibility path is also used after the member
+  // logout, then the owner disables/enables that same account through the UI.
+  await login(page)
+  expect(await getJSON<{ login: string; role: string }>(page, '/api/user')).toMatchObject({ login: 'owner', role: 'owner' })
+  // Establish a fresh member session so disable proves immediate invalidation,
+  // after the prior member logout and owner re-login have both completed.
+  await loginAs(memberSecondPage, memberLogin, memberPassword)
+  await page.goto('/settings')
+  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  const memberRowAfterLogin = page.getByRole('listitem').filter({ hasText: memberLogin })
+  await memberRowAfterLogin.getByRole('button', { name: /Disable|비활성화/ }).click()
+  await page.getByRole('alertdialog').getByRole('button', { name: /Disable|비활성화/ }).click()
+  await expect(memberRowAfterLogin).toContainText(/Disabled|비활성/)
+  expect((await getJSON<{ authenticated: boolean }>(memberSecondPage, '/api/auth/session')).authenticated).toBe(false)
+  expect((await getJSON<{ authenticated: boolean }>(page, '/api/auth/session')).authenticated).toBe(true)
+
+  await memberSecondPage.goto('/login')
+  await memberSecondPage.getByLabel(/Account name|계정 이름/).fill(memberLogin)
+  await memberSecondPage.getByLabel(/Password|비밀번호/).fill(memberPassword)
+  const disabledLoginResponsePromise = memberSecondPage.waitForResponse(response => response.url().endsWith('/api/auth/login'))
+  await memberSecondPage.getByRole('button', { name: /Sign in|로그인/ }).click()
+  const disabledLoginResponse = await disabledLoginResponsePromise
+  expect(disabledLoginResponse.status()).toBe(401)
+  await expect(memberSecondPage.getByRole('alert')).toBeVisible()
+  const disabledIdentity = await memberSecondPage.request.post('/api/auth/login', { data: { login: memberLogin, password: memberPassword } })
+  const missingIdentity = await memberSecondPage.request.post('/api/auth/login', { data: { login: 'no-such-browser-user', password: memberPassword } })
+  const wrongPassword = await memberSecondPage.request.post('/api/auth/login', { data: { login: memberLogin, password: 'wrong-browser-member-password' } })
+  expect(disabledIdentity.status()).toBe(401)
+  expect(missingIdentity.status()).toBe(disabledIdentity.status())
+  expect(wrongPassword.status()).toBe(disabledIdentity.status())
+  expect(await missingIdentity.text()).toBe(await disabledIdentity.text())
+  expect(await wrongPassword.text()).toBe(await disabledIdentity.text())
+
+  await page.goto('/settings')
+  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await memberRowAfterLogin.getByRole('button', { name: /Enable|활성화/ }).click()
+  await expect(memberRowAfterLogin).toContainText(/Active|활성/)
+  await loginAs(memberPage, memberLogin, memberPassword)
+  expect(await getJSON<{ user_id: string; login: string; role: string }>(memberPage, '/api/user')).toMatchObject({ user_id: member.user_id, login: memberLogin, role: 'member' })
+  expect((await getJSON<{ authenticated: boolean }>(page, '/api/auth/session')).authenticated).toBe(true)
+  expect(await getJSON<UserPreferencesWire>(memberPage, '/api/user/preferences')).toEqual(memberPreferences)
+
+  await memberSecondContext.close()
+  await memberContext.close()
+  await ownerContext.close()
+})
+
 async function login(page: Page) {
   await page.goto('/login')
   await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
   await setLocaleForCurrentUser(page, 'ko-KR')
+}
+
+async function loginAs(page: Page, login: string, password: string) {
+  await page.goto('/login')
+  await page.getByLabel(/Account name|계정 이름/).fill(login)
+  await page.getByLabel(/Password|비밀번호/).fill(password)
+  await page.getByRole('button', { name: /Sign in|로그인/ }).click()
+  await expect(page).toHaveURL('/')
+}
+
+async function logoutFromApplication(page: Page) {
+  await page.getByRole('button', { name: /Administrator|관리자/ }).click()
+  await page.getByRole('button', { name: /Sign out|로그아웃/ }).click()
+  await expect(page).toHaveURL('/login')
+}
+
+async function saveUserPreferences(page: Page, preferences: UserPreferencesWire) {
+  const session = await getJSON<{ csrf_token: string }>(page, '/api/auth/session')
+  const response = await page.request.put('/api/user/preferences', {
+    headers: { 'X-CSRF-Token': session.csrf_token }, data: preferences,
+  })
+  expect(response.status()).toBe(200)
+  await page.reload()
+  await expect(page.locator('html')).toHaveAttribute('lang', preferences.locale)
 }
 
 async function setLocaleForCurrentUser(page: Page, locale: 'ko-KR' | 'en-US') {

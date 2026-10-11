@@ -266,8 +266,8 @@ func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
 	if authn.HasPermission(owner, unknownKnownNamespace) {
 		t.Fatalf("unclassified namespace mutation was granted: %q", unknownKnownNamespace)
 	}
-	if got := permissionForRequest(httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)); got != authn.PermissionSettingsManage {
-		t.Fatalf("logout permission=%q", got)
+	if got := permissionForRequest(httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)); got != authn.PermissionUserPreferences || !authn.HasPermission(member, got) {
+		t.Fatalf("logout permission=%q; every user must be able to revoke their own session", got)
 	}
 	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodOptions} {
 		got := permissionForRequest(httptest.NewRequest(method, "/api/not-classified", nil))
@@ -294,6 +294,23 @@ func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
 	}
 	if !authn.HasPermission(member, authn.PermissionUserPreferences) || authn.HasPermission(member, authn.PermissionSettingsManage) {
 		t.Fatal("self preference permission should be available to an authenticated non-owner without granting system settings")
+	}
+	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters", nil)); got != authn.PermissionRecordingControl || !authn.HasPermission(member, got) {
+		t.Fatalf("source adapter catalog permission=%q; recording members need the read-only catalog to start captures", got)
+	}
+	for _, path := range []string{"/api/adapters/hls/schema", "/api/adapters/hls/resources", "/api/adapters/hls/resources/search"} {
+		if got := permissionForRequest(httptest.NewRequest(http.MethodGet, path, nil)); got != authn.PermissionRecordingControl || !authn.HasPermission(member, got) {
+			t.Errorf("recording source read %s permission=%q; recording members need source inputs to start captures", path, got)
+		}
+	}
+	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls", nil)); got != authn.PermissionPluginManage || authn.HasPermission(member, got) {
+		t.Fatalf("adapter management detail permission=%q; members must not manage plugins", got)
+	}
+	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls/config", nil)); got != authn.PermissionPluginManage || authn.HasPermission(member, got) {
+		t.Fatalf("adapter configuration permission=%q; members must not read plugin configuration", got)
+	}
+	if got := permissionForRequest(httptest.NewRequest(http.MethodPut, "/api/adapters/hls/config", nil)); got != authn.PermissionPluginManage || authn.HasPermission(member, got) {
+		t.Fatalf("adapter configuration mutation permission=%q; members must not manage plugin configuration", got)
 	}
 }
 

@@ -72,9 +72,13 @@ describe('E2E temporary build storage', () => {
 
   it('removes only old, marked, dead-owner directories', () => {
     const root = testRoot()
-    const old = createBuildDir(root, 202, 1_000)
-    const active = createBuildDir(root, 303, 1_000)
-    const recent = createBuildDir(root, 404, 9_000_000)
+    // Keep fixture creation from running startup recovery with the host's real
+    // process table. PID 202 may be occupied locally, making the old fixture
+    // survive on one runner and disappear on another.
+    const preserveFixtures = { isAlive: () => true }
+    const old = createBuildDir(root, 202, 1_000, preserveFixtures)
+    const active = createBuildDir(root, 303, 1_000, preserveFixtures)
+    const recent = createBuildDir(root, 404, 9_000_000, preserveFixtures)
     const unmarked = join(root, `${prefix}unmarked`)
     mkdirSync(unmarked, { mode: 0o700 })
     const symlink = join(root, `${prefix}symlink`)

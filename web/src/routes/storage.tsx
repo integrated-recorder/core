@@ -25,7 +25,7 @@ export function StoragePage() {
   const { t } = useI18n()
   const pools = useQuery(storagePoolsQuery)
   return <div className="page-enter">
-    <PageHeading eyebrow={t('storage.pageEyebrow')} title={t('storage.pageTitle')} description={t('storage.pageDescription')} actions={<Button variant="outline" onClick={() => void pools.refetch()}><RefreshCw className="h-4 w-4" />{t('storage.refresh')}</Button>} />
+    <PageHeading title={t('storage.pageTitle')} actions={<Button variant="outline" onClick={() => void pools.refetch()}><RefreshCw className="h-4 w-4" />{t('storage.refresh')}</Button>} />
     <StorageProviderManagement />
     {pools.isLoading ? <LoadingState label={t('storage.loading')} /> : pools.error ? <ErrorState message={errorMessage(pools.error)} retry={() => void pools.refetch()} /> : <StoragePoolList pools={pools.data?.items ?? []} />}
   </div>
@@ -40,7 +40,7 @@ function StorageProviderManagement() {
   return <section aria-labelledby="primary-storage-title" className="mb-8 space-y-4">
     <Card>
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border/70">
-        <div><CardTitle id="primary-storage-title" className="flex items-center gap-2"><HardDrive className="h-4 w-4 text-primary" />{t('storage.primary')}</CardTitle><p className="mt-1 text-xs text-muted-foreground">{t('storage.primaryHelp')}</p></div>
+        <div><CardTitle id="primary-storage-title" className="flex items-center gap-2"><HardDrive className="h-4 w-4 text-primary" />{t('storage.primary')}</CardTitle></div>
         <Button variant="outline" onClick={() => { retry(); void client.invalidateQueries({ queryKey }) }} disabled={query.isFetching}><RefreshCw className={`h-4 w-4 ${query.isFetching ? 'animate-spin' : ''}`} />{t('storage.refresh')}</Button>
       </CardHeader>
       <CardContent className="pt-4">
@@ -240,7 +240,7 @@ export function StoragePoolDetailPage() {
   const metrics = useQuery(storageMetricsQuery(poolId, window, !pools.isLoading && !pools.error && Boolean(pool)))
 
   return <div className="page-enter">
-    <PageHeading eyebrow={t('storage.pool.pageEyebrow')} title={pool?.display_name ?? poolId} description={pool ? `${pool.id} · ${kindLabel(pool.kind, t)} · ${roleLabel(pool.role, t)}` : t('storage.pool.pageDescription')} actions={<><Select aria-label={t('storage.pool.timeWindow')} value={window} onValueChange={value => setWindow(value as StorageMetricWindow)} className="w-28"><SelectItem value="1h">{t('storage.pool.last1h')}</SelectItem><SelectItem value="6h">{t('storage.pool.last6h')}</SelectItem><SelectItem value="24h">{t('storage.pool.last24h')}</SelectItem></Select><Link to="/storage"><Button variant="outline"><ArrowLeft className="h-4 w-4" />{t('storage.pool.list')}</Button></Link></>} />
+    <PageHeading title={pool?.display_name ?? poolId} actions={<><Select aria-label={t('storage.pool.timeWindow')} value={window} onValueChange={value => setWindow(value as StorageMetricWindow)} className="w-28"><SelectItem value="1h">{t('storage.pool.last1h')}</SelectItem><SelectItem value="6h">{t('storage.pool.last6h')}</SelectItem><SelectItem value="24h">{t('storage.pool.last24h')}</SelectItem></Select><Link to="/storage"><Button variant="outline"><ArrowLeft className="h-4 w-4" />{t('storage.pool.list')}</Button></Link></>} />
     {pools.isLoading ? <LoadingState label={t('storage.loading')} /> : pools.error ? <ErrorState message={errorMessage(pools.error)} retry={() => void pools.refetch()} /> : !pool ? <EmptyState title={t('storage.pool.notFound')} description={t('storage.pool.notFoundHelp')} /> : <>
       <PoolDetailSummary pool={pool} />
       <div className="mt-5 flex items-center justify-between gap-3"><h2 className="text-base font-semibold">{t('storage.pool.recentMetrics')}</h2>{metrics.data && <span className="text-xs text-muted-foreground">{t('storage.pool.sampleInterval', { seconds: formatNumber(metrics.data.sample_interval_seconds) })}</span>}</div>

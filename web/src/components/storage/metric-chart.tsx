@@ -3,27 +3,27 @@ import type { StorageMetricSample, StoragePool } from '@/types/api'
 import { EmptyState } from '@/components/query-state'
 import { formatBytes } from '@/lib/utils'
 import { formatDateTime } from '@/lib/formatting'
+import { useI18n } from '@/i18n/provider'
 
 type ChartKind = 'throughput' | 'backlog'
 type Series = { key: keyof StorageMetricSample; label: string; color: string; format: (value: number) => string }
-const throughputSeries: Series[] = [
-  { key: 'read_bytes_per_second', label: 'Recorder 읽기', color: 'hsl(var(--primary))', format: formatRate },
-  { key: 'write_bytes_per_second', label: 'Recorder 쓰기', color: 'hsl(155 62% 40%)', format: formatRate },
-]
-const backlogSeries: Series[] = [
-  { key: 'buffer_used_bytes', label: '수집 버퍼', color: 'hsl(var(--primary))', format: formatBytes },
-  { key: 'persist_queue_bytes', label: '저장 대기열', color: 'hsl(155 62% 40%)', format: formatBytes },
-]
 
 export function MetricChart({ title, samples, kind, pool }: { title: string; samples: StorageMetricSample[]; kind: ChartKind; pool?: StoragePool }) {
+  const { t } = useI18n()
   const uid = useId().replaceAll(':', '')
-  if (!samples.length) return <EmptyState title="표시할 측정 기록이 없습니다." description="새 측정값이 수집되면 여기에 추이가 표시됩니다." />
+  if (!samples.length) return <EmptyState title={t('storage.chart.noSamples')} description={t('storage.chart.noSamplesHelp')} />
 
-  const series = kind === 'throughput' ? throughputSeries : backlogSeries
+  const series: Series[] = kind === 'throughput' ? [
+    { key: 'read_bytes_per_second', label: t('storage.chart.read'), color: 'hsl(var(--primary))', format: formatRate },
+    { key: 'write_bytes_per_second', label: t('storage.chart.write'), color: 'hsl(155 62% 40%)', format: formatRate },
+  ] : [
+    { key: 'buffer_used_bytes', label: t('storage.chart.buffer'), color: 'hsl(var(--primary))', format: formatBytes },
+    { key: 'persist_queue_bytes', label: t('storage.chart.queue'), color: 'hsl(155 62% 40%)', format: formatBytes },
+  ]
   const usable = downsample(samples.filter(sample => Number.isFinite(Date.parse(sample.at))).sort((a, b) => Date.parse(a.at) - Date.parse(b.at)), 240)
-  if (!usable.length) return <EmptyState title="표시할 측정 기록이 없습니다." description="유효한 시간 정보가 포함된 측정값이 없습니다." />
+  if (!usable.length) return <EmptyState title={t('storage.chart.noValidSamples')} />
   const maxSample = Math.max(0, ...usable.flatMap(sample => series.map(item => finiteNumber(sample[item.key]))))
-  const ceilings = kind === 'throughput' ? meaningfulCeilings(pool) : []
+  const ceilings = kind === 'throughput' ? meaningfulCeilings(pool, t) : []
   const maximum = Math.max(1, maxSample, ...ceilings.map(item => item.value))
   const width = 800, height = 280, left = 76, right = 18, top = 20, bottom = 48
   const plotWidth = width - left - right, plotHeight = height - top - bottom
@@ -31,12 +31,12 @@ export function MetricChart({ title, samples, kind, pool }: { title: string; sam
   const y = (value: number) => top + plotHeight - Math.max(0, value) / maximum * plotHeight
   const ticks = [0, 0.25, 0.5, 0.75, 1]
   const ids = { title: `${uid}-title`, desc: `${uid}-desc` }
-  const unit = kind === 'throughput' ? '바이트/초' : '바이트'
+  const unit = kind === 'throughput' ? t('storage.chart.bytePerSecond') : t('storage.chart.byte')
 
   return <div className="min-w-0" data-testid={`metric-chart-${kind}`}>
     <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
       <h3 className="text-sm font-semibold">{title}</h3>
-      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground" aria-label="그래프 범례">
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground" aria-label={t('storage.chart.legend')}>
         {series.map(item => <span key={item.key} className="inline-flex items-center gap-1.5"><span className="h-0.5 w-3 rounded" style={{ backgroundColor: item.color }} />{item.label}</span>)}
         {ceilings.map(item => <span key={item.key} className="inline-flex items-center gap-1.5"><span className="h-0 w-3 border-t border-dashed" style={{ borderColor: item.color }} />{item.label}</span>)}
       </div>
@@ -44,7 +44,7 @@ export function MetricChart({ title, samples, kind, pool }: { title: string; sam
     <div className="w-full overflow-hidden rounded-md border border-border/70 bg-background/50">
       <svg viewBox={`0 0 ${width} ${height}`} className="block h-auto w-full" role="img" aria-labelledby={`${ids.title} ${ids.desc}`}>
         <title id={ids.title}>{title}</title>
-        <desc id={ids.desc}>시간에 따른 {series.map(item => item.label).join(' 및 ')} 측정값. 세로축 단위는 {unit}입니다.</desc>
+        <desc id={ids.desc}>{t('storage.chart.description', { series: series.map(item => item.label).join(', '), unit })}</desc>
         {ticks.map((tick, index) => {
           const value = maximum * tick
           const yy = y(value)
@@ -70,20 +70,20 @@ export function MetricChart({ title, samples, kind, pool }: { title: string; sam
         {xAxisIndexes(usable.length).map(index => <text key={index} x={x(index)} y={height - 15} textAnchor={index === 0 ? 'start' : index === usable.length - 1 ? 'end' : 'middle'} fill="hsl(var(--muted-foreground))" fontSize="11">{formatSampleTime(usable[index]!.at)}</text>)}
       </svg>
     </div>
-    <p className="sr-only">{`${usable.length}개 측정값, 단위 ${unit}`}</p>
+    <p className="sr-only">{t('storage.chart.sampleCount', { count: usable.length, unit })}</p>
   </div>
 }
 
-function meaningfulCeilings(pool?: StoragePool) {
+function meaningfulCeilings(pool: StoragePool | undefined, t: ReturnType<typeof useI18n>['t']) {
   if (!pool || pool.estimated_ceiling.source === 'unknown') return []
-  const labels: Record<string, string> = { observed: '관측 기반 예상 상한', configured: '설정된 상한', benchmarked: '측정된 상한' }
+  const labels = { observed: t('storage.chart.ceiling.observed'), configured: t('storage.chart.ceiling.configured'), benchmarked: t('storage.chart.ceiling.benchmarked') }
   const sourceLabel = labels[pool.estimated_ceiling.source]
   if (!sourceLabel) return []
   const result: { key: string; label: string; value: number; color: string }[] = []
   const read = pool.estimated_ceiling.read_bytes_per_second
   const write = pool.estimated_ceiling.write_bytes_per_second
-  if (read !== undefined && Number.isFinite(read) && read > 0) result.push({ key: 'read', label: `읽기 ${sourceLabel}`, value: read, color: 'hsl(var(--primary))' })
-  if (write !== undefined && Number.isFinite(write) && write > 0) result.push({ key: 'write', label: `쓰기 ${sourceLabel}`, value: write, color: 'hsl(155 62% 40%)' })
+  if (read !== undefined && Number.isFinite(read) && read > 0) result.push({ key: 'read', label: t('storage.chart.readCeiling', { source: sourceLabel }), value: read, color: 'hsl(var(--primary))' })
+  if (write !== undefined && Number.isFinite(write) && write > 0) result.push({ key: 'write', label: t('storage.chart.writeCeiling', { source: sourceLabel }), value: write, color: 'hsl(155 62% 40%)' })
   return result
 }
 function xAxisIndexes(length: number) { return length <= 1 ? [0] : [...new Set([0, Math.floor((length - 1) / 2), length - 1])] }

@@ -7,10 +7,10 @@ import { ToastProvider } from '@/components/ui/toast'
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
-async function renderAdapters() {
+async function renderAdapters(installedAdapters: unknown[] = []) {
   vi.spyOn(window, 'scrollTo').mockImplementation(() => undefined)
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  client.setQueryData(['adapters'], [])
+  client.setQueryData(['adapters'], installedAdapters)
   const root = createRootRoute()
   const adaptersRoute = createRoute({ getParentRoute: () => root, path: '/', component: AdaptersPage })
   const storageRoute = createRoute({ getParentRoute: () => root, path: '/storage', component: () => null })
@@ -38,8 +38,8 @@ describe('adapter discovery controls', () => {
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/adapters/reconcile' && init?.method === 'POST')).toBe(true))
     expect(await screen.findByText('새 플러그인 세대를 활성화했습니다.')).toBeInTheDocument()
-    expect(screen.getByText(/공식 Plugin Registry에서 Source Plugin을 찾아 설치하세요/)).toBeInTheDocument()
-    expect(screen.getByText(/운영자 executable 가져오기는 기본적으로 비활성화되어 있습니다/)).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Plugin Registry' })).toBeInTheDocument()
+    expect(screen.queryByText(/운영자 executable 가져오기는 기본적으로 비활성화되어 있습니다/)).not.toBeInTheDocument()
     expect(screen.queryByText(/어댑터 디렉터리에 넣으면/)).not.toBeInTheDocument()
   })
 
@@ -55,10 +55,10 @@ describe('adapter discovery controls', () => {
 
     await renderAdapters()
 
-    expect(await screen.findByRole('status')).toHaveTextContent(/Plugin Registry가 비활성화되었거나 URL이 구성되지 않았습니다/)
+    await waitFor(() => expect(screen.getAllByRole('status').some(status => /Registry가 설정되지 않았습니다/.test(status.textContent ?? ''))).toBe(true))
     expect(screen.getByRole('button', { name: 'Registry 새로고침' })).toBeDisabled()
-    expect(screen.getByText(/Registry가 비활성화되어 새 Source Plugin 목록을 표시하지 못했습니다/)).toBeInTheDocument()
-    expect(screen.queryByText(/아래 공식 Plugin Registry에서 source plugin을 찾아 설치하세요/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/새 Source Plugin 목록을 표시하지 못했습니다/)).not.toBeInTheDocument()
+    expect(screen.getAllByRole('status')).toHaveLength(1)
   })
 
   it('shows the registry and installs an available plugin through the Host API', async () => {
@@ -102,7 +102,7 @@ describe('adapter discovery controls', () => {
     await renderAdapters()
     expect(await screen.findByRole('region', { name: 'Source Plugin' })).toHaveTextContent('Sample Source')
     expect(screen.getByRole('region', { name: 'Storage Provider' })).toHaveTextContent('Sample Storage')
-    expect(screen.getByText(/기본 저장소는 바뀌지 않으며/)).toBeInTheDocument()
+    expect(screen.getByText(/기본 저장소는 바뀌지 않습니다/)).toBeInTheDocument()
     const storageSection = screen.getByRole('region', { name: 'Storage Provider' })
     fireEvent.click(within(storageSection).getByRole('button', { name: '설치' }))
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/plugins/storage-sample/install' && init?.method === 'POST')).toBe(true))
@@ -126,6 +126,25 @@ describe('adapter discovery controls', () => {
     expect(await screen.findByText(/Registry에 연결할 수 없습니다\. 이미 설치된 Source Plugin과 storage provider는 계속 사용할 수 있습니다\./)).toBeInTheDocument()
     expect(screen.getByText(/설치됨 1\.0\.0/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Registry 새로고침' })).toBeEnabled()
+  })
+
+  it('shows one security warning for unreviewed installed or available plugins', async () => {
+    const trust = { provenance: 'operator', authority: 'local', publisher: 'unknown', reviewed: false }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      const body = url === '/api/runtime/plugins'
+        ? { state: 'ready', plugins: [{ id: 'local-demo', type: 'source', name: 'Local Demo', available_version: '1.0.0', installed: false, update_available: false, trust }] }
+        : [{ status: { id: 'local-installed', name: 'Local Installed', state: 'ready' }, trust }]
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await renderAdapters([{ status: { id: 'local-installed', name: 'Local Installed', state: 'ready' }, trust }])
+
+    expect(await screen.findByRole('note')).toHaveTextContent('일부 플러그인은 검토되지 않았으며 Core와 같은 OS 권한으로 실행됩니다.')
+    expect(screen.getAllByText('일부 플러그인은 검토되지 않았으며 Core와 같은 OS 권한으로 실행됩니다.')).toHaveLength(1)
+    expect(screen.getByText('Local Installed')).toBeInTheDocument()
+    expect(await screen.findByText('Local Demo')).toBeInTheDocument()
   })
 
   it('shows artifact verification failures separately from registry availability', async () => {

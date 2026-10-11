@@ -94,7 +94,7 @@ export function AppShell() {
           <Popover><PopoverTrigger asChild><Button variant="ghost" className="gap-2 px-2"><span className="grid h-7 w-7 place-items-center rounded-full bg-primary/10 text-xs font-bold text-primary">IR</span><span className="hidden sm:inline">{t('shell.admin')}</span><ChevronDown className="hidden h-3.5 w-3.5 sm:inline" /></Button></PopoverTrigger><PopoverContent align="end" className="w-48 p-1"><Button variant="ghost" className="w-full justify-start" onClick={() => logout.mutate()} disabled={logout.isPending}><LogOut className="h-4 w-4" />{t('shell.logout')}</Button></PopoverContent></Popover>
         </div>
       </header>
-      <main id="main-content" className="mx-auto w-full max-w-[1680px] px-4 py-6 md:px-7 md:py-8"><Outlet /></main>
+      <main id="main-content" className="mx-auto w-full max-w-[1680px] px-4 py-4 md:px-7 md:py-6"><Outlet /></main>
     </div>
   </div>
 }

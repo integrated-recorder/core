@@ -30,7 +30,7 @@ describe('storage observability UI', () => {
 
   it('shows an empty state when the pool has no metric history yet', () => {
     render(<MetricChart title="Recorder 읽기/쓰기" samples={[]} kind="throughput" pool={pool} />)
-    expect(screen.getByText('표시할 측정 기록이 없습니다.')).toBeInTheDocument()
+    expect(screen.getByText('측정값이 아직 없습니다.')).toBeInTheDocument()
   })
 
   it('shows the API pool identity, capacity, recorder rates, buffer, queue, writer and unknown ceiling', async () => {
@@ -42,8 +42,8 @@ describe('storage observability UI', () => {
     await router.load()
     render(<RouterProvider router={router} />)
     expect(screen.getByText(/local-primary/)).toBeInTheDocument()
-    expect(screen.getByText('Recorder 읽기')).toBeInTheDocument()
-    expect(screen.getByText('Recorder 쓰기')).toBeInTheDocument()
+    expect(screen.getByText('읽기')).toBeInTheDocument()
+    expect(screen.getByText('쓰기')).toBeInTheDocument()
     expect(screen.getByText('7.20 TB / 10.0 TB')).toBeInTheDocument()
     expect(screen.getByRole('progressbar', { name: '사용량 72%' })).toBeInTheDocument()
     expect(screen.getByText('수집 버퍼')).toBeInTheDocument()
@@ -88,8 +88,8 @@ describe('storage observability UI', () => {
   it('renders the sample trend as an accessible SVG without inventing an unknown ceiling reference', () => {
     const { container } = render(<MetricChart title="Recorder 읽기/쓰기" samples={samples} kind="throughput" pool={pool} />)
     expect(screen.getByRole('img', { name: /Recorder 읽기\/쓰기/ })).toBeInTheDocument()
-    expect(screen.getByText('Recorder 읽기')).toBeInTheDocument()
-    expect(screen.getByText('Recorder 쓰기')).toBeInTheDocument()
+    expect(screen.getByText('읽기')).toBeInTheDocument()
+    expect(screen.getByText('쓰기')).toBeInTheDocument()
     expect(container.querySelector('svg polyline')).toBeInTheDocument()
     expect(container.querySelector('line[stroke-dasharray="7 5"]')).not.toBeInTheDocument()
     expect(container.querySelectorAll('circle')).toHaveLength(4)

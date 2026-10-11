@@ -49,15 +49,10 @@ export function RuntimeUpdates() {
 
   return <div role="tabpanel" id="settings-panel-updates" aria-labelledby="settings-tab-updates" tabIndex={0} className="space-y-4">
     <Card>
-      <CardHeader><CardTitle className="flex items-center gap-2"><Sparkles className="h-4 w-4 text-primary" />{t('runtime.title')}</CardTitle><p className="text-xs leading-5 text-muted-foreground">{t('runtime.description')}</p></CardHeader>
+      <CardHeader><CardTitle className="flex items-center gap-2"><Sparkles className="h-4 w-4 text-primary" />{t('runtime.title')}</CardTitle></CardHeader>
       <CardContent>
         {status.isLoading ? <LoadingState /> : status.error || !value ? <ErrorState message={status.error ? errorMessage(status.error) : t('runtime.statusUnavailable')} retry={() => void status.refetch()} /> : <div className="space-y-5">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <IdentityCard title={t('runtime.currentApplication')} identity={value.application} />
-            <IdentityCard title={t('runtime.host')} identity={value.host} />
-          </div>
-
-          <div className="grid gap-3 lg:grid-cols-3">
+          <div className="grid gap-4 lg:grid-cols-3">
             <ReleaseCard title={t('runtime.availableVersion')} release={value.available_release} empty={t('runtime.noReleaseChecked')} />
             <ReleaseCard title={t('runtime.stagedVersion')} release={value.staged_release} empty={t('runtime.noCandidate')} />
             <ReleaseCard title={t('runtime.rollbackVersion')} release={value.previous_release} empty={t('runtime.noPrevious')} />
@@ -81,15 +76,17 @@ export function RuntimeUpdates() {
           </div>
           {pending && <p role="status" className="text-xs text-muted-foreground">{t('runtime.pending')}</p>}
           <p className="text-xs leading-5 text-muted-foreground">{t('runtime.continuity')}</p>
+          <details className="border-t border-border pt-3">
+            <summary className="cursor-pointer text-xs font-medium">{t('runtime.technicalDetails')}</summary>
+            <div className="mt-3 space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2"><IdentityCard title={t('runtime.currentApplication')} identity={value.application} /><IdentityCard title={t('runtime.host')} identity={value.host} /></div>
+              <section><h3 className="text-xs font-semibold">{t('runtime.runningGenerations')}</h3><p className="mt-1 text-xs text-muted-foreground">{t('runtime.runningGenerationsHelp')}</p><div className="mt-2"><GenerationList active={value.active_generations ?? []} draining={value.draining_generations ?? []} activeControl={value.active_control} defaultEngine={value.default_engine} /></div></section>
+              {value.handover_diagnostic && <HandoverDiagnostic diagnostic={value.handover_diagnostic} />}
+            </div>
+          </details>
         </div>}
       </CardContent>
     </Card>
-
-    {value && <Card>
-      <CardHeader><CardTitle>{t('runtime.runningGenerations')}</CardTitle><p className="text-xs text-muted-foreground">{t('runtime.runningGenerationsHelp')}</p></CardHeader>
-      <CardContent><GenerationList active={value.active_generations ?? []} draining={value.draining_generations ?? []} activeControl={value.active_control} defaultEngine={value.default_engine} /></CardContent>
-    </Card>}
-    {value?.handover_diagnostic && <HandoverDiagnostic diagnostic={value.handover_diagnostic} />}
   </div>
 }
 
@@ -103,9 +100,8 @@ function HandoverDiagnostic({ diagnostic }: { diagnostic: NonNullable<RuntimeUpd
   const reasonKey: TranslationKey = `diagnostic.reason.${knownReason}` as TranslationKey
   const safeIdentifier = (value: string) => /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : '—'
   const safeVersion = /^[A-Za-z0-9.+_-]{1,80}$/.test(diagnostic.target_version) ? diagnostic.target_version : '—'
-  return <Card>
-    <CardHeader><CardTitle>{t('diagnostic.title')}</CardTitle><p className="text-xs leading-5 text-muted-foreground">{t('diagnostic.help')}</p></CardHeader>
-    <CardContent>
+  return <section className="border-t border-border pt-3">
+    <h3 className="text-xs font-semibold">{t('diagnostic.title')}</h3><p className="mt-1 text-xs text-muted-foreground">{t('diagnostic.help')}</p>
       <dl className="grid gap-x-5 gap-y-3 text-xs sm:grid-cols-2 lg:grid-cols-3">
         <DiagnosticField label={t('diagnostic.phase')} value={t(phaseKey)} />
         <DiagnosticField label={t('diagnostic.reason')} value={`${t(reasonKey)} · ${knownReason}`} />
@@ -120,8 +116,7 @@ function HandoverDiagnostic({ diagnostic }: { diagnostic: NonNullable<RuntimeUpd
         <DiagnosticField label={t('diagnostic.ownership')} value={diagnostic.ownership_retained ? t('diagnostic.ownerRetained') : t('diagnostic.no')} />
         {diagnostic.resolved_at && <DiagnosticField label={t('diagnostic.resolvedAt')} value={formatDateTime(diagnostic.resolved_at)} />}
       </dl>
-    </CardContent>
-  </Card>
+  </section>
 }
 
 function DiagnosticField({ label, value }: { label: string; value: string }) {
@@ -135,7 +130,7 @@ function IdentityCard({ title, identity }: { title: string; identity: RuntimeUpd
 
 function ReleaseCard({ title, release, empty }: { title: string; release?: RuntimeReleaseSummary; empty: string }) {
 	const { t } = useI18n()
-	return <div className="min-w-0 rounded-md border border-border p-3"><p className="text-xs text-muted-foreground">{title}</p>{release ? <><p className="mt-1 truncate text-sm font-semibold" title={release.version}>{release.version}</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{release.commit}</p><p className="mt-1 text-xs text-muted-foreground">{t('runtime.channelBuild', { channel: t(channelKeys[release.release_channel] ?? 'runtime.channel.other'), time: release.build_time })}</p>{release.notes_summary && <div className="mt-2 border-t border-border pt-2"><p className="text-[11px] font-medium text-muted-foreground">{t('runtime.releaseNotes')}</p><p className="mt-1 line-clamp-3 whitespace-normal text-xs leading-5 text-foreground">{release.notes_summary}</p></div>}</> : <p className="mt-2 text-xs text-muted-foreground">{empty}</p>}</div>
+	return <div className="min-w-0 border-t border-border pt-3"><p className="text-xs text-muted-foreground">{title}</p>{release ? <><p className="mt-1 truncate text-sm font-semibold" title={release.version}>{release.version}</p>{release.notes_summary && <p className="mt-2 line-clamp-3 whitespace-normal text-xs leading-5 text-foreground">{release.notes_summary}</p>}<details className="mt-2"><summary className="cursor-pointer text-[11px] text-muted-foreground">{t('runtime.buildDetails')}</summary><p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">{release.commit}</p><p className="mt-1 text-xs text-muted-foreground">{t('runtime.channelBuild', { channel: t(channelKeys[release.release_channel] ?? 'runtime.channel.other'), time: release.build_time })}</p></details></> : <p className="mt-1 text-xs text-muted-foreground">{empty}</p>}</div>
 }
 
 function GenerationList({ active, draining, activeControl, defaultEngine }: {

@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Clipboard, HardDrive, LoaderCircle, LockKeyhole, RefreshCw, Server, ShieldCheck, Wifi } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Clipboard, HardDrive, LoaderCircle, RefreshCw, Server } from 'lucide-react'
 import { adaptersAPI, authAPI, dashboardAPI, setupAPI } from '@/api'
 import { installationQuery, qk, sessionQuery } from '@/api/queries'
 import { AdapterMark } from '@/components/adapter/adapter-mark'
@@ -33,8 +33,8 @@ const stepHeadingKeys: Record<VisibleSetupStep, TranslationKey> = {
   resume: 'setup.heading.resume', recovery: 'setup.heading.recovery',
 }
 
-const stepDescriptionKeys: Record<VisibleSetupStep, TranslationKey> = {
-  welcome: 'setup.description.welcome', administrator: 'setup.description.administrator', storage: 'setup.description.storage',
+const stepDescriptionKeys: Record<Exclude<VisibleSetupStep, 'welcome'>, TranslationKey> = {
+  administrator: 'setup.description.administrator', storage: 'setup.description.storage',
   adapters: 'setup.description.adapters', review: 'setup.description.review', complete: 'setup.description.complete',
   resume: 'setup.description.resume', recovery: 'setup.description.recovery',
 }
@@ -224,23 +224,13 @@ export function SetupPage() {
   const adapterWarnings = adapters.filter(adapter => !['ready', 'running'].includes(adapter.status.state))
 
   return <SetupFrame>
-    <div className="mx-auto grid w-full max-w-5xl gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
+    <div className="mx-auto grid w-full max-w-5xl gap-5 lg:grid-cols-[minmax(0,1fr)_260px]">
       <section className="min-w-0">
-        <div className="mb-5 flex items-center gap-3">
-          <div className="grid h-10 w-10 place-items-center rounded-lg bg-primary/10 text-primary"><ShieldCheck className="h-5 w-5" /></div>
-          <div><p className="text-xs font-semibold uppercase tracking-[.14em] text-primary">{t('setup.eyebrow')}</p><p className="text-sm text-muted-foreground">{t('setup.intro')}</p></div>
-        </div>
         <Card className="overflow-hidden">
-          <CardHeader className="border-b border-border bg-muted/20 px-5 py-5 sm:px-7"><CardTitle className="text-xl">{t(stepHeadingKeys[visibleStep])}</CardTitle><CardDescription>{t(stepDescriptionKeys[visibleStep])}</CardDescription></CardHeader>
-          <CardContent className="px-5 py-6 sm:px-7 sm:py-7">
+          <CardHeader className="border-b border-border bg-muted/20"><CardTitle className="text-lg">{t(stepHeadingKeys[visibleStep])}</CardTitle>{visibleStep !== 'welcome' && <p className="text-sm text-muted-foreground">{t(stepDescriptionKeys[visibleStep])}</p>}</CardHeader>
+          <CardContent className="py-5">
             {visibleStep === 'welcome' && <div>
-              <div className="rounded-xl bg-[#101c2e] p-5 text-white sm:p-7"><AppBrand variant="login" inverse /><h1 className="mt-8 text-2xl font-semibold sm:text-3xl">{t('setup.welcome.title')}</h1><p className="mt-3 max-w-xl text-sm leading-6 text-white/65">{t('setup.welcome.description')}</p></div>
-              <div className="mt-6 flex flex-wrap gap-3 text-xs text-muted-foreground">
-                <span className="inline-flex items-center gap-1.5"><LockKeyhole className="h-3.5 w-3.5" />{t('setup.welcome.secureAccess')}</span>
-                <span className="inline-flex items-center gap-1.5"><HardDrive className="h-3.5 w-3.5" />{t('setup.welcome.storageCheck')}</span>
-                <span className="inline-flex items-center gap-1.5"><Wifi className="h-3.5 w-3.5" />{t('setup.welcome.adapterCheck')}</span>
-              </div>
-              <div className="mt-7 flex justify-end"><Button onClick={() => status.claim_required && !status.auth_disabled ? setStep('administrator') : begin.mutate()} disabled={begin.isPending}>{begin.isPending ? t('setup.welcome.starting') : t('setup.welcome.start')}<ArrowRight className="h-4 w-4" /></Button></div>
+              <div className="flex justify-end"><Button onClick={() => status.claim_required && !status.auth_disabled ? setStep('administrator') : begin.mutate()} disabled={begin.isPending}>{begin.isPending ? t('setup.welcome.starting') : t('setup.welcome.start')}<ArrowRight className="h-4 w-4" /></Button></div>
             </div>}
 
             {visibleStep === 'administrator' && <form className="max-w-xl space-y-5" onSubmit={submitAdministrator}>
@@ -322,15 +312,13 @@ export function SetupPage() {
             return <li key={item.id}><div aria-current={current ? 'step' : undefined} className={`flex items-center gap-3 rounded-md px-2.5 py-2 text-sm ${current ? 'bg-primary/10 font-medium text-primary' : 'text-muted-foreground'}`}><span className={`grid h-6 w-6 shrink-0 place-items-center rounded-full border text-xs ${complete ? 'border-emerald-600 bg-emerald-600 text-white' : current ? 'border-primary' : 'border-border'}`}>{complete ? <Check className="h-3.5 w-3.5" /> : index + 1}</span>{t(item.label)}</div></li>
           })}</ol>
         </CardContent></Card>
-        <p className="px-1 text-xs leading-5 text-muted-foreground">{status.version ? t('setup.review.version', { version: status.version }) : t('setup.review.versionPending')}{status.release_channel ? ` · ${t(releaseChannelKey(status.release_channel))}` : ''}</p>
       </aside>
     </div>
   </SetupFrame>
 }
 
 function SetupFrame({ children }: { children: React.ReactNode }) {
-  const { t } = useI18n()
-  return <main className="min-h-screen bg-background px-4 py-6 sm:px-6 sm:py-9"><div className="mx-auto mb-7 flex w-full max-w-5xl items-center justify-between"><AppBrand variant="mobile" /><span className="hidden text-xs text-muted-foreground sm:block">{t('setup.secureFirstRun')}</span></div>{children}</main>
+  return <main className="min-h-screen bg-background px-4 py-5 sm:px-6 sm:py-7"><div className="mx-auto mb-5 flex w-full max-w-5xl items-center justify-between"><AppBrand variant="mobile" /></div>{children}</main>
 }
 
 function SetupError({ title, message, onRetry }: { title: string; message: string; onRetry: () => void }) {

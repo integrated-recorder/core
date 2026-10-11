@@ -61,7 +61,7 @@ describe('first-run setup flow', () => {
     setBrowserLocale('en-US')
     renderSetup()
     expect(await screen.findByRole('heading', { name: 'Get started with Integrated Recorder' })).toBeInTheDocument()
-    expect(screen.getByText('Complete a few setup steps to get started.')).toBeInTheDocument()
+    expect(screen.queryByText('Complete a few setup steps to get started.')).not.toBeInTheDocument()
     await waitFor(() => expect(document.documentElement.lang).toBe('en-US'))
     expect(document.body.textContent).not.toMatch(/[\uac00-\ud7a3]/)
   })
@@ -69,7 +69,7 @@ describe('first-run setup flow', () => {
   it('resolves unauthenticated setup to ko-KR from browser locale', async () => {
     renderSetup()
     expect(await screen.findByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeInTheDocument()
-    expect(screen.getByText('처음 몇 가지만 설정하면 바로 시작할 수 있습니다.')).toBeInTheDocument()
+    expect(screen.queryByText('처음 몇 가지만 설정하면 바로 시작할 수 있습니다.')).not.toBeInTheDocument()
     await waitFor(() => expect(document.documentElement.lang).toBe('ko-KR'))
   })
 

@@ -147,7 +147,7 @@ test('administrator can log in, use the application, and log out', async ({ page
   })
 
   await page.goto('/login')
-  await page.getByLabel('관리자 비밀번호').fill('a-strong-passphrase')
+  await page.getByLabel('비밀번호').fill('a-strong-passphrase')
   await page.getByRole('button', { name: '로그인' }).click()
   await expect(page).toHaveURL('/')
   await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
@@ -155,4 +155,36 @@ test('administrator can log in, use the application, and log out', async ({ page
   await page.getByRole('button', { name: '로그아웃' }).click()
   await expect(page).toHaveURL('/login')
   expect(logoutCSRF).toBe('session-csrf')
+})
+
+test('login stays compact at desktop and mobile widths in both locales', async ({ browser }, testInfo) => {
+  for (const locale of ['ko-KR', 'en-US'] as const) {
+    const context = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale })
+    const page = await context.newPage()
+    await page.route('**/api/**', async route => {
+      const path = new URL(route.request().url()).pathname
+      if (path === '/api/setup/status') {
+        await route.fulfill({ json: { state: 'ready', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false } })
+      } else if (path === '/api/auth/session') {
+        await route.fulfill({ json: { auth_enabled: true, authenticated: false, needs_bootstrap: false, csrf_token: '' } })
+      } else {
+        await route.fulfill({ status: 404, json: { error: 'unexpected test request' } })
+      }
+    })
+
+    for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }]) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height })
+      await page.goto('/login')
+      await expect(page.locator('html')).toHaveAttribute('lang', locale)
+      await expect(page.getByText('Integrated Recorder', { exact: true })).toBeVisible()
+      await expect(page.getByRole('heading', { name: locale === 'ko-KR' ? '로그인' : 'Sign in' })).toBeVisible()
+      await expect(page.getByLabel(locale === 'ko-KR' ? '비밀번호' : 'Password')).toBeVisible()
+      await expect(page.getByRole('button', { name: locale === 'ko-KR' ? '로그인' : 'Sign in' })).toBeVisible()
+      expect(await page.locator('body').innerText()).not.toMatch(/Archive Live|Preserve Source|HttpOnly|브라우저에 저장되지 않습니다/)
+      const dimensions = await page.evaluate(() => ({ body: document.body.scrollWidth, viewport: window.innerWidth }))
+      expect(dimensions.body).toBeLessThanOrEqual(dimensions.viewport)
+      await page.screenshot({ path: testInfo.outputPath(`login-${locale}-${viewport.name}.png`), fullPage: true })
+    }
+    await context.close()
+  }
 })

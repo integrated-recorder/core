@@ -12,7 +12,7 @@ describe('ResourceBreadcrumbs', () => {
   it('offers root, ancestors, and parent navigation using opaque references', () => {
     const onNavigate = vi.fn()
     render(<ResourceBreadcrumbs resource={resource} onNavigate={onNavigate} />)
-    fireEvent.click(screen.getByRole('button', { name: '상위로' }))
+    fireEvent.click(screen.getByRole('button', { name: '상위' }))
     expect(onNavigate).toHaveBeenCalledWith(resource.parent)
     fireEvent.click(screen.getByRole('button', { name: 'alpha / 1' }))
     expect(onNavigate).toHaveBeenLastCalledWith(resource.parent?.parent)

@@ -43,7 +43,7 @@ describe('SchemaForm', () => {
       { key: 'action', control: 'action', label: 'Refresh' },
       { key: 'display', control: 'status', label: 'Status' },
     ] }} initialValues={{ enabled: false, formats: [{ ids: [1, 2], mode: 'source' }] }} onSubmit={onSubmit} />)
-    expect(screen.getByRole('checkbox', { name: /Enabled 사용/ })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'Enabled' })).not.toBeChecked()
     expect(screen.getByRole('checkbox', { name: 'Source' })).toBeChecked()
     fireEvent.click(screen.getByRole('button', { name: '저장' }))
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ values: { enabled: false, formats: [{ mode: 'source', ids: [1, 2] }] } })))

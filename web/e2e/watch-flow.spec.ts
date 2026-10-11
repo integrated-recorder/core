@@ -106,7 +106,7 @@ async function login(page: Page) {
     await page.getByLabel('비밀번호 확인').fill('browser-e2e-strong-password')
     await page.getByRole('button', { name: '서버 초기화' }).click()
   } else {
-    await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
+    await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
     await page.getByRole('button', { name: '로그인' }).click()
   }
   await expect(page).toHaveURL('/')

@@ -25,12 +25,12 @@ describe('plugin trust badges', () => {
     const { rerender } = render(<PluginTrustBadges trust={{ provenance: 'registry', authority: 'custom', publisher: 'unknown', reviewed: false }} warning />)
     expect(screen.getByText('사용자 지정 Registry')).toBeInTheDocument()
     expect(screen.getByText('게시자 알 수 없음')).toBeInTheDocument()
-    expect(screen.getByText(/검토되지 않았으며 샌드박스 없이 실행됩니다/)).toBeInTheDocument()
+    expect(screen.getByText('Integrated Recorder에서 검토하지 않았습니다.')).toBeInTheDocument()
     expect(screen.queryByText('Registry 승인됨')).not.toBeInTheDocument()
 
     rerender(<PluginTrustBadges trust={{ provenance: 'operator', authority: 'local', publisher: 'unknown', reviewed: false }} warning />)
     expect(screen.getByText('로컬 운영자')).toBeInTheDocument()
-    expect(screen.getByText(/검토되지 않았으며 샌드박스 없이 실행됩니다/)).toBeInTheDocument()
+    expect(screen.getByText('Integrated Recorder에서 검토하지 않았습니다.')).toBeInTheDocument()
   })
 
   it('does not infer trust for legacy or inconsistent API responses', () => {

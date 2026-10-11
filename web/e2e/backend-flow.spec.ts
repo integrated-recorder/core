@@ -31,7 +31,7 @@ type CSPViolation = { effectiveDirective: string; violatedDirective: string; blo
 
 test.describe.configure({ mode: 'serial' })
 
-test('actual Go backend: direct HLS capture, VOD, management, and delete', async ({ page }) => {
+test('actual Go backend: direct HLS capture, VOD, management, and delete', async ({ page }, testInfo) => {
   test.setTimeout(180_000)
   await forceHlsJSPlayback(page)
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
@@ -79,8 +79,8 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   expect(await page.locator('script:not([src])').count()).toBe(0)
   await assertResponsive(page)
   await page.setViewportSize({ width: 1440, height: 900 })
-  await expect(page.getByLabel(/Administrator password|관리자 비밀번호/)).toBeVisible()
-  await page.getByLabel(/Administrator password|관리자 비밀번호/).fill('browser-e2e-strong-password')
+  await expect(page.getByLabel(/Password|비밀번호/)).toBeVisible()
+  await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
   await setLocaleForCurrentUser(page, 'ko-KR')
@@ -98,13 +98,26 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
     await page.goto(route)
     await assertResponsive(page)
     await assertNoCSPViolations(cspViolations)
+    if (['/', '/recordings', '/adapters', '/settings', '/storage'].includes(route)) {
+      await expect(page.locator('#main-content h1').first()).toBeVisible()
+      const name = route === '/' ? 'dashboard' : route.slice(1)
+      await page.screenshot({ path: testInfo.outputPath(`${name}-ko-desktop.png`), fullPage: true })
+      await page.setViewportSize({ width: 390, height: 844 })
+      await page.screenshot({ path: testInfo.outputPath(`${name}-ko-mobile.png`), fullPage: true })
+      await page.setViewportSize({ width: 1440, height: 900 })
+    }
   }
+  await page.goto('/adapters/hls')
+  await page.screenshot({ path: testInfo.outputPath('adapter-detail-ko-desktop.png'), fullPage: true })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.screenshot({ path: testInfo.outputPath('adapter-detail-ko-mobile.png'), fullPage: true })
+  await page.setViewportSize({ width: 1440, height: 900 })
   await page.goto('/storage')
   await expect(page.getByRole('heading', { name: '저장소', exact: true })).toBeVisible()
   await expect(page.getByText('local-primary', { exact: false }).first()).toBeVisible()
   await page.goto('/storage/local-primary')
   await expect(page.getByRole('heading', { name: '기본 보관 저장소' })).toBeVisible()
-  const noMetricHistory = page.getByText('표시할 측정 기록이 없습니다.').first()
+  const noMetricHistory = page.getByText('측정값이 아직 없습니다.').first()
   const throughputChart = page.getByTestId('metric-chart-throughput')
   await expect.poll(async () => (await noMetricHistory.count()) > 0 || (await throughputChart.count()) > 0).toBe(true)
   if (await noMetricHistory.count()) await expect(noMetricHistory).toBeVisible()
@@ -115,6 +128,10 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   await exerciseNativeSelect(recordingState)
   await exerciseNativeSelect(recordingAdapter)
   await page.goto('/settings')
+  const runtimeDetails = page.locator('details').filter({ hasText: '진단 정보' })
+  await expect(runtimeDetails).toBeVisible()
+  await expect(runtimeDetails).not.toHaveAttribute('open', '')
+  await runtimeDetails.locator('summary').click()
   await expect(page.getByText('커밋', { exact: true })).toBeVisible()
   const settingsSelects = page.locator('#settings-panel-preferences select')
   await expect(settingsSelects).toHaveCount(3)
@@ -231,6 +248,10 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   await seekAndAssertPlayback(vodVideo, 0.25, vodDuration)
   await seekAndAssertPlayback(vodVideo, vodDuration / 2, vodDuration)
   await seekAndAssertPlayback(vodVideo, Math.max(0.25, vodDuration - 0.5), vodDuration)
+  await page.screenshot({ path: testInfo.outputPath('vod-ko-desktop.png') })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.screenshot({ path: testInfo.outputPath('vod-ko-mobile.png') })
+  await page.setViewportSize({ width: 1440, height: 900 })
 
   await page.getByRole('button', { name: '편집' }).click()
   await page.getByLabel('태그 목록').fill('browser-e2e, source-preserved')
@@ -259,6 +280,7 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   expect('adapter' in listItem).toBe(false)
   expect('resource' in listItem).toBe(false)
   await page.goto('/recordings?state=stopped')
+  await page.screenshot({ path: testInfo.outputPath('recordings-filled-ko-desktop.png'), fullPage: true })
   await expect(page.getByRole('link', { name: 'Browser E2E HLS capture' }).first()).toBeVisible()
   await expect(page.getByRole('row').filter({ hasText: 'Browser E2E HLS capture' }).getByText('중지됨', { exact: true })).toBeVisible()
   await expect(
@@ -276,11 +298,15 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   }, { timeout: 20_000 }).toBeGreaterThan(0)
   await expect(page.getByTestId('metric-chart-throughput').locator('svg')).toBeVisible()
   await expect(page.getByTestId('metric-chart-backlog').locator('svg')).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Recorder 읽기/쓰기', exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '읽기/쓰기', exact: true })).toBeVisible()
   await assertResponsive(page)
 
   await page.goto(`/recordings/${recordingID}`)
   await expect(page.getByRole('heading', { name: 'Browser E2E HLS capture' })).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath('recording-detail-ko-desktop.png'), fullPage: true })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.screenshot({ path: testInfo.outputPath('recording-detail-ko-mobile.png'), fullPage: true })
+  await page.setViewportSize({ width: 1440, height: 900 })
 
   await page.getByRole('button', { name: '삭제' }).click()
   await expect(page.getByRole('alertdialog')).toContainText('되돌릴 수 없습니다')
@@ -411,7 +437,7 @@ test('actual browser HLS decode: active live playback and terminal VOD seeks', a
   expect(fatalPlaybackErrors).toEqual([])
 })
 
-test('actual Go backend: locale preference save updates the current document language', async ({ page }) => {
+test('actual Go backend: locale preference save updates the current document language', async ({ page }, testInfo) => {
   await login(page)
   await page.goto('/settings')
   const localeSelect = page.locator('#user-locale')
@@ -431,6 +457,9 @@ test('actual Go backend: locale preference save updates the current document lan
     message: `After locale selector en-US save, PUT /api/user/preferences returned ${JSON.stringify(body)}`,
   }).toBe('en-US')
   await expect(page.getByRole('navigation', { name: /Main navigation|주 메뉴/ }).getByRole('link', { name: /^(Dashboard|대시보드)$/ })).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath('settings-en-US-desktop.png'), fullPage: true })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.screenshot({ path: testInfo.outputPath('settings-en-US-mobile.png'), fullPage: true })
 })
 
 test('actual Go backend: metadata fixture changes are archived and rendered as a timeline', async ({ page }) => {
@@ -733,7 +762,7 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
   await expect.poll(async () => (await getJSON<RecordingWire>(page, `/api/recordings/${recordingID}`)).state).toBe('stopped')
 
   await page.goto(`/workflows/${firstWorkflowID}`)
-  await expect(page.getByRole('heading', { name: '워크플로를 찾을 수 없습니다' })).toBeVisible()
+  await expect(page.getByRole('alert')).toContainText('요청한 항목을 찾을 수 없습니다.')
 
   await page.goto('/new')
   await page.getByRole('button', { name: /Workflow Fixture/ }).click()
@@ -743,21 +772,26 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
   await page.getByRole('button', { name: /녹화 시작|Start recording/ }).click()
   await expect(page).toHaveURL(/\/workflows\/[^/]+$/)
   await page.getByRole('button', { name: '취소' }).click()
-  await page.getByRole('alertdialog').getByRole('button', { name: '워크플로 취소' }).click()
+  await page.getByRole('alertdialog').getByRole('button', { name: '취소', exact: true }).last().click()
   await expect(page).toHaveURL('/workflows')
   await expect(page.getByText(/Workflow Fixture · 취소됨/)).toBeVisible()
 })
 
-test('actual Go backend: account password, sessions, and owner user management', async ({ page, browser }) => {
+test('actual Go backend: account password, sessions, and owner user management', async ({ page, browser }, testInfo) => {
   test.setTimeout(120_000)
   await page.goto('/login')
-  await page.getByLabel(/Administrator password|관리자 비밀번호/).fill('browser-e2e-strong-password')
+  await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
+  await setLocaleForCurrentUser(page, 'ko-KR')
   await page.goto('/settings')
   await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
   await expect(page.getByRole('heading', { name: /Account information|계정 정보/ })).toBeVisible()
   await expect(page.getByRole('heading', { name: /User management|사용자 관리/ })).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath('account-security-ko-desktop.png'), fullPage: true })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.screenshot({ path: testInfo.outputPath('account-security-ko-mobile.png'), fullPage: true })
+  await page.setViewportSize({ width: 1440, height: 900 })
 
   const currentPassword = 'browser-e2e-strong-password'
   const changedPassword = 'browser-e2e-updated-password'
@@ -767,19 +801,19 @@ test('actual Go backend: account password, sessions, and owner user management',
   await page.getByRole('button', { name: /Change password|비밀번호 변경/ }).click()
   await expect(page).toHaveURL('/login')
 
-  await page.getByLabel(/Administrator password|관리자 비밀번호/).fill(currentPassword)
+  await page.getByLabel(/Password|비밀번호/).fill(currentPassword)
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page.getByRole('alert')).toBeVisible()
-  await page.getByLabel(/계정 이름/).fill('owner')
-  await page.getByLabel(/Administrator password|관리자 비밀번호/).fill(changedPassword)
+  await page.getByLabel(/Account name|계정 이름/).fill('owner')
+  await page.getByLabel(/Password|비밀번호/).fill(changedPassword)
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
 
   const otherContext = await browser.newContext({ locale: 'ko-KR' })
   const otherPage = await otherContext.newPage()
   await otherPage.goto('/login')
-  await otherPage.getByLabel(/계정 이름/).fill('owner')
-  await otherPage.getByLabel(/Administrator password|관리자 비밀번호/).fill(changedPassword)
+  await otherPage.getByLabel(/Account name|계정 이름/).fill('owner')
+  await otherPage.getByLabel(/Password|비밀번호/).fill(changedPassword)
   await otherPage.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(otherPage).toHaveURL('/')
   await otherContext.close()
@@ -799,8 +833,8 @@ test('actual Go backend: account password, sessions, and owner user management',
   const memberContext = await browser.newContext({ locale: 'ko-KR' })
   const memberPage = await memberContext.newPage()
   await memberPage.goto('/login')
-  await memberPage.getByLabel(/계정 이름/).fill('stage7-member')
-  await memberPage.getByLabel(/Administrator password|관리자 비밀번호/).fill('stage7-member-password')
+  await memberPage.getByLabel(/Account name|계정 이름/).fill('stage7-member')
+  await memberPage.getByLabel(/Password|비밀번호/).fill('stage7-member-password')
   await memberPage.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(memberPage).toHaveURL('/')
   await memberPage.goto('/settings')
@@ -833,7 +867,7 @@ test('actual Go backend: account password, sessions, and owner user management',
 
 async function login(page: Page) {
   await page.goto('/login')
-  await page.getByLabel(/Administrator password|관리자 비밀번호/).fill('browser-e2e-strong-password')
+  await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
   await setLocaleForCurrentUser(page, 'ko-KR')

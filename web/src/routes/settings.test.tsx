@@ -199,13 +199,13 @@ describe('per-user preferences', () => {
     vi.spyOn(authAPI, 'session').mockResolvedValue({ auth_enabled: true, authenticated: true, needs_bootstrap: false })
     vi.mocked(userPreferencesAPI.get).mockResolvedValue({ locale: 'en-US', theme: 'system', timezone: 'system' })
     renderLocalizedSettings()
-    expect(await screen.findByRole('heading', { name: 'User preferences' })).toBeInTheDocument()
+    expect(await screen.findByRole('combobox', { name: 'Language' })).toBeInTheDocument()
     const locale = await screen.findByRole('combobox', { name: 'Language' })
     fireEvent.change(locale, { target: { value: 'ko-KR' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save preferences' }))
     expect(await screen.findByText('환경 설정을 저장했습니다.')).toBeInTheDocument()
     await waitFor(() => expect(document.documentElement.lang).toBe('ko-KR'))
-    expect(screen.getByRole('heading', { name: '사용자 환경' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '사용자 환경' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '환경 설정 저장' })).toBeInTheDocument()
   })
 
@@ -214,7 +214,7 @@ describe('per-user preferences', () => {
     vi.mocked(userPreferencesAPI.get).mockResolvedValue({ locale: 'ko-KR', theme: 'system', timezone: 'system' })
     vi.mocked(userPreferencesAPI.update).mockImplementation(async preferences => preferences)
     renderLocalizedSettings()
-    expect(await screen.findByRole('heading', { name: '사용자 환경' })).toBeInTheDocument()
+    expect(await screen.findByRole('combobox', { name: '언어' })).toBeInTheDocument()
     const locale = await screen.findByRole('combobox', { name: '언어' })
     fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
     await waitFor(() => expect(userPreferencesAPI.update).toHaveBeenCalledTimes(1))
@@ -223,14 +223,14 @@ describe('per-user preferences', () => {
     fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
     await waitFor(() => expect(userPreferencesAPI.update).toHaveBeenLastCalledWith({ locale: 'en-US', theme: 'system', timezone: 'system' }, expect.objectContaining({ client: expect.anything() })))
     await waitFor(() => expect(document.documentElement.lang).toBe('en-US'))
-    expect(screen.getByRole('heading', { name: 'User preferences' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Preferences' })).toBeInTheDocument()
   })
 
   it('loads and persists locale, theme, and time zone together', async () => {
     const saved: UserPreferences = { locale: 'ko-KR', theme: 'dark', timezone: 'Asia/Seoul' }
     vi.mocked(userPreferencesAPI.update).mockResolvedValue(saved)
     renderSettings()
-    expect(await screen.findByRole('heading', { name: '사용자 환경' })).toBeInTheDocument()
+    expect(await screen.findByRole('combobox', { name: '언어' })).toBeInTheDocument()
     fireEvent.change(await screen.findByRole('combobox', { name: '언어' }), { target: { value: 'ko-KR' } })
     fireEvent.change(await screen.findByRole('combobox', { name: '테마' }), { target: { value: 'dark' } })
     fireEvent.change(await screen.findByLabelText('시간대'), { target: { value: 'Asia/Seoul' } })
@@ -242,7 +242,7 @@ describe('per-user preferences', () => {
 
   it('rejects invalid IANA time zones before sending the update', async () => {
     renderSettings()
-    await screen.findByRole('heading', { name: '사용자 환경' })
+    await screen.findByRole('combobox', { name: '언어' })
     fireEvent.change(await screen.findByLabelText('시간대'), { target: { value: 'Mars/Olympus' } })
     fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('환경 설정 값을 확인하세요.')

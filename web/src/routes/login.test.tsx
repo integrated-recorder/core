@@ -25,7 +25,11 @@ beforeEach(() => {
 describe('normal administrator login', () => {
   it('submits only a password and navigates into the application', async () => {
     renderLogin()
-    fireEvent.change(await screen.findByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
+    expect(screen.getByRole('heading', { name: '로그인' })).toBeInTheDocument()
+    expect(screen.queryByText('Archive Live.')).not.toBeInTheDocument()
+    expect(screen.queryByText(/HttpOnly|브라우저에 저장되지 않습니다/)).not.toBeInTheDocument()
+    expect(screen.getByLabelText('계정 이름')).toBeInTheDocument()
+    fireEvent.change(await screen.findByLabelText('비밀번호'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.click(screen.getByRole('button', { name: '로그인' }))
     await waitFor(() => expect(mocks.login).toHaveBeenCalledWith('a-strong-passphrase'))
     expect(mocks.navigate).toHaveBeenCalledWith({ to: '/' })

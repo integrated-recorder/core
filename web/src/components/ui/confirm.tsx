@@ -1,7 +1,9 @@
 import { cloneElement, isValidElement, useEffect, useId, useRef, useState, type HTMLAttributes, type MouseEvent, type ReactElement, type ReactNode } from 'react'
 import { Button } from './button'
+import { useI18n } from '@/i18n/provider'
 
-export function Confirm({ trigger, title, description, confirmLabel = '확인', destructive = false, onConfirm, disabled }: { trigger: ReactNode; title: string; description: string; confirmLabel?: string; destructive?: boolean; onConfirm: () => void; disabled?: boolean }) {
+export function Confirm({ trigger, title, description, confirmLabel, destructive = false, onConfirm, disabled }: { trigger: ReactNode; title: string; description: string; confirmLabel?: string; destructive?: boolean; onConfirm: () => void; disabled?: boolean }) {
+  const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const titleId = useId()
   const descriptionId = useId()
@@ -41,7 +43,7 @@ export function Confirm({ trigger, title, description, confirmLabel = '확인', 
       }}>
         <h2 id={titleId} className="pr-8 text-lg font-semibold">{title}</h2>
         <p id={descriptionId} className="mt-2 text-sm leading-6 text-muted-foreground">{description}</p>
-        <div className="mt-6 flex justify-end gap-2"><Button ref={cancelRef} variant="outline" onClick={close}>취소</Button><Button variant={destructive ? 'destructive' : 'default'} disabled={disabled} onClick={() => { onConfirm(); close() }}>{confirmLabel}</Button></div>
+        <div className="mt-6 flex justify-end gap-2"><Button ref={cancelRef} variant="outline" onClick={close}>{t('common.cancel')}</Button><Button variant={destructive ? 'destructive' : 'default'} disabled={disabled} onClick={() => { onConfirm(); close() }}>{confirmLabel ?? t('common.confirm')}</Button></div>
       </section>
     </div>}
   </>

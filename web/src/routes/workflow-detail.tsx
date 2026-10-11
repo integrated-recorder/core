@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link, useNavigate, useParams } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, ShieldQuestion } from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 import { workflowsAPI } from '@/api'
 import { adaptersQuery, qk } from '@/api/queries'
 import { SchemaForm } from '@/components/schema-form'
@@ -17,25 +17,35 @@ import { errorMessage } from '@/lib/errors'
 import { WorkflowPromptPanel } from '@/components/workflow/prompt-panel'
 import type { RecordingDetail, Schema, WorkflowProgress } from '@/types/api'
 import { AdapterMark } from '@/components/adapter/adapter-mark'
-import { workflowStateLabel } from '@/lib/labels'
+import { useI18n } from '@/i18n/provider'
 
 export function WorkflowDetailPage() {
-  const { workflowId } = useParams({ from: '/workflows/$workflowId' }); const client = useQueryClient(); const navigate = useNavigate(); const { toast } = useToast()
+  const { workflowId } = useParams({ from: '/workflows/$workflowId' })
+  const { t } = useI18n()
+  const client = useQueryClient()
+  const navigate = useNavigate()
+  const { toast } = useToast()
   const workflow = useQuery({ queryKey: qk.workflow(workflowId), queryFn: () => workflowsAPI.get(workflowId), retry: false })
   const adapters = useQuery(adaptersQuery)
   const [errorText, setErrorText] = useState('')
-  const cancel = useMutation({ mutationFn: () => workflowsAPI.cancel(workflowId), onSuccess: async () => { toast('워크플로를 취소했습니다.'); await client.invalidateQueries({ queryKey: qk.workflows }); await client.invalidateQueries({ queryKey: qk.workflowHistory }); await navigate({ to: '/workflows' }) }, onError: error => toast('취소 실패', errorMessage(error), 'error') })
+  const cancel = useMutation({ mutationFn: () => workflowsAPI.cancel(workflowId), onSuccess: async () => { toast(t('workflow.detail.cancelled')); await client.invalidateQueries({ queryKey: qk.workflows }); await client.invalidateQueries({ queryKey: qk.workflowHistory }); await navigate({ to: '/workflows' }) }, onError: error => toast(t('workflow.detail.cancelFailed'), errorMessage(error), 'error') })
   const proceed = useMutation({ mutationFn: (body: { values: Record<string, unknown>; secrets: Record<string, string>; persist_fields: string[] }) => workflowsAPI.continue(workflowId, body), onSuccess: async (result: WorkflowProgress | RecordingDetail) => {
-    if ('id' in result) { toast('확인이 완료되어 녹화를 시작했습니다.'); await client.invalidateQueries({ queryKey: qk.dashboard }); await client.invalidateQueries({ queryKey: ['recordings'] }); await navigate({ to: '/recordings/$recordingId', params: { recordingId: result.id } }); return }
-    setErrorText(''); client.setQueryData(qk.workflow(workflowId), result); await client.invalidateQueries({ queryKey: qk.workflows }); await client.invalidateQueries({ queryKey: qk.workflowHistory }); toast('워크플로가 업데이트되었습니다.', workflowStateLabel(result.state), 'info')
+    if ('id' in result) { toast(t('workflow.detail.startedRecording')); await client.invalidateQueries({ queryKey: qk.dashboard }); await client.invalidateQueries({ queryKey: ['recordings'] }); await navigate({ to: '/recordings/$recordingId', params: { recordingId: result.id } }); return }
+    setErrorText(''); client.setQueryData(qk.workflow(workflowId), result); await client.invalidateQueries({ queryKey: qk.workflows }); await client.invalidateQueries({ queryKey: qk.workflowHistory }); toast(t('workflow.detail.updated'))
   }, onError: error => setErrorText(errorMessage(error)) })
   if (workflow.isLoading) return <LoadingState />
-  if (workflow.error || !workflow.data) return <div className="page-enter"><PageHeading title="워크플로를 찾을 수 없습니다" description="만료되었거나 이미 종료된 워크플로입니다." actions={<Link to="/workflows"><Button variant="outline"><ArrowLeft className="h-4 w-4" />워크플로 목록</Button></Link>} /><ErrorState message={errorMessage(workflow.error ?? '워크플로를 사용할 수 없습니다.')} retry={() => void workflow.refetch()} /></div>
-  const item = workflow.data; const challengeSchema: Schema = item.challenge?.schema ?? { fields: [] }; const prompt = item.challenge?.prompt
+  if (workflow.error || !workflow.data) return <div className="page-enter"><ErrorState message={workflow.error ? errorMessage(workflow.error) : t('workflow.detail.missing')} retry={() => void workflow.refetch()} /><Link to="/workflows"><Button variant="outline" className="mt-3"><ArrowLeft className="h-4 w-4" />{t('workflow.detail.back')}</Button></Link></div>
+  const item = workflow.data
+  const challengeSchema: Schema = item.challenge?.schema ?? { fields: [] }
+  const prompt = item.challenge?.prompt
   const submit = (result: { values: Record<string, unknown>; secrets: Record<string, string>; persistFields: string[] }) => proceed.mutate({ values: result.values, secrets: result.secrets, persist_fields: result.persistFields })
   const terminalPrompt = prompt?.type === 'complete' || prompt?.type === 'error'
   const adapter = adapters.data?.find(candidate => candidate.status.id === item.adapter_id)
-  return <div className="page-enter"><PageHeading eyebrow="어댑터 워크플로" title="추가 정보 요청" description={`${item.adapter_id} · ${item.workflow_id}`} actions={<><Link to="/workflows"><Button variant="outline"><ArrowLeft className="h-4 w-4" />워크플로 목록</Button></Link><Confirm trigger={<Button variant="destructive"><span>취소</span></Button>} title="워크플로를 취소할까요?" description="현재 어댑터 확인 작업을 취소합니다. 입력한 값은 저장되지 않습니다." confirmLabel="워크플로 취소" destructive onConfirm={() => cancel.mutate()} disabled={cancel.isPending || terminalPrompt} /></>} />
-    <div className="grid gap-4 xl:grid-cols-[1fr_360px]"><Card><CardHeader><CardTitle className="flex items-center gap-2"><ShieldQuestion className="h-5 w-5 text-primary" />{prompt?.title ?? '어댑터 입력이 필요합니다'}</CardTitle><p className="text-sm leading-6 text-muted-foreground">{prompt?.message ?? '어댑터에서 요청한 정보를 입력해 확인을 이어가세요.'}</p></CardHeader><CardContent>{prompt && <WorkflowPromptPanel prompt={prompt} />}{challengeSchema.fields.length && !terminalPrompt ? <SchemaForm key={`${workflowId}-${item.state}`} schema={challengeSchema} mode="challenge" submitLabel="계속 진행" onSubmit={submit} busy={proceed.isPending} /> : item.state === 'resolved' || prompt?.type === 'complete' ? <EmptyState title="요청이 완료되었습니다." /> : terminalPrompt ? null : <EmptyState title="입력 가능한 요청이 없습니다." description="이 워크플로 상태를 확인하거나 취소하세요." />}{errorText && <p role="alert" className="mt-4 rounded-md bg-destructive/10 p-3 text-sm text-destructive">{errorText}</p>}{proceed.isPending && <p className="mt-3 text-xs text-muted-foreground">어댑터 확인 진행 중…</p>}</CardContent></Card><div className="space-y-4"><Card><CardHeader><CardTitle>진행 상태</CardTitle></CardHeader><CardContent><div className="mb-3"><AdapterMark adapter={adapter} adapterId={item.adapter_id} showName size="sm" /></div><StatusBadge state={item.state} /><dl className="mt-4 space-y-3">{[['어댑터 ID', item.adapter_id], ['리소스', item.resource ? resourceLabel(item.resource) : '발견 대기'], ['워크플로 ID', item.workflow_id]].map(([key, value]) => <div key={key}><dt className="text-[11px] text-muted-foreground">{key}</dt><dd className="mt-1 break-all text-xs font-medium">{value}</dd></div>)}</dl></CardContent></Card><Card><CardHeader><CardTitle>보안 안내</CardTitle></CardHeader><CardContent className="space-y-2 text-xs leading-5 text-muted-foreground"><p>비밀 답변은 표시하거나 기록에 저장하지 않습니다.</p><p>저장 여부와 범위는 각 입력 항목에 대해 어댑터가 선언한 정책을 따릅니다.</p><p>프로세스 재시작 또는 만료 후에는 워크플로를 다시 시작해야 할 수 있습니다.</p></CardContent></Card></div></div>
+  return <div className="page-enter">
+    <PageHeading title={t('workflow.detail.title')} actions={<><Link to="/workflows"><Button variant="outline"><ArrowLeft className="h-4 w-4" />{t('workflow.detail.back')}</Button></Link><Confirm trigger={<Button variant="destructive">{t('workflow.detail.cancel')}</Button>} title={t('workflow.detail.cancelTitle')} description={t('workflow.detail.cancelDescription')} confirmLabel={t('workflow.detail.cancel')} destructive onConfirm={() => cancel.mutate()} disabled={cancel.isPending || terminalPrompt} /></>} />
+    <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <Card><CardHeader><CardTitle>{prompt?.title ?? t('workflow.detail.inputNeeded')}</CardTitle></CardHeader><CardContent>{prompt && <WorkflowPromptPanel prompt={prompt} />}{challengeSchema.fields.length && !terminalPrompt ? <SchemaForm key={`${workflowId}-${item.state}`} schema={challengeSchema} mode="challenge" submitLabel={t('workflow.detail.continue')} onSubmit={submit} busy={proceed.isPending} /> : item.state === 'resolved' || prompt?.type === 'complete' ? <EmptyState title={t('workflow.detail.complete')} /> : terminalPrompt ? null : <EmptyState title={t('workflow.detail.noInputs')} description={t('workflow.detail.noInputsHelp')} />}{errorText && <p role="alert" className="mt-4 rounded-md bg-destructive/10 p-3 text-sm text-destructive">{errorText}</p>}{proceed.isPending && <p role="status" className="mt-3 text-xs text-muted-foreground">{t('workflow.detail.continuing')}</p>}</CardContent></Card>
+      <Card><CardHeader><CardTitle>{t('workflow.detail.status')}</CardTitle></CardHeader><CardContent><div className="mb-3"><AdapterMark adapter={adapter} adapterId={item.adapter_id} showName size="sm" /></div><StatusBadge state={item.state} /><dl className="mt-4 space-y-3">{[[t('workflow.detail.resource'), item.resource ? resourceLabel(item.resource) : t('workflow.detail.waitingResource')], [t('workflow.detail.id'), item.workflow_id]].map(([key, value]) => <div key={key}><dt className="text-[11px] text-muted-foreground">{key}</dt><dd className="mt-1 break-all text-xs font-medium">{value}</dd></div>)}</dl><details className="mt-4 border-t border-border pt-3"><summary className="cursor-pointer text-xs font-medium">{t('workflow.detail.security')}</summary><p className="mt-2 text-xs leading-5 text-muted-foreground">{t('workflow.detail.securityHelp')}</p></details></CardContent></Card>
+    </div>
   </div>
 }

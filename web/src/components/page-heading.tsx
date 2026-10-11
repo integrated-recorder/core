@@ -1,2 +1,11 @@
 import type { ReactNode } from 'react'
-export function PageHeading({ eyebrow, title, description, actions }: { eyebrow?: string; title: ReactNode; description?: string; actions?: ReactNode }) { return <div className="mb-6 flex min-w-0 flex-col justify-between gap-4 sm:flex-row sm:items-end"><div className="min-w-0"><p className="mb-1 text-[11px] font-semibold tracking-[.16em] text-primary">{eyebrow ?? 'Integrated Recorder'}</p><h1 className="min-w-0 truncate text-2xl font-semibold tracking-tight md:text-[28px]">{title}</h1>{description && <p className="mt-1.5 text-sm text-muted-foreground">{description}</p>}</div>{actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}</div> }
+
+export function PageHeading({ title, description, actions }: { title: ReactNode; description?: string; actions?: ReactNode }) {
+  return <div className="mb-5 flex min-w-0 flex-col justify-between gap-3 sm:flex-row sm:items-center">
+    <div className="min-w-0">
+      <h1 className="min-w-0 truncate text-xl font-semibold tracking-tight md:text-2xl">{title}</h1>
+      {description && <p className="mt-1 text-sm text-muted-foreground">{description}</p>}
+    </div>
+    {actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}
+  </div>
+}

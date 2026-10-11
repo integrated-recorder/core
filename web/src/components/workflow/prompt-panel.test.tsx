@@ -43,6 +43,6 @@ describe('workflow prompt parity', () => {
   it('does not render a link for an unsafe action URL', () => {
     render(<WorkflowPromptPanel prompt={{ type: 'action', data: { url: 'https://user:pass@example.test/' } }} />)
     expect(screen.queryByRole('link')).not.toBeInTheDocument()
-    expect(screen.getByText(/안전한 외부 URL/)).toBeInTheDocument()
+    expect(screen.getByText('열 수 있는 외부 링크가 없습니다.')).toBeInTheDocument()
   })
 })

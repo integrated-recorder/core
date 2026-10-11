@@ -11,7 +11,6 @@ export function AppBrand({ variant = 'sidebar', className, inverse = false }: Ap
     <span className={cn('grid shrink-0 aspect-square place-items-center bg-primary text-primary-foreground', markSize, inverse && 'bg-blue-500')} aria-hidden="true"><Archive className={cn('shrink-0', iconSize)} /></span>
     <span className="min-w-0">
       <span className={cn('block whitespace-nowrap font-bold tracking-tight', compact ? 'text-xs' : variant === 'login' ? 'text-base' : 'text-sm', inverse && 'text-white')}>Integrated Recorder</span>
-      {!compact && <span className={cn('block truncate whitespace-nowrap text-[10px] font-medium tracking-wide text-muted-foreground', variant === 'login' && 'text-white/55')}>Archive Live. Preserve Source.</span>}
     </span>
   </div>
 }

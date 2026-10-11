@@ -35,7 +35,7 @@ async function requestHostRestart() {
   }, { timeout: 30_000 }).toBe(true)
 }
 
-test('fresh setup resolves browser locale before authentication', async ({ browser }) => {
+test('fresh setup resolves browser locale before authentication', async ({ browser }, testInfo) => {
   for (const locale of ['en-US', 'ko-KR'] as const) {
     const context = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale })
     const page = await context.newPage()
@@ -44,10 +44,18 @@ test('fresh setup resolves browser locale before authentication', async ({ brows
     await expect(page.locator('html')).toHaveAttribute('lang', locale)
     if (locale === 'en-US') {
       await expect(page.getByRole('heading', { name: 'Get started with Integrated Recorder' })).toBeVisible()
+      await expect(page.getByText('Complete a few checks before starting archive operations.')).toHaveCount(0)
       expect(await page.locator('body').innerText()).not.toMatch(/[\uac00-\ud7a3]/)
     } else {
       await expect(page.getByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeVisible()
+      await expect(page.getByText('몇 가지 확인을 마치면 보관 작업을 시작할 수 있습니다.')).toHaveCount(0)
       expect(await page.locator('body').innerText()).toMatch(/[\uac00-\ud7a3]/)
+    }
+    for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }]) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height })
+      const dimensions = await page.evaluate(() => ({ body: document.body.scrollWidth, viewport: window.innerWidth }))
+      expect(dimensions.body).toBeLessThanOrEqual(dimensions.viewport)
+      await page.screenshot({ path: testInfo.outputPath(`setup-${locale}-${viewport.name}.png`), fullPage: true })
     }
     await context.close()
   }

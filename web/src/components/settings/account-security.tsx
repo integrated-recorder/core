@@ -20,7 +20,7 @@ export function AccountSecurityPanel({ account }: { account: AccountUser }) {
   const { t } = useI18n()
   return <div role="tabpanel" id="settings-panel-account" aria-labelledby="settings-tab-account" tabIndex={0} className="space-y-4">
     <Card>
-      <CardHeader><CardTitle className="flex items-center gap-2"><Shield className="h-4 w-4 text-primary" />{t('account.profile')}</CardTitle><p className="text-xs text-muted-foreground">{t('account.description')}</p></CardHeader>
+      <CardHeader><CardTitle className="flex items-center gap-2"><Shield className="h-4 w-4 text-primary" />{t('account.profile')}</CardTitle></CardHeader>
       <CardContent><dl className="grid gap-4 sm:grid-cols-3"><ProfileValue label={t('account.login')} value={account.login} /><ProfileValue label={t('account.role')} value={account.role === 'owner' ? t('account.role.owner') : t('account.role.member')} /><ProfileValue label={t('account.status')} value={account.status === 'active' ? t('account.status.active') : t('account.status.disabled')} /></dl></CardContent>
     </Card>
     <PasswordCard />

@@ -1507,7 +1507,7 @@ func snapshotHandoverTrackFiles(t *testing.T, store *storage.Store, recordingID 
 }
 
 func TestHandoverPrepareValidatesMediaURLs(t *testing.T) {
-	fixture := &handoverFixture{max: 2, metadata: "title"}
+	fixture := &handoverFixture{max: 1, metadata: "title"}
 	store, owners, source, owner, _, snapshot := pausedHandoverRecording(t, fixture, "https://fixture.invalid/live.m3u8", 1)
 	sourceSnapshot := cloneHandoverSnapshot(snapshot)
 	defer func() {

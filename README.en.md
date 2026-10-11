@@ -46,6 +46,8 @@ docker compose logs archiver
 
 Use the one-time setup code printed to the local Runtime Host console or container logs, then open [http://localhost:8080/](http://localhost:8080/) and complete `/setup`. If logs are unavailable, run `docker compose exec archiver runtime-host setup-code`. The container uses a named `/data` volume.
 
+Change passwords and manage users or sessions under Settings → Account & security. There is no remote password-reset endpoint. An operator with direct server access can run `docker compose exec -it archiver runtime-host reset-password <login>` and enter the new password at the terminal prompt. The password is not passed as a command-line argument.
+
 The official Plugin Registry catalog is `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`. The Registry distributes plugin metadata; it does not build plugins. Already installed plugins and archives remain usable when the Registry is unavailable.
 
 ## Archive and storage

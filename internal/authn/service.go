@@ -47,6 +47,9 @@ var (
 	ErrNotBootstrapped       = errors.New("administrator is not configured")
 	ErrUserNotFound          = errors.New("user not found")
 	ErrDuplicateLogin        = errors.New("login identity already exists")
+	ErrCurrentPassword       = errors.New("current credentials could not be verified")
+	ErrLastOwner             = errors.New("the last active owner cannot be disabled")
+	ErrSelfDisable           = errors.New("the current user cannot disable their own account")
 	ErrStorage               = errors.New("authentication storage failure")
 	ErrCorruptStore          = errors.New("authentication store is invalid")
 )
@@ -55,6 +58,7 @@ var (
 // token is omitted from JSON so callers can place it in an HttpOnly cookie;
 // the CSRF token remains available for request-header validation.
 type Session struct {
+	ID        string    `json:"-"`
 	Token     string    `json:"-"`
 	CSRFToken string    `json:"csrf_token,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
@@ -68,8 +72,10 @@ type adminRecord struct {
 }
 
 const (
-	RoleOwner        = "owner"
-	UserStatusActive = "active"
+	RoleOwner          = "owner"
+	RoleMember         = "member"
+	UserStatusActive   = "active"
+	UserStatusDisabled = "disabled"
 )
 
 // User is safe identity metadata. Password hashes never leave the private
@@ -84,7 +90,8 @@ type User struct {
 
 type userRecord struct {
 	User
-	PasswordHash string `json:"password_hash"`
+	PasswordHash    string `json:"password_hash"`
+	CredentialEpoch uint64 `json:"credential_epoch,omitempty"`
 }
 
 type persistedUserStore struct {
@@ -95,15 +102,19 @@ type persistedUserStore struct {
 const userStoreVersion = 1
 
 type sessionRecord struct {
-	csrfHash  [sha256.Size]byte
-	expiresAt time.Time
-	userID    string
+	id              string
+	csrfHash        [sha256.Size]byte
+	expiresAt       time.Time
+	userID          string
+	credentialEpoch uint64
 }
 
 type persistedSessionRecord struct {
-	CSRFHash  string    `json:"csrf_hash"`
-	ExpiresAt time.Time `json:"expires_at"`
-	UserID    string    `json:"user_id,omitempty"`
+	ID              string    `json:"id,omitempty"`
+	CSRFHash        string    `json:"csrf_hash"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	UserID          string    `json:"user_id,omitempty"`
+	CredentialEpoch uint64    `json:"credential_epoch,omitempty"`
 }
 
 // Service manages local users and sessions persisted as private,
@@ -118,9 +129,18 @@ type Service struct {
 	allowToken           bool
 	removeSessionFile    func(string) error
 	syncSessionDirectory func(string) error
+	persistUsers         func(string, []byte) error
 
 	now        func() time.Time
 	bcryptCost int
+}
+
+// SessionInfo is a privacy-minimal projection of one active session. IDs are
+// opaque revocation handles; raw tokens and CSRF values are never included.
+type SessionInfo struct {
+	ID        string    `json:"id"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Current   bool      `json:"current"`
 }
 
 // Open loads authentication state and prepares first-run bootstrap if no
@@ -128,6 +148,22 @@ type Service struct {
 // file and is never returned by this API.
 func Open(dataRoot string) (*Service, error) {
 	return open(dataRoot, true)
+}
+
+// withAuthLock serializes security state transitions both within a process
+// and across Runtime Host/Control processes that share the same data root.
+func (s *Service) withAuthLock(run func() error) error {
+	if s == nil || run == nil {
+		return ErrStorage
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	release, err := lockAuthStoreFile(s.securityDir)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return run()
 }
 
 // OpenWithoutBootstrap opens existing authentication state without creating a
@@ -185,7 +221,7 @@ func open(dataRoot string, allowToken bool) (*Service, error) {
 	if _, err := os.Stat(filepath.Join(securityDir, usersFilename)); err == nil {
 		// Older session records have no user binding. Invalidate them on the
 		// identity model transition instead of guessing which user owns them.
-		if err := s.invalidateUnboundSessions(); err != nil {
+		if err := s.withAuthLock(s.invalidateUnboundSessions); err != nil {
 			return nil, err
 		}
 		if err := removeIfExists(filepath.Join(securityDir, bootstrapTokenFilename)); err != nil {
@@ -298,61 +334,60 @@ func (s *Service) Bootstrap(token, password string) error {
 	if !validPasswordLength(password) {
 		return ErrInvalidPassword
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.allowToken {
-		return ErrBootstrapUnavailable
-	}
-	if users, err := readUserStore(filepath.Join(s.securityDir, usersFilename)); err == nil && len(users.Users) > 0 {
-		return ErrBootstrapUnavailable
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return ErrBootstrapUnavailable
-	}
-	if _, err := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename)); err == nil {
-		return ErrBootstrapUnavailable
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return ErrBootstrapUnavailable
-	}
-
-	storedToken, err := readBootstrapToken(filepath.Join(s.securityDir, bootstrapTokenFilename))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+	return s.withAuthLock(func() error {
+		if !s.allowToken {
 			return ErrBootstrapUnavailable
 		}
-		return err
-	}
-	providedHash := sha256.Sum256([]byte(token))
-	storedHash := sha256.Sum256(storedToken)
-	if subtle.ConstantTimeCompare(providedHash[:], storedHash[:]) != 1 {
-		return ErrInvalidBootstrapToken
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), s.bcryptCost)
-	if err != nil {
-		return fmt.Errorf("%w: hash administrator password", ErrStorage)
-	}
-	owner, err := newUserRecord("owner", RoleOwner, string(hash), s.now())
-	if err != nil {
-		return err
-	}
-	data, err := encodeUserStore([]userRecord{owner})
-	if err != nil {
-		return err
-	}
-	if err := atomicCreate(filepath.Join(s.securityDir, usersFilename), data, 0600); err != nil {
-		if errors.Is(err, os.ErrExist) {
+		if users, err := readUserStore(filepath.Join(s.securityDir, usersFilename)); err == nil && len(users.Users) > 0 {
+			return ErrBootstrapUnavailable
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return ErrBootstrapUnavailable
 		}
-		return err
-	}
-	if err := removeIfExists(filepath.Join(s.securityDir, bootstrapTokenFilename)); err != nil {
-		return fmt.Errorf("%w: consume bootstrap token", ErrStorage)
-	}
-	if err := syncDirectory(s.securityDir); err != nil {
-		return fmt.Errorf("%w: sync consumed bootstrap token", ErrStorage)
-	}
-	return nil
+		if _, err := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename)); err == nil {
+			return ErrBootstrapUnavailable
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return ErrBootstrapUnavailable
+		}
+
+		storedToken, err := readBootstrapToken(filepath.Join(s.securityDir, bootstrapTokenFilename))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return ErrBootstrapUnavailable
+			}
+			return err
+		}
+		providedHash := sha256.Sum256([]byte(token))
+		storedHash := sha256.Sum256(storedToken)
+		if subtle.ConstantTimeCompare(providedHash[:], storedHash[:]) != 1 {
+			return ErrInvalidBootstrapToken
+		}
+
+		hash, err := bcrypt.GenerateFromPassword([]byte(password), s.bcryptCost)
+		if err != nil {
+			return fmt.Errorf("%w: hash administrator password", ErrStorage)
+		}
+		owner, err := newUserRecord("owner", RoleOwner, string(hash), s.now())
+		if err != nil {
+			return err
+		}
+		data, err := encodeUserStore([]userRecord{owner})
+		if err != nil {
+			return err
+		}
+		if err := atomicCreate(filepath.Join(s.securityDir, usersFilename), data, 0600); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return ErrBootstrapUnavailable
+			}
+			return err
+		}
+		if err := removeIfExists(filepath.Join(s.securityDir, bootstrapTokenFilename)); err != nil {
+			return fmt.Errorf("%w: consume bootstrap token", ErrStorage)
+		}
+		if err := syncDirectory(s.securityDir); err != nil {
+			return fmt.Errorf("%w: sync consumed bootstrap token", ErrStorage)
+		}
+		return nil
+	})
 }
 
 // NeedsBootstrap reports whether the administrator has not yet been set up.
@@ -373,14 +408,6 @@ func (s *Service) LoginAs(login, password string) (Session, error) {
 	if !validPasswordLength(password) {
 		return Session{}, ErrInvalidCredentials
 	}
-	user, err := s.VerifyCredentials(login, password)
-	if err != nil {
-		if errors.Is(err, ErrNotBootstrapped) {
-			return Session{}, ErrNotBootstrapped
-		}
-		return Session{}, ErrInvalidCredentials
-	}
-
 	token, err := randomToken()
 	if err != nil {
 		return Session{}, fmt.Errorf("%w: generate session", ErrStorage)
@@ -389,32 +416,37 @@ func (s *Service) LoginAs(login, password string) (Session, error) {
 	if err != nil {
 		return Session{}, fmt.Errorf("%w: generate CSRF token", ErrStorage)
 	}
+	id, err := randomSessionID()
+	if err != nil {
+		return Session{}, fmt.Errorf("%w: generate session identity", ErrStorage)
+	}
 	now := s.now()
-	session := Session{Token: token, CSRFToken: csrf, ExpiresAt: now.Add(defaultSessionLifetime), UserID: user.ID, Login: user.Login, Role: user.Role}
+	session := Session{ID: id, Token: token, CSRFToken: csrf, ExpiresAt: now.Add(defaultSessionLifetime)}
 	csrfHash := sha256.Sum256([]byte(csrf))
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	active, err := s.countAndCleanSessions(now)
+	err = s.withAuthLock(func() error {
+		user, verifyErr := s.verifyCredentialsLocked(login, password)
+		if verifyErr != nil {
+			return verifyErr
+		}
+		session.UserID, session.Login, session.Role = user.ID, user.Login, user.Role
+		active, countErr := s.countAndCleanSessions(now)
+		if countErr != nil {
+			return countErr
+		}
+		if active >= maxActiveSessions {
+			return ErrSessionCapacity
+		}
+		record := sessionRecord{id: id, csrfHash: csrfHash, expiresAt: session.ExpiresAt, userID: user.ID, credentialEpoch: user.CredentialEpoch}
+		if writeErr := s.writeSession(token, record); writeErr != nil {
+			return writeErr
+		}
+		return nil
+	})
+	if errors.Is(err, ErrInvalidCredentials) {
+		return Session{}, ErrInvalidCredentials
+	}
 	if err != nil {
 		return Session{}, err
-	}
-	if active >= maxActiveSessions {
-		return Session{}, ErrSessionCapacity
-	}
-	if err := s.writeSession(token, sessionRecord{csrfHash: csrfHash, expiresAt: session.ExpiresAt, userID: user.ID}); err != nil {
-		return Session{}, err
-	}
-	// A second control process may have admitted a login concurrently. Keep the
-	// historical capacity bound best-effort across processes without a shared
-	// mutable map: if this admission crossed the bound, revoke this new session.
-	active, err = s.countAndCleanSessions(now)
-	if err != nil {
-		s.removeSession(token)
-		return Session{}, err
-	}
-	if active > maxActiveSessions {
-		s.removeSession(token)
-		return Session{}, ErrSessionCapacity
 	}
 	return session, nil
 }
@@ -425,20 +457,28 @@ func (s *Service) Authenticate(token string) (Session, error) {
 	if token == "" {
 		return Session{}, ErrUnauthenticated
 	}
-	record, err := s.readSession(token)
+	var session Session
+	err := s.withAuthLock(func() error {
+		record, readErr := s.readSession(token)
+		if readErr != nil {
+			return ErrUnauthenticated
+		}
+		if !s.now().Before(record.expiresAt) || !validUserID(record.userID) {
+			_ = s.removeSession(token)
+			return ErrUnauthenticated
+		}
+		user, userErr := findUserRecordByID(filepath.Join(s.securityDir, usersFilename), record.userID)
+		if userErr != nil || user.Status != UserStatusActive || record.credentialEpoch != user.CredentialEpoch {
+			_ = s.removeSession(token)
+			return ErrUnauthenticated
+		}
+		session = Session{ID: record.id, ExpiresAt: record.expiresAt, UserID: user.ID, Login: user.Login, Role: user.Role}
+		return nil
+	})
 	if err != nil {
 		return Session{}, ErrUnauthenticated
 	}
-	if !s.now().Before(record.expiresAt) || !validUserID(record.userID) {
-		s.removeSession(token)
-		return Session{}, ErrUnauthenticated
-	}
-	user, err := s.GetUser(record.userID)
-	if err != nil || user.Status != UserStatusActive {
-		s.removeSession(token)
-		return Session{}, ErrUnauthenticated
-	}
-	return Session{ExpiresAt: record.expiresAt, UserID: user.ID, Login: user.Login, Role: user.Role}, nil
+	return session, nil
 }
 
 // Logout durably revokes a session. Unknown and empty tokens are harmless.
@@ -446,7 +486,7 @@ func (s *Service) Logout(token string) error {
 	if token == "" {
 		return nil
 	}
-	return s.removeSession(token)
+	return s.withAuthLock(func() error { return s.removeSession(token) })
 }
 
 // ValidCSRF compares the supplied value with the CSRF token bound to a live
@@ -456,15 +496,26 @@ func (s *Service) ValidCSRF(sessionToken, supplied string) bool {
 		return false
 	}
 	suppliedHash := sha256.Sum256([]byte(supplied))
-	record, err := s.readSession(sessionToken)
-	if err != nil {
+	valid := false
+	if err := s.withAuthLock(func() error {
+		record, readErr := s.readSession(sessionToken)
+		if readErr != nil {
+			return nil
+		}
+		if !s.now().Before(record.expiresAt) {
+			_ = s.removeSession(sessionToken)
+			return nil
+		}
+		if !validUserID(record.userID) {
+			return nil
+		}
+		user, userErr := findUserRecordByID(filepath.Join(s.securityDir, usersFilename), record.userID)
+		valid = userErr == nil && user.Status == UserStatusActive && record.credentialEpoch == user.CredentialEpoch && subtle.ConstantTimeCompare(record.csrfHash[:], suppliedHash[:]) == 1
+		return nil
+	}); err != nil {
 		return false
 	}
-	if !s.now().Before(record.expiresAt) {
-		s.removeSession(sessionToken)
-		return false
-	}
-	return validUserID(record.userID) && subtle.ConstantTimeCompare(record.csrfHash[:], suppliedHash[:]) == 1
+	return valid
 }
 
 func (s *Service) readSession(token string) (sessionRecord, error) {
@@ -474,7 +525,11 @@ func (s *Service) readSession(token string) (sessionRecord, error) {
 	if err := validatePrivateDirectory(s.sessionsDir); err != nil {
 		return sessionRecord{}, err
 	}
-	return readSessionRecordAt(s.sessionPath(token))
+	record, err := readSessionRecordAt(s.sessionPath(token))
+	if err == nil && record.id == "" {
+		record.id = sessionFilenameID(token)
+	}
+	return record, err
 }
 
 func readSessionRecordAt(path string) (sessionRecord, error) {
@@ -508,7 +563,7 @@ func (s *Service) writeSession(token string, record sessionRecord) error {
 	if err := securePrivateDirectory(s.sessionsDir); err != nil {
 		return fmt.Errorf("%w: secure session directory", ErrStorage)
 	}
-	persisted := persistedSessionRecord{CSRFHash: hex.EncodeToString(record.csrfHash[:]), ExpiresAt: record.expiresAt.UTC(), UserID: record.userID}
+	persisted := persistedSessionRecord{ID: record.id, CSRFHash: hex.EncodeToString(record.csrfHash[:]), ExpiresAt: record.expiresAt.UTC(), UserID: record.userID, CredentialEpoch: record.credentialEpoch}
 	data, err := json.Marshal(persisted)
 	if err != nil {
 		return fmt.Errorf("%w: encode session record", ErrStorage)
@@ -559,6 +614,14 @@ func (s *Service) countAndCleanSessions(now time.Time) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%w: read session directory", ErrStorage)
 	}
+	store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+	if err != nil {
+		return 0, fmt.Errorf("%w: inspect users for sessions", ErrStorage)
+	}
+	users := make(map[string]userRecord, len(store.Users))
+	for _, user := range store.Users {
+		users[user.ID] = user
+	}
 	active := 0
 	removed := false
 	for _, entry := range entries {
@@ -576,7 +639,8 @@ func (s *Service) countAndCleanSessions(now time.Time) (int, error) {
 			// closed instead of silently counting attacker-controlled state.
 			return 0, fmt.Errorf("%w: inspect session record", ErrStorage)
 		}
-		if !now.Before(record.expiresAt) || !validUserID(record.userID) {
+		user, exists := users[record.userID]
+		if !now.Before(record.expiresAt) || !validUserID(record.userID) || !exists || user.Status != UserStatusActive || user.CredentialEpoch != record.credentialEpoch {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return 0, fmt.Errorf("%w: remove expired session", ErrStorage)
 			}
@@ -616,7 +680,10 @@ func decodeSessionRecord(data []byte) (sessionRecord, error) {
 	if persisted.UserID != "" && !validUserID(persisted.UserID) {
 		return sessionRecord{}, ErrCorruptStore
 	}
-	return sessionRecord{csrfHash: csrfHash, expiresAt: persisted.ExpiresAt, userID: persisted.UserID}, nil
+	if persisted.ID != "" && !validSessionID(persisted.ID) {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	return sessionRecord{id: persisted.ID, csrfHash: csrfHash, expiresAt: persisted.ExpiresAt, userID: persisted.UserID, credentialEpoch: persisted.CredentialEpoch}, nil
 }
 
 func securePrivateDirectory(path string) error {
@@ -655,6 +722,31 @@ func randomToken() (string, error) {
 
 func hashSessionToken(token string) [sha256.Size]byte {
 	return sha256.Sum256([]byte(token))
+}
+
+func randomSessionID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func sessionFilenameID(token string) string {
+	hash := hashSessionToken(token)
+	return hex.EncodeToString(hash[:])
+}
+
+func validSessionID(value string) bool {
+	if len(value) != 16*2 && len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func validSessionFileName(value string) bool {
+	return len(value) == sha256.Size*2 && validSessionID(value)
 }
 
 func readAdminHashReadOnly(path string) ([]byte, error) {

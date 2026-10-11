@@ -50,17 +50,18 @@ func HasPermission(principal Principal, permission Permission) bool {
 	if permission == PermissionUserPreferences {
 		return true
 	}
-	if principal.Role != RoleOwner {
-		return false
+	switch principal.Role {
+	case RoleOwner:
+		switch permission {
+		case PermissionRecordingRead, PermissionRecordingControl, PermissionRecordingDelete,
+			PermissionStorageManage, PermissionPluginManage, PermissionSettingsManage,
+			PermissionAuditRead, PermissionUpdateManage:
+			return true
+		}
+	case RoleMember:
+		return permission == PermissionRecordingRead || permission == PermissionRecordingControl
 	}
-	switch permission {
-	case PermissionRecordingRead, PermissionRecordingControl, PermissionRecordingDelete,
-		PermissionStorageManage, PermissionPluginManage, PermissionSettingsManage,
-		PermissionAuditRead, PermissionUpdateManage:
-		return true
-	default:
-		return false
-	}
+	return false
 }
 
 // RequirePermission is the shared authorization middleware seam. Current

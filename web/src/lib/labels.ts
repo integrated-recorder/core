@@ -69,6 +69,8 @@ const auditEventLabels: Record<string, string> = {
   adapter_restarted: '어댑터 재시작', adapter_enabled: '어댑터 활성화', adapter_disabled: '어댑터 비활성화',
   config_changed: '설정 변경', recording_tags_updated: '녹화 태그 변경', recording_deleted: '녹화 삭제',
   integrity_verification_requested: '무결성 검사 요청', export_requested: '내보내기 요청',
+  password_changed: '비밀번호 변경', password_recovered: '비밀번호 복구', session_revoked: '세션 취소', sessions_revoked: '다른 세션 취소',
+  user_created: '사용자 생성', user_disabled: '사용자 비활성화', user_enabled: '사용자 활성화',
 }
 
 function labelFrom(map: Record<string, string>, value?: string, locale = getFormatPreferences().locale): string {
@@ -104,4 +106,11 @@ export const recordingEventLabel = (value?: string, locale = getFormatPreference
   const key = value ? eventTranslationKeys[value.toLowerCase()] : undefined
   return key ? translate(locale, key) : labelFrom(recordingEventLabels, value, locale)
 }
-export const auditEventLabel = (value?: string) => labelFrom(auditEventLabels, value)
+const auditTranslationKeys: Record<string, TranslationKey> = {
+  password_changed: 'audit.passwordChanged', password_recovered: 'audit.passwordRecovered', session_revoked: 'audit.sessionRevoked',
+  sessions_revoked: 'audit.sessionsRevoked', user_created: 'audit.userCreated', user_disabled: 'audit.userDisabled', user_enabled: 'audit.userEnabled',
+}
+export const auditEventLabel = (value?: string) => {
+  const key = value ? auditTranslationKeys[value.toLowerCase()] : undefined
+  return key ? translate(getFormatPreferences().locale, key) : labelFrom(auditEventLabels, value)
+}

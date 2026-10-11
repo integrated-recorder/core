@@ -1,7 +1,9 @@
 package management
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,11 +79,12 @@ type AuditActor struct {
 }
 
 const (
-	AuditActorUser      = "user"
-	AuditActorSystem    = "system"
-	auditCursorVersion  = 1
-	maxAuditCursorBytes = 256
-	maxAuditPageSize    = 500
+	AuditActorUser       = "user"
+	AuditActorSystem     = "system"
+	AuditActorLocalAdmin = "local_admin"
+	auditCursorVersion   = 1
+	maxAuditCursorBytes  = 256
+	maxAuditPageSize     = 500
 )
 
 type auditCursor struct {
@@ -134,6 +137,8 @@ var auditTypes = map[string]struct{}{
 	"storage_instance_created": {}, "storage_instance_configured": {}, "storage_instance_probed": {},
 	"storage_instance_activated": {}, "storage_provider_configured": {}, "storage_provider_probed": {},
 	"storage_provider_activated": {}, "installation_setup_begun": {}, "installation_setup_completed": {},
+	"password_changed": {}, "password_recovered": {}, "session_revoked": {}, "sessions_revoked": {},
+	"user_created": {}, "user_disabled": {}, "user_enabled": {},
 }
 
 var notificationTypes = map[string]struct{}{
@@ -368,6 +373,14 @@ func (s *Store) AppendAudit(event AuditEvent) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := lockAuditFile(s.root)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := s.reloadAuditLocked(); err != nil {
+		return err
+	}
 	if containsAuditID(s.audit, event.ID) {
 		return fmt.Errorf("duplicate audit event identifier")
 	}
@@ -404,6 +417,14 @@ func (s *Store) AuditPage(limit int, cursor string) ([]AuditEvent, string, error
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := lockAuditFile(s.root)
+	if err != nil {
+		return nil, "", err
+	}
+	defer release()
+	if err := s.reloadAuditLocked(); err != nil {
+		return nil, "", err
+	}
 	start := 0
 	if cursor != "" {
 		start = sort.Search(len(s.audit), func(index int) bool {
@@ -425,6 +446,59 @@ func (s *Store) AuditPage(limit int, cursor string) ([]AuditEvent, string, error
 		next = encoded
 	}
 	return items, next, nil
+}
+
+// AppendLocalAdminAudit records local CLI actions using the existing audit
+// projection and a distinct local administrator actor. The action is closed
+// over security recovery events and cannot carry arbitrary payload data.
+func AppendLocalAdminAudit(dataRoot, action, objectID string) error {
+	if action != "password_recovered" {
+		return fmt.Errorf("unsupported local administrator audit action")
+	}
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return fmt.Errorf("generate local audit identifier")
+	}
+	store, err := Open(dataRoot)
+	if err != nil {
+		return err
+	}
+	return store.AppendAudit(AuditEvent{
+		ID: hex.EncodeToString(id[:]), Type: action, At: time.Now().UTC(), ObjectID: objectID,
+		Actor: &AuditActor{Type: AuditActorLocalAdmin},
+	})
+}
+
+func (s *Store) reloadAuditLocked() error {
+	path := filepath.Join(s.root, "audit.json")
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		s.audit = []AuditEvent{}
+		return nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 0 || info.Size() > maxProjectionFileBytes {
+		return fmt.Errorf("audit store is unavailable")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || int64(len(data)) != info.Size() {
+		return fmt.Errorf("audit store is unavailable")
+	}
+	var events []AuditEvent
+	if err := decodeStrict(data, &events); err != nil || len(events) > maxAuditEvents {
+		return fmt.Errorf("audit store is invalid")
+	}
+	seen := make(map[string]struct{}, len(events))
+	for _, event := range events {
+		if err := validateAuditEvent(event); err != nil {
+			return fmt.Errorf("audit store is invalid")
+		}
+		if _, ok := seen[event.ID]; ok {
+			return fmt.Errorf("audit store is invalid")
+		}
+		seen[event.ID] = struct{}{}
+	}
+	s.audit = sortAudit(events)
+	return nil
 }
 
 func encodeAuditCursor(event AuditEvent) (string, error) {
@@ -629,6 +703,10 @@ func validateAuditEvent(event AuditEvent) error {
 	case AuditActorUser:
 		if !validIdentifier(event.Actor.UserID, 128) {
 			return fmt.Errorf("invalid user audit actor")
+		}
+	case AuditActorLocalAdmin:
+		if event.Actor.UserID != "" {
+			return fmt.Errorf("invalid local administrator audit actor")
 		}
 	default:
 		return fmt.Errorf("invalid audit actor type")

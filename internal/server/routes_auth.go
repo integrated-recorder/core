@@ -19,6 +19,7 @@ func (s *Server) registerAuthRoutes() {
 	s.mux.HandleFunc("POST /api/auth/logout", s.authLogout)
 	s.mux.HandleFunc("GET /api/user/preferences", s.userPreferencesGet)
 	s.mux.HandleFunc("PUT /api/user/preferences", s.userPreferencesPut)
+	s.registerAccountRoutes()
 }
 
 func (s *Server) userPreferencesGet(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +213,12 @@ func permissionForRequest(r *http.Request) authn.Permission {
 	}
 	if path == "/api/user/preferences" && (method == http.MethodGet || method == http.MethodPut) {
 		return authn.PermissionUserPreferences
+	}
+	if path == "/api/user" && method == http.MethodGet || path == "/api/user/sessions" && method == http.MethodGet || path == "/api/user/password" && method == http.MethodPost || strings.HasPrefix(path, "/api/user/sessions/") && (method == http.MethodDelete || method == http.MethodPost) {
+		return authn.PermissionUserPreferences
+	}
+	if path == "/api/users" && (method == http.MethodGet || method == http.MethodPost) || strings.HasPrefix(path, "/api/users/") && method == http.MethodPost {
+		return authn.PermissionSettingsManage
 	}
 	if path == "/api/audit" && method == http.MethodGet {
 		return authn.PermissionAuditRead

@@ -1,10 +1,10 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, UserPreferences, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { AccountSession, AccountUser, Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, UserPreferences, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
   bootstrap: (token: string, password: string) => api<ApiSession>('/api/auth/bootstrap', { method: 'POST', body: { token, password } }),
-  login: (password: string) => api<ApiSession>('/api/auth/login', { method: 'POST', body: { password } }),
+  login: (password: string, login?: string) => api<ApiSession>('/api/auth/login', { method: 'POST', body: login ? { login, password } : { password } }),
   logout: () => api<void>('/api/auth/logout', { method: 'POST' }),
 }
 export const setupAPI = {
@@ -121,6 +121,16 @@ export const productAPI = {
 export const userPreferencesAPI = {
   get: () => api<UserPreferences>('/api/user/preferences'),
   update: (preferences: UserPreferences) => api<UserPreferences>('/api/user/preferences', { method: 'PUT', body: preferences }),
+}
+export const accountAPI = {
+  self: () => api<AccountUser>('/api/user'),
+  changePassword: (body: { current_password: string; new_password: string }) => api<void>('/api/user/password', { method: 'POST', body }),
+  sessions: () => api<{ items: AccountSession[] }>('/api/user/sessions'),
+  revokeSession: (id: string) => api<void>(`/api/user/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  revokeOthers: () => api<{ revoked_count: number }>('/api/user/sessions/revoke-others', { method: 'POST', body: {} }),
+  users: () => api<{ items: AccountUser[] }>('/api/users'),
+  createUser: (body: { login: string; password: string }) => api<AccountUser>('/api/users', { method: 'POST', body }),
+  setUserEnabled: (id: string, enabled: boolean) => api<AccountUser>(`/api/users/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST', body: {} }),
 }
 export const runtimeUpdateAPI = {
   status: () => api<RuntimeUpdateStatus>('/api/runtime/update'),

@@ -46,6 +46,8 @@ docker compose logs archiver
 
 로컬 Runtime Host 콘솔 또는 container log에 표시된 one-time setup code를 사용해 브라우저에서 [http://localhost:8080/](http://localhost:8080/)의 `/setup`을 완료하세요. 로그에 접근할 수 없는 경우 `docker compose exec archiver runtime-host setup-code`를 실행하세요. 컨테이너는 named `/data` volume을 사용합니다.
 
+비밀번호 변경과 사용자·세션 관리는 Settings의 `계정·보안`에서 할 수 있습니다. 비밀번호를 잊은 경우 원격 reset endpoint는 제공하지 않습니다. 서버에 직접 접근할 수 있는 운영자는 `docker compose exec -it archiver runtime-host reset-password <login>`을 실행하고, 터미널에 표시되는 비밀번호 입력 prompt를 사용하세요. 비밀번호는 명령 인자로 전달되지 않습니다.
+
 공식 Plugin Registry 주소는 `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`입니다. Registry는 plugin 배포 metadata이며 build 서비스가 아닙니다. 이미 설치된 plugin과 archive는 Registry에 연결할 수 없어도 사용할 수 있습니다.
 
 ## Archive와 저장소

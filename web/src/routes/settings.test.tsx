@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { authAPI, dashboardAPI, productAPI, runtimeUpdateAPI, userPreferencesAPI } from '@/api'
+import { accountAPI, authAPI, dashboardAPI, productAPI, runtimeUpdateAPI, userPreferencesAPI } from '@/api'
 import { ToastProvider } from '@/components/ui/toast'
 import { APIError } from '@/api/client'
 import type { RuntimeUpdateStatus, StorageSettings, SystemSettings } from '@/types/api'
@@ -43,9 +43,17 @@ function renderLocalizedSettings() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   return render(<QueryClientProvider client={client}><I18nProvider><ToastProvider><SettingsPage /></ToastProvider></I18nProvider></QueryClientProvider>)
 }
-function openStorageTab() { fireEvent.click(screen.getByRole('tab', { name: '저장소' })) }
+async function openStorageTab() { fireEvent.click(await screen.findByRole('tab', { name: '저장소' })) }
 
 beforeEach(() => {
+  vi.spyOn(accountAPI, 'self').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000001', login: 'owner', role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+  vi.spyOn(accountAPI, 'sessions').mockResolvedValue({ items: [{ id: 'opaque-session-id', expires_at: '2026-10-12T00:00:00Z', current: true }] })
+  vi.spyOn(accountAPI, 'users').mockResolvedValue({ items: [{ user_id: 'usr-00000000000000000000000000000001', login: 'owner', role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' }] })
+  vi.spyOn(accountAPI, 'changePassword').mockResolvedValue(undefined)
+  vi.spyOn(accountAPI, 'revokeSession').mockResolvedValue(undefined)
+  vi.spyOn(accountAPI, 'revokeOthers').mockResolvedValue({ revoked_count: 0 })
+  vi.spyOn(accountAPI, 'createUser').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', role: 'member', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+  vi.spyOn(accountAPI, 'setUserEnabled').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', role: 'member', status: 'disabled', created_at: '2026-10-01T00:00:00Z' })
   vi.spyOn(productAPI, 'settings').mockResolvedValue(structuredClone(settingsDefaults))
   vi.spyOn(productAPI, 'saveSettings').mockResolvedValue(structuredClone(settingsDefaults))
   vi.spyOn(userPreferencesAPI, 'get').mockResolvedValue({ locale: 'system', theme: 'system', timezone: 'system' })
@@ -70,7 +78,7 @@ describe('storage ingest settings UI', () => {
     saved.restart_required = ['storage.observability.sampling_interval_ms']
     vi.mocked(productAPI.saveSettings).mockResolvedValue(saved)
     renderSettings()
-    openStorageTab()
+    await openStorageTab()
 
     expect(await screen.findByRole('heading', { name: '고급 수집·저장 설정' })).toBeInTheDocument()
     expect(screen.getByLabelText('전체 버퍼 한도')).toHaveValue(1024)
@@ -107,7 +115,7 @@ describe('storage ingest settings UI', () => {
   it('shows an authoritative server validation error for invalid related limits', async () => {
     vi.mocked(productAPI.saveSettings).mockRejectedValue(new APIError(400, 'untrusted backend detail', undefined, 'invalid_argument'))
     renderSettings()
-    openStorageTab()
+    await openStorageTab()
     await screen.findByRole('heading', { name: '고급 수집·저장 설정' })
     fireEvent.change(screen.getByLabelText('녹화별 버퍼 한도'), { target: { value: '1100' } })
     fireEvent.click(screen.getByRole('button', { name: '수집·저장 설정 저장' }))
@@ -117,7 +125,7 @@ describe('storage ingest settings UI', () => {
 })
 
 describe('runtime update settings UI', () => {
-  function openUpdatesTab() { fireEvent.click(screen.getByRole('tab', { name: '업데이트' })) }
+  async function openUpdatesTab() { fireEvent.click(await screen.findByRole('tab', { name: '업데이트' })) }
 
   it('renders only stable, sanitized handover diagnostics', async () => {
     const diagnostic = {
@@ -128,7 +136,7 @@ describe('runtime update settings UI', () => {
     } as NonNullable<RuntimeUpdateStatus['handover_diagnostic']>
     vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({ ...structuredClone(updateStatus), handover_diagnostic: diagnostic })
     renderSettings()
-    openUpdatesTab()
+    await openUpdatesTab()
     expect(await screen.findByRole('heading', { name: '최근 세대 전환 진단' })).toBeInTheDocument()
     expect(screen.getByText(/가장 최근 진단 하나만 보관합니다/)).toBeInTheDocument()
     expect(screen.getByText('대상 시작 시간 초과 · target_start_timeout')).toBeInTheDocument()
@@ -139,7 +147,7 @@ describe('runtime update settings UI', () => {
 
   it('loads release state, runs update actions and refreshes the displayed status', async () => {
     const { container } = renderSettings()
-    openUpdatesTab()
+    await openUpdatesTab()
     expect(await screen.findByRole('heading', { name: '애플리케이션 업데이트' })).toBeInTheDocument()
     await waitFor(() => expect(runtimeUpdateAPI.status).toHaveBeenCalledTimes(1))
     expect(screen.getAllByText('1.0.0').length).toBeGreaterThan(0)
@@ -167,7 +175,7 @@ describe('runtime update settings UI', () => {
   it('shows update action errors', async () => {
     vi.mocked(runtimeUpdateAPI.check).mockRejectedValue(new APIError(502, 'private backend details'))
     renderSettings()
-    openUpdatesTab()
+    await openUpdatesTab()
     await screen.findByText('1.1.0')
     fireEvent.click(screen.getByRole('button', { name: '업데이트 확인' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('서버가 요청을 처리하지 못했습니다.')
@@ -177,7 +185,7 @@ describe('runtime update settings UI', () => {
   it('shows unavailable reason and disables update operations for a development build', async () => {
     vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({ ...structuredClone(updateStatus), application: { ...runtimeIdentity, version: 'dev', commit: 'unknown', build_time: 'unknown', release_channel: 'development' }, update_unavailable_reason: 'development_build' })
     renderSettings()
-    openUpdatesTab()
+    await openUpdatesTab()
     expect(await screen.findByText('개발 빌드에서는 애플리케이션 업데이트를 사용할 수 없습니다.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '업데이트 확인' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '다운로드 및 검증' })).toBeDisabled()
@@ -239,5 +247,41 @@ describe('per-user preferences', () => {
     fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('환경 설정 값을 확인하세요.')
     expect(userPreferencesAPI.update).not.toHaveBeenCalled()
+  })
+})
+
+describe('account and security settings', () => {
+  it('shows account identity, recovery guidance, and owner user management in Korean', async () => {
+    renderSettings()
+    fireEvent.click(screen.getByRole('tab', { name: '계정·보안' }))
+    expect(await screen.findByRole('heading', { name: '계정 정보' })).toBeInTheDocument()
+    expect(screen.getAllByText('owner')[0]).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '활성 세션' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '사용자 관리' })).toBeInTheDocument()
+    expect(screen.getByText(/runtime-host reset-password/)).toBeInTheDocument()
+  })
+
+  it('forces the browser back to login after a successful password change', async () => {
+    const unauthorized = vi.fn()
+    window.addEventListener('ir:unauthorized', unauthorized)
+    renderSettings()
+    fireEvent.click(screen.getByRole('tab', { name: '계정·보안' }))
+    fireEvent.change(await screen.findByLabelText('현재 비밀번호'), { target: { value: 'old-password-123' } })
+    fireEvent.change(screen.getByLabelText('새 비밀번호'), { target: { value: 'new-password-123' } })
+    fireEvent.change(screen.getAllByLabelText('새 비밀번호 확인')[0]!, { target: { value: 'new-password-123' } })
+    fireEvent.click(screen.getByRole('button', { name: '비밀번호 변경' }))
+    await waitFor(() => expect(accountAPI.changePassword).toHaveBeenCalledWith({ current_password: 'old-password-123', new_password: 'new-password-123' }, expect.anything()))
+    await waitFor(() => expect(unauthorized).toHaveBeenCalledTimes(1))
+    window.removeEventListener('ir:unauthorized', unauthorized)
+  })
+
+  it('hides owner user management from a member account', async () => {
+    vi.mocked(accountAPI.self).mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', role: 'member', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+    renderSettings()
+    fireEvent.click(screen.getByRole('tab', { name: '계정·보안' }))
+    expect(await screen.findByRole('heading', { name: '계정 정보' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: '사용자 관리' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: '저장소' })).not.toBeInTheDocument()
+    expect(accountAPI.users).not.toHaveBeenCalled()
   })
 })

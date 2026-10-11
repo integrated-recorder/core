@@ -656,9 +656,13 @@ func TestConcurrentSessionCapacityAndExpiredCleanup(t *testing.T) {
 	bootstrapForTest(t, service, token)
 	now := time.Now()
 	service.now = func() time.Time { return now }
+	owner, err := service.FindByLogin("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < maxActiveSessions-1; i++ {
 		path := filepath.Join(service.sessionsDir, fmt.Sprintf("%064x", i+1))
-		writeTestSessionRecord(t, path, now.Add(time.Hour))
+		writeTestSessionRecord(t, path, owner.ID, now.Add(time.Hour))
 	}
 
 	const callers = 16
@@ -692,7 +696,7 @@ func TestConcurrentSessionCapacityAndExpiredCleanup(t *testing.T) {
 	}
 
 	for _, entry := range entries {
-		writeTestSessionRecord(t, filepath.Join(service.sessionsDir, entry.Name()), now.Add(-time.Second))
+		writeTestSessionRecord(t, filepath.Join(service.sessionsDir, entry.Name()), owner.ID, now.Add(-time.Second))
 	}
 	if _, err := service.Login(testPassword); err != nil {
 		t.Fatalf("login after expired-session cleanup: %v", err)
@@ -706,11 +710,11 @@ func TestConcurrentSessionCapacityAndExpiredCleanup(t *testing.T) {
 	}
 }
 
-func writeTestSessionRecord(t *testing.T, path string, expiresAt time.Time) {
+func writeTestSessionRecord(t *testing.T, path, userID string, expiresAt time.Time) {
 	t.Helper()
 	csrfHash := make([]byte, sha256.Size)
 	csrfHash[0] = 1
-	record := persistedSessionRecord{CSRFHash: hex.EncodeToString(csrfHash), ExpiresAt: expiresAt.UTC(), UserID: "usr-00000000000000000000000000000000"}
+	record := persistedSessionRecord{ID: filepath.Base(path), CSRFHash: hex.EncodeToString(csrfHash), ExpiresAt: expiresAt.UTC(), UserID: userID, CredentialEpoch: 1}
 	data, err := json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)

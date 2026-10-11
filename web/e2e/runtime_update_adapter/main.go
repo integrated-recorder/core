@@ -169,7 +169,19 @@ func resolveSource(raw string) (adapterproto.MediaSource, error) {
 	if err != nil {
 		return adapterproto.MediaSource{}, err
 	}
-	return mediaFor(origin, stream, "token-0", ""), nil
+	media := mediaFor(origin, stream, "token-0", "")
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return adapterproto.MediaSource{}, errors.New("fixture source URL is invalid")
+	}
+	if parsed.Query().Get("historical") == "1" {
+		media.HistoricalAvailability = &adapterproto.HistoricalAvailability{
+			Mode: adapterproto.HistoricalModeManifest,
+			HistoricalManifestURL: origin + "/hls/history.m3u8?stream=" + url.QueryEscape(stream) +
+				"&token=" + url.QueryEscape("token-0"),
+		}
+	}
+	return media, nil
 }
 
 func mediaFor(origin, stream, token, session string) adapterproto.MediaSource {

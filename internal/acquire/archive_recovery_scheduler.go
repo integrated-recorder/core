@@ -492,6 +492,11 @@ func (s *automaticRecoveryScheduler) complete(id string, item automaticRecoveryQ
 			due = time.Time{}
 		} else {
 			switch {
+			case outcome.more:
+				// A bounded pass found more declared work. Continue immediately;
+				// the FIFO queue still gives other recordings their fairness turn.
+				e.recoveryAttempts = 0
+				e.recoveryNoProgress = 0
 			case outcome.retry:
 				if e.recoveryAttempts < 31 {
 					e.recoveryAttempts++
@@ -506,9 +511,6 @@ func (s *automaticRecoveryScheduler) complete(id string, item automaticRecoveryQ
 					e.recoveryNoProgress++
 					due = s.now().Add(automaticRecoveryRecheck)
 				}
-			case outcome.more:
-				e.recoveryAttempts = 0
-				e.recoveryNoProgress = 0
 			default:
 				e.recoveryAttempts = 0
 			}

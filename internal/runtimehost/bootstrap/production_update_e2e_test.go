@@ -413,26 +413,32 @@ type runtimeUpdateFixture struct {
 }
 
 type runtimeUpdateStream struct {
-	latest           uint64
-	online           bool
-	sessionID        string
-	title            string
-	description      string
-	tokenGeneration  uint64
-	expired          bool
-	segmentRequests  map[uint64][]runtimeSegmentRequest
-	manifestRequests []runtimeManifestRequest
-	refreshes        []runtimeRefreshRequest
-	metadataRequests []time.Time
-	watchRequests    []time.Time
-	refreshStarted   chan time.Time
-	refreshRelease   chan struct{}
-	failNextRefresh  bool
-	failNextManifest bool
-	failNextSegment  targetPreflightFailure
-	blockedSegment   uint64
-	segmentStarted   chan runtimeSegmentRequest
-	segmentRelease   chan struct{}
+	latest            uint64
+	liveFirstSequence uint64
+	online            bool
+	sessionID         string
+	title             string
+	description       string
+	tokenGeneration   uint64
+	expired           bool
+	segmentRequests   map[uint64][]runtimeSegmentRequest
+	manifestRequests  []runtimeManifestRequest
+	historyManifest   []byte
+	historyRequests   []runtimeManifestRequest
+	historyBlockAt    int
+	historyStarted    chan struct{}
+	historyRelease    chan struct{}
+	refreshes         []runtimeRefreshRequest
+	metadataRequests  []time.Time
+	watchRequests     []time.Time
+	refreshStarted    chan time.Time
+	refreshRelease    chan struct{}
+	failNextRefresh   bool
+	failNextManifest  bool
+	failNextSegment   targetPreflightFailure
+	blockedSegment    uint64
+	segmentStarted    chan runtimeSegmentRequest
+	segmentRelease    chan struct{}
 }
 
 type runtimeSegmentRequest struct {
@@ -461,6 +467,7 @@ func newRuntimeUpdateFixture(t *testing.T) *runtimeUpdateFixture {
 	mux.HandleFunc("GET /e2e/metadata", fixture.handleMetadata)
 	mux.HandleFunc("GET /e2e/refresh", fixture.handleRefresh)
 	mux.HandleFunc("GET /hls/stream.m3u8", fixture.handleManifest)
+	mux.HandleFunc("GET /hls/history.m3u8", fixture.handleHistoricalManifest)
 	mux.HandleFunc("GET /hls/segments/{sequence}", fixture.handleSegment)
 	fixture.server = httptest.NewServer(mux)
 	t.Cleanup(fixture.server.Close)
@@ -471,9 +478,35 @@ func (f *runtimeUpdateFixture) reset(stream, title, description, sessionID strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.streams[stream] = &runtimeUpdateStream{
-		sessionID: sessionID, title: title, description: description,
+		sessionID: sessionID, title: title, description: description, liveFirstSequence: 1,
 		segmentRequests: make(map[uint64][]runtimeSegmentRequest),
 	}
+}
+
+func (f *runtimeUpdateFixture) setLiveFirstSequence(stream string, sequence uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	value := f.streams[stream]
+	value.liveFirstSequence = sequence
+	value.latest = sequence - 1
+}
+
+func (f *runtimeUpdateFixture) setHistoricalManifest(stream string, manifest []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.streams[stream].historyManifest = append([]byte(nil), manifest...)
+}
+
+func (f *runtimeUpdateFixture) blockHistoricalManifest(stream string, requestNumber int) (<-chan struct{}, func()) {
+	f.mu.Lock()
+	value := f.streams[stream]
+	value.historyBlockAt = requestNumber
+	value.historyStarted = make(chan struct{})
+	value.historyRelease = make(chan struct{})
+	started, release := value.historyStarted, value.historyRelease
+	f.mu.Unlock()
+	var once sync.Once
+	return started, func() { once.Do(func() { close(release) }) }
 }
 
 func (f *runtimeUpdateFixture) advance(stream string, count uint64) uint64 {
@@ -592,6 +625,12 @@ func (f *runtimeUpdateFixture) manifestRequestsFor(stream string) []runtimeManif
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]runtimeManifestRequest(nil), f.streams[stream].manifestRequests...)
+}
+
+func (f *runtimeUpdateFixture) historicalRequestsFor(stream string) []runtimeManifestRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]runtimeManifestRequest(nil), f.streams[stream].historyRequests...)
 }
 
 func (f *runtimeUpdateFixture) refreshesFor(stream string) []runtimeRefreshRequest {
@@ -718,7 +757,7 @@ func (f *runtimeUpdateFixture) handleManifest(w http.ResponseWriter, r *http.Req
 		value.manifestRequests[requestIndex].Failed = true
 	}
 	valid := token == fmt.Sprintf("token-%d", value.tokenGeneration) && !value.expired
-	latest := value.latest
+	latest, first := value.latest, value.liveFirstSequence
 	f.mu.Unlock()
 	if failOnce {
 		http.Error(w, "fixture manifest temporarily unavailable", http.StatusServiceUnavailable)
@@ -729,10 +768,56 @@ func (f *runtimeUpdateFixture) handleManifest(w http.ResponseWriter, r *http.Req
 		return
 	}
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n")
-	for sequence := uint64(1); sequence <= latest; sequence++ {
+	_, _ = fmt.Fprintf(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:%d\n", first)
+	for sequence := first; sequence <= latest; sequence++ {
 		_, _ = fmt.Fprintf(w, "#EXTINF:1.0,\n/hls/segments/%06d.ts?stream=%s&token=%s\n", sequence, urlQueryEscape(stream), urlQueryEscape(token))
 	}
+}
+
+func (f *runtimeUpdateFixture) handleHistoricalManifest(w http.ResponseWriter, r *http.Request) {
+	stream, token := r.URL.Query().Get("stream"), r.URL.Query().Get("token")
+	f.mu.Lock()
+	value := f.streams[stream]
+	if value == nil {
+		f.mu.Unlock()
+		http.NotFound(w, r)
+		return
+	}
+	requestNumber := len(value.historyRequests) + 1
+	value.historyRequests = append(value.historyRequests, runtimeManifestRequest{Token: token, At: time.Now().UTC()})
+	valid := token == fmt.Sprintf("token-%d", value.tokenGeneration) && !value.expired
+	manifest := append([]byte(nil), value.historyManifest...)
+	blocked := requestNumber == value.historyBlockAt && value.historyRelease != nil
+	started, release := value.historyStarted, value.historyRelease
+	f.mu.Unlock()
+	if !valid {
+		http.Error(w, "fixture historical manifest token is invalid", http.StatusForbidden)
+		return
+	}
+	if blocked {
+		if started != nil {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			http.Error(w, "historical manifest request canceled", http.StatusGatewayTimeout)
+			return
+		case <-time.After(40 * time.Second):
+			http.Error(w, "historical manifest fixture timed out", http.StatusGatewayTimeout)
+			return
+		}
+	}
+	if len(manifest) == 0 {
+		http.Error(w, "historical fixture manifest is not configured", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	_, _ = w.Write(manifest)
 }
 
 func (f *runtimeUpdateFixture) handleSegment(w http.ResponseWriter, r *http.Request) {
@@ -1974,6 +2059,14 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	leaseAfterHandover := waitRecordingLeaseGeneration(t, dataDir, recordingR.ID, activateStatus.DefaultEngine.ID, 40*time.Second, process.output.String, func() string {
 		return fmt.Sprintf("%s child diagnostics:%s", fixture.describe(streamR), readRuntimeE2EChildDiagnostics(process.diagnosticDir))
 	})
+	ownerStoreAfterHandover, err := recordingowner.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerAfterHandover, err := ownerStoreAfterHandover.Current(recordingR.ID)
+	if err != nil || ownerAfterHandover.EngineGeneration != leaseAfterHandover.EngineGeneration {
+		t.Fatalf("durable owner after handover does not match target lease: owner=%+v lease=%+v err=%v", ownerAfterHandover, leaseAfterHandover, err)
+	}
 	// The durable owner file changes before target activation completes. Require
 	// the Host's commit event as well so a transient owner-CAS window followed by
 	// a safe rollback cannot satisfy the continuity assertion.
@@ -2086,6 +2179,30 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	stopRecording(t, client, baseURL, recordingS.ID)
 	stopRecording(t, client, baseURL, recordingR.ID)
 	waitRuntimeRecordingState(t, client, baseURL, recordingR.ID, domain.StateStopped, 20*time.Second)
+	// Seal immediately after the handed-over Engine stops this Recording. The
+	// Runtime Host stays alive for the entire transition: restarting it here
+	// would hide a stale generation-router or ownership-routing defect.
+	var stoppedLifecycle struct {
+		CaptureState  domain.RecordingState `json:"capture_state"`
+		ArchiveSealed bool                  `json:"archive_sealed"`
+		Repairable    bool                  `json:"repairable"`
+	}
+	code, err = requestRuntimeJSON(client, baseURL, http.MethodGet, "/api/recordings/"+recordingR.ID+"/lifecycle", nil, &stoppedLifecycle)
+	if err != nil || code != http.StatusOK || stoppedLifecycle.CaptureState != domain.StateStopped || stoppedLifecycle.ArchiveSealed || !stoppedLifecycle.Repairable {
+		t.Fatalf("immediate post-handover lifecycle read failed before seal: code=%d snapshot=%+v err=%v; host pid=%d output=%s", code, stoppedLifecycle, err, command.Process.Pid, process.output.String())
+	}
+	var sealed struct {
+		Sealed bool `json:"sealed"`
+	}
+	code, err = requestRuntimeJSON(client, baseURL, http.MethodPost, "/api/recordings/"+recordingR.ID+"/seal", map[string]any{}, &sealed)
+	if err != nil || code != http.StatusOK || !sealed.Sealed || processForBinary(artifacts.hostA) != command.Process.Pid {
+		t.Fatalf("immediate post-handover seal failed without a Host restart: code=%d sealed=%t err=%v host pid=%d current pid=%d output=%s", code, sealed.Sealed, err, command.Process.Pid, processForBinary(artifacts.hostA), process.output.String())
+	}
+	code, err = requestRuntimeJSON(client, baseURL, http.MethodGet, "/api/recordings/"+recordingR.ID+"/lifecycle", nil, &stoppedLifecycle)
+	if err != nil || code != http.StatusOK || !stoppedLifecycle.ArchiveSealed || stoppedLifecycle.Repairable {
+		t.Fatalf("immediate post-handover sealed lifecycle read failed: code=%d snapshot=%+v err=%v", code, stoppedLifecycle, err)
+	}
+	t.Logf("post-handover immediate seal proof: recording=%s generation=%s owner_epoch=%d capture=stopped/unsealed→sealed host_pid=%d", recordingR.ID, ownerAfterHandover.EngineGeneration, ownerAfterHandover.Epoch, command.Process.Pid)
 	assertRuntimeStorageIntegrity(t, client, baseURL, recordingR.ID)
 	waitLeaseAbsent(t, dataDir, recordingR.ID, 20*time.Second)
 	if err := waitProcessAbsent(t, engineABinary, 30*time.Second); err != nil {

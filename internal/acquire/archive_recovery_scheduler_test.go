@@ -234,6 +234,31 @@ func TestAutomaticRecoveryManifestEmptyObservationUsesFiniteSlowRechecks(t *test
 	}
 }
 
+func TestAutomaticRecoveryKnownMoreWorkPreemptsSlowManifestRecheck(t *testing.T) {
+	const id = "00000000000000000000000000000008"
+	_, entries, scheduler := newSchedulerUnitFixture(id)
+	defer scheduler.cancel()
+	e := entries[id]
+	fixedNow := time.Now()
+	scheduler.now = func() time.Time { return fixedNow }
+	scheduler.enqueue(id, time.Time{})
+	gotID, item, _, ok := scheduler.next()
+	if !ok || gotID != id {
+		t.Fatalf("first recovery pass did not run: id=%q ok=%v", gotID, ok)
+	}
+	scheduler.complete(id, item, automaticRecoveryOutcome{more: true, recheck: true, progressed: true})
+	if scheduled := scheduler.queued[id]; !scheduled.due.IsZero() {
+		t.Fatalf("known remaining work was delayed for the manifest slow-recheck interval: due=%s", scheduled.due)
+	}
+	if e.recoveryNoProgress != 0 || e.recoveryAttempts != 0 {
+		t.Fatalf("known remaining work retained retry/recheck counters: noProgress=%d attempts=%d", e.recoveryNoProgress, e.recoveryAttempts)
+	}
+	gotID, _, _, ok = scheduler.next()
+	if !ok || gotID != id {
+		t.Fatalf("bounded recovery pass with remaining work was not immediately eligible: id=%q ok=%v", gotID, ok)
+	}
+}
+
 func TestAutomaticRecoveryRescanRetainsOverflowedImmediateTrigger(t *testing.T) {
 	ids := make([]string, maxAutomaticRecoveryQueue+1)
 	for i := range ids {

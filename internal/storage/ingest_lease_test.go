@@ -522,6 +522,10 @@ func TestCoordinatorReleaseRetriesSameIDAndSurfacesUnresolvedLease(t *testing.T)
 		if err := waitCommit(t, service, coordinator, "writer-release-fail", func() error { return nil }); err != nil {
 			t.Fatalf("release failure changed successful canonical result: %v", err)
 		}
+		// Completion publishes the commit result before the writer loop finishes
+		// its active-writer accounting transition. Wait for that transition
+		// before asserting that only the coordinator lease remains unresolved.
+		waitForActiveWriters(t, service, 0)
 		if got := service.Snapshot(); got.PendingCoordinatorLeases != 1 || got.QueueObjects != 0 || got.ActiveWriters != 0 {
 			t.Fatalf("writer release failure accounting = %#v", got)
 		}

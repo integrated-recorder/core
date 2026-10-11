@@ -99,8 +99,11 @@ type Status struct {
 	UpdateUnavailableReason string              `json:"update_unavailable_reason,omitempty"`
 }
 
-// HandoverDiagnostic is a sanitized operational summary for the latest
-// active-recording generation handover failure. It contains allowlisted phase
+// HandoverDiagnostic is the Runtime Host's single global latest-only,
+// sanitized operational summary for an active-recording generation handover
+// failure. A newer failure replaces the prior summary, including one from a
+// different recording. ReconcileState distinguishes a pending failure from a
+// successfully resolved historical failure. It contains allowlisted phase
 // and reason values only. Raw process, adapter, IPC, and storage errors never
 // cross the Runtime Host status boundary.
 type HandoverDiagnostic struct {

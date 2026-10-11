@@ -18,7 +18,7 @@ import { Input } from '@/components/ui/input'
 import { LoadingState, ErrorState, EmptyState } from '@/components/query-state'
 import { useToast } from '@/components/ui/use-toast'
 import { isFFmpegAvailable } from '@/lib/derivatives'
-import type { ArchiveEntry, ExportJob, Gap, RecordingMetadata, Segment } from '@/types/api'
+import type { ArchiveEntry, DerivedJobState, ExportJob, Gap, RecordingMetadata, Segment } from '@/types/api'
 import { AdapterMark } from '@/components/adapter/adapter-mark'
 import { LivePreviewViewport, PreviewFrameGrid, PreviewStateMessage } from '@/components/recording/previews'
 import { seekToPreview } from '@/lib/previews'
@@ -128,7 +128,7 @@ export function RecordingDetailPage() {
               <Button size="sm" onClick={() => verify.mutate()} disabled={verify.isPending || item.state === 'recording'}><ShieldCheck className="h-4 w-4" />{t('detail.verify')}</Button>
               {job.data && activeJob(job.data.state) && <Button variant="outline" size="sm" onClick={() => cancelJob.mutate()}>{t('detail.cancelVerify')}</Button>}
             </div>
-            {(job.data && isTerminalJob(job.data.state) || integrity.data?.active_job && isTerminalJob(integrity.data.active_job.state)) && <div className="mt-2 space-y-1" role="status"><StatusBadge state={job.data?.state ?? integrity.data?.active_job?.state} />{(job.data?.state === 'failed' || integrity.data?.active_job?.state === 'failed') && <JobErrorMessage errorCode={job.data?.error_code ?? integrity.data?.active_job?.error_code} />}{(job.data?.state === 'interrupted' || integrity.data?.active_job?.state === 'interrupted') && <p className="text-xs text-muted-foreground">{t('detail.job.interrupted')}</p>}{(['canceled', 'cancelled'].includes(job.data?.state ?? '') || ['canceled', 'cancelled'].includes(integrity.data?.active_job?.state ?? '')) && <p className="text-xs text-muted-foreground">{t('detail.job.cancelled')}</p>}</div>}
+            {(job.data && isTerminalJob(job.data.state) || integrity.data?.active_job && isTerminalJob(integrity.data.active_job.state)) && <div className="mt-2 space-y-1" role="status"><StatusBadge state={job.data?.state ?? integrity.data?.active_job?.state} /><JobTerminalMessage state={job.data?.state ?? integrity.data?.active_job?.state} errorCode={job.data?.error_code ?? integrity.data?.active_job?.error_code} /></div>}
             {(job.data && activeJob(job.data.state) || integrity.data?.active_job && activeJob(integrity.data.active_job.state)) && <JobProgress label={t('progress.integrity')} progress={job.data?.progress ?? integrity.data?.active_job?.progress} />}
             {job.data?.freshness === 'stale' && <p role="status" className="mt-2 text-xs text-amber-700 dark:text-amber-300">{t('progress.freshness.stale')}</p>}
           </div>
@@ -205,10 +205,17 @@ export function Events({ items, loading, error, retry }: { items?: { id: string;
 export function ExportRow({ item, onDelete, deleting }: { item: ExportJob; onDelete: () => void; deleting: boolean }) {
   const { t } = useI18n()
   const terminal = isTerminalJob(item.state)
-  return <div className="py-3"><div className="flex flex-wrap items-center gap-2"><StatusBadge state={item.state} />{item.freshness === 'stale' && <Badge tone="amber">{t('export.stale')}</Badge>}{item.freshness === 'unknown' && item.state === 'completed' && <Badge tone="neutral">{t('export.freshnessUnknown')}</Badge>}<span className="min-w-0 flex-1 truncate text-xs">{item.output_name ?? item.id}</span>{item.state === 'completed' && <a href={derivativeAPI.download(item.id)}><Button variant="outline" size="sm"><Download className="h-3.5 w-3.5" />{t('export.download')}</Button></a>}{activeJob(item.state) ? <Button variant="outline" size="sm" onClick={onDelete} disabled={deleting} aria-label={t('export.cancelLabel')}><XCircle className="h-3.5 w-3.5" />{t('export.cancel')}</Button> : <Confirm trigger={<Button variant="ghost" size="icon" aria-label={t('export.deleteLabel')} disabled={deleting}><Trash2 className="h-4 w-4" /></Button>} title={t('export.deleteTitle')} description={t('export.deleteDescription')} confirmLabel={t('export.deleteAction')} destructive onConfirm={onDelete} disabled={deleting} />}</div>{activeJob(item.state) && <JobProgress label={t('progress.export')} progress={item.progress} />}{terminal && item.state === 'failed' && <JobErrorMessage errorCode={item.error_code} />}{terminal && item.state === 'interrupted' && <p className="mt-1 text-xs text-muted-foreground">{t('detail.job.interrupted')}</p>}{terminal && ['canceled', 'cancelled'].includes(item.state) && <p className="mt-1 text-xs text-muted-foreground">{t('detail.job.cancelled')}</p>}</div>
+  return <div className="py-3"><div className="flex flex-wrap items-center gap-2"><StatusBadge state={item.state} />{item.freshness === 'stale' && <Badge tone="amber">{t('export.stale')}</Badge>}{item.freshness === 'unknown' && item.state === 'completed' && <Badge tone="neutral">{t('export.freshnessUnknown')}</Badge>}<span className="min-w-0 flex-1 truncate text-xs">{item.output_name ?? item.id}</span>{item.state === 'completed' && <a href={derivativeAPI.download(item.id)}><Button variant="outline" size="sm"><Download className="h-3.5 w-3.5" />{t('export.download')}</Button></a>}{activeJob(item.state) ? <Button variant="outline" size="sm" onClick={onDelete} disabled={deleting} aria-label={t('export.cancelLabel')}><XCircle className="h-3.5 w-3.5" />{t('export.cancel')}</Button> : <Confirm trigger={<Button variant="ghost" size="icon" aria-label={t('export.deleteLabel')} disabled={deleting}><Trash2 className="h-4 w-4" /></Button>} title={t('export.deleteTitle')} description={t('export.deleteDescription')} confirmLabel={t('export.deleteAction')} destructive onConfirm={onDelete} disabled={deleting} />}</div>{activeJob(item.state) && <JobProgress label={t('progress.export')} progress={item.progress} />}{terminal && <JobTerminalMessage state={item.state} errorCode={item.error_code} />}</div>
 }
 
-function isTerminalJob(state: string) { return ['completed', 'failed', 'interrupted', 'canceled', 'cancelled'].includes(state) }
+function isTerminalJob(state?: DerivedJobState) { return state === 'completed' || state === 'failed' || state === 'canceled' }
+export function JobTerminalMessage({ state, errorCode }: { state?: DerivedJobState; errorCode?: string }) {
+  const { t } = useI18n()
+  if (state === 'failed' && errorCode === 'interrupted_by_restart') return <p className="mt-1 text-xs text-muted-foreground">{t('detail.job.interrupted')}</p>
+  if (state === 'failed') return <JobErrorMessage errorCode={errorCode} />
+  if (state === 'canceled') return <p className="mt-1 text-xs text-muted-foreground">{t('detail.job.cancelled')}</p>
+  return null
+}
 function JobErrorMessage({ errorCode }: { errorCode?: string }) {
   const { locale } = useI18n()
   return <p className="mt-1 text-xs text-destructive">{localizedAPIError(locale, errorCode, 500)}</p>

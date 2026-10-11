@@ -1,6 +1,10 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import * as ts from 'typescript'
+import { I18nProvider } from '@/i18n/provider'
 import { SetupPage } from './setup'
 
 const mocks = vi.hoisted(() => ({
@@ -30,10 +34,16 @@ const storageCapacityUnknown = { status: 'warning' as const, capacity_known: fal
 
 function renderSetup() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={client}><SetupPage /></QueryClientProvider>)
+  return render(<QueryClientProvider client={client}><I18nProvider><SetupPage /></I18nProvider></QueryClientProvider>)
+}
+
+function setBrowserLocale(locale: string) {
+  Object.defineProperty(navigator, 'languages', { configurable: true, value: [locale] })
+  Object.defineProperty(navigator, 'language', { configurable: true, value: locale })
 }
 
 beforeEach(() => {
+  setBrowserLocale('ko-KR')
   vi.clearAllMocks()
   mocks.status.mockResolvedValue(status('uninitialized'))
   mocks.session.mockResolvedValue(session(false))
@@ -47,12 +57,40 @@ beforeEach(() => {
 })
 
 describe('first-run setup flow', () => {
+  it('resolves unauthenticated setup to en-US from browser locale', async () => {
+    setBrowserLocale('en-US')
+    renderSetup()
+    expect(await screen.findByRole('heading', { name: 'Get started with Integrated Recorder' })).toBeInTheDocument()
+    expect(screen.getByText('Complete a few setup steps to get started.')).toBeInTheDocument()
+    await waitFor(() => expect(document.documentElement.lang).toBe('en-US'))
+    expect(document.body.textContent).not.toMatch(/[\uac00-\ud7a3]/)
+  })
+
+  it('resolves unauthenticated setup to ko-KR from browser locale', async () => {
+    renderSetup()
+    expect(await screen.findByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeInTheDocument()
+    expect(screen.getByText('처음 몇 가지만 설정하면 바로 시작할 수 있습니다.')).toBeInTheDocument()
+    await waitFor(() => expect(document.documentElement.lang).toBe('ko-KR'))
+  })
+
+  it('keeps setup UI text in translation keys', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/routes/setup.tsx'), 'utf8')
+    const file = ts.createSourceFile('setup.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+    const visibleLiterals: string[] = []
+    const visit = (node: ts.Node) => {
+      if (ts.isJsxText(node) && /[\p{L}\p{N}]/u.test(node.getText(file))) visibleLiterals.push(node.getText(file).trim())
+      ts.forEachChild(node, visit)
+    }
+    visit(file)
+    expect(visibleLiterals).toEqual([])
+  })
+
   it('submits the one-time code, creates the administrator session, then begins setup', async () => {
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
     expect(await screen.findByText(/로컬 콘솔과 container logs/)).toBeInTheDocument()
     expect(screen.getByText('docker compose logs archiver')).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('Setup code'), { target: { value: 'test-only-code' } })
+    fireEvent.change(screen.getByLabelText('설치 코드'), { target: { value: 'test-only-code' } })
     fireEvent.change(screen.getByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.change(screen.getByLabelText('비밀번호 확인'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.click(screen.getByRole('button', { name: '관리자 계정 만들기' }))
@@ -65,7 +103,7 @@ describe('first-run setup flow', () => {
   it('rejects password mismatch before submitting the bootstrap code', async () => {
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
-    fireEvent.change(screen.getByLabelText('Setup code'), { target: { value: 'test-only-code' } })
+    fireEvent.change(screen.getByLabelText('설치 코드'), { target: { value: 'test-only-code' } })
     fireEvent.change(screen.getByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.change(screen.getByLabelText('비밀번호 확인'), { target: { value: 'different-passphrase' } })
     fireEvent.click(screen.getByRole('button', { name: '관리자 계정 만들기' }))
@@ -77,11 +115,11 @@ describe('first-run setup flow', () => {
     mocks.bootstrap.mockRejectedValueOnce(new Error('Setup code was rejected'))
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
-    fireEvent.change(screen.getByLabelText('Setup code'), { target: { value: 'bad-code' } })
+    fireEvent.change(screen.getByLabelText('설치 코드'), { target: { value: 'bad-code' } })
     fireEvent.change(screen.getByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.change(screen.getByLabelText('비밀번호 확인'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.click(screen.getByRole('button', { name: '관리자 계정 만들기' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('Setup code를 확인하거나 서버 연결 후 다시 시도하세요.')
+    expect(await screen.findByRole('alert')).toHaveTextContent('설치 코드 또는 서버 연결을 확인한 뒤 다시 시도하세요.')
     expect(screen.queryByText('Setup code was rejected')).not.toBeInTheDocument()
     expect(document.body.textContent).not.toContain('/data/')
     expect(mocks.begin).not.toHaveBeenCalled()
@@ -92,7 +130,7 @@ describe('first-run setup flow', () => {
     mocks.session.mockResolvedValue(session(true))
     renderSetup()
     expect(await screen.findByRole('heading', { name: '저장소 확인' })).toBeInTheDocument()
-    expect(screen.queryByLabelText('Setup code')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('설치 코드')).not.toBeInTheDocument()
     expect(mocks.bootstrap).not.toHaveBeenCalled()
   })
 
@@ -102,7 +140,7 @@ describe('first-run setup flow', () => {
     mocks.storageTest.mockRejectedValueOnce(new Error('storage probe unavailable')).mockResolvedValueOnce(storagePassed)
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '저장소 검사 실행' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('요청을 완료하지 못했습니다. 잠시 후 다시 시도하세요.')
+    expect(await screen.findByRole('alert')).toHaveTextContent('저장소 검사를 완료하지 못했습니다. 저장소 설정을 확인한 뒤 다시 시도하세요.')
     fireEvent.click(screen.getByRole('button', { name: '저장소 검사 실행' }))
     expect(await screen.findByText('기본 저장소 진단')).toBeInTheDocument()
     expect(screen.getAllByText('정상').length).toBeGreaterThan(0)
@@ -114,8 +152,9 @@ describe('first-run setup flow', () => {
     mocks.storageTest.mockResolvedValue(storageCapacityUnknown)
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '저장소 검사 실행' }))
+    await waitFor(() => expect(mocks.storageTest).toHaveBeenCalledTimes(1))
     expect(await screen.findByText(/저장소가 사용 가능 용량을 제공하지 않아 용량은 알 수 없습니다/)).toBeInTheDocument()
-    expect(screen.getAllByText('알 수 없음').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('용량 알 수 없음').length).toBeGreaterThan(0)
     fireEvent.click(screen.getByRole('button', { name: '계속' }))
     fireEvent.click(await screen.findByRole('button', { name: '계속' }))
     fireEvent.click(await screen.findByRole('button', { name: '설치 완료' }))

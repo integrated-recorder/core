@@ -1,10 +1,17 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import process from 'node:process'
 
+const webDir = dirname(fileURLToPath(import.meta.url))
 const dataDir = mkdtempSync(join(tmpdir(), 'integrated-recorder-ui-e2e-'))
+const build = spawnSync('npm', ['run', 'build'], { cwd: webDir, stdio: 'inherit' })
+if (build.error || build.status !== 0) {
+  try { rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }) } catch { /* isolated test data cleanup is best effort */ }
+  process.exit(build.status ?? 1)
+}
 const child = spawn('npx', ['playwright', 'test', ...process.argv.slice(2)], {
   env: { ...process.env, IR_E2E_DATA_DIR: dataDir },
   stdio: 'inherit',

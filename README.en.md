@@ -27,7 +27,13 @@ Source Plugins provide platform-specific behavior; Storage Providers place physi
 
 Owncast is a first-party Source Plugin, but it is not bundled in Core or the Docker image. It is distributed as v0.2.0 through the official Plugin Registry. Plugin executables are native code and are not sandboxed. See the [Plugin Trust Model](docs/PLUGIN_TRUST_MODEL.md) for admission provenance and its limits.
 
-Operator-supplied plugins are disabled by default; set `IR_ALLOW_OPERATOR_PLUGINS=1` to use them in a production Runtime Host. They are native executables that have not been reviewed by the project. The default file secret store restricts permissions but does not encrypt stored values. Keep the unauthenticated control API on a trusted network or behind an authenticated reverse proxy.
+Operator-supplied plugins are disabled by default; set `IR_ALLOW_OPERATOR_PLUGINS=1` to use them in a production Runtime Host. They are native executables that have not been reviewed by the project. The default file secret store restricts permissions but does not encrypt stored values.
+
+## Authentication and network exposure
+
+The default Runtime Host uses built-in user authentication. First-run setup requires the one-time claim code printed to the local console or container logs. After setup, the browser authenticates with a session cookie. Mutation requests require a CSRF token. `AUTH_DISABLED=1` is a development escape hatch and is accepted only when the listener binds to loopback. The Runtime Host fails closed on public binds.
+
+For production network access, configure HTTPS, a trusted reverse proxy, and an appropriate network boundary. Set `COOKIE_SECURE=1` behind a TLS reverse proxy to require Secure cookies.
 
 ## Quick start
 

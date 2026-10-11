@@ -686,7 +686,7 @@ func TestExplicitCancelStopsAndPersistsRunningVerification(t *testing.T) {
 	}
 }
 
-func TestRestartRecoveryFailsPersistedActiveJobs(t *testing.T) {
+func TestRestartRecoveryUsesFailedWireStateAndInterruptedProgressPhase(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.New(root)
 	if err != nil {
@@ -717,6 +717,20 @@ func TestRestartRecoveryFailsPersistedActiveJobs(t *testing.T) {
 	}
 	if recovered.State != StateFailed || recovered.ErrorCode != ErrorInterruptedByRestart || recovered.FinishedAt == nil {
 		t.Fatalf("stuck job was not recovered: %#v", recovered)
+	}
+	wire, err := json.Marshal(recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wireJob struct {
+		State    State    `json:"state"`
+		Progress Progress `json:"progress"`
+	}
+	if err := json.Unmarshal(wire, &wireJob); err != nil {
+		t.Fatal(err)
+	}
+	if wireJob.State != StateFailed || wireJob.Progress.Phase != "interrupted" {
+		t.Fatalf("restart wire contract=%s/%s, want failed/interrupted", wireJob.State, wireJob.Progress.Phase)
 	}
 	if recovered.Progress.Phase != "interrupted" {
 		t.Fatalf("recovered progress=%+v, want interrupted phase", recovered.Progress)

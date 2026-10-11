@@ -35,9 +35,47 @@ async function requestHostRestart() {
   }, { timeout: 30_000 }).toBe(true)
 }
 
-test('fresh installation completes through product APIs and remains ready after Host restart', async ({ page }) => {
-  const requests: Array<{ method: string; url: string }> = []
-  page.on('request', request => requests.push({ method: request.method(), url: request.url() }))
+test('fresh setup resolves browser locale before authentication', async ({ browser }) => {
+  for (const locale of ['en-US', 'ko-KR'] as const) {
+    const context = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale })
+    const page = await context.newPage()
+    await page.goto('/')
+    await expect(page).toHaveURL(/\/setup$/)
+    await expect(page.locator('html')).toHaveAttribute('lang', locale)
+    if (locale === 'en-US') {
+      await expect(page.getByRole('heading', { name: 'Get started with Integrated Recorder' })).toBeVisible()
+      expect(await page.locator('body').innerText()).not.toMatch(/[\uac00-\ud7a3]/)
+    } else {
+      await expect(page.getByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeVisible()
+      expect(await page.locator('body').innerText()).toMatch(/[\uac00-\ud7a3]/)
+    }
+    await context.close()
+  }
+})
+
+test('fresh installation completes through product APIs and remains ready after Host restart', async ({ browser }) => {
+  const context = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale: 'ko-KR' })
+  const page = await context.newPage()
+  let requestURLLeak = false
+  let disallowedRequestBodyLeak = false
+  let bootstrapBodyContainsCode = false
+  let responseBodyLeak = false
+  const responseChecks: Promise<void>[] = []
+  page.on('request', request => {
+    const url = request.url()
+    if (url.includes(setupCode!) || url.includes('bootstrap-token') || url.includes(dataDir!)) requestURLLeak = true
+    const body = request.postData() ?? ''
+    if (request.method() === 'POST' && new URL(url).pathname === '/api/auth/bootstrap') {
+      bootstrapBodyContainsCode ||= body.includes(setupCode!)
+    } else if (body.includes(setupCode!)) {
+      disallowedRequestBodyLeak = true
+    }
+  })
+  page.on('response', response => {
+    responseChecks.push(response.body().then(body => {
+      if (body.toString('utf8').includes(setupCode!)) responseBodyLeak = true
+    }).catch(() => undefined))
+  })
 
   const initial = persistedInstallation()
   expect(initial.state).toBe('uninitialized')
@@ -46,17 +84,20 @@ test('fresh installation completes through product APIs and remains ready after 
 
   const initialStatusResponse = await page.request.get('/api/setup/status')
   expect(initialStatusResponse.ok()).toBeTruthy()
-  const initialStatus = await initialStatusResponse.json()
+  const initialStatusBody = await initialStatusResponse.text()
+  expect(initialStatusBody.includes(setupCode!)).toBe(false)
+  const initialStatus = JSON.parse(initialStatusBody)
   expect(initialStatus.state).toBe('uninitialized')
   expect(initialStatus.claim_required).toBe(true)
   expect(initialStatus.recovery_required).toBe(false)
 
   await page.goto('/')
   await expect(page).toHaveURL(/\/setup$/)
-  await expect(page.getByRole('heading', { name: /Integrated Recorder 시작하기/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeVisible()
 
   await page.getByRole('button', { name: '시작하기' }).click()
-  await page.getByLabel('Setup code').fill(setupCode)
+  await page.getByLabel('설치 코드').fill(setupCode)
+  expect((await page.locator('body').innerText()).includes(setupCode!)).toBe(false)
   await page.getByLabel('관리자 비밀번호').fill('first-run-product-e2e-password-2026')
   await page.getByLabel('비밀번호 확인').fill('first-run-product-e2e-password-2026')
   await page.getByRole('button', { name: '관리자 계정 만들기' }).click()
@@ -70,14 +111,18 @@ test('fresh installation completes through product APIs and remains ready after 
   await expect(page.getByRole('heading', { name: '저장소 확인' })).toBeVisible()
   const resumedStatusResponse = await page.request.get('/api/setup/status')
   expect(resumedStatusResponse.ok()).toBeTruthy()
-  const resumedStatus = await resumedStatusResponse.json()
+  const resumedStatusBody = await resumedStatusResponse.text()
+  expect(resumedStatusBody.includes(setupCode!)).toBe(false)
+  const resumedStatus = JSON.parse(resumedStatusBody)
   expect(resumedStatus.state).toBe('setup_in_progress')
   const resumed = persistedInstallation()
   expect(resumed.state).toBe('setup_in_progress')
   expect(resumed.installation_id).toBe(installationID)
   const resumedSessionResponse = await page.request.get('/api/auth/session')
   expect(resumedSessionResponse.ok()).toBeTruthy()
-  expect((await resumedSessionResponse.json()).authenticated).toBe(true)
+  const resumedSessionBody = await resumedSessionResponse.text()
+  expect(resumedSessionBody.includes(setupCode!)).toBe(false)
+  expect(JSON.parse(resumedSessionBody).authenticated).toBe(true)
 
   await page.getByRole('button', { name: '저장소 검사 실행' }).click()
   await expect(page.getByText('기본 저장소 진단')).toBeVisible()
@@ -129,10 +174,11 @@ test('fresh installation completes through product APIs and remains ready after 
   const postRestartDashboard = await page.request.get('/api/dashboard')
   expect(postRestartDashboard.ok()).toBeTruthy()
 
-  const requestsAvoidSetupSecrets = requests.every(({ url }) => !url.includes(setupCode!) && !url.includes('bootstrap-token') && !url.includes(dataDir!))
-  expect(requestsAvoidSetupSecrets).toBe(true)
-  expect(requests.some(({ method, url }) => method === 'POST' && url.endsWith('/api/auth/bootstrap'))).toBe(true)
-  expect(requests.some(({ method, url }) => method === 'POST' && url.endsWith('/api/setup/begin'))).toBe(true)
-  expect(requests.some(({ method, url }) => method === 'POST' && url.endsWith('/api/setup/storage-test'))).toBe(true)
-  expect(requests.some(({ method, url }) => method === 'POST' && url.endsWith('/api/setup/complete'))).toBe(true)
+  expect((await page.locator('body').innerText()).includes(setupCode!)).toBe(false)
+  await Promise.all(responseChecks)
+  expect(requestURLLeak).toBe(false)
+  expect(disallowedRequestBodyLeak).toBe(false)
+  expect(bootstrapBodyContainsCode).toBe(true)
+  expect(responseBodyLeak).toBe(false)
+  await context.close()
 })

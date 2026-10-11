@@ -320,16 +320,34 @@ func (s *LocalFilesystemBackend) RecordingFormatVersion(ctx context.Context, id 
 	if err != nil {
 		return 0, err
 	}
-	if !rootInfo.Mode().IsRegular() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Size() < 0 || rootInfo.Size() > maxRecordingJSONBytes {
+	return readRecordingFormatVersionSnapshot(ctx, rootPath, rootInfo)
+}
+
+// readRecordingFormatVersionSnapshot reads the format marker from one stable,
+// bounded root file descriptor. A concurrent atomic root publication may make
+// the descriptor refer to either the previously observed root or the current
+// root. Both are complete canonical snapshots and must remain readable.
+func readRecordingFormatVersionSnapshot(ctx context.Context, path string, observed os.FileInfo) (int, error) {
+	if observed == nil || !observed.Mode().IsRegular() || observed.Mode()&os.ModeSymlink != 0 || observed.Size() < 0 || observed.Size() > maxRecordingJSONBytes {
 		return 0, ErrShardedArchiveInvalid
 	}
-	file, err := os.Open(rootPath)
+	file, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
 	opened, err := file.Stat()
-	if err != nil || !os.SameFile(rootInfo, opened) {
+	if err != nil || !opened.Mode().IsRegular() || opened.Mode()&os.ModeSymlink != 0 || opened.Size() < 0 || opened.Size() > maxRecordingJSONBytes {
+		return 0, ErrShardedArchiveInvalid
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	if !current.Mode().IsRegular() || current.Mode()&os.ModeSymlink != 0 {
+		return 0, ErrShardedArchiveInvalid
+	}
+	if !os.SameFile(observed, opened) && !os.SameFile(current, opened) {
 		return 0, ErrShardedArchiveInvalid
 	}
 	prefix, err := io.ReadAll(io.LimitReader(contextReader{ctx: ctx, reader: file}, 4096))

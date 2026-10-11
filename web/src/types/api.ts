@@ -109,10 +109,11 @@ export type JobProgress = {
   unit: string
   updated_at?: string
 }
-export type IntegrityJobState = 'queued' | 'running' | 'completed' | 'failed' | 'interrupted' | 'canceled' | 'cancelled'
+export type DerivedJobState = 'queued' | 'running' | 'completed' | 'failed' | 'canceled'
+export type IntegrityJobState = DerivedJobState
 export type IntegrityResult = { status: IntegrityStatus; last_verified_at?: string; objects_total?: number; objects_verified?: number; objects_missing?: number; objects_corrupt?: number; issues?: { code: string; path?: string }[]; freshness?: RevisionFreshness; revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; active_job?: Pick<IntegrityJob, 'id' | 'state' | 'progress' | 'freshness' | 'error_code'> }
 export type IntegrityJob = { id: string; recording_id: string; state: IntegrityJobState; created_at: string; started_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness; progress?: JobProgress; result?: IntegrityResult }
-export type ExportJob = { id: string; recording_id: string; state: string; format?: string; output_name?: string; created_at?: string; started_at?: string; updated_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness; progress?: JobProgress }
+export type ExportJob = { id: string; recording_id: string; state: DerivedJobState; format?: string; output_name?: string; created_at?: string; started_at?: string; updated_at?: string; finished_at?: string; error_code?: string; source_revision_known?: boolean; source_archive_revision?: number; source_timeline_revision?: number; current_archive_revision?: number; current_timeline_revision?: number; freshness?: RevisionFreshness; progress?: JobProgress }
 export type Notification = { id: string; type: string; at: string; read: boolean; object_id?: string }
 export type WorkflowProgress = {
   workflow_id: string; adapter_id: string; state: string; resource?: ResourceRef;

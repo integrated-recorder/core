@@ -9,6 +9,7 @@ import (
 
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/management"
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
@@ -26,7 +27,11 @@ func TestRecordingLifecycleEndpointsKeepCaptureAndArchiveSeparate(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer manager.Close(context.Background())
-	handler := New(manager, nil, nil)
+	products, err := management.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(manager, nil, nil, Options{Management: products})
 
 	complete := httptest.NewRecorder()
 	handler.ServeHTTP(complete, httptest.NewRequest(http.MethodPost, "/api/recordings/"+stoppedID+"/complete", nil))
@@ -49,6 +54,11 @@ func TestRecordingLifecycleEndpointsKeepCaptureAndArchiveSeparate(t *testing.T) 
 	if seal.Code != http.StatusOK || !strings.Contains(seal.Body.String(), `"sealed":true`) {
 		t.Fatalf("seal status=%d body=%s", seal.Code, seal.Body.String())
 	}
+	events := httptest.NewRecorder()
+	handler.ServeHTTP(events, httptest.NewRequest(http.MethodGet, "/api/recordings/"+stoppedID+"/events", nil))
+	if events.Code != http.StatusOK || !strings.Contains(events.Body.String(), `"type":"archive_sealed"`) {
+		t.Fatalf("sealed recording event status=%d body=%s", events.Code, events.Body.String())
+	}
 	sealedView := httptest.NewRecorder()
 	handler.ServeHTTP(sealedView, httptest.NewRequest(http.MethodGet, "/api/recordings/"+stoppedID+"/lifecycle", nil))
 	if sealedView.Code != http.StatusOK || !strings.Contains(sealedView.Body.String(), `"capture_state":"completed"`) || !strings.Contains(sealedView.Body.String(), `"archive_sealed":true`) || !strings.Contains(sealedView.Body.String(), `"repairable":false`) || !strings.Contains(sealedView.Body.String(), `"recovery_state":"sealed"`) {
@@ -65,6 +75,11 @@ func TestRecordingLifecycleEndpointsKeepCaptureAndArchiveSeparate(t *testing.T) 
 		if retry.Code != http.StatusOK {
 			t.Fatalf("idempotent %s status=%d body=%s", path, retry.Code, retry.Body.String())
 		}
+	}
+	events = httptest.NewRecorder()
+	handler.ServeHTTP(events, httptest.NewRequest(http.MethodGet, "/api/recordings/"+stoppedID+"/events", nil))
+	if events.Code != http.StatusOK || strings.Count(events.Body.String(), `"type":"archive_sealed"`) != 1 {
+		t.Fatalf("idempotent seal duplicated or omitted lifecycle event: status=%d body=%s", events.Code, events.Body.String())
 	}
 
 	sealStopped := httptest.NewRecorder()

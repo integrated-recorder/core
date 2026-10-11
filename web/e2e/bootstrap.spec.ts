@@ -1,5 +1,9 @@
 import { expect, test } from '@playwright/test'
 
+// These mock-flow assertions use the Korean system-resolved catalog. Keep the
+// browser locale explicit instead of relying on the machine running Playwright.
+test.use({ locale: 'ko-KR' })
+
 const storageSettings = {
   ingest_memory: { global_buffer_bytes: 1073741824, per_recording_buffer_bytes: 805306368, max_payload_bytes: 536870912 },
   queue_writer: { pending_queue_capacity: 128, writer_concurrency: 1 },
@@ -67,11 +71,13 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
 
   await page.goto('/')
   await expect(page).toHaveURL('/setup')
+  await expect(page.locator('html')).toHaveAttribute('lang', 'ko-KR')
   await expect(page.getByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeVisible()
   await expect(page.getByText(/docker compose exec archiver runtime-host setup-code/)).toHaveCount(0)
   await page.getByRole('button', { name: '시작하기' }).click()
-  await expect(page.getByText('docker compose exec archiver runtime-host setup-code')).toBeVisible()
-  await page.getByLabel('Setup code').fill(testOnlySetupCode)
+  await expect(page.getByText('docker compose logs archiver', { exact: true })).toBeVisible()
+  await expect(page.getByText(/runtime-host setup-code/)).toBeVisible()
+  await page.getByLabel(/Setup code|설치 코드/).fill(testOnlySetupCode)
   await page.getByLabel('관리자 비밀번호').fill('a-strong-passphrase')
   await page.getByLabel('비밀번호 확인').fill('a-strong-passphrase')
   await page.getByRole('button', { name: '관리자 계정 만들기' }).click()

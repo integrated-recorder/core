@@ -944,11 +944,21 @@ func (s *Server) sealRecordingArchive(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "recording not found")
 		return
 	}
+	lock := s.productLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	before, err := s.manager.LifecycleSnapshot(r.Context(), id)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
 	if err := s.manager.SealArchiveContext(r.Context(), id); err != nil {
 		writeLifecycleError(w, err)
 		return
 	}
-	s.appendRecordingEvent(id, "archive_sealed", time.Now().UTC(), 0, "archive sealed")
+	if !before.ArchiveSealed {
+		s.appendRecordingEvent(id, "archive_sealed", time.Now().UTC(), 0, "archive sealed")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sealed": true})
 }
 

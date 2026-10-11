@@ -16,12 +16,14 @@ const dataDir = join(root, 'data')
 const binDir = join(root, 'bin')
 const bundleDir = join(root, 'initial')
 const adapterDir = join(root, 'adapters')
+const bundledAdapterDir = join(root, 'bundled-adapters')
+const bundledStorageDir = join(root, 'bundled-storage')
 const controlFile = join(root, 'restart-request.json')
 const responseFile = `${controlFile}.response`
 const hostAddress = '127.0.0.1:4173'
 const baseURL = `http://${hostAddress}`
 
-for (const path of [dataDir, binDir, bundleDir, adapterDir]) mkdirSync(path, { mode: 0o700 })
+for (const path of [dataDir, binDir, bundleDir, adapterDir, bundledAdapterDir, bundledStorageDir]) mkdirSync(path, { mode: 0o700 })
 
 let host
 let playwright
@@ -79,18 +81,23 @@ function build() {
   const control = output('control-plane', './cmd/control-plane')
   const engine = output('recorder-engine', './cmd/recorder-engine')
   const adapter = output('integrated-recorder-adapter-hls', './cmd/adapters/hls')
+  const storageLocal = output('storage.local', './cmd/storage-local')
   copyFileSync(control, join(bundleDir, 'control-plane'))
   copyFileSync(engine, join(bundleDir, 'recorder-engine'))
   chmodSync(join(bundleDir, 'control-plane'), 0o555)
   chmodSync(join(bundleDir, 'recorder-engine'), 0o555)
   chmodSync(bundleDir, 0o700)
-  copyFileSync(adapter, join(adapterDir, 'integrated-recorder-adapter-hls'))
-  chmodSync(join(adapterDir, 'integrated-recorder-adapter-hls'), 0o700)
+  copyFileSync(adapter, join(bundledAdapterDir, 'integrated-recorder-adapter-hls'))
+  chmodSync(join(bundledAdapterDir, 'integrated-recorder-adapter-hls'), 0o700)
 
-  const bundledHLSPath = join(adapterDir, 'integrated-recorder-adapter-hls')
+  const bundledHLSPath = join(bundledAdapterDir, 'integrated-recorder-adapter-hls')
+  const bundledStoragePath = join(bundledStorageDir, 'storage.local')
+  copyFileSync(storageLocal, bundledStoragePath)
+  chmodSync(bundledStoragePath, 0o500)
   const hostExtra = [
     `-X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundleDir=${bundleDir}`,
     `-X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultBundledHLSBinary=${bundledHLSPath}`,
+    `-X github.com/integrated-recorder/core/internal/runtimehost/bootstrap.defaultStorageLocalBinary=${bundledStoragePath}`,
   ].join(' ')
   return output('runtime-host', './cmd/runtime-host', hostExtra)
 }
@@ -181,10 +188,7 @@ async function waitForHealth(child, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (restartFailure) throw new Error(restartFailure)
-    if (hostExited(child)) {
-      const safeLog = hostLogs.replaceAll(root, '<private-e2e-dir>').replaceAll(dataDir, '<private-data-dir>')
-      throw new Error(`Runtime Host exited before becoming healthy.${safeLog ? `\n${safeLog}` : ''}`)
-    }
+    if (hostExited(child)) throw new Error('Runtime Host exited before becoming healthy.')
     try {
       const response = await fetch(`${baseURL}/healthz`, { signal: AbortSignal.timeout(1_000) })
       if (response.ok) return
@@ -262,8 +266,8 @@ async function main() {
     playwright.once('error', reject)
     playwright.once('exit', (code, signal) => resolveExit(code ?? (signal ? 1 : 0)))
   })
-  if (hostLogContainsSetupCode) {
-    console.error('Runtime Host logs unexpectedly contained the setup secret.')
+  if (!hostLogContainsSetupCode) {
+    console.error('Runtime Host local logs did not contain the one-time setup code.')
     process.exitCode = 1
   } else if (hostChildLeakDetected) {
     console.error('Runtime Host left product child processes running after graceful shutdown; remaining processes were force-cleaned.')
@@ -299,7 +303,8 @@ process.on('SIGTERM', () => { process.exitCode = 143; void cleanup().finally(() 
 try {
   await main()
 } catch (error) {
-  if (error instanceof Error) console.error(error.message)
+  const message = error instanceof Error ? error.message : 'Setup browser test failed.'
+  console.error(setupCodeForLogCheck ? message.replaceAll(setupCodeForLogCheck, '<redacted-setup-code>') : message)
   process.exitCode = 1
 } finally {
   await cleanup()

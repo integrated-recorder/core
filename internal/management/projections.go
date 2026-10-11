@@ -108,6 +108,7 @@ var recordingEventTypes = map[string]struct{}{
 	"recording_started": {}, "manifest_observed": {}, "source_refreshed": {},
 	"segment_retry": {}, "gap_detected": {}, "gap_committed": {},
 	"recording_completed": {}, "recording_stopped": {}, "recording_interrupted": {},
+	"archive_sealed":    {},
 	"integrity_started": {}, "integrity_completed": {}, "export_started": {}, "export_completed": {},
 	"export_failed": {}, "export_canceled": {},
 }
@@ -116,6 +117,7 @@ var safeRecordingMessages = map[string]struct{}{
 	"manifest observed": {}, "source refreshed": {}, "segment retry scheduled": {},
 	"gap detected": {}, "gap committed": {}, "recording completed": {},
 	"recording stopped": {}, "recording interrupted": {}, "integrity verification started": {},
+	"archive sealed":                   {},
 	"integrity verification completed": {}, "export started": {}, "export completed": {},
 	"export failed": {}, "export canceled": {},
 }

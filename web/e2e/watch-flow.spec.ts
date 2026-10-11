@@ -5,17 +5,27 @@ import { join } from 'node:path'
 const dataDir = process.env.IR_E2E_DATA_DIR
 if (!dataDir) throw new Error('IR_E2E_DATA_DIR was not provided by Playwright config')
 
+// The test selectors below intentionally exercise the Korean catalog while
+// the user's saved preference is `system`.
+test.use({ locale: 'ko-KR' })
+
 test('actual Go backend: Watch detects live, records segments, and resumes monitoring', async ({ page }) => {
   const sourceURL = readFileSync(join(dataDir!, 'e2e-source-url'), 'utf8').trim()
   const consoleErrors: string[] = []
   const pageErrors: string[] = []
   const watchCreateFailures: string[] = []
+  let watchCreateBody: Record<string, unknown> | undefined
   page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()) })
   page.on('pageerror', error => pageErrors.push(error.message))
   page.on('response', async response => {
     if (response.request().method() !== 'POST' || !response.url().endsWith('/api/watches')) return
     if (response.ok()) return
     watchCreateFailures.push(`HTTP ${response.status()}: ${await response.text()}`)
+  })
+  page.on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/watches') {
+      watchCreateBody = request.postDataJSON() as Record<string, unknown>
+    }
   })
 
   await login(page)
@@ -25,10 +35,12 @@ test('actual Go backend: Watch detects live, records segments, and resumes monit
   await page.getByLabel('Fixture source URL').fill(sourceURL)
   await page.getByLabel('녹화 제목').fill('Browser E2E automatic Watch')
   await page.getByLabel('방송 확인 주기 (초)').fill('2')
-  await expect(page.getByRole('checkbox', { name: '장면 미리보기 생성' })).not.toBeChecked()
+  const previewToggle = page.getByRole('checkbox', { name: '장면 미리보기 생성' })
+  await expect(previewToggle).toBeChecked()
   await page.getByRole('button', { name: '자동 녹화 등록' }).click()
   await expect.poll(() => watchCreateFailures.length > 0 || /\/watches\/[a-f0-9]{32}$/.test(page.url()), { timeout: 10_000 }).toBe(true)
   if (watchCreateFailures.length) throw new Error(`Watch creation failed: ${watchCreateFailures.join('; ')}`)
+  expect(watchCreateBody).toMatchObject({ preview_mode: 'segment' })
   await expect(page).toHaveURL(/\/watches\/[a-f0-9]{32}$/)
   const watchID = page.url().split('/').at(-1)!
   await expect(page.getByRole('heading', { name: 'Browser E2E automatic Watch' })).toBeVisible()
@@ -74,6 +86,7 @@ type WatchWire = {
 type RecordingWire = {
   id: string
   state: string
+  segment_count?: number
   tracks?: Record<string, { segments?: unknown[] }>
 }
 type SessionWire = { needs_bootstrap: boolean; authenticated?: boolean }
@@ -111,5 +124,6 @@ async function getJSON<T>(page: Page, path: string): Promise<T> {
 }
 
 function segmentCount(recording: RecordingWire): number {
+  if (typeof recording.segment_count === 'number') return recording.segment_count
   return Object.values(recording.tracks ?? {}).reduce((count, track) => count + (track.segments?.length ?? 0), 0)
 }

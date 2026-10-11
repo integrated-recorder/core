@@ -101,6 +101,91 @@ func TestShardedClaimOrphanRetryPreservesIdentityAndReplacesSelection(t *testing
 	}
 }
 
+func TestSaveRecordingHeaderRejectsStaleRevisionAfterClaimAdmission(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, "b5e2f247ab144c6a850fd5c07fb1e6a1")
+	coordinate := archiveindex.Coordinate{SessionID: header.SourceSessionID, TrackID: "main", Sequence: 1, Kind: archiveindex.ObjectMedia}
+	segmentID, err := archiveindex.SegmentIdentity(coordinate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("claim revision fixture")
+	payloadPath := "tracks/main/objects/claim-revision.ts"
+	stored, err := store.StorageBackend.SavePayloadExact(header.ID, payloadPath, bytes.NewReader(payload), 1024, int64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 9, 0, 1, 0, 0, time.UTC)
+	selected := archiveindex.Claim{
+		ID: "live_origin:" + segmentID + ":" + stored.SHA256, Source: archiveindex.ClaimLiveOrigin,
+		AcquiredAt: now, PayloadPath: payloadPath, Size: int64(len(payload)), SHA256: stored.SHA256,
+		Verification: archiveindex.VerificationVerified, Disposition: archiveindex.DispositionAccepted,
+	}
+	record := v2ScaleMediaRecord(coordinate, 1, payloadPath, int64(len(payload)), stored.SHA256)
+	record.SelectedClaim, record.ClaimState = &selected, archiveindex.CoveragePresent
+	if err := store.PublishShardedMedia(ctx, header, record); err != nil {
+		t.Fatalf("publish canonical media: %v", err)
+	}
+	alternate := selected
+	alternate.ID = "historical:" + segmentID + ":" + stored.SHA256
+	alternate.Source = archiveindex.ClaimHistorical
+	alternate.AcquiredAt = now.Add(time.Second)
+	set := V2ClaimSet{
+		SegmentID: segmentID, Coordinate: coordinate, SelectedClaimID: selected.ID,
+		State: archiveindex.CoveragePresent, Claims: []archiveindex.Claim{selected, alternate},
+	}
+	if err := store.SaveShardedClaimSet(ctx, header.ID, set); err != nil {
+		t.Fatalf("admit supplemental claim: %v", err)
+	}
+	current, err := store.LoadRecordingHeader(ctx, header.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ArchiveRevision <= header.ArchiveRevision {
+		t.Fatalf("claim mutation did not advance canonical revision: stale=%d current=%d", header.ArchiveRevision, current.ArchiveRevision)
+	}
+	if err := store.SaveRecordingHeader(ctx, header); !errors.Is(err, ErrShardedArchiveConflict) {
+		t.Fatalf("stale root save error=%v, want ErrShardedArchiveConflict", err)
+	}
+}
+
+func TestPublishShardedMediaRejectsStaleHeaderAfterMetadataAppend(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, "b6e2f247ab144c6a850fd5c07fb1e6a1")
+	payload := []byte("stale media header fixture")
+	payloadPath := "tracks/main/objects/stale-header.ts"
+	stored, err := store.StorageBackend.SavePayloadExact(header.ID, payloadPath, bytes.NewReader(payload), 1024, int64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	title := "metadata advances archive revision"
+	if err := store.AppendShardedMetadata(ctx, header.ID, domain.MetadataRevision{
+		ObservedAt: time.Date(2026, 10, 9, 0, 1, 0, 0, time.UTC), Title: &title,
+	}); err != nil {
+		t.Fatalf("append metadata: %v", err)
+	}
+	current, err := store.LoadRecordingHeader(ctx, header.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ArchiveRevision <= header.ArchiveRevision {
+		t.Fatalf("metadata mutation did not advance revision: stale=%d current=%d", header.ArchiveRevision, current.ArchiveRevision)
+	}
+
+	coordinate := archiveindex.Coordinate{SessionID: header.SourceSessionID, TrackID: "main", Sequence: 1, Kind: archiveindex.ObjectMedia}
+	record := v2ScaleMediaRecord(coordinate, 1, payloadPath, int64(len(payload)), stored.SHA256)
+	if err := store.PublishShardedMedia(ctx, header, record); !errors.Is(err, ErrShardedArchiveConflict) {
+		t.Fatalf("stale media publication error=%v, want ErrShardedArchiveConflict", err)
+	}
+	if err := store.PublishShardedMedia(ctx, current, record); err != nil {
+		t.Fatalf("retry media publication from current root: %v", err)
+	}
+	visible, err := store.LookupShardedMediaByArchiveOrdinal(ctx, header.ID, "main", 1)
+	if err != nil || visible.Segment.ID != record.Segment.ID {
+		t.Fatalf("retry did not publish canonical media: record=%#v err=%v", visible, err)
+	}
+}
+
 func TestCreateShardedRecordingAcceptsOnlyUnspecifiedOrCurrentFormat(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -2457,7 +2542,7 @@ func TestShardedArchiveLocalFilesystemScaleAcceptance(t *testing.T) {
 	const supplementalClaimCount uint64 = 50_000
 	const metadataCount uint64 = 10_000
 	const claimsPerCoordinate = 2
-	root := t.TempDir()
+	root := newScaleAcceptanceTempDir(t)
 	store, err := New(root)
 	if err != nil {
 		t.Fatal(err)
@@ -2669,9 +2754,17 @@ func TestShardedArchiveLocalFilesystemScaleAcceptance(t *testing.T) {
 			if err := store.SaveShardedClaimSet(ctx, id, set); err != nil {
 				t.Fatalf("admit claim set above 100k: %v", err)
 			}
-			if got, err := store.LoadRecordingHeader(ctx, id); err != nil || got.ShardedArchive.ClaimCount != apiClaimCount+1 {
-				t.Fatalf("claim API admission count=%v err=%v, want %d", got, err, apiClaimCount+1)
+			got, err := store.LoadRecordingHeader(ctx, id)
+			if err != nil {
+				t.Fatalf("load header after claim API admission: %v", err)
 			}
+			if got.ShardedArchive.ClaimCount != apiClaimCount+1 {
+				t.Fatalf("claim API admission count=%d, want %d", got.ShardedArchive.ClaimCount, apiClaimCount+1)
+			}
+			// Public claim admission advances the root revision. Continue the
+			// fixture's later bounded summary updates from the current root so
+			// SaveRecordingHeader does not reject a stale revision snapshot.
+			header = got
 			set.CountedClaims = 1
 			_, pagePath, _, _, err := store.locateV2ClaimSet(ctx, id, segmentID)
 			if err != nil {
@@ -2838,6 +2931,10 @@ func TestShardedArchiveLocalFilesystemScaleAcceptance(t *testing.T) {
 	if err != nil || latestMetadata == nil || latestMetadata.Title == nil || *latestMetadata.Title != largeTitle || !latestMetadata.ObservedAt.Equal(now.Add(time.Duration(metadataCount+1)*time.Second)) {
 		t.Fatalf("latest metadata lookup=%+v err=%v", latestMetadata, err)
 	}
+	appendHeader, err := reopened.LoadRecordingHeader(ctx, id)
+	if err != nil {
+		t.Fatalf("load current root before media append: %v", err)
+	}
 
 	// Count local backend object I/O during append 100,001. No prior history
 	// page or whole recording is read or rewritten.
@@ -2850,7 +2947,7 @@ func TestShardedArchiveLocalFilesystemScaleAcceptance(t *testing.T) {
 	pageNo, _ := mediaPageSlot(appendOrdinal)
 	pagePath := v2MediaPagePath("main", false, pageNo)
 	pageBefore, rootBefore := statSidecarBytes(t, root, id, pagePath), statRootBytes(t, root, id)
-	if err := reopened.PublishShardedMedia(ctx, all[0], appendRecord); err != nil {
+	if err := reopened.PublishShardedMedia(ctx, appendHeader, appendRecord); err != nil {
 		t.Fatalf("publish media 100001: %v", err)
 	}
 	stats := counter.snapshot()

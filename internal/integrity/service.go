@@ -40,6 +40,9 @@ var (
 	ErrClosed   = errors.New("integrity service is closed")
 )
 
+// State is the durable wire lifecycle. Restart recovery records queued/running
+// jobs as failed with ErrorInterruptedByRestart; only Progress.Phase uses
+// "interrupted" to describe why the job stopped.
 type State string
 
 const (

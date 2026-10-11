@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useState, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { authAPI } from '@/api'
 import { qk, userPreferencesQuery } from '@/api/queries'
@@ -17,13 +17,16 @@ type I18nContextValue = {
 }
 
 const defaults: UserPreferences = { locale: 'system', theme: 'system', timezone: 'system' }
+// Keep the context fallback aligned with the product's existing Korean default.
+// Browser-system resolution belongs to the mounted provider, including pre-auth setup.
+const fallbackLocale: ResolvedLocale = 'ko-KR'
 function prefersDarkMode() {
   return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-color-scheme: dark)').matches
 }
 const fallback: I18nContextValue = {
   preferences: defaults,
-  locale: 'ko-KR',
-  t: (key, values) => translate('ko-KR', key, values),
+  locale: fallbackLocale,
+  t: (key, values) => translate(fallbackLocale, key, values),
   setPreferences: () => undefined,
 }
 const I18nContext = createContext<I18nContextValue>(fallback)
@@ -41,7 +44,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   }, [queryClient, session.data?.authenticated])
   useEffect(() => { if (session.data?.authenticated && saved.data) setPreferences(saved.data) }, [saved.data, session.data?.authenticated])
   const locale = resolveLocale(preferences.locale)
-  useEffect(() => {
+  useLayoutEffect(() => {
     document.documentElement.lang = locale
     configureFormatPreferences(locale, preferences.timezone)
     const update = (theme: ThemePreference) => applyResolvedTheme(resolveTheme(theme, prefersDarkMode()))

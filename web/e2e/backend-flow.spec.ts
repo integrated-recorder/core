@@ -9,8 +9,10 @@ if (!dataDir) throw new Error('IR_E2E_DATA_DIR was not provided by Playwright co
 
 type RecordingWire = {
   state: string
+  segment_count?: number
   tracks?: Record<string, { segments?: unknown[] }>
 }
+type UserPreferencesWire = { locale: string; theme: string; timezone: string }
 type IntegrityWire = { status: string; objects_total: number; objects_corrupt: number }
 type TagsWire = { tags: string[] }
 type ArchiveIndexWire = { entries: { path: string }[] }
@@ -30,6 +32,8 @@ type CSPViolation = { effectiveDirective: string; violatedDirective: string; blo
 test.describe.configure({ mode: 'serial' })
 
 test('actual Go backend: direct HLS capture, VOD, management, and delete', async ({ page }) => {
+  test.setTimeout(180_000)
+  await forceHlsJSPlayback(page)
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
   const manifestURL = `${sourceURL}/hls/stream.m3u8`
   const expectedSegmentSHA256 = createHash('sha256').update(readFileSync(join(dataDir, 'e2e-source-segment'))).digest('hex')
@@ -75,15 +79,16 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   expect(await page.locator('script:not([src])').count()).toBe(0)
   await assertResponsive(page)
   await page.setViewportSize({ width: 1440, height: 900 })
-  await expect(page.getByLabel('관리자 비밀번호')).toBeVisible()
-  await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
-  await page.getByRole('button', { name: '로그인' }).click()
+  await expect(page.getByLabel(/Administrator password|관리자 비밀번호/)).toBeVisible()
+  await page.getByLabel(/Administrator password|관리자 비밀번호/).fill('browser-e2e-strong-password')
+  await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
+  await setLocaleForCurrentUser(page, 'ko-KR')
   await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
   const primaryNav = page.getByRole('navigation', { name: /Main navigation|주 메뉴/ })
   await expect(primaryNav.getByRole('link', { name: /Dashboard|대시보드/ })).toBeVisible()
-  await expect(primaryNav.getByRole('link', { name: /Recordings|녹화/ })).toBeVisible()
-  await expect(primaryNav.getByRole('link', { name: /New recording|새 녹화/ })).toHaveAttribute('href', '/new')
+  await expect(primaryNav.getByRole('link', { name: /^(Recordings|녹화)$/ })).toBeVisible()
+  await expect(primaryNav.getByRole('link', { name: /^(New recording|새 녹화)$/ })).toHaveAttribute('href', '/new')
   const settingsNav = page.getByRole('navigation', { name: /Settings navigation|설정 메뉴/ })
   await expect(settingsNav.getByRole('link', { name: /Source plugins|소스 플러그인/ })).toBeVisible()
   await expect(settingsNav.getByRole('link', { name: /Workflows|워크플로/ })).toBeVisible()
@@ -106,7 +111,7 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   else await expect(throughputChart.locator('svg')).toBeVisible()
   await page.goto('/recordings')
   const recordingState = page.getByRole('combobox', { name: '상태 필터' })
-  const recordingAdapter = page.getByRole('combobox', { name: '어댑터 필터' })
+  const recordingAdapter = page.getByRole('combobox', { name: '소스 플러그인 필터' })
   await exerciseNativeSelect(recordingState)
   await exerciseNativeSelect(recordingAdapter)
   await page.goto('/settings')
@@ -115,13 +120,25 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   await expect(settingsSelects).toHaveCount(3)
   const localeSelect = page.locator('#user-locale')
   await localeSelect.selectOption('ko-KR')
+  const koreanPreferencesResponsePromise = page.waitForResponse(response => response.url().endsWith('/api/user/preferences') && response.request().method() === 'PUT')
   await page.getByRole('button', { name: /환경 설정 저장|Save preferences/ }).click()
+  const koreanPreferencesResponse = await koreanPreferencesResponsePromise
+  expect(koreanPreferencesResponse.status()).toBe(200)
+  expect(await koreanPreferencesResponse.json()).toMatchObject({ locale: 'ko-KR' })
   await expect(page.locator('html')).toHaveAttribute('lang', 'ko-KR')
   await localeSelect.selectOption('en-US')
+  const englishPreferencesResponsePromise = page.waitForResponse(response => response.url().endsWith('/api/user/preferences') && response.request().method() === 'PUT')
   await page.getByRole('button', { name: /환경 설정 저장|Save preferences/ }).click()
-  await expect(page.locator('html')).toHaveAttribute('lang', 'en-US')
+  const englishPreferencesResponse = await englishPreferencesResponsePromise
+  const englishPreferencesBody = await englishPreferencesResponse.json() as UserPreferencesWire
+  expect(englishPreferencesResponse.status(), JSON.stringify(englishPreferencesBody)).toBe(200)
+  expect(englishPreferencesBody).toMatchObject({ locale: 'en-US' })
+  await expect.poll(() => page.locator('html').getAttribute('lang'), {
+    message: `After locale selector en-US save, PUT /api/user/preferences returned ${JSON.stringify(englishPreferencesBody)}`,
+  }).toBe('en-US')
   await localeSelect.selectOption('system')
   await page.getByRole('button', { name: /Save preferences|환경 설정 저장/ }).click()
+  await expect(page.locator('html')).toHaveAttribute('lang', 'en-US')
   const themeSelect = page.locator('#user-theme')
   const originalTheme = await themeSelect.inputValue()
   await themeSelect.selectOption(originalTheme === 'dark' ? 'light' : 'dark')
@@ -137,11 +154,14 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   await exerciseNativeSelect(concurrencySelect)
   await exerciseTopbarPopovers(page)
   await assertNoCSPViolations(cspViolations)
+  // The remaining assertions use the Korean UI; set an explicit preference
+  // after verifying that `system` follows Playwright's en-US browser locale.
+  await setLocaleForCurrentUser(page, 'ko-KR')
   await page.goto('/new')
   await page.getByRole('button', { name: /HLS/ }).click()
   await page.getByRole('button', { name: /입력 설정|Next|다음/ }).click()
   await page.getByLabel('HLS manifest URL').fill(manifestURL)
-  await page.getByLabel('녹화 제목').fill('Browser E2E HLS capture')
+  await page.getByLabel(/Recording title|녹화 제목/).fill('Browser E2E HLS capture')
   const previewToggle = page.getByRole('checkbox', { name: /장면 미리보기 생성|Generate scene previews/ })
   await expect(previewToggle).toBeChecked()
   await previewToggle.uncheck()
@@ -156,9 +176,39 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   const recordingID = page.url().split('/').at(-1)!
 
   await expect.poll(async () => segmentCount(await getJSON<RecordingWire>(page, `/api/recordings/${encodeURIComponent(recordingID)}`))).toBeGreaterThan(0)
+  const activeRecording = await getJSON<RecordingWire>(page, `/api/recordings/${encodeURIComponent(recordingID)}`)
+  expect(activeRecording.state).toBe('recording')
   await expect(page.getByRole('group', { name: '녹화 중 표시 방식' })).toBeVisible()
   await expect(page.getByRole('button', { name: '실시간 HLS' })).toHaveAttribute('aria-pressed', 'true')
-  await expect(page.locator('#vod-player video')).toBeVisible()
+  const liveVideo = page.locator('#vod-player video')
+  await expect(liveVideo).toBeVisible()
+  const liveMaster = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}/play/live/master.m3u8`)
+  expect(liveMaster.status()).toBe(200)
+  const liveMasterText = await liveMaster.text()
+  expect(liveMasterText).not.toContain('#EXT-X-ENDLIST')
+  const liveVariantPath = playlistURI(liveMasterText)
+  const liveVariant = await page.request.get(new URL(liveVariantPath, page.url()).toString())
+  expect(liveVariant.status()).toBe(200)
+  const firstLiveSnapshot = parseMediaPlaylist(await liveVariant.text())
+  expect(firstLiveSnapshot.text).not.toContain('#EXT-X-ENDLIST')
+  expect(firstLiveSnapshot.uris.length).toBeGreaterThan(0)
+  expect(firstLiveSnapshot.text).not.toContain('#EXT-X-GAP')
+
+  const liveSegment = await page.request.get(new URL(firstLiveSnapshot.uris[0]!, page.url()).toString())
+  expect(liveSegment.status()).toBe(200)
+  const liveSegmentBytes = await liveSegment.body()
+  expect(liveSegmentBytes.length).toBeGreaterThan(0)
+  expect(createHash('sha256').update(liveSegmentBytes).digest('hex')).toBe(expectedSegmentSHA256)
+  expect(Number(liveSegment.headers()['content-length'] ?? liveSegmentBytes.length)).toBe(liveSegmentBytes.length)
+
+  await decodeAndAssertPlayback(page, liveVideo)
+  const secondLiveVariant = await page.request.get(new URL(liveVariantPath, page.url()).toString())
+  expect(secondLiveVariant.status()).toBe(200)
+  const secondLiveSnapshot = parseMediaPlaylist(await secondLiveVariant.text())
+  expect(secondLiveSnapshot.text).not.toContain('#EXT-X-ENDLIST')
+  assertOverlappingLiveIdentity(firstLiveSnapshot, secondLiveSnapshot)
+  expect((await getJSON<RecordingWire>(page, `/api/recordings/${encodeURIComponent(recordingID)}`)).state).toBe('recording')
+
   const livePlaylist = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}/play/live/tracks/main/playlist.m3u8`)
   expect(livePlaylist.status()).toBe(200)
   expect(await livePlaylist.text()).not.toContain('#EXT-X-ENDLIST')
@@ -172,6 +222,15 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   expect(vod.playlistStatus).toBe(200)
   expect(vod.segmentStatus).toBe(200)
   expect(vod.segmentSHA256).toBe(expectedSegmentSHA256)
+  expect(vod.playlistText).toContain('#EXT-X-ENDLIST')
+  const vodDuration = playlistDuration(vod.playlistText)
+  expect(vodDuration).toBeGreaterThan(1)
+  const vodVideo = page.locator('#vod-player video')
+  await expect(vodVideo).toBeVisible()
+  await decodeAndAssertPlayback(page, vodVideo)
+  await seekAndAssertPlayback(vodVideo, 0.25, vodDuration)
+  await seekAndAssertPlayback(vodVideo, vodDuration / 2, vodDuration)
+  await seekAndAssertPlayback(vodVideo, Math.max(0.25, vodDuration - 0.5), vodDuration)
 
   await page.getByRole('button', { name: '편집' }).click()
   await page.getByLabel('태그 목록').fill('browser-e2e, source-preserved')
@@ -242,7 +301,11 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
     expect(response.headers()['content-type']).toContain('text/html')
   }
   for (const path of ['/foo', '/recordings/a/b', '/api/unknown', '/static/unknown']) {
-    expect((await page.request.get(path, { headers: { accept: 'text/html' } })).status(), `${path} must not be consumed by SPA fallback`).toBe(404)
+    const response = await page.request.get(path, { headers: { accept: 'text/html' } })
+    const expectedStatus = path === '/static/unknown' ? 404 : 403
+    expect(response.status(), `${path} must fail closed before SPA fallback`).toBe(expectedStatus)
+    expect(response.headers()['content-type'] ?? '').not.toContain('text/html')
+    if (expectedStatus === 403) expect(await response.text()).toContain('permission denied')
   }
   await assertNoCSPViolations(cspViolations)
   expect(consoleErrors).toEqual([])
@@ -250,6 +313,124 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   expect(staticAssetFailures).toEqual([])
   expect(unexpectedRequestFailures).toEqual([])
   expect(expectedAPIResponseFailures).toEqual([])
+})
+
+test('actual browser HLS decode: active live playback and terminal VOD seeks', async ({ page }) => {
+  test.setTimeout(180_000)
+  const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
+  const manifestURL = `${sourceURL}/hls/stream.m3u8`
+  const expectedSegmentSHA256 = createHash('sha256').update(readFileSync(join(dataDir, 'e2e-source-segment'))).digest('hex')
+  const fatalPlaybackErrors: string[] = []
+  await forceHlsJSPlayback(page)
+  page.on('console', message => {
+    if (message.type() === 'error' && /hls(?:\.js)?.*(?:fatal|error)|fatal.*hls/i.test(message.text())) fatalPlaybackErrors.push(message.text())
+  })
+
+  await login(page)
+  await page.goto('/new')
+  await page.getByRole('button', { name: /HLS/ }).click()
+  await page.getByRole('button', { name: /입력 설정|Next|다음/ }).click()
+  await page.getByLabel('HLS manifest URL').fill(manifestURL)
+  await page.getByLabel('녹화 제목').fill('Browser HLS decode E2E')
+  const previewToggle = page.getByRole('checkbox', { name: /장면 미리보기 생성|Generate scene previews/ })
+  await expect(previewToggle).toBeChecked()
+  await previewToggle.uncheck()
+  await page.getByRole('button', { name: /입력 확인|Next|다음/ }).click()
+  await page.getByRole('button', { name: /녹화 시작|Start recording/ }).click()
+  await expect(page).toHaveURL(/\/recordings\/[a-f0-9]{32}$/)
+  const recordingID = page.url().split('/').at(-1)!
+  const recordingPath = `/api/recordings/${encodeURIComponent(recordingID)}`
+
+  let activeRecording: RecordingWire | undefined
+  await expect.poll(async () => {
+    activeRecording = await getJSON<RecordingWire>(page, recordingPath)
+    return activeRecording.state === 'recording' ? await segmentCount(activeRecording) : 0
+  }, { timeout: 30_000 }).toBeGreaterThan(0)
+  expect(activeRecording?.state).toBe('recording')
+
+  const liveMasterPath = `${recordingPath}/play/live/master.m3u8`
+  const liveMaster = await page.request.get(liveMasterPath)
+  expect(liveMaster.status()).toBe(200)
+  const liveMasterText = await liveMaster.text()
+  expect(liveMasterText).toContain('#EXTM3U')
+  expect(liveMasterText).not.toContain('#EXT-X-ENDLIST')
+  const liveVariant = await page.request.get(new URL(playlistURI(liveMasterText), liveMaster.url()).toString())
+  expect(liveVariant.status()).toBe(200)
+  const firstLiveSnapshot = parseMediaPlaylist(await liveVariant.text())
+  expect(firstLiveSnapshot.text).not.toContain('#EXT-X-ENDLIST')
+  expect(firstLiveSnapshot.uris.length).toBeGreaterThan(0)
+  expect(firstLiveSnapshot.uris.length).toBeLessThanOrEqual(12)
+  expect(firstLiveSnapshot.text).not.toContain('#EXT-X-GAP')
+
+  const liveSegment = await page.request.get(new URL(firstLiveSnapshot.uris[0]!, liveVariant.url()).toString())
+  expect(liveSegment.status()).toBe(200)
+  const liveBytes = await liveSegment.body()
+  expect(liveBytes.length).toBeGreaterThan(0)
+  expect(createHash('sha256').update(liveBytes).digest('hex')).toBe(expectedSegmentSHA256)
+  expect(Number(liveSegment.headers()['content-length'] ?? liveBytes.length)).toBe(liveBytes.length)
+
+  const liveVideo = page.locator('#vod-player video')
+  await expect(liveVideo).toBeVisible()
+  await decodeAndAssertPlayback(page, liveVideo)
+  const secondLiveVariant = await page.request.get(new URL(playlistURI(liveMasterText), liveMaster.url()).toString())
+  expect(secondLiveVariant.status()).toBe(200)
+  const secondLiveSnapshot = parseMediaPlaylist(await secondLiveVariant.text())
+  expect(secondLiveSnapshot.text).not.toContain('#EXT-X-ENDLIST')
+  assertOverlappingLiveIdentity(firstLiveSnapshot, secondLiveSnapshot)
+  expect((await getJSON<RecordingWire>(page, recordingPath)).state).toBe('recording')
+  expect(fatalPlaybackErrors).toEqual([])
+
+  await page.getByRole('button', { name: /중지|Stop recording/, exact: true }).click()
+  await page.getByRole('alertdialog').getByRole('button', { name: /중지|Stop recording/, exact: true }).click()
+  await expect.poll(async () => (await getJSON<RecordingWire>(page, recordingPath)).state).toBe('stopped')
+
+  const vodMasterPath = `/api/recordings/${encodeURIComponent(recordingID)}/play/master.m3u8`
+  const vodMaster = await page.request.get(vodMasterPath)
+  expect(vodMaster.status()).toBe(200)
+  const vodMasterText = await vodMaster.text()
+  const vodVariant = await page.request.get(new URL(playlistURI(vodMasterText), vodMaster.url()).toString())
+  expect(vodVariant.status()).toBe(200)
+  const vodPlaylistText = await vodVariant.text()
+  expect(vodPlaylistText).toContain('#EXT-X-ENDLIST')
+  const vodDuration = playlistDuration(vodPlaylistText)
+  expect(vodDuration).toBeGreaterThan(1)
+  const vodSegmentPath = vodPlaylistText.split(/\r?\n/).map(line => line.trim()).find(line => line && !line.startsWith('#'))
+  expect(vodSegmentPath).toBeTruthy()
+  const vodSegment = await page.request.get(new URL(vodSegmentPath!, vodVariant.url()).toString())
+  expect(vodSegment.status()).toBe(200)
+  const vodBytes = await vodSegment.body()
+  expect(vodBytes.length).toBeGreaterThan(0)
+  expect(createHash('sha256').update(vodBytes).digest('hex')).toBe(expectedSegmentSHA256)
+
+  const vodVideo = page.locator('#vod-player video')
+  await expect(vodVideo).toBeVisible()
+  await decodeAndAssertPlayback(page, vodVideo)
+  await seekAndAssertPlayback(vodVideo, 0.25, vodDuration)
+  await seekAndAssertPlayback(vodVideo, vodDuration / 2, vodDuration)
+  await seekAndAssertPlayback(vodVideo, Math.max(0.25, vodDuration - 0.5), vodDuration)
+  expect(fatalPlaybackErrors).toEqual([])
+})
+
+test('actual Go backend: locale preference save updates the current document language', async ({ page }) => {
+  await login(page)
+  await page.goto('/settings')
+  const localeSelect = page.locator('#user-locale')
+  await expect(localeSelect).toHaveValue('ko-KR')
+  const previous = await getJSON<UserPreferencesWire>(page, '/api/user/preferences')
+  expect(previous.locale).toBe('ko-KR')
+  await localeSelect.selectOption('en-US')
+  const responsePromise = page.waitForResponse(response => response.url().endsWith('/api/user/preferences') && response.request().method() === 'PUT')
+  await page.getByRole('button', { name: /Save preferences|환경 설정 저장/ }).click()
+  const response = await responsePromise
+  const body = await response.json() as UserPreferencesWire
+  const submitted = response.request().postDataJSON() as UserPreferencesWire
+  expect(response.status(), JSON.stringify(body)).toBe(200)
+  expect(submitted).toEqual({ ...previous, locale: 'en-US' })
+  expect(body).toEqual(submitted)
+  await expect.poll(() => page.locator('html').getAttribute('lang'), {
+    message: `After locale selector en-US save, PUT /api/user/preferences returned ${JSON.stringify(body)}`,
+  }).toBe('en-US')
+  await expect(page.getByRole('navigation', { name: /Main navigation|주 메뉴/ }).getByRole('link', { name: /^(Dashboard|대시보드)$/ })).toBeVisible()
 })
 
 test('actual Go backend: metadata fixture changes are archived and rendered as a timeline', async ({ page }) => {
@@ -349,7 +530,7 @@ async function exerciseNativeSelect(select: Locator) {
 async function exerciseTopbarPopovers(page: Page) {
   for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
     await page.setViewportSize(viewport)
-    for (const trigger of [page.getByRole('button', { name: /알림/ }), page.getByRole('button', { name: /IR/ }).last()]) {
+    for (const trigger of [page.getByRole('button', { name: /^(Notifications|알림)$/ }), page.getByRole('button', { name: /IR/ }).last()]) {
       await trigger.click()
       const content = page.getByRole('dialog').last()
       await expect(content).toBeVisible()
@@ -569,9 +750,22 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
 
 async function login(page: Page) {
   await page.goto('/login')
-  await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
-  await page.getByRole('button', { name: '로그인' }).click()
+  await page.getByLabel(/Administrator password|관리자 비밀번호/).fill('browser-e2e-strong-password')
+  await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
+  await setLocaleForCurrentUser(page, 'ko-KR')
+}
+
+async function setLocaleForCurrentUser(page: Page, locale: 'ko-KR' | 'en-US') {
+  const session = await getJSON<{ csrf_token: string }>(page, '/api/auth/session')
+  const current = await getJSON<UserPreferencesWire>(page, '/api/user/preferences')
+  const response = await page.request.put('/api/user/preferences', {
+    headers: { 'X-CSRF-Token': session.csrf_token },
+    data: { ...current, locale },
+  })
+  expect(response.status()).toBe(200)
+  await page.reload()
+  await expect(page.locator('html')).toHaveAttribute('lang', locale)
 }
 
 async function assertResponsive(page: Page) {
@@ -594,7 +788,78 @@ async function getJSON<T>(page: Page, path: string): Promise<T> {
 }
 
 async function segmentCount(recording: RecordingWire): Promise<number> {
+  if (typeof recording.segment_count === 'number') return recording.segment_count
   return Object.values(recording.tracks ?? {}).reduce((count, track) => count + (track.segments?.length ?? 0), 0)
+}
+
+function playlistURI(text: string): string {
+  const uri = text.split(/\r?\n/).map(line => line.trim()).find(line => line && !line.startsWith('#'))
+  if (!uri) throw new Error('HLS master playlist had no variant URI')
+  return uri
+}
+
+function parseMediaPlaylist(text: string) {
+  const match = /^#EXT-X-MEDIA-SEQUENCE:(\d+)$/m.exec(text)
+  if (!match) throw new Error('HLS media playlist had no media sequence')
+  return {
+    text,
+    mediaSequence: Number(match[1]),
+    uris: text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#')),
+  }
+}
+
+function assertOverlappingLiveIdentity(first: ReturnType<typeof parseMediaPlaylist>, second: ReturnType<typeof parseMediaPlaylist>) {
+  const firstSequences = new Map(first.uris.map((uri, index) => [uri, first.mediaSequence + index]))
+  const overlap = second.uris.filter(uri => firstSequences.has(uri))
+  expect(overlap.length, 'live reloads should retain at least one media URI').toBeGreaterThan(0)
+  for (const uri of overlap) expect(second.mediaSequence + second.uris.indexOf(uri)).toBe(firstSequences.get(uri))
+}
+
+function playlistDuration(text: string): number {
+  return text.split(/\r?\n/).reduce((total, line) => {
+    const match = /^#EXTINF:([\d.]+)(?:,|$)/.exec(line.trim())
+    return total + (match ? Number(match[1]) : 0)
+  }, 0)
+}
+
+async function decodeAndAssertPlayback(page: Page, video: Locator) {
+  expect(await video.evaluate(node => (node as HTMLVideoElement).canPlayType('application/vnd.apple.mpegurl'))).toBe('')
+  expect(await page.evaluate(() => typeof MediaSource !== 'undefined')).toBe(true)
+  await video.evaluate(node => { (node as HTMLVideoElement).muted = true })
+  await expect.poll(() => video.evaluate(node => (node as HTMLVideoElement).readyState), { timeout: 30_000 }).toBeGreaterThanOrEqual(2)
+  await expect.poll(() => video.evaluate(node => (node as HTMLVideoElement).videoWidth), { timeout: 30_000 }).toBeGreaterThan(0)
+  await expect.poll(() => video.evaluate(node => (node as HTMLVideoElement).videoHeight), { timeout: 30_000 }).toBeGreaterThan(0)
+  await expect(page.getByText(/Playback unavailable|재생할 수 없습니다/)).toHaveCount(0)
+  const initialTime = await video.evaluate(node => (node as HTMLVideoElement).currentTime)
+  await video.evaluate(node => (node as HTMLVideoElement).play())
+  await expect.poll(() => video.evaluate(node => (node as HTMLVideoElement).currentTime), { timeout: 15_000 }).toBeGreaterThan(initialTime + 0.2)
+  await expect(page.getByText(/Playback unavailable|재생할 수 없습니다/)).toHaveCount(0)
+}
+
+async function forceHlsJSPlayback(page: Page) {
+  await page.addInitScript(() => {
+    const nativeCanPlayType = HTMLMediaElement.prototype.canPlayType
+    Object.defineProperty(HTMLMediaElement.prototype, 'canPlayType', {
+      configurable: true,
+      value(this: HTMLMediaElement, type: string) {
+        if (type === 'application/vnd.apple.mpegurl') return ''
+        return nativeCanPlayType.call(this, type)
+      },
+    })
+  })
+}
+
+async function seekAndAssertPlayback(video: Locator, requestedTime: number, duration: number) {
+  const target = Math.min(Math.max(0, requestedTime), Math.max(0, duration - 0.25))
+  await video.evaluate((node, time) => {
+    const element = node as HTMLVideoElement
+    element.pause()
+    element.currentTime = time
+  }, target)
+  await expect.poll(() => video.evaluate((node, expected) => {
+    const element = node as HTMLVideoElement
+    return !element.seeking && Math.abs(element.currentTime - expected) <= 0.5 && element.readyState >= 2
+  }, target), { timeout: 20_000 }).toBe(true)
 }
 
 async function readVOD(page: Page, recordingID: string) {
@@ -612,6 +877,7 @@ async function readVOD(page: Page, recordingID: string) {
     return {
       masterStatus: master.status,
       playlistStatus: playlist.status,
+      playlistText,
       segmentStatus: segment.status,
       segmentSHA256: await crypto.subtle.digest('SHA-256', await segment.arrayBuffer()).then(digest =>
         [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join(''),

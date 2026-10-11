@@ -108,6 +108,12 @@ func snapshotRecordingObjects(root string) (map[string]string, error) {
 		if path == root {
 			return nil
 		}
+		if strings.HasPrefix(filepath.Base(path), "\x1f.ir-storage-local-tmp-") {
+			// Atomic-Put staging files can disappear between WalkDir and this
+			// callback. They are not canonical archive objects, so skip them
+			// before Lstat rather than treating their normal cleanup as a failure.
+			return nil
+		}
 		info, err := os.Lstat(path)
 		if err != nil {
 			return err
@@ -120,10 +126,6 @@ func snapshotRecordingObjects(root string) (map[string]string, error) {
 		}
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("canonical archive contains non-regular object %q", filepath.Base(path))
-		}
-		if strings.HasPrefix(filepath.Base(path), "\x1f.ir-storage-local-tmp-") {
-			// These are incomplete atomic-Put staging objects, not canonical logical objects.
-			return nil
 		}
 		relative, err := filepath.Rel(root, path)
 		if err != nil {

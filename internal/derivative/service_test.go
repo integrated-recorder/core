@@ -628,7 +628,7 @@ func TestProgressStateReflectsTerminalPersistenceFailure(t *testing.T) {
 	}
 }
 
-func TestRestartMarksQueuedAndRunningJobsInterrupted(t *testing.T) {
+func TestRestartMarksQueuedAndRunningJobsFailedWithInterruptedPhase(t *testing.T) {
 	root, store, _ := fixtureRecording(t)
 	id := strings.Repeat("a", 32)
 	recordingID := strings.Repeat("b", 32)
@@ -646,8 +646,22 @@ func TestRestartMarksQueuedAndRunningJobsInterrupted(t *testing.T) {
 	}
 	service := openService(t, root, store, fakeFFmpeg(t), 1)
 	for _, job := range service.List("") {
-		if job.State != StateFailed || job.ErrorCode != "interrupted_by_restart" {
+		if job.State != StateFailed || job.ErrorCode != "interrupted_by_restart" || job.FinishedAt == nil {
 			t.Fatalf("job=%+v", job)
+		}
+		wire, err := json.Marshal(job)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wireJob struct {
+			State    State    `json:"state"`
+			Progress Progress `json:"progress"`
+		}
+		if err := json.Unmarshal(wire, &wireJob); err != nil {
+			t.Fatal(err)
+		}
+		if wireJob.State != StateFailed || wireJob.Progress.Phase != "interrupted" {
+			t.Fatalf("restart wire contract=%s/%s, want failed/interrupted", wireJob.State, wireJob.Progress.Phase)
 		}
 		if job.Progress.Phase != "interrupted" {
 			t.Fatalf("restarted active job progress=%+v, want interrupted phase", job.Progress)

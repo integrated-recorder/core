@@ -7,7 +7,7 @@ import { I18nProvider, useI18n } from './provider'
 
 function Probe() {
   const { locale, t, preferences, setPreferences } = useI18n()
-  return <><p>{locale} · {t('nav.recordings')}</p><p>{preferences.theme} · {preferences.timezone}</p><button onClick={() => setPreferences({ ...preferences, locale: 'ko-KR' })}>switch locale</button></>
+  return <><p>{locale} · {t('nav.recordings')}</p><p>{preferences.theme} · {preferences.timezone}</p><button onClick={() => setPreferences({ ...preferences, locale: preferences.locale === 'ko-KR' ? 'en-US' : 'ko-KR' })}>switch locale</button></>
 }
 
 afterEach(() => {
@@ -29,6 +29,9 @@ describe('I18nProvider', () => {
     fireEvent.click(screen.getByRole('button', { name: 'switch locale' }))
     await waitFor(() => expect(document.documentElement.lang).toBe('ko-KR'))
     expect(screen.getByText('ko-KR · 녹화')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'switch locale' }))
+    await waitFor(() => expect(document.documentElement.lang).toBe('en-US'))
+    expect(screen.getByText('en-US · Recordings')).toBeInTheDocument()
   })
 
   it('drops cached preferences at logout before loading next signed-in user preferences', async () => {

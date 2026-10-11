@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -11,6 +12,100 @@ import (
 )
 
 const futureFormatRecordingID = "a123456789abcdef0123456789abcdef"
+
+func TestRecordingFormatVersionSnapshotAcceptsAtomicRootReplacement(t *testing.T) {
+	dir := t.TempDir()
+	store, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.NewRecordingDir(futureFormatRecordingID); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "recordings", futureFormatRecordingID, "recording.json")
+	oldRoot := []byte(`{"format_version":2,"id":"` + futureFormatRecordingID + `","title":"old"}`)
+	newRoot := []byte(`{"format_version":2,"id":"` + futureFormatRecordingID + `","title":"new"}`)
+	if err := os.WriteFile(path, oldRoot, 0600); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary := filepath.Join(dir, "recording.next")
+	if err := os.WriteFile(temporary, newRoot, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		t.Fatal(err)
+	}
+
+	version, err := store.RecordingFormatVersion(context.Background(), futureFormatRecordingID)
+	if err != nil || version != ShardedArchiveFormatVersion {
+		t.Fatalf("format version after atomic replacement = %d, %v; want V2", version, err)
+	}
+	// Reuse stale Lstat result to deterministically model publication in the
+	// interval between RecordingFormatVersion's Lstat and Open calls.
+	version, err = readRecordingFormatVersionSnapshot(context.Background(), path, observed)
+	if err != nil || version != ShardedArchiveFormatVersion {
+		t.Fatalf("format snapshot after atomic replacement = %d, %v; want V2", version, err)
+	}
+}
+
+func TestRecordingFormatVersionSnapshotRejectsRootSymlinkSwap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recording.json")
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(path, []byte(`{"format_version":2}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(`{"format_version":2}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := readRecordingFormatVersionSnapshot(context.Background(), path, observed); !errors.Is(err, ErrShardedArchiveInvalid) {
+		t.Fatalf("root symlink swap error = %v, want ErrShardedArchiveInvalid", err)
+	}
+}
+
+func TestRecordingFormatVersionSnapshotRejectsOversizedPublishedRoot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recording.json")
+	if err := os.WriteFile(path, []byte(`{"format_version":2}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary := filepath.Join(dir, "recording.next")
+	file, err := os.Create(temporary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxRecordingJSONBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readRecordingFormatVersionSnapshot(context.Background(), path, observed); !errors.Is(err, ErrShardedArchiveInvalid) {
+		t.Fatalf("oversized published root error = %v, want ErrShardedArchiveInvalid", err)
+	}
+}
 
 func TestLocalUnknownRecordingFormatIsPreservedAndRejected(t *testing.T) {
 	root := t.TempDir()

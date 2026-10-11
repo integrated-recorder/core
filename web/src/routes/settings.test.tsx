@@ -130,6 +130,7 @@ describe('runtime update settings UI', () => {
     renderSettings()
     openUpdatesTab()
     expect(await screen.findByRole('heading', { name: '최근 세대 전환 진단' })).toBeInTheDocument()
+    expect(screen.getByText(/가장 최근 진단 하나만 보관합니다/)).toBeInTheDocument()
     expect(screen.getByText('대상 시작 시간 초과 · target_start_timeout')).toBeInTheDocument()
     expect(screen.getByText('generation-old')).toBeInTheDocument()
     expect(screen.getByText('generation-new')).toBeInTheDocument()
@@ -198,6 +199,23 @@ describe('per-user preferences', () => {
     await waitFor(() => expect(document.documentElement.lang).toBe('ko-KR'))
     expect(screen.getByRole('heading', { name: '사용자 환경' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '환경 설정 저장' })).toBeInTheDocument()
+  })
+
+  it('applies en-US to document lang immediately after saving from ko-KR', async () => {
+    vi.spyOn(authAPI, 'session').mockResolvedValue({ auth_enabled: true, authenticated: true, needs_bootstrap: false })
+    vi.mocked(userPreferencesAPI.get).mockResolvedValue({ locale: 'ko-KR', theme: 'system', timezone: 'system' })
+    vi.mocked(userPreferencesAPI.update).mockImplementation(async preferences => preferences)
+    renderLocalizedSettings()
+    expect(await screen.findByRole('heading', { name: '사용자 환경' })).toBeInTheDocument()
+    const locale = await screen.findByRole('combobox', { name: '언어' })
+    fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
+    await waitFor(() => expect(userPreferencesAPI.update).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByRole('button', { name: '환경 설정 저장' })).toBeEnabled())
+    fireEvent.change(locale, { target: { value: 'en-US' } })
+    fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
+    await waitFor(() => expect(userPreferencesAPI.update).toHaveBeenLastCalledWith({ locale: 'en-US', theme: 'system', timezone: 'system' }, expect.objectContaining({ client: expect.anything() })))
+    await waitFor(() => expect(document.documentElement.lang).toBe('en-US'))
+    expect(screen.getByRole('heading', { name: 'User preferences' })).toBeInTheDocument()
   })
 
   it('loads and persists locale, theme, and time zone together', async () => {

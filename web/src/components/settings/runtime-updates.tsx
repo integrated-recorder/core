@@ -104,7 +104,7 @@ function HandoverDiagnostic({ diagnostic }: { diagnostic: NonNullable<RuntimeUpd
   const safeIdentifier = (value: string) => /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : '—'
   const safeVersion = /^[A-Za-z0-9.+_-]{1,80}$/.test(diagnostic.target_version) ? diagnostic.target_version : '—'
   return <Card>
-    <CardHeader><CardTitle>{t('diagnostic.title')}</CardTitle></CardHeader>
+    <CardHeader><CardTitle>{t('diagnostic.title')}</CardTitle><p className="text-xs leading-5 text-muted-foreground">{t('diagnostic.help')}</p></CardHeader>
     <CardContent>
       <dl className="grid gap-x-5 gap-y-3 text-xs sm:grid-cols-2 lg:grid-cols-3">
         <DiagnosticField label={t('diagnostic.phase')} value={t(phaseKey)} />

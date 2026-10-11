@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,8 +30,10 @@ import (
 	"github.com/integrated-recorder/core/internal/management"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
 	"github.com/integrated-recorder/core/internal/preview"
+	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
 	"github.com/integrated-recorder/core/internal/server"
 	"github.com/integrated-recorder/core/internal/storage"
+	"github.com/integrated-recorder/core/internal/storageproto"
 	"github.com/integrated-recorder/core/internal/systemsettings"
 	"github.com/integrated-recorder/core/internal/watch"
 )
@@ -43,6 +46,8 @@ type sourceFixture struct {
 	segments          map[string][]byte
 	streamTitle       string
 	streamDescription string
+	online            bool
+	endlist           bool
 }
 
 func main() {
@@ -216,7 +221,7 @@ func run() error {
 	if addr == "" {
 		addr = "127.0.0.1:4173"
 	}
-	web := &http.Server{Addr: addr, Handler: legacyWorkflowReadyHostProjection(api), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	web := &http.Server{Addr: addr, Handler: legacyWorkflowReadyHostProjection(api, auth), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- web.ListenAndServe() }()
 	log.Printf("browser e2e API listening on %s", addr)
@@ -274,7 +279,7 @@ func run() error {
 // Runtime Host. The separate setup E2E exercises the real Host-owned setup API.
 // Keep this projection narrowly scoped so every other request reaches the real
 // application server unchanged.
-func legacyWorkflowReadyHostProjection(next http.Handler) http.Handler {
+func legacyWorkflowReadyHostProjection(next http.Handler, auth *authn.Service) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/api/setup/status" {
 			w.Header().Set("Content-Type", "application/json")
@@ -287,8 +292,57 @@ func legacyWorkflowReadyHostProjection(next http.Handler) http.Handler {
 			})
 			return
 		}
+		if r.Method == http.MethodGet && r.URL.Path == "/api/runtime/plugins" {
+			serveFixtureRuntimeRead(w, r, auth, authn.PermissionPluginManage, httpapi.PluginStatus{
+				State: "not_configured", Plugins: []httpapi.PluginStatusItem{},
+			})
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/api/runtime/storage/provider" {
+			// This legacy in-process fixture uses Core's local archive backend,
+			// not Runtime Host. Project it as the Host's bundled local provider so
+			// the current UI sees the same ready local-storage contract.
+			serveFixtureRuntimeRead(w, r, auth, authn.PermissionStorageManage, httpapi.StorageProviderStatus{
+				Primary: httpapi.PrimaryStorageStatus{Kind: "plugin", ProviderID: "local", Version: "browser-e2e", State: "ready"},
+				Providers: []httpapi.StorageProviderSummary{{
+					ID: "local", Name: "Local Storage", Version: "browser-e2e",
+					Distribution: "bundled", ConfigurationManaged: true, Uninstallable: false,
+					Configured: true, Active: true, Health: "ready",
+					ConfigurationSchema: storageproto.Schema{Fields: []storageproto.Field{}},
+				}},
+			})
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/api/runtime/storage/instances" {
+			// The in-process E2E server has no Runtime Host storage catalog.
+			// Return its truthful empty instance inventory, not an API failure.
+			serveFixtureRuntimeRead(w, r, auth, authn.PermissionStorageManage, []httpapi.StorageInstanceSummary{})
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func serveFixtureRuntimeRead(w http.ResponseWriter, r *http.Request, auth *authn.Service, permission authn.Permission, value any) {
+	if auth == nil {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+	session, err := auth.Authenticate(authn.SessionToken(r))
+	if err != nil {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Role: session.Role}
+	if !authn.HasPermission(principal, permission) {
+		http.Error(w, "permission denied", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		return
+	}
 }
 
 func closeServices(manager *acquire.Manager, integrityService *integrity.Service, exportService *derivative.Service, previewService *preview.Service, adapters *adapterhost.Host) error {
@@ -399,6 +453,27 @@ func playlistSegmentNames(playlist []byte) []string {
 }
 
 func (fixture *sourceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/api/status" {
+		fixture.mu.RLock()
+		online := fixture.online
+		fixture.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"online": online})
+		return
+	}
+	if r.URL.Path == "/e2e/set-online" {
+		online, onlineErr := strconv.ParseBool(r.URL.Query().Get("value"))
+		endlist, endlistErr := strconv.ParseBool(r.URL.Query().Get("endlist"))
+		if onlineErr != nil || endlistErr != nil {
+			http.Error(w, "invalid fixture state", http.StatusBadRequest)
+			return
+		}
+		fixture.mu.Lock()
+		fixture.online, fixture.endlist = online, endlist
+		fixture.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.URL.Path == "/e2e/metadata" {
 		fixture.mu.RLock()
 		title, description := fixture.streamTitle, fixture.streamDescription
@@ -423,7 +498,11 @@ func (fixture *sourceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) 
 	if r.URL.Path == "/hls/stream.m3u8" {
 		fixture.mu.RLock()
 		playlist := append([]byte(nil), fixture.playlist...)
+		endlist := fixture.endlist
 		fixture.mu.RUnlock()
+		if endlist && !bytes.Contains(playlist, []byte("#EXT-X-ENDLIST")) {
+			playlist = append(playlist, []byte("#EXT-X-ENDLIST\n")...)
+		}
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		_, _ = w.Write(playlist)
 		return

@@ -54,7 +54,9 @@ var (
 	ErrConflict    = errors.New("export job is active")
 )
 
-// State is the durable lifecycle of one derived export.
+// State is the durable wire lifecycle of one derived export. Restart recovery
+// records queued/running jobs as failed with error_code
+// "interrupted_by_restart"; only Progress.Phase uses "interrupted".
 type State string
 
 const (

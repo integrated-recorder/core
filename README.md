@@ -27,7 +27,13 @@ Core는 Runtime Host, Recorder Engine, Control Plane, Web UI/API와 canonical ar
 
 Owncast는 first-party Source Plugin이지만 Core나 Docker image에 bundled되지 않습니다. 공식 Plugin Registry를 통해 v0.2.0으로 배포됩니다. 현재 plugin executable은 native code이며 sandbox가 없습니다. 상세한 admission provenance와 한계는 [Plugin Trust Model](docs/PLUGIN_TRUST_MODEL.md)을 참고하세요.
 
-운영자가 직접 제공하는 plugin은 기본적으로 허용되지 않으며, production Runtime Host에서 사용하려면 `IR_ALLOW_OPERATOR_PLUGINS=1`을 명시해야 합니다. 이 plugin은 프로젝트 검토를 거치지 않은 native executable입니다. 기본 file secret store는 접근 권한을 제한하지만 저장값을 암호화하지 않으며, 인증 없는 control API는 신뢰할 수 있는 네트워크나 인증 reverse proxy 안에서만 사용해야 합니다.
+운영자가 직접 제공하는 plugin은 기본적으로 허용되지 않으며, production Runtime Host에서 사용하려면 `IR_ALLOW_OPERATOR_PLUGINS=1`을 명시해야 합니다. 이 plugin은 프로젝트 검토를 거치지 않은 native executable입니다. 기본 file secret store는 접근 권한을 제한하지만 저장값을 암호화하지 않습니다.
+
+## 인증과 네트워크 노출
+
+기본 Runtime Host는 내장 사용자 인증을 사용합니다. 최초 설정에는 local console 또는 container log에 표시되는 one-time claim code가 필요하며, 완료 뒤 browser는 session cookie로 인증합니다. 모든 mutation 요청에는 CSRF token이 필요합니다. `AUTH_DISABLED=1`은 개발용 escape hatch이며 listener가 loopback에 bind된 경우에만 허용됩니다. public bind에서는 Runtime Host가 fail closed합니다.
+
+Production에서 network를 통해 접속하려면 HTTPS, trusted reverse proxy, 적절한 network boundary를 구성하세요. TLS reverse proxy 뒤에서는 `COOKIE_SECURE=1`로 Secure cookie를 강제하세요.
 
 ## 빠른 시작
 

@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -306,6 +310,92 @@ func TestSubprocessAuthenticationAndBoundedFrames(t *testing.T) {
 	if err != nil || response.StatusCode != http.StatusNotFound || json.Unmarshal(body, &notFound) != nil || notFound.Error.Code != "not_found" {
 		t.Fatalf("unknown route did not return bounded error: status=%d", response.StatusCode)
 	}
+}
+
+func TestListResponseIsByteBoundedAndPreservesPagination(t *testing.T) {
+	items := make([]ObjectEntry, 708)
+	for i := range items {
+		items[i] = ObjectEntry{Key: fmt.Sprintf("recordings/%032x/archive/v2/manifests/%020d-%s.json", 1, i, strings.Repeat("x", 48)), Size: int64(i)}
+	}
+	fullPage := ListPage{Items: items}
+	encoded, err := json.Marshal(fullPage)
+	if err != nil || len(encoded) <= MaxControlFrameBytes {
+		t.Fatalf("fixture response bytes=%d, err=%v; want oversized response", len(encoded), err)
+	}
+	provider := &largeListProvider{items: items}
+	handler := providerHandler(provider, []byte("test-private-token"), 0)
+	var collected []string
+	cursor := ""
+	for pageNumber := 0; pageNumber < len(items); pageNumber++ {
+		query := url.Values{"prefix": []string{"recordings/"}, "limit": []string{"1000"}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+		request := httptest.NewRequest(http.MethodGet, "/v1/list?"+query.Encode(), nil)
+		request.Header.Set("Authorization", "Bearer test-private-token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Body.Len() > MaxControlFrameBytes {
+			t.Fatalf("page %d status=%d bytes=%d", pageNumber, response.Code, response.Body.Len())
+		}
+		var page ListPage
+		if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+			t.Fatalf("decode bounded page %d: %v", pageNumber, err)
+		}
+		if err := validatePage(page, "recordings/", cursor, 1000); err != nil {
+			t.Fatalf("bounded page %d is invalid: %v", pageNumber, err)
+		}
+		if len(page.Items) == 0 {
+			t.Fatalf("bounded page %d is empty before enumeration completed", pageNumber)
+		}
+		for _, item := range page.Items {
+			collected = append(collected, item.Key)
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		if page.NextCursor != page.Items[len(page.Items)-1].Key {
+			t.Fatalf("page %d cursor=%q does not equal its final key", pageNumber, page.NextCursor)
+		}
+		cursor = page.NextCursor
+	}
+	want := make([]string, len(items))
+	for i := range items {
+		want[i] = items[i].Key
+	}
+	if !reflect.DeepEqual(collected, want) {
+		t.Fatalf("bounded pagination changed object enumeration: got=%d want=%d", len(collected), len(want))
+	}
+}
+
+func TestLegacyPlainTextGatewayErrorIsTypedForListFallback(t *testing.T) {
+	response := httptest.NewRecorder()
+	response.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	response.WriteHeader(http.StatusBadGateway)
+	_, _ = response.Write([]byte("provider response invalid\n"))
+	if err := checkStatus(response.Result(), http.StatusOK); !errors.Is(err, ErrUnframedResponse) {
+		t.Fatalf("legacy unframed gateway response error=%v, want ErrUnframedResponse", err)
+	}
+}
+
+type largeListProvider struct {
+	Provider
+	items []ObjectEntry
+}
+
+func (p *largeListProvider) Descriptor() Descriptor { return fixtureDescriptor() }
+
+func (p *largeListProvider) List(_ context.Context, prefix, cursor string, limit int) (ListPage, error) {
+	start := 0
+	for start < len(p.items) && p.items[start].Key <= cursor {
+		start++
+	}
+	end := min(start+limit, len(p.items))
+	page := ListPage{Items: append([]ObjectEntry{}, p.items[start:end]...)}
+	if end < len(p.items) && len(page.Items) > 0 {
+		page.NextCursor = page.Items[len(page.Items)-1].Key
+	}
+	return page, nil
 }
 
 func buildFixture(t *testing.T) string {

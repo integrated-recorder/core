@@ -303,7 +303,12 @@ func (r *Runtime) Close() error {
 	return nil
 }
 
-type objectStore struct{ runtime *Runtime }
+type objectStore struct {
+	runtime *Runtime
+
+	listLimitMu sync.RWMutex
+	listLimit   int
+}
 
 func (s *objectStore) StorageProviderIdentity() (id, name string) {
 	if s == nil || s.runtime == nil {
@@ -392,10 +397,15 @@ func (s *objectStore) Stat(ctx context.Context, key string) (storage.PhysicalObj
 }
 
 func (s *objectStore) List(ctx context.Context, prefix, cursor string, limit int) (storage.PhysicalObjectPage, error) {
+	if s == nil || s.runtime == nil {
+		return storage.PhysicalObjectPage{}, storageproto.ErrClosed
+	}
+	requestLimit := s.effectiveListLimit(limit)
 	var page storageproto.ListPage
+	usedLimit := requestLimit
 	err := s.runtime.call(ctx, func(callCtx context.Context, client *storageproto.Client) error {
 		var err error
-		page, err = client.List(callCtx, prefix, cursor, limit)
+		page, usedLimit, err = listPageWithFallback(callCtx, prefix, cursor, requestLimit, client.List)
 		return err
 	})
 	if err != nil {
@@ -416,7 +426,40 @@ func (s *objectStore) List(ctx context.Context, prefix, cursor string, limit int
 	if !sort.SliceIsSorted(items, func(i, j int) bool { return items[i].Key < items[j].Key }) {
 		return storage.PhysicalObjectPage{}, errors.New("storage provider returned an unordered object page")
 	}
+	if usedLimit < requestLimit {
+		s.rememberListLimit(usedLimit)
+	}
 	return storage.PhysicalObjectPage{Items: items, NextCursor: page.NextCursor}, nil
+}
+
+func (s *objectStore) effectiveListLimit(requested int) int {
+	s.listLimitMu.RLock()
+	defer s.listLimitMu.RUnlock()
+	if s.listLimit > 0 && s.listLimit < requested {
+		return s.listLimit
+	}
+	return requested
+}
+
+func (s *objectStore) rememberListLimit(limit int) {
+	if limit <= 0 {
+		return
+	}
+	s.listLimitMu.Lock()
+	if s.listLimit == 0 || limit < s.listLimit {
+		s.listLimit = limit
+	}
+	s.listLimitMu.Unlock()
+}
+
+func listPageWithFallback(ctx context.Context, prefix, cursor string, limit int, request func(context.Context, string, string, int) (storageproto.ListPage, error)) (storageproto.ListPage, int, error) {
+	for {
+		page, err := request(ctx, prefix, cursor, limit)
+		if err == nil || !errors.Is(err, storageproto.ErrUnframedResponse) || limit <= 1 {
+			return page, limit, err
+		}
+		limit /= 2
+	}
 }
 
 func (s *objectStore) Delete(ctx context.Context, key string) error {

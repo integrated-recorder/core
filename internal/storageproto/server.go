@@ -292,7 +292,12 @@ func providerHandler(provider Provider, token []byte, maxConcurrentReads int) ht
 			writeError(w, http.StatusBadGateway, "invalid_provider_response", "provider response is invalid")
 			return
 		}
-		writeJSON(w, http.StatusOK, page, MaxControlFrameBytes)
+		encoded, err := marshalBoundedListPage(page)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "invalid_provider_response", "provider response is invalid")
+			return
+		}
+		writeJSONBytes(w, http.StatusOK, encoded, MaxControlFrameBytes)
 	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !authOK(r.Header.Get("Authorization"), token) {
@@ -597,14 +602,66 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 }
 func writeJSON(w http.ResponseWriter, status int, value any, maximum int) {
 	b, err := json.Marshal(value)
-	if err != nil || len(b) > maximum {
+	if err != nil {
+		http.Error(w, "provider response invalid", http.StatusBadGateway)
+		return
+	}
+	writeJSONBytes(w, status, b, maximum)
+}
+
+func writeJSONBytes(w http.ResponseWriter, status int, data []byte, maximum int) {
+	if len(data) > maximum {
 		http.Error(w, "provider response invalid", http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(status)
-	_, _ = w.Write(b)
+	_, _ = w.Write(data)
+}
+
+// marshalBoundedListPage keeps the protocol's fixed response-frame bound even
+// when a provider returns many long object keys in one otherwise-valid page.
+// LIST limits are maxima, so a shortened page resumes at its last returned key.
+func marshalBoundedListPage(page ListPage) ([]byte, error) {
+	encoded, err := json.Marshal(page)
+	if err != nil || len(encoded) <= MaxControlFrameBytes {
+		return encoded, err
+	}
+	if len(page.Items) == 0 {
+		return nil, ErrProtocol
+	}
+
+	encodedItems := make([][]byte, len(page.Items))
+	for i, item := range page.Items {
+		encodedItems[i], err = json.Marshal(item)
+		if err != nil {
+			return nil, err
+		}
+	}
+	const itemsPrefix = `{"items":[`
+	const cursorSuffix = `],"next_cursor":`
+	bestCount := 0
+	itemBytes := 0
+	for i, item := range page.Items {
+		itemBytes += len(encodedItems[i])
+		if i > 0 {
+			itemBytes++ // comma between adjacent JSON items
+		}
+		encodedCursor, marshalErr := json.Marshal(item.Key)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		candidateSize := len(itemsPrefix) + itemBytes + len(cursorSuffix) + len(encodedCursor) + 1
+		if candidateSize <= MaxControlFrameBytes {
+			bestCount = i + 1
+		}
+	}
+	if bestCount == 0 {
+		return nil, ErrProtocol
+	}
+	bounded := ListPage{Items: page.Items[:bestCount], NextCursor: page.Items[bestCount-1].Key}
+	return json.Marshal(bounded)
 }
 func writeObjectHeaders(w http.ResponseWriter, info ObjectInfo) bool {
 	if info.Size < 0 || info.Size > MaxObjectBytes || !validDigest(info.SHA256) {

@@ -33,6 +33,10 @@ var (
 	ErrInvalidRange = errors.New("storage object range is invalid")
 	ErrProtocol     = errors.New("storage provider protocol error")
 	ErrClosed       = errors.New("storage provider process is closed")
+	// ErrUnframedResponse identifies a legacy provider's plain-text 502 response.
+	// LIST callers may retry it with a smaller page while still validating every
+	// returned key and cursor.
+	ErrUnframedResponse = errors.New("storage provider returned an unframed error response")
 )
 
 var (

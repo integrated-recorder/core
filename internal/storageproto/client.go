@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -360,6 +361,10 @@ func checkStatus(resp *http.Response, expected int) error {
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		return ErrNotFound
+	}
+	if resp.StatusCode == http.StatusBadGateway && strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/plain") {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, MaxControlFrameBytes+1))
+		return ErrUnframedResponse
 	}
 	var wire wireError
 	if decodeResponse(resp, maxSafeErrorBody, &wire) == nil && validErrorCode(wire.Error.Code) {

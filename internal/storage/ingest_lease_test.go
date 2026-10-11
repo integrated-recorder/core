@@ -496,6 +496,10 @@ func TestCoordinatorReleaseRetriesSameIDAndSurfacesUnresolvedLease(t *testing.T)
 			t.Fatalf("release failure changed successful canonical result: %v", err)
 		}
 		assertSameLeaseID(t, coordinator.callIDs("release_queue"), runtimeResourceOperationAttempts)
+		// The completion callback runs before the writer loop finishes its
+		// accounting transition. Wait before asserting that only the queue
+		// coordinator lease remains unresolved.
+		waitForActiveWriters(t, service, 0)
 		if got := service.Snapshot(); got.PendingCoordinatorLeases != 1 || got.QueueObjects != 0 || got.ActiveWriters != 0 {
 			t.Fatalf("release failure accounting = %#v", got)
 		}

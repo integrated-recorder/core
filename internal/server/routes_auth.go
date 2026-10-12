@@ -402,7 +402,7 @@ func recordingPermission(method, path string) (authn.Permission, bool) {
 	suffix := strings.Join(parts[1:], "/")
 	if method == http.MethodGet {
 		parts := strings.Split(suffix, "/")
-		if suffix == "diagnostics/storage" || suffix == "lifecycle" || suffix == "play/master.m3u8" || suffix == "play/live/master.m3u8" || suffix == "archive/index" || suffix == "integrity" || suffix == "exports" || suffix == "thumbnail" || suffix == "previews" || suffix == "events" || suffix == "metadata" || suffix == "tags" || len(parts) == 4 && parts[0] == "play" && parts[1] == "tracks" && parts[2] != "" && parts[3] == "playlist.m3u8" || len(parts) == 5 && parts[0] == "play" && parts[1] == "live" && parts[2] == "tracks" && parts[3] != "" && parts[4] == "playlist.m3u8" || len(parts) == 3 && parts[0] == "play" && parts[1] == "segments" && parts[2] != "" || len(parts) == 2 && parts[0] == "previews" && parts[1] != "" {
+		if suffix == "diagnostics/storage" || suffix == "lifecycle" || suffix == "play/master.m3u8" || suffix == "play/live/master.m3u8" || suffix == "archive/index" || suffix == "integrity" || suffix == "exports" || suffix == "thumbnail" || suffix == "previews" || suffix == "events" || suffix == "timed-events" || suffix == "timed-events/export" || suffix == "metadata" || suffix == "tags" || len(parts) == 4 && parts[0] == "play" && parts[1] == "tracks" && parts[2] != "" && parts[3] == "playlist.m3u8" || len(parts) == 5 && parts[0] == "play" && parts[1] == "live" && parts[2] == "tracks" && parts[3] != "" && parts[4] == "playlist.m3u8" || len(parts) == 3 && parts[0] == "play" && parts[1] == "segments" && parts[2] != "" || len(parts) == 2 && parts[0] == "previews" && parts[1] != "" {
 			return authn.PermissionRecordingRead, true
 		}
 		return "", false

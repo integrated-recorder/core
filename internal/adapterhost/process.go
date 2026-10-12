@@ -29,11 +29,18 @@ type process struct {
 	unusable     atomic.Bool
 	stderr       *boundedCapture
 	startedAt    time.Time
+	streamsMu    sync.Mutex
+	streams      map[string]*eventSubscription
 }
 
 type readResult struct {
 	response adapterproto.Response
 	err      error
+}
+
+type eventSubscription struct {
+	batches chan adapterproto.TimedEventBatch
+	errors  chan error
 }
 
 // SafeProtocolError preserves only protocol error codes whose meaning is safe
@@ -89,7 +96,7 @@ func startProcess(path string) (*process, error) {
 	if err = cmd.Start(); err != nil {
 		return nil, err
 	}
-	p := &process{cmd: cmd, stdin: stdin, requests: make(chan struct{}, 1), responses: make(chan readResult, 1), done: make(chan struct{}), stderr: stderr, startedAt: time.Now()}
+	p := &process{cmd: cmd, stdin: stdin, requests: make(chan struct{}, 1), responses: make(chan readResult, 1), done: make(chan struct{}), stderr: stderr, startedAt: time.Now(), streams: make(map[string]*eventSubscription)}
 	p.requests <- struct{}{}
 	go func() {
 		p.readLoop(bufio.NewReaderSize(stdout, 32<<10))
@@ -104,7 +111,7 @@ func startProcess(path string) (*process, error) {
 
 func (p *process) readLoop(reader *bufio.Reader) {
 	for {
-		response, err := adapterproto.ReadResponse(reader)
+		frame, err := adapterproto.ReadFrame(reader)
 		if err != nil {
 			// The caller may have canceled after writing a request and left a
 			// complete response queued. Preserve that frame; EOF is also signaled
@@ -120,8 +127,18 @@ func (p *process) readLoop(reader *bufio.Reader) {
 			}
 			return
 		}
+		if frame.Kind == adapterproto.FrameTypeNotification {
+			p.routeNotification(*frame.Notification)
+			continue
+		}
+		if frame.Kind != adapterproto.FrameTypeResponse || frame.Response == nil {
+			p.unusable.Store(true)
+			p.kill()
+			_, _ = io.Copy(io.Discard, reader)
+			return
+		}
 		select {
-		case p.responses <- readResult{response: response}:
+		case p.responses <- readResult{response: *frame.Response}:
 		default:
 			// More than one frame arrived without a request/response consumer.
 			// The stream can no longer be synchronized, so discard this process.
@@ -131,6 +148,66 @@ func (p *process) readLoop(reader *bufio.Reader) {
 			return
 		}
 	}
+}
+
+func (p *process) routeNotification(notification adapterproto.Notification) {
+	if notification.Method != adapterproto.MethodEventsBatch && notification.Method != adapterproto.MethodEventsEnded {
+		return
+	}
+	var identity struct {
+		StreamID string `json:"stream_id"`
+	}
+	if json.Unmarshal(notification.Params, &identity) != nil || identity.StreamID == "" {
+		return
+	}
+	p.streamsMu.Lock()
+	subscription := p.streams[identity.StreamID]
+	p.streamsMu.Unlock()
+	if subscription == nil {
+		return
+	}
+	if notification.Method == adapterproto.MethodEventsEnded {
+		select {
+		case subscription.errors <- errors.New("adapter timed event stream ended"):
+		default:
+		}
+		return
+	}
+	var batch adapterproto.TimedEventBatch
+	if json.Unmarshal(notification.Params, &batch) != nil || batch.Validate() != nil {
+		select {
+		case subscription.errors <- errors.New("adapter timed event batch is invalid"):
+		default:
+		}
+		return
+	}
+	select {
+	case subscription.batches <- batch:
+	default:
+		select {
+		case subscription.errors <- errors.New("adapter timed event stream exceeded its bounded buffer"):
+		default:
+		}
+	}
+}
+
+func (p *process) subscribeTimedEvents(streamID string) (<-chan adapterproto.TimedEventBatch, <-chan error, func(), error) {
+	if streamID == "" || len(streamID) > 128 {
+		return nil, nil, nil, errors.New("timed event stream identity is invalid")
+	}
+	p.streamsMu.Lock()
+	defer p.streamsMu.Unlock()
+	if len(p.streams) >= 16 {
+		return nil, nil, nil, errors.New("adapter timed event stream limit reached")
+	}
+	if _, exists := p.streams[streamID]; exists {
+		return nil, nil, nil, errors.New("timed event stream already exists")
+	}
+	subscription := &eventSubscription{batches: make(chan adapterproto.TimedEventBatch, 1), errors: make(chan error, 1)}
+	p.streams[streamID] = subscription
+	var once sync.Once
+	cleanup := func() { once.Do(func() { p.streamsMu.Lock(); delete(p.streams, streamID); p.streamsMu.Unlock() }) }
+	return subscription.batches, subscription.errors, cleanup, nil
 }
 
 func (p *process) call(ctx context.Context, method string, params any) (json.RawMessage, error) {

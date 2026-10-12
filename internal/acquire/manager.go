@@ -57,6 +57,12 @@ type MetadataPreparer interface {
 	PrepareMetadata(context.Context, string, *adapterproto.ResourceRef, adapterproto.MediaSource) (adapterproto.MetadataResult, func() error, bool, error)
 }
 
+// TimedEventPreparer is optional. Its cursor is read only from the durable
+// archive and is acknowledged only after an owner-fenced event batch commit.
+type TimedEventPreparer interface {
+	PrepareTimedEvents(context.Context, string, string, *adapterproto.ResourceRef, adapterproto.MediaSource, json.RawMessage) (adapterproto.TimedEventStream, bool, error)
+}
+
 // OwnershipToken aliases the Runtime Host's durable owner identity so the
 // acquisition layer and Host cannot drift into subtly different token shapes.
 type OwnershipToken = recordingowner.Owner

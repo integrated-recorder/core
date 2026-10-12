@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { AccountSession, AccountUser, Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, UserPreferences, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { AccountSession, AccountUser, Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, TimedEventPage, UserPreferences, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -50,6 +50,8 @@ export const recordingsAPI = {
   setTags: (id: string, tags: string[]) => api<{ tags: string[] }>(`/api/recordings/${encodeURIComponent(id)}/tags`, { method: 'PUT', body: { tags } }),
   archive: (id: string, query: { limit?: number; cursor?: string } = {}) => api<ArchiveIndexPage>(`/api/recordings/${encodeURIComponent(id)}/archive/index${queryString(query)}`),
   events: (id: string) => api<{ items: RecordingEvent[] }>(`/api/recordings/${encodeURIComponent(id)}/events`),
+  timedEvents: (id: string, query: { limit?: number; cursor?: string; after?: number; tail?: 1; type?: string; from_ms?: number; to_ms?: number } = {}) => api<TimedEventPage>(`/api/recordings/${encodeURIComponent(id)}/timed-events${queryString(query)}`),
+  timedEventsExport: (id: string) => `/api/recordings/${encodeURIComponent(id)}/timed-events/export`,
   metadata: (id: string) => api<RecordingMetadata>(`/api/recordings/${encodeURIComponent(id)}/metadata`),
   previews: (id: string, query: PreviewQuery) => api<PreviewFramesResponse>(`/api/recordings/${encodeURIComponent(id)}/previews${queryString(query)}`),
   previewFrame: (id: string, ordinal: number) => `/api/recordings/${encodeURIComponent(id)}/previews/${encodeURIComponent(String(ordinal))}`,

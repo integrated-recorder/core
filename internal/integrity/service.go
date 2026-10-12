@@ -1233,6 +1233,27 @@ func verifyShardedRecording(ctx context.Context, store *storage.Store, recording
 			return incompleteShardedResult(result, ctx, err)
 		}
 	}
+	_, timedEventObjects, eventErr := store.VerifyShardedTimedEvents(ctx, recording.ID)
+	if eventErr != nil {
+		if errors.Is(eventErr, context.Canceled) || errors.Is(eventErr, context.DeadlineExceeded) || ctx.Err() != nil {
+			return storage.IntegrityResult{Status: storage.IntegrityUnknown, Issues: []storage.IntegrityIssue{}}
+		}
+		result.Status = storage.IntegrityFailed
+		result.ObjectsCorrupt++
+		result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "timed_event_archive_invalid"})
+		return result
+	}
+	if timedEventObjects > uint64(^uint(0)>>1)-uint64(result.ObjectsTotal) || timedEventObjects > uint64(^uint(0)>>1)-uint64(result.ObjectsVerified) {
+		result.Status = storage.IntegrityFailed
+		result.ObjectsCorrupt++
+		result.Issues = append(result.Issues, storage.IntegrityIssue{Code: "timed_event_archive_invalid"})
+		return result
+	}
+	result.ObjectsTotal += int(timedEventObjects)
+	result.ObjectsVerified += int(timedEventObjects)
+	if progress != nil {
+		progress(uint64(result.ObjectsTotal))
+	}
 	if len(result.Issues) > 0 {
 		result.Status = storage.IntegrityDegraded
 	}
@@ -1334,7 +1355,7 @@ func safeRelativeIssuePath(path string) bool {
 
 func validIssueCode(code string) bool {
 	switch code {
-	case "invalid_recording", "invalid_reference", "missing_payload", "unavailable_payload", "invalid_integrity_metadata", "payload_mismatch", "invalid_track_metadata":
+	case "invalid_recording", "invalid_reference", "missing_payload", "unavailable_payload", "invalid_integrity_metadata", "payload_mismatch", "invalid_track_metadata", "timed_event_archive_invalid":
 		return true
 	default:
 		return false
@@ -1374,6 +1395,18 @@ func integrityObjectTotal(recording *domain.Recording) (uint64, bool) {
 	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
 		if recording.ShardedArchive == nil || !add(recording.ShardedArchive.ManifestSnapshotCount) {
 			return 0, false
+		}
+		if recording.ShardedArchive.TimedEventBatchCount > ^uint64(0)/2 || !add(recording.ShardedArchive.TimedEventBatchCount*2) {
+			return 0, false
+		}
+		for _, highWater := range recording.ShardedArchive.TimedEventIdentityHighWater {
+			pages := uint64(0)
+			if highWater > 0 {
+				pages = (highWater-1)/4096 + 1
+			}
+			if !add(pages) {
+				return 0, false
+			}
 		}
 		for _, track := range recording.Tracks {
 			if track == nil || !add(track.MediaCount) || !add(track.InitCount) {

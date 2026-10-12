@@ -1428,6 +1428,93 @@ func (h *Host) PrepareMetadata(ctx context.Context, id string, resource *adapter
 	return result, commit, true, nil
 }
 
+// PrepareTimedEvents starts the optional, persistent source event stream. The
+// adapter child sends bounded notifications independently of media requests;
+// each batch is acknowledged only after the caller's durable archive commit.
+func (h *Host) PrepareTimedEvents(ctx context.Context, id, recordingID string, resource *adapterproto.ResourceRef, current adapterproto.MediaSource, resumeState json.RawMessage) (adapterproto.TimedEventStream, bool, error) {
+	d, err := h.Descriptor(id)
+	if err != nil {
+		return adapterproto.TimedEventStream{}, false, err
+	}
+	if !hasCapability(d, adapterproto.CapabilityEvents) {
+		return adapterproto.TimedEventStream{}, false, nil
+	}
+	if err := adapterproto.ValidateResourceRefForDescriptor(d, resource); err != nil {
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("invalid resource reference")
+	}
+	if err := adapterproto.ValidateMediaSource(current, d.MediaTypes); err != nil {
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("current media source is invalid")
+	}
+	if len(resumeState) > adapterproto.MaxTimedEventResumeBytes || len(resumeState) > 0 && !json.Valid(resumeState) {
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("timed event resume state is invalid")
+	}
+	effective, err := h.effective(id, resource)
+	if err != nil {
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("effective adapter configuration is unavailable")
+	}
+	schema, err := h.Schema(id, resource)
+	if err != nil {
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("effective adapter schema is unavailable")
+	}
+	configuration, secrets, err := effectiveConfiguration(schema, effective, true)
+	if err != nil {
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("effective adapter configuration is invalid")
+	}
+	state, err := h.stateDocuments(id, resource)
+	if err != nil {
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("adapter state is unavailable")
+	}
+	streamID, err := newWorkflowID()
+	if err != nil {
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("timed event stream could not be initialized")
+	}
+	params := adapterproto.TimedEventStartParams{StreamID: streamID, RecordingID: recordingID, Resource: cloneResourceRef(resource), Current: current, Configuration: configuration, Secrets: secrets, State: state, ResumeState: append(json.RawMessage(nil), resumeState...)}
+	e, err := h.entryFor(id)
+	if err != nil {
+		return adapterproto.TimedEventStream{}, true, err
+	}
+	e.opMu.Lock()
+	p, err := h.ensureProcess(ctx, e)
+	if err != nil {
+		e.opMu.Unlock()
+		return adapterproto.TimedEventStream{}, true, err
+	}
+	e.stateMu.Lock()
+	generation := e.status.Generation
+	e.stateMu.Unlock()
+	batches, streamErrors, cleanup, err := p.subscribeTimedEvents(streamID)
+	if err != nil {
+		e.opMu.Unlock()
+		return adapterproto.TimedEventStream{}, true, err
+	}
+	raw, callErr := p.call(ctx, adapterproto.MethodEventsStart, params)
+	e.opMu.Unlock()
+	if callErr != nil {
+		cleanup()
+		return adapterproto.TimedEventStream{}, true, callErr
+	}
+	var result adapterproto.TimedEventStartResult
+	if json.Unmarshal(raw, &result) != nil || !result.Accepted {
+		cleanup()
+		return adapterproto.TimedEventStream{}, true, fmt.Errorf("adapter did not accept timed event stream")
+	}
+	ack := func(ackCtx context.Context, value adapterproto.TimedEventAckParams) error {
+		if value.StreamID != streamID {
+			return fmt.Errorf("timed event acknowledgement stream mismatch")
+		}
+		_, err := h.callAtGeneration(ackCtx, id, adapterproto.MethodEventsAck, value, generation)
+		return err
+	}
+	stop := func(stopCtx context.Context) error {
+		defer cleanup()
+		if _, err := h.callAtGeneration(stopCtx, id, adapterproto.MethodEventsStop, adapterproto.TimedEventStopParams{StreamID: streamID}, generation); err != nil {
+			return err
+		}
+		return nil
+	}
+	return adapterproto.TimedEventStream{Batches: batches, Errors: streamErrors, Done: p.done, Ack: ack, Stop: stop}, true, nil
+}
+
 func (h *Host) Close() {
 	h.mu.Lock()
 	if h.closed {

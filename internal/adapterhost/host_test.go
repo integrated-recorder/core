@@ -758,6 +758,65 @@ func TestProcessDrainsResponseBeforeReapingAdapter(t *testing.T) {
 	}
 }
 
+func TestProcessDemultiplexesTimedEventNotificationWithoutBreakingCalls(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "timed-events-adapter")
+	script := "#!/bin/sh\n" +
+		"while IFS= read -r request; do\n" +
+		"  case \"$request\" in\n" +
+		"    *describe*) printf '%s\\n' '{\"protocol_version\":1,\"id\":\"1\",\"result\":{}}' ;;\n" +
+		"    *events.start*) printf '%s\\n' '{\"protocol_version\":1,\"type\":\"notification\",\"method\":\"events.batch\",\"params\":{\"stream_id\":\"stream-1\",\"events\":[]}}'; printf '%s\\n' '{\"protocol_version\":1,\"type\":\"notification\",\"method\":\"events.batch\",\"params\":{\"stream_id\":\"stream-1\",\"batch_id\":\"batch-1\",\"events\":[{\"event_type\":\"custom.example\",\"payload\":{\"value\":1}}]}}'; printf '%s\\n' '{\"protocol_version\":1,\"id\":\"2\",\"result\":{\"accepted\":true}}' ;;\n" +
+		"    *events.ack*) printf '%s\\n' '{\"protocol_version\":1,\"id\":\"3\",\"result\":{}}' ;;\n" +
+		"    *get_status*) printf '%s\\n' '{\"protocol_version\":1,\"id\":\"4\",\"result\":{\"ok\":true}}' ;;\n" +
+		"  esac\n" +
+		"done\n"
+	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	p, err := startProcess(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.shutdown()
+	if _, err := p.call(context.Background(), "describe", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	batches, failures, cleanup, err := p.subscribeTimedEvents("stream-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	raw, err := p.call(context.Background(), "events.start", map[string]string{"stream_id": "stream-1"})
+	if err != nil || string(raw) != `{"accepted":true}` {
+		t.Fatalf("start response=%s err=%v", raw, err)
+	}
+	select {
+	case err := <-failures:
+		if err == nil {
+			t.Fatal("malformed notification had no validation error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("malformed event was not isolated and reported")
+	}
+	select {
+	case batch := <-batches:
+		if batch.BatchID != "batch-1" || len(batch.Events) != 1 || batch.Events[0].EventType != "custom.example" {
+			t.Fatalf("unexpected batch after malformed notification: %#v", batch)
+		}
+	case err := <-failures:
+		t.Fatalf("valid notification failed validation: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("valid timed event notification after malformed event was not delivered")
+	}
+	if _, err := p.call(context.Background(), "events.ack", map[string]string{"stream_id": "stream-1", "batch_id": "batch-1"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = p.call(context.Background(), "get_status", map[string]any{})
+	if err != nil || string(raw) != `{"ok":true}` || p.isUnusable() {
+		t.Fatalf("post-notification call=%s err=%v unusable=%v", raw, err, p.isUnusable())
+	}
+}
+
 func TestAdapterOwnedSecretStateSurvivesProcessRestart(t *testing.T) {
 	dir := t.TempDir()
 	writeAdapter(t, dir, binaryPrefix+"state", "state", "state", true)

@@ -1101,6 +1101,8 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 	}()
 	var metadataCancel context.CancelFunc
 	var metadataDone chan struct{}
+	var timedEventsCancel context.CancelFunc
+	var timedEventsDone chan struct{}
 	startMetadata := func() {
 		if _, ok := m.resolver.(MetadataPreparer); !ok || metadataCancel != nil {
 			return
@@ -1113,6 +1115,15 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			m.runMetadataMonitor(metadataCtx, e)
 		}(metadataDone)
 	}
+	startTimedEvents := func() {
+		if _, ok := m.resolver.(TimedEventPreparer); !ok || timedEventsCancel != nil {
+			return
+		}
+		eventCtx, cancel := context.WithCancel(ctx)
+		timedEventsCancel = cancel
+		timedEventsDone = make(chan struct{})
+		go func(done chan struct{}) { defer close(done); m.runTimedEventMonitor(eventCtx, e) }(timedEventsDone)
+	}
 	stopMetadata := func() {
 		if metadataCancel == nil {
 			return
@@ -1122,10 +1133,21 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		metadataCancel = nil
 		metadataDone = nil
 	}
-	startMetadata()
+	stopTimedEvents := func() {
+		if timedEventsCancel == nil {
+			return
+		}
+		timedEventsCancel()
+		<-timedEventsDone
+		timedEventsCancel = nil
+		timedEventsDone = nil
+	}
+	startObservers := func() { startMetadata(); startTimedEvents() }
+	stopObservers := func() { stopTimedEvents(); stopMetadata() }
+	startObservers()
 	// This defer is registered after scheduler cleanup, so the monitor is
 	// canceled and joined before acquisition shutdown drains the scheduler.
-	defer stopMetadata()
+	defer stopObservers()
 
 	selectedURL := media.ManifestURL
 	selectedBaseURL := media.ManifestURL
@@ -1140,7 +1162,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 	refreshCycles := 0
 	proactiveRefreshes := 0
 	for ctx.Err() == nil {
-		if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopMetadata, startMetadata); paused {
+		if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopObservers, startObservers); paused {
 			return true
 		} else if pauseErr != nil {
 			m.fail(e, pauseErr)
@@ -1399,7 +1421,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 				default:
 				}
 			}
-			if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopMetadata, startMetadata); paused {
+			if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopObservers, startObservers); paused {
 				return true
 			} else if pauseErr != nil {
 				m.fail(e, pauseErr)
@@ -1416,7 +1438,7 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 // the request a precise boundary: the manifest already being handled may
 // finish discovery, but no later manifest is admitted before the scheduler is
 // drained and closed.
-func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler *segmentScheduler, stopMetadata, startMetadata func()) (bool, error) {
+func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler *segmentScheduler, stopObservers, startObservers func()) (bool, error) {
 	e.mu.Lock()
 	op := e.handover
 	if op == nil || op.state != handoverRequested {
@@ -1442,13 +1464,13 @@ func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler
 
 	// Joining the source metadata monitor before the scheduler drain guarantees
 	// no metadata root/state commit can race the ownership boundary.
-	stopMetadata()
+	stopObservers()
 	if err := runtimehook.Pause(runtimehook.DuringSourceDrain, recordingID); err != nil {
 		return false, err
 	}
 	if err := scheduler.drainForHandover(op.ctx); err != nil {
 		if ctx.Err() == nil && op.ctx.Err() != nil {
-			startMetadata()
+			startObservers()
 			e.mu.Lock()
 			if e.handover == op {
 				op.state = handoverAborted
@@ -1477,7 +1499,7 @@ func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler
 		return false, err
 	}
 	if err := acquireArchiveRecoveryGate(op.ctx, e); err != nil {
-		startMetadata()
+		startObservers()
 		e.mu.Lock()
 		if e.handover == op {
 			op.state = handoverAborted

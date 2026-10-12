@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/runtimehook"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func writeRuntimeHookArm(directory string, arm runtimehook.Arm) error {
@@ -191,6 +193,25 @@ func compareArchiveSnapshotsAllowingManifestAppend(before, after map[string]stri
 // strict append. V2's current final page is an atomic bounded page, so adding
 // a snapshot may replace that page while preserving all prior entries.
 func compareArchiveSnapshotsAllowingV2ManifestAppend(root string, before, after map[string]string, beforeSnapshots, afterSnapshots []domain.ManifestSnapshot) error {
+	return compareArchiveSnapshotsAllowingV2ManifestAndTimedEventAppend(root, before, after, beforeSnapshots, afterSnapshots, 0, 0, 0, 0)
+}
+
+// compareArchiveSnapshotsAllowingV2ManifestAndTimedEventAppend additionally
+// permits a complete timed-event batch that was durable before its root
+// visibility update to be reconciled during cold recovery. Immutable batch
+// pages and batch identities remain byte-for-byte stable; only the bounded
+// identity index may append in place, and the recovered archive must verify
+// against its root high-water counters.
+func compareArchiveSnapshotsAllowingV2ManifestAndTimedEventAppend(root string, before, after map[string]string, beforeSnapshots, afterSnapshots []domain.ManifestSnapshot, beforeEventBatches, beforeEventCount, afterEventBatches, afterEventCount uint64) error {
+	if afterEventBatches < beforeEventBatches || afterEventCount < beforeEventCount {
+		return fmt.Errorf("timed event archive high-water decreased: batches %d->%d events %d->%d", beforeEventBatches, afterEventBatches, beforeEventCount, afterEventCount)
+	}
+	if afterEventBatches == beforeEventBatches && afterEventCount != beforeEventCount {
+		return fmt.Errorf("timed event count changed without a new batch: batches %d->%d events %d->%d", beforeEventBatches, afterEventBatches, beforeEventCount, afterEventCount)
+	}
+	if err := validateTimedEventSnapshotAppend(root, before, after, beforeEventBatches, beforeEventCount, afterEventBatches, afterEventCount); err != nil {
+		return err
+	}
 	if len(afterSnapshots) < len(beforeSnapshots) {
 		return fmt.Errorf("V2 manifest history shrank from %d to %d entries", len(beforeSnapshots), len(afterSnapshots))
 	}
@@ -224,11 +245,17 @@ func compareArchiveSnapshotsAllowingV2ManifestAppend(root string, before, after 
 			}
 			continue
 		}
+		if isV2TimedEventPath(object) {
+			continue
+		}
 		filteredBefore[object] = digest
 	}
 	filteredAfter := make(map[string]string, len(after))
 	for object, digest := range after {
 		if isV2ManifestPagePath(object) {
+			continue
+		}
+		if isV2TimedEventPath(object) {
 			continue
 		}
 		if strings.HasPrefix(object, "archive/v2/manifests/") {
@@ -240,6 +267,194 @@ func compareArchiveSnapshotsAllowingV2ManifestAppend(root string, before, after 
 		return err
 	}
 	return validateV2ManifestPages(root, after, afterSnapshots)
+}
+
+func validateTimedEventSnapshotAppend(root string, before, after map[string]string, beforeBatches, beforeEvents, afterBatches, afterEvents uint64) error {
+	if beforeBatches == 0 && beforeEvents == 0 && afterBatches == 0 && afterEvents == 0 {
+		for object := range before {
+			if isV2TimedEventPath(object) {
+				return fmt.Errorf("timed event objects exist without a timed event root: %q", object)
+			}
+		}
+		for object := range after {
+			if isV2TimedEventPath(object) {
+				return fmt.Errorf("timed event objects exist without a timed event root: %q", object)
+			}
+		}
+		return nil
+	}
+	for object, oldDigest := range before {
+		if !isV2TimedEventPath(object) {
+			continue
+		}
+		newDigest, exists := after[object]
+		if !exists {
+			return fmt.Errorf("pre-crash timed event object %q was removed", object)
+		}
+		if !isV2TimedEventIdentityPath(object) && newDigest != oldDigest {
+			return fmt.Errorf("immutable timed event object %q changed digest", object)
+		}
+	}
+	for object, digest := range after {
+		if isV2TimedEventPath(object) && !validV2TimedEventObjectPath(object) {
+			return fmt.Errorf("invalid timed event archive object path %q", object)
+		}
+		if isV2TimedEventPath(object) {
+			data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(object)))
+			if err != nil {
+				return fmt.Errorf("read timed event archive object %q: %w", object, err)
+			}
+			actual := sha256.Sum256(data)
+			if hex.EncodeToString(actual[:]) != digest {
+				return fmt.Errorf("timed event archive snapshot digest differs for %q", object)
+			}
+		}
+	}
+	var header domain.Recording
+	rootBytes, err := os.ReadFile(filepath.Join(root, "recording.json"))
+	if err != nil {
+		return fmt.Errorf("read recovered archive root for timed event verification: %w", err)
+	}
+	if err := json.Unmarshal(rootBytes, &header); err != nil || header.ID == "" || header.ShardedArchive == nil || header.FormatVersion != storage.ShardedArchiveFormatVersion {
+		return fmt.Errorf("recovered archive root has invalid timed event summary")
+	}
+	if header.ShardedArchive.TimedEventBatchCount != afterBatches || header.ShardedArchive.TimedEventCount != afterEvents {
+		return fmt.Errorf("timed event summary differs from expected recovery high-water: root=%d/%d expected=%d/%d", header.ShardedArchive.TimedEventBatchCount, header.ShardedArchive.TimedEventCount, afterBatches, afterEvents)
+	}
+	if afterBatches-beforeBatches > 0 {
+		for ordinal := beforeBatches; ordinal < afterBatches; {
+			ordinal++
+			name := fmt.Sprintf("archive/v2/timed-events/batches/%020d.json", ordinal)
+			if _, exists := after[name]; !exists {
+				return fmt.Errorf("reconciled timed event batch page %q is missing", name)
+			}
+		}
+	}
+	if err := validateTimedEventIndexes(root, after, &header); err != nil {
+		return err
+	}
+	store, err := storage.New(filepath.Dir(filepath.Dir(root)))
+	if err != nil {
+		return fmt.Errorf("open recovered timed event archive: %w", err)
+	}
+	count, _, err := store.VerifyShardedTimedEvents(context.Background(), header.ID)
+	if err != nil || count != afterEvents {
+		return fmt.Errorf("recovered timed event archive failed integrity verification: count=%d expected=%d err=%v", count, afterEvents, err)
+	}
+	return nil
+}
+
+func validateTimedEventIndexes(root string, objects map[string]string, header *domain.Recording) error {
+	if header == nil || header.ShardedArchive == nil {
+		return fmt.Errorf("timed event root summary is missing")
+	}
+	expectedIdentityPaths := make(map[string]struct{})
+	for bucket, highWater := range header.ShardedArchive.TimedEventIdentityHighWater {
+		pages := highWater / 4096
+		if highWater%4096 != 0 {
+			pages++
+		}
+		for page := uint64(0); page < pages; page++ {
+			name := fmt.Sprintf("archive/v2/timed-events/identities/%04x/%020d.json", bucket, page)
+			expectedIdentityPaths[name] = struct{}{}
+			if _, exists := objects[name]; !exists {
+				return fmt.Errorf("timed event identity index page %q is missing", name)
+			}
+		}
+	}
+	expectedBatchIDs := make(map[string]struct{}, header.ShardedArchive.TimedEventBatchCount)
+	for ordinal := uint64(1); ordinal <= header.ShardedArchive.TimedEventBatchCount; ordinal++ {
+		name := fmt.Sprintf("archive/v2/timed-events/batches/%020d.json", ordinal)
+		if _, exists := objects[name]; !exists {
+			return fmt.Errorf("timed event batch page %q is missing", name)
+		}
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			return fmt.Errorf("read timed event batch page %q: %w", name, err)
+		}
+		var page struct {
+			Number  uint64 `json:"number"`
+			BatchID string `json:"batch_id"`
+		}
+		if err := json.Unmarshal(data, &page); err != nil || page.Number != ordinal || page.BatchID == "" {
+			return fmt.Errorf("timed event batch page %q has invalid identity", name)
+		}
+		digest := sha256.Sum256([]byte(page.BatchID))
+		idPath := fmt.Sprintf("archive/v2/timed-events/batch-ids/%x.json", digest[:])
+		expectedBatchIDs[idPath] = struct{}{}
+		if _, exists := objects[idPath]; !exists {
+			return fmt.Errorf("timed event batch identity %q is missing", idPath)
+		}
+	}
+	for object := range objects {
+		if !isV2TimedEventPath(object) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(object, "archive/v2/timed-events/batches/"):
+			ordinal, _ := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(object, "archive/v2/timed-events/batches/"), ".json"), 10, 64)
+			if ordinal == 0 || ordinal > header.ShardedArchive.TimedEventBatchCount {
+				return fmt.Errorf("unreferenced timed event batch page %q", object)
+			}
+		case strings.HasPrefix(object, "archive/v2/timed-events/batch-ids/"):
+			if _, exists := expectedBatchIDs[object]; !exists {
+				return fmt.Errorf("unreferenced timed event batch identity %q", object)
+			}
+		case isV2TimedEventIdentityPath(object):
+			if _, exists := expectedIdentityPaths[object]; !exists {
+				return fmt.Errorf("unreferenced timed event identity page %q", object)
+			}
+		default:
+			return fmt.Errorf("unknown timed event archive object %q", object)
+		}
+	}
+	return nil
+}
+
+func isV2TimedEventPath(object string) bool {
+	return strings.HasPrefix(object, "archive/v2/timed-events/")
+}
+
+func isV2TimedEventIdentityPath(object string) bool {
+	const prefix = "archive/v2/timed-events/identities/"
+	if !strings.HasPrefix(object, prefix) || !strings.HasSuffix(object, ".json") {
+		return false
+	}
+	remainder := strings.TrimSuffix(strings.TrimPrefix(object, prefix), ".json")
+	bucket, page, ok := strings.Cut(remainder, "/")
+	if !ok || len(bucket) != 4 || len(page) != 20 {
+		return false
+	}
+	if _, err := strconv.ParseUint(bucket, 16, 16); err != nil {
+		return false
+	}
+	_, err := strconv.ParseUint(page, 10, 64)
+	return err == nil
+}
+
+func validV2TimedEventObjectPath(object string) bool {
+	const (
+		batchesPrefix = "archive/v2/timed-events/batches/"
+		idsPrefix     = "archive/v2/timed-events/batch-ids/"
+	)
+	switch {
+	case strings.HasPrefix(object, batchesPrefix) && strings.HasSuffix(object, ".json"):
+		page := strings.TrimSuffix(strings.TrimPrefix(object, batchesPrefix), ".json")
+		if len(page) != 20 {
+			return false
+		}
+		ordinal, err := strconv.ParseUint(page, 10, 64)
+		return err == nil && ordinal > 0
+	case strings.HasPrefix(object, idsPrefix) && strings.HasSuffix(object, ".json"):
+		digest := strings.TrimSuffix(strings.TrimPrefix(object, idsPrefix), ".json")
+		if len(digest) != 64 {
+			return false
+		}
+		_, err := hex.DecodeString(digest)
+		return err == nil && strings.ToLower(digest) == digest
+	default:
+		return isV2TimedEventIdentityPath(object)
+	}
 }
 
 func equalManifestSnapshot(left, right domain.ManifestSnapshot) bool {

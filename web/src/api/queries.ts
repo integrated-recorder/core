@@ -7,7 +7,7 @@ export const qk = {
   settings: ['settings'] as const, runtimeUpdate: ['runtime-update'] as const, recordings: (query: RecordingQuery) => ['recordings', query] as const,
   recording: (id: string) => ['recording', id] as const, lifecycle: (id: string) => ['recording', id, 'lifecycle'] as const, tags: (id: string) => ['recording', id, 'tags'] as const,
   previews: (id: string, query: PreviewQuery) => ['recording', id, 'previews', query] as const,
-  archive: (id: string) => ['recording', id, 'archive'] as const, events: (id: string) => ['recording', id, 'events'] as const,
+  archive: (id: string) => ['recording', id, 'archive'] as const, events: (id: string) => ['recording', id, 'events'] as const, timedEvents: (id: string) => ['recording', id, 'timed-events'] as const,
   metadata: (id: string) => ['recording', id, 'metadata'] as const,
   integrity: (id: string) => ['recording', id, 'integrity'] as const, exports: (id: string) => ['recording', id, 'exports'] as const,
   adapters: ['adapters'] as const, plugins: ['plugin-registry'] as const, adapter: (id: string) => ['adapter', id] as const, schema: (id: string, resource?: unknown) => ['adapter', id, 'schema', resource] as const,

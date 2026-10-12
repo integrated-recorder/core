@@ -137,12 +137,18 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 	return *frame.Request, nil
 }
 
-func ReadResponse(r *bufio.Reader) (Response, error) {
+// ReadFrame reads one bounded, typed protocol frame. It is used by the Core
+// process supervisor to demultiplex async plugin notifications and replies.
+func ReadFrame(r *bufio.Reader) (Frame, error) {
 	line, err := readFrame(r)
 	if err != nil {
-		return Response{}, err
+		return Frame{}, err
 	}
-	frame, err := ParseFrame(line)
+	return ParseFrame(line)
+}
+
+func ReadResponse(r *bufio.Reader) (Response, error) {
+	frame, err := ReadFrame(r)
 	if err != nil {
 		return Response{}, err
 	}

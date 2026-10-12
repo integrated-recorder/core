@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 
+	"encoding/json"
+	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 )
@@ -23,6 +25,43 @@ type archiveIndexReadCounts struct {
 	payloadStats     int
 	listRequests     int
 	payloadOpenCalls int
+}
+
+func TestShardedArchiveIndexIncludesTimedEventPagesAndIndexes(t *testing.T) {
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, strings.Repeat("a", 32))
+	batch := adapterproto.TimedEventBatch{StreamID: "s", BatchID: "batch-one", ResumeState: json.RawMessage(`{"cursor":"one"}`), Events: []adapterproto.TimedEvent{{EventType: "custom.example", SourceEventID: "event-one"}}}
+	if _, err := store.AppendShardedTimedEventBatch(ctx, header.ID, batch); err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]bool{}
+	cursor := ""
+	for {
+		page, err := store.ShardedArchiveIndexPage(ctx, header.ID, cursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range page.Entries {
+			paths[entry.Path] = true
+		}
+		if !page.HasMore {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if !paths[timedEventBatchPath(1)+".json"] || !paths[timedEventBatchKey(batch.BatchID)+".json"] {
+		t.Fatalf("timed event archive index paths missing: %#v", paths)
+	}
+	foundIdentity := false
+	for path := range paths {
+		if strings.HasPrefix(path, "archive/v2/timed-events/identities/") {
+			foundIdentity = true
+			break
+		}
+	}
+	if !foundIdentity {
+		t.Fatalf("timed event identity index missing: %#v", paths)
+	}
 }
 
 type archiveIndexCountingBackend struct {

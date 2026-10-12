@@ -141,6 +141,81 @@ type handoverRefreshResolver struct {
 	fail      bool
 }
 
+type timedEventHandoverResolver struct {
+	fixture       *handoverFixture
+	starts        atomic.Int64
+	firstAck      chan struct{}
+	firstStop     chan struct{}
+	targetResume  chan json.RawMessage
+	firstAckOnce  sync.Once
+	firstStopOnce sync.Once
+}
+
+func (r *timedEventHandoverResolver) Resolve(context.Context, string, json.RawMessage, *adapterproto.ResourceRef) (adapterproto.MediaSource, error) {
+	return adapterproto.MediaSource{}, errors.New("not used in timed-event handover fixture")
+}
+
+func (r *timedEventHandoverResolver) PrepareMetadata(ctx context.Context, adapterID string, resource *adapterproto.ResourceRef, current adapterproto.MediaSource) (adapterproto.MetadataResult, func() error, bool, error) {
+	return (&handoverMetadataResolver{fixture: r.fixture}).PrepareMetadata(ctx, adapterID, resource, current)
+}
+
+func (r *timedEventHandoverResolver) PrepareTimedEvents(_ context.Context, _ string, _ string, _ *adapterproto.ResourceRef, _ adapterproto.MediaSource, resume json.RawMessage) (adapterproto.TimedEventStream, bool, error) {
+	start := r.starts.Add(1)
+	streamID := fmt.Sprintf("handover-%d", start)
+	batches := make(chan adapterproto.TimedEventBatch, 1)
+	eventErrors := make(chan error)
+	stream := adapterproto.TimedEventStream{Batches: batches, Errors: eventErrors, Done: make(chan struct{}), Stop: func(context.Context) error { return nil }}
+	switch start {
+	case 1:
+		if len(resume) != 0 {
+			return adapterproto.TimedEventStream{}, true, fmt.Errorf("first event stream had unexpected resume state")
+		}
+		batches <- adapterproto.TimedEventBatch{StreamID: streamID, BatchID: "handover-old", ResumeState: json.RawMessage(`{"cursor":"cursor-1"}`), Events: []adapterproto.TimedEvent{{EventType: "chat.message", SourceEventID: "handover-event-1", Message: &adapterproto.TimedEventMessage{Text: "before handover"}}}}
+		stream.Ack = func(_ context.Context, ack adapterproto.TimedEventAckParams) error {
+			if ack.StreamID != streamID || ack.BatchID != "handover-old" {
+				return fmt.Errorf("old timed-event acknowledgement mismatch")
+			}
+			r.firstAckOnce.Do(func() { close(r.firstAck) })
+			return nil
+		}
+		stream.Stop = func(context.Context) error { r.firstStopOnce.Do(func() { close(r.firstStop) }); return nil }
+	case 2:
+		if string(resume) != `{"cursor":"cursor-1"}` {
+			return adapterproto.TimedEventStream{}, true, fmt.Errorf("target did not resume from durable event cursor")
+		}
+		r.targetResume <- append(json.RawMessage(nil), resume...)
+		batches <- adapterproto.TimedEventBatch{StreamID: streamID, BatchID: "handover-new", ResumeState: json.RawMessage(`{"cursor":"cursor-2"}`), Events: []adapterproto.TimedEvent{{EventType: "chat.message", SourceEventID: "handover-event-2", Message: &adapterproto.TimedEventMessage{Text: "after handover"}}}}
+		stream.Ack = func(_ context.Context, ack adapterproto.TimedEventAckParams) error {
+			if ack.StreamID != streamID || ack.BatchID != "handover-new" {
+				return fmt.Errorf("target timed-event acknowledgement mismatch")
+			}
+			return nil
+		}
+	default:
+		stream.Ack = func(context.Context, adapterproto.TimedEventAckParams) error { return nil }
+	}
+	return stream, true, nil
+}
+
+type blockSecondHandoverManifest struct {
+	fixture *handoverFixture
+	seen    atomic.Int64
+	started chan struct{}
+	release chan struct{}
+}
+
+func (t *blockSecondHandoverManifest) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Path == "/live.m3u8" && t.seen.Add(1) == 2 {
+		close(t.started)
+		select {
+		case <-t.release:
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		}
+	}
+	return t.fixture.RoundTrip(request)
+}
+
 func (r *handoverRefreshResolver) Resolve(context.Context, string, json.RawMessage, *adapterproto.ResourceRef) (adapterproto.MediaSource, error) {
 	return adapterproto.MediaSource{}, errors.New("not used in handover fixture")
 }
@@ -360,6 +435,129 @@ func startHandoverRecordingAtURL(t *testing.T, manager *Manager, owner Ownership
 		t.Fatal(err)
 	}
 	return recording
+}
+
+func TestHandoverDrainsTimedEventStreamAndResumesDurableCursor(t *testing.T) {
+	store, owners, _ := newHandoverStores(t)
+	fixture := &handoverFixture{max: 1, metadata: "timed event handover"}
+	transport := &blockSecondHandoverManifest{fixture: fixture, started: make(chan struct{}), release: make(chan struct{})}
+	var releaseManifestOnce sync.Once
+	releaseManifest := func() { releaseManifestOnce.Do(func() { close(transport.release) }) }
+	resolver := &timedEventHandoverResolver{fixture: fixture, firstAck: make(chan struct{}), firstStop: make(chan struct{}), targetResume: make(chan json.RawMessage, 1)}
+	source, err := NewManagerWithMode(store, &http.Client{Transport: transport}, resolver, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ConfigureCanonicalCommitFence(owners); err != nil {
+		t.Fatal(err)
+	}
+	source.metadataPollInterval = 8 * time.Millisecond
+	t.Cleanup(func() {
+		releaseManifest()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := source.Close(ctx); err != nil {
+			t.Errorf("close source manager: %v", err)
+		}
+	})
+
+	oldOwner := claimHandoverOwner(t, owners, handoverGenA, handoverWorkerA)
+	recording := startHandoverRecordingAtURL(t, source, oldOwner, "https://fixture.invalid/live.m3u8")
+	select {
+	case <-resolver.firstAck:
+	case <-time.After(3 * time.Second):
+		t.Fatal("source timed event was not durably acknowledged")
+	}
+	select {
+	case <-transport.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker did not reach the blocked second manifest request")
+	}
+	paused := make(chan struct {
+		snapshot HandoverSnapshot
+		err      error
+	}, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		snapshot, pauseErr := source.PauseForHandover(ctx, recording.ID, oldOwner)
+		paused <- struct {
+			snapshot HandoverSnapshot
+			err      error
+		}{snapshot, pauseErr}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	releaseManifest()
+	var pause struct {
+		snapshot HandoverSnapshot
+		err      error
+	}
+	select {
+	case pause = <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handover did not finish after the manifest boundary")
+	}
+	if pause.err != nil {
+		t.Fatalf("pause for handover: %v", pause.err)
+	}
+	select {
+	case <-resolver.firstStop:
+	case <-time.After(time.Second):
+		t.Fatal("old timed-event stream was not stopped and joined at handover")
+	}
+	header, err := store.LoadRecordingHeader(context.Background(), recording.ID)
+	if err != nil || header.ShardedArchive.TimedEventCount != 1 {
+		t.Fatalf("source event was not canonical before transfer: header=%#v err=%v", header.ShardedArchive, err)
+	}
+	fixture.mu.Lock()
+	fixture.max = 3
+	fixture.mu.Unlock()
+
+	target, err := NewManagerWithMode(store, &http.Client{Transport: fixture}, resolver, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ConfigureCanonicalCommitFence(owners); err != nil {
+		t.Fatal(err)
+	}
+	target.metadataPollInterval = 8 * time.Millisecond
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := target.Close(ctx); err != nil {
+			t.Errorf("close target manager: %v", err)
+		}
+	})
+	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
+	if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), pause.snapshot, identity); err != nil {
+		t.Fatalf("prepare target: %v", err)
+	}
+	newOwner, err := owners.Transfer(oldOwner, handoverGenB, handoverWorkerB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ActivatePreparedHandover(newOwner); err != nil {
+		t.Fatalf("activate target: %v", err)
+	}
+	if err := source.CompleteHandover(recording.ID, oldOwner); err != nil {
+		t.Fatalf("complete source handover: %v", err)
+	}
+	select {
+	case resume := <-resolver.targetResume:
+		if string(resume) != `{"cursor":"cursor-1"}` {
+			t.Fatalf("target resume cursor=%s", resume)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("target timed-event stream did not start")
+	}
+	waitHandover(t, func() bool {
+		header, err := store.LoadRecordingHeader(context.Background(), recording.ID)
+		return err == nil && header.ShardedArchive.TimedEventCount == 2
+	}, "target timed event after owner transfer")
+	page, err := store.PageShardedTimedEvents(context.Background(), recording.ID, 1, 0, 10, "", nil, nil)
+	if err != nil || len(page.Events) != 2 || page.Events[0].EventArchiveOrdinal != 1 || page.Events[1].EventArchiveOrdinal != 2 || page.Events[0].SourceEventID != "handover-event-1" || page.Events[1].SourceEventID != "handover-event-2" {
+		t.Fatalf("handover event stream duplicated/reordered canonical events: %#v err=%v", page.Events, err)
+	}
 }
 
 func waitHandover(t *testing.T, condition func() bool, description string) {

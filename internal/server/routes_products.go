@@ -69,6 +69,8 @@ func (s *Server) registerProductRoutes() {
 	s.mux.HandleFunc("GET /api/adapters/{id}/resources/search", s.resourceSearch)
 	s.mux.HandleFunc("GET /api/search", s.globalSearch)
 	s.mux.HandleFunc("GET /api/recordings/{id}/events", s.recordingEvents)
+	s.mux.HandleFunc("GET /api/recordings/{id}/timed-events", s.timedEventsGet)
+	s.mux.HandleFunc("GET /api/recordings/{id}/timed-events/export", s.timedEventsExport)
 	s.mux.HandleFunc("GET /api/recordings/{id}/metadata", s.recordingMetadataGet)
 	s.mux.HandleFunc("GET /api/audit", s.auditList)
 	s.mux.HandleFunc("GET /api/notifications", s.notificationList)

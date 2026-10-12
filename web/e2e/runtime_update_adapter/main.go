@@ -49,6 +49,51 @@ func serve(input io.Reader, output io.Writer) error {
 		switch request.Method {
 		case adapterproto.MethodDescribe:
 			response, _ = adapterproto.Success(request.ID, descriptor())
+		case adapterproto.MethodEventsStart:
+			var params adapterproto.TimedEventStartParams
+			if json.Unmarshal(request.Params, &params) != nil || params.StreamID == "" {
+				response = adapterproto.Failure(request.ID, "invalid_params", "timed event request is invalid", nil)
+				break
+			}
+			cursor := ""
+			if len(params.ResumeState) > 0 {
+				var resume struct {
+					Cursor string `json:"cursor"`
+				}
+				if json.Unmarshal(params.ResumeState, &resume) != nil {
+					response = adapterproto.Failure(request.ID, "invalid_cursor", "timed event cursor is invalid", nil)
+					break
+				}
+				cursor = resume.Cursor
+			}
+			var batch *adapterproto.TimedEventBatch
+			switch cursor {
+			case "":
+				batch = &adapterproto.TimedEventBatch{StreamID: params.StreamID, BatchID: "fixture-event-batch-1", ResumeState: json.RawMessage(`{"cursor":"1"}`), Events: []adapterproto.TimedEvent{{EventType: "chat.message", SourceEventID: "fixture-chat-1", Message: &adapterproto.TimedEventMessage{Text: "generation A"}}}}
+			case "1":
+				batch = &adapterproto.TimedEventBatch{StreamID: params.StreamID, BatchID: "fixture-event-batch-2", ResumeState: json.RawMessage(`{"cursor":"2"}`), Events: []adapterproto.TimedEvent{
+					{EventType: "chat.message", SourceEventID: "fixture-chat-1", Message: &adapterproto.TimedEventMessage{Text: "generation A"}},
+					{EventType: "chat.message", SourceEventID: "fixture-chat-2", Message: &adapterproto.TimedEventMessage{Text: "generation B"}},
+				}}
+			case "2":
+			default:
+				response = adapterproto.Failure(request.ID, "invalid_cursor", "timed event cursor is invalid", nil)
+				break
+			}
+			if response.Error != nil {
+				break
+			}
+			if batch != nil {
+				params, err := json.Marshal(batch)
+				if err != nil || adapterproto.WriteNotification(output, adapterproto.Notification{ProtocolVersion: adapterproto.Version, Method: adapterproto.MethodEventsBatch, Params: params}) != nil {
+					return errors.New("fixture timed event notification failed")
+				}
+			}
+			response, _ = adapterproto.Success(request.ID, adapterproto.TimedEventStartResult{Accepted: true})
+		case adapterproto.MethodEventsAck:
+			response, _ = adapterproto.Success(request.ID, map[string]bool{"accepted": true})
+		case adapterproto.MethodEventsStop:
+			response, _ = adapterproto.Success(request.ID, map[string]bool{"stopped": true})
 		case adapterproto.MethodResolve:
 			var params adapterproto.ResolveParams
 			var input struct {
@@ -158,7 +203,7 @@ type fixtureState struct {
 func descriptor() adapterproto.Descriptor {
 	return adapterproto.Descriptor{
 		ID: fixtureAdapterID, Name: "Runtime Update Fixture", Version: fixtureAdapterVersion, ProtocolVersion: adapterproto.Version,
-		Capabilities:        []string{adapterproto.CapabilityResolve, adapterproto.CapabilityWatch, adapterproto.CapabilityMetadata, adapterproto.CapabilityRefresh},
+		Capabilities:        []string{adapterproto.CapabilityResolve, adapterproto.CapabilityWatch, adapterproto.CapabilityMetadata, adapterproto.CapabilityRefresh, adapterproto.CapabilityEvents},
 		InputSchema:         adapterproto.Schema{Fields: []adapterproto.Field{{Key: "source_url", Control: "text", Label: "Fixture source URL", Required: true}}},
 		ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{}}, ResourceTypes: []adapterproto.ResourceType{}, MediaTypes: []string{"hls"},
 	}

@@ -181,35 +181,37 @@ func TestProtocolConstantsAreListedInNormativeSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(root, "internal", "adapterproto", "protocol.go"), nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var capabilities, methods []string
-	for _, declaration := range file.Decls {
-		group, ok := declaration.(*ast.GenDecl)
-		if !ok || group.Tok != token.CONST {
-			continue
+	for _, name := range []string{"protocol.go", "timed_events.go"} {
+		file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(root, "internal", "adapterproto", name), nil, 0)
+		if err != nil {
+			t.Fatal(err)
 		}
-		for _, spec := range group.Specs {
-			valueSpec := spec.(*ast.ValueSpec)
-			for index, name := range valueSpec.Names {
-				if index >= len(valueSpec.Values) {
-					continue
-				}
-				literal, ok := valueSpec.Values[index].(*ast.BasicLit)
-				if !ok || literal.Kind != token.STRING {
-					continue
-				}
-				value, unquoteErr := strconv.Unquote(literal.Value)
-				if unquoteErr != nil {
-					t.Fatal(unquoteErr)
-				}
-				switch {
-				case strings.HasPrefix(name.Name, "Capability"):
-					capabilities = append(capabilities, value)
-				case strings.HasPrefix(name.Name, "Method"):
-					methods = append(methods, value)
+		for _, declaration := range file.Decls {
+			group, ok := declaration.(*ast.GenDecl)
+			if !ok || group.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range group.Specs {
+				valueSpec := spec.(*ast.ValueSpec)
+				for index, name := range valueSpec.Names {
+					if index >= len(valueSpec.Values) {
+						continue
+					}
+					literal, ok := valueSpec.Values[index].(*ast.BasicLit)
+					if !ok || literal.Kind != token.STRING {
+						continue
+					}
+					value, unquoteErr := strconv.Unquote(literal.Value)
+					if unquoteErr != nil {
+						t.Fatal(unquoteErr)
+					}
+					switch {
+					case strings.HasPrefix(name.Name, "Capability"):
+						capabilities = append(capabilities, value)
+					case strings.HasPrefix(name.Name, "Method"):
+						methods = append(methods, value)
+					}
 				}
 			}
 		}

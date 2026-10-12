@@ -1,15 +1,19 @@
 package bootstrap
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func TestCompareArchiveSnapshotsAllowingManifestAppend(t *testing.T) {
@@ -166,6 +170,66 @@ func TestCompareArchiveSnapshotsAllowingV2ManifestAppend(t *testing.T) {
 		afterWithMedia["archive/v2/media/main/00000000000000000000.json"] = "media-after"
 		if err := compareArchiveSnapshotsAllowingV2ManifestAppend(root, beforeWithMedia, afterWithMedia, []domain.ManifestSnapshot{first}, []domain.ManifestSnapshot{first, second}); err == nil {
 			t.Fatal("changed media shard accepted")
+		}
+	})
+}
+
+func TestCompareArchiveSnapshotsAllowsVerifiedTimedEventRecoveryAppend(t *testing.T) {
+	const recordingID = "f1e2d3c4b5a697887766554433221100"
+	dataDir := t.TempDir()
+	store, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
+	header := &domain.Recording{
+		FormatVersion:   storage.ShardedArchiveFormatVersion,
+		ShardedArchive:  &domain.ShardedArchiveSummary{},
+		ID:              recordingID,
+		SourceSessionID: "session-" + strings.Repeat("a", 64),
+		Title:           "crash snapshot fixture",
+		AdapterID:       "fixture",
+		State:           domain.StateRecording,
+		CreatedAt:       now,
+		StartedAt:       now,
+		Tracks:          map[string]*domain.Track{"main": {ID: "main", NextArchiveOrdinal: 1}},
+	}
+	if err := store.CreateShardedRecording(header); err != nil {
+		t.Fatal(err)
+	}
+	archiveRoot := filepath.Join(dataDir, "recordings", recordingID)
+	before, err := snapshotRecordingObjects(archiveRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := adapterproto.TimedEventBatch{StreamID: "fixture-stream", BatchID: "fixture-batch-1", Events: []adapterproto.TimedEvent{{EventType: "chat.message", SourceEventID: "fixture-event-1", Message: &adapterproto.TimedEventMessage{Text: "durable before root publication"}}}}
+	if _, err := store.AppendShardedTimedEventBatch(context.Background(), recordingID, batch); err != nil {
+		t.Fatal(err)
+	}
+	after, err := snapshotRecordingObjects(archiveRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.LoadRecordingReadOnly(recordingID)
+	if err != nil || recovered.ShardedArchive == nil {
+		t.Fatalf("load timed event archive root: archive=%+v err=%v", recovered, err)
+	}
+	if err := compareArchiveSnapshotsAllowingV2ManifestAndTimedEventAppend(archiveRoot, before, after, nil, nil, 0, 0, recovered.ShardedArchive.TimedEventBatchCount, recovered.ShardedArchive.TimedEventCount); err != nil {
+		t.Fatalf("verified timed event append was rejected: %v", err)
+	}
+
+	t.Run("rejects changed immutable batch page", func(t *testing.T) {
+		mutated := copySnapshot(after)
+		mutated["archive/v2/timed-events/batches/00000000000000000001.json"] = "changed-digest"
+		if err := compareArchiveSnapshotsAllowingV2ManifestAndTimedEventAppend(archiveRoot, before, mutated, nil, nil, 0, 0, recovered.ShardedArchive.TimedEventBatchCount, recovered.ShardedArchive.TimedEventCount); err == nil {
+			t.Fatal("changed immutable timed event page was accepted")
+		}
+	})
+	t.Run("rejects orphan event object", func(t *testing.T) {
+		mutated := copySnapshot(after)
+		mutated["archive/v2/timed-events/unknown/orphan.json"] = "orphan"
+		if err := compareArchiveSnapshotsAllowingV2ManifestAndTimedEventAppend(archiveRoot, before, mutated, nil, nil, 0, 0, recovered.ShardedArchive.TimedEventBatchCount, recovered.ShardedArchive.TimedEventCount); err == nil {
+			t.Fatal("unrecognized timed event archive object was accepted")
 		}
 	})
 }

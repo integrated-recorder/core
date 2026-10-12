@@ -1646,7 +1646,16 @@ func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArt
 	t.Logf("append-only canonical archive objects observed after recovery: %v", addedArchiveObjects)
 	var compareErr error
 	if postCrashArchive != nil {
-		compareErr = compareArchiveSnapshotsAllowingV2ManifestAppend(archiveDir, preCrashObjects, postCrashObjects, preCrashArchive.Snapshots, postCrashArchive.Snapshots)
+		var beforeEventBatches, beforeEventCount, afterEventBatches, afterEventCount uint64
+		if preCrashArchive.ShardedArchive != nil {
+			beforeEventBatches = preCrashArchive.ShardedArchive.TimedEventBatchCount
+			beforeEventCount = preCrashArchive.ShardedArchive.TimedEventCount
+		}
+		if postCrashArchive.ShardedArchive != nil {
+			afterEventBatches = postCrashArchive.ShardedArchive.TimedEventBatchCount
+			afterEventCount = postCrashArchive.ShardedArchive.TimedEventCount
+		}
+		compareErr = compareArchiveSnapshotsAllowingV2ManifestAndTimedEventAppend(archiveDir, preCrashObjects, postCrashObjects, preCrashArchive.Snapshots, postCrashArchive.Snapshots, beforeEventBatches, beforeEventCount, afterEventBatches, afterEventCount)
 	} else {
 		compareErr = compareArchiveSnapshotsAllowingManifestAppend(preCrashObjects, postCrashObjects)
 	}

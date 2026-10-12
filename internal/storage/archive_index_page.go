@@ -50,6 +50,9 @@ const (
 	archiveIndexPhaseManifest
 	archiveIndexPhaseInit
 	archiveIndexPhaseMedia
+	archiveIndexPhaseTimedEventBatch
+	archiveIndexPhaseTimedEventBatchID
+	archiveIndexPhaseTimedEventIdentity
 	archiveIndexPhaseDone
 )
 
@@ -226,6 +229,65 @@ func (r *archiveIndexPageReader) next(state archiveIndexCursor) (ArchiveEntry, b
 				state.Phase, state.Track, state.Ordinal = archiveIndexPhaseMedia, 0, 1
 				continue
 			}
+			state.Phase, state.Track, state.Ordinal = archiveIndexPhaseTimedEventBatch, 0, 1
+		case archiveIndexPhaseTimedEventBatch:
+			count := r.header.ShardedArchive.TimedEventBatchCount
+			if state.Ordinal == 0 {
+				state.Ordinal = 1
+			}
+			if state.Ordinal > count {
+				state.Phase, state.Ordinal = archiveIndexPhaseTimedEventBatchID, 1
+				continue
+			}
+			path := timedEventBatchPath(state.Ordinal)
+			entry, err := r.timedEventEntry(path, "timed_event_batch")
+			if err != nil {
+				return ArchiveEntry{}, false, state, err
+			}
+			state.Ordinal++
+			return entry, true, state, nil
+		case archiveIndexPhaseTimedEventBatchID:
+			count := r.header.ShardedArchive.TimedEventBatchCount
+			if state.Ordinal == 0 {
+				state.Ordinal = 1
+			}
+			if state.Ordinal > count {
+				state.Phase, state.Track, state.Ordinal = archiveIndexPhaseTimedEventIdentity, 0, 1
+				continue
+			}
+			var batch timedEventBatchPage
+			if err := r.store.loadV2JSON(r.ctx, r.id, timedEventBatchPath(state.Ordinal), archiveShardMaxBytes, &batch); err != nil {
+				return ArchiveEntry{}, false, state, err
+			}
+			if batch.Version != 1 || batch.Number != state.Ordinal || !validTimedEventPageDigest(batch) {
+				return ArchiveEntry{}, false, state, ErrShardedArchiveInvalid
+			}
+			entry, err := r.timedEventEntry(timedEventBatchKey(batch.BatchID), "timed_event_batch_identity")
+			if err != nil {
+				return ArchiveEntry{}, false, state, err
+			}
+			state.Ordinal++
+			return entry, true, state, nil
+		case archiveIndexPhaseTimedEventIdentity:
+			highWater := r.header.ShardedArchive.TimedEventIdentityHighWater
+			for state.Track < uint32(len(highWater)) {
+				if state.Ordinal == 0 {
+					state.Ordinal = 1
+				}
+				pages := timedEventIdentityPageCount(highWater[state.Track])
+				if state.Ordinal > pages {
+					state.Track++
+					state.Ordinal = 1
+					continue
+				}
+				path := timedEventIdentityPath(int(state.Track), state.Ordinal-1)
+				entry, err := r.timedEventEntry(path, "timed_event_identity_index")
+				if err != nil {
+					return ArchiveEntry{}, false, state, err
+				}
+				state.Ordinal++
+				return entry, true, state, nil
+			}
 			state.Phase = archiveIndexPhaseDone
 		case archiveIndexPhaseDone:
 			return ArchiveEntry{}, false, state, nil
@@ -233,6 +295,18 @@ func (r *archiveIndexPageReader) next(state archiveIndexCursor) (ArchiveEntry, b
 			return ArchiveEntry{}, false, state, ErrArchiveIndexInvalidCursor
 		}
 	}
+}
+
+func (r *archiveIndexPageReader) timedEventEntry(path, kind string) (ArchiveEntry, error) {
+	if !canonicalRelativePath(path) || !strings.HasPrefix(path, "archive/v2/timed-events/") {
+		return ArchiveEntry{}, ErrShardedArchiveInvalid
+	}
+	path += ".json"
+	info, err := r.store.StatPayload(r.id, path)
+	if err != nil || !info.Regular || info.Size < 0 {
+		return ArchiveEntry{}, errors.New("timed event archive metadata is unavailable")
+	}
+	return ArchiveEntry{Path: path, Kind: kind, Size: info.Size}, nil
 }
 
 func (r *archiveIndexPageReader) manifest(ordinal uint64) (domain.ManifestSnapshot, error) {
@@ -299,11 +373,30 @@ func validArchiveIndexCursorState(cursor archiveIndexCursor, trackIDs []string, 
 			count = header.Tracks[trackIDs[cursor.Track]].InitCount
 		}
 		return archiveIndexOrdinalAtBoundary(cursor.Ordinal, count)
+	case archiveIndexPhaseTimedEventBatch, archiveIndexPhaseTimedEventBatchID:
+		return cursor.Track == 0 && cursor.Part == 0 && archiveIndexOrdinalAtBoundary(cursor.Ordinal, header.ShardedArchive.TimedEventBatchCount)
+	case archiveIndexPhaseTimedEventIdentity:
+		highWater := header.ShardedArchive.TimedEventIdentityHighWater
+		if cursor.Part != 0 || cursor.Track > uint32(len(highWater)) {
+			return false
+		}
+		if cursor.Track == uint32(len(highWater)) {
+			return cursor.Ordinal == 1
+		}
+		pages := timedEventIdentityPageCount(highWater[cursor.Track])
+		return archiveIndexOrdinalAtBoundary(cursor.Ordinal, pages)
 	case archiveIndexPhaseDone:
 		return cursor.Part == 0
 	default:
 		return false
 	}
+}
+
+func timedEventIdentityPageCount(entries uint64) uint64 {
+	if entries == 0 {
+		return 0
+	}
+	return (entries-1)/timedEventIndexPageEntries + 1
 }
 
 func archiveIndexOrdinalAtBoundary(ordinal, count uint64) bool {
@@ -325,14 +418,21 @@ func archiveIndexSnapshot(header *domain.Recording) (string, error) {
 	}
 	sort.Slice(tracks, func(i, j int) bool { return tracks[i].ID < tracks[j].ID })
 	snapshot := struct {
-		ID                    string          `json:"id"`
-		ArchiveRevision       uint64          `json:"archive_revision"`
-		TimelineRevision      uint64          `json:"timeline_revision"`
-		ManifestSnapshotCount uint64          `json:"manifest_snapshot_count"`
-		Tracks                []trackSnapshot `json:"tracks"`
+		ID                          string          `json:"id"`
+		ArchiveRevision             uint64          `json:"archive_revision"`
+		TimelineRevision            uint64          `json:"timeline_revision"`
+		ManifestSnapshotCount       uint64          `json:"manifest_snapshot_count"`
+		TimedEventCount             uint64          `json:"timed_event_count"`
+		TimedEventBatchCount        uint64          `json:"timed_event_batch_count"`
+		TimedEventIdentityHighWater []uint64        `json:"timed_event_identity_high_water,omitempty"`
+		Tracks                      []trackSnapshot `json:"tracks"`
 	}{
 		ID: header.ID, ArchiveRevision: header.ArchiveRevision, TimelineRevision: header.TimelineRevision,
-		ManifestSnapshotCount: header.ShardedArchive.ManifestSnapshotCount, Tracks: tracks,
+		ManifestSnapshotCount:       header.ShardedArchive.ManifestSnapshotCount,
+		TimedEventCount:             header.ShardedArchive.TimedEventCount,
+		TimedEventBatchCount:        header.ShardedArchive.TimedEventBatchCount,
+		TimedEventIdentityHighWater: append([]uint64(nil), header.ShardedArchive.TimedEventIdentityHighWater...),
+		Tracks:                      tracks,
 	}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {

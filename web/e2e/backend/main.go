@@ -77,6 +77,7 @@ func run() error {
 		{name: "integrated-recorder-adapter-hls", pkg: "./cmd/adapters/hls"},
 		{name: "integrated-recorder-adapter-workflow-fixture", pkg: "./web/e2e/fixture_adapter"},
 		{name: "integrated-recorder-adapter-metadata-fixture", pkg: "./web/e2e/metadata_fixture_adapter"},
+		{name: "integrated-recorder-adapter-timed-event-fixture", pkg: "./web/e2e/timed_event_fixture_adapter"},
 	} {
 		command := exec.Command("go", "build", "-trimpath", "-o", filepath.Join(adapterDir, build.name), build.pkg)
 		command.Dir = root

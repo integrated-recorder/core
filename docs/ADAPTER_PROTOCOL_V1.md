@@ -111,11 +111,10 @@ the object shape expected by Core.
 
 ### Notifications
 
-The parser recognizes a reserved typed notification envelope such as
-`{"protocol_version":1,"type":"notification","method":"events.emit"}`.
-This only means the syntax can be parsed. The current runtime does not deliver
-asynchronous notifications. Adapter implementations must not depend on
-notification delivery in v1.
+The Core runtime delivers bounded `events.batch` and `events.ended` typed
+notifications for the optional `events` capability. They share the NDJSON
+protocol stream and do not have request IDs. See [Timed Events](TIMED_EVENTS.en.md)
+for the wire schema, limits, acknowledgement boundary, and ordering semantics.
 
 ## Identifiers, schemas, resources, and configuration
 
@@ -300,7 +299,8 @@ JSON properties are omitted when absent unless stated otherwise.
 | `Request` | `protocol_version` integer; `id`, `method` strings; optional `params` JSON. |
 | `Response` | `protocol_version`; `id`; exactly one of `result` JSON or `error`. |
 | `Error` | required nonempty `code`; `message`; optional arbitrary JSON `details`. |
-| `Notification` | reserved typed form: `protocol_version`, `type:"notification"`, `method`, optional `params`; no `id`. Runtime delivery is unsupported. |
+| `Notification` | `protocol_version`, `type:"notification"`, `method`, optional `params`; no `id`. `events.batch` and `events.ended` are active notification forms. |
+| `TimedEvent` / `TimedEventBatch` | `event_type` and optional normalized fields; batch has `stream_id`, `batch_id`, `events`, optional opaque `resume_state`. |
 | `Descriptor` | `id`, `name`, `version`, `protocol_version`, optional `capabilities`, `input_schema`, `configuration_schema`, optional `resource_types`, `media_types`, optional `branding`. |
 | `Branding` / `BrandIcon` | optional `icon`; icon `media_type`, base64 `data`. |
 | `Schema` / `Field` | `fields`; field members are `key`, `control`, `label`, optional `description`, `required`, `inherit`, `default`, `constraints`, `options`, `visible_when`, `persistence`. |
@@ -363,10 +363,9 @@ and is not supplied by the adapter.
 
 `describe` is always called and has no capability requirement. A valid
 descriptor declares `resolve` or `resolve_workflow`. The Core actively dispatches
-the operations in the table below. `status`, `configure`, `interaction`, and
-`events` are recognized v1 names/capabilities but currently have no active Core
-dispatch path; declaring them does not make Core call them. Capability
-declaration is required for the actively gated operation.
+the operations in the table below. `events` is an active optional capability;
+`status`, `configure`, and `interaction` remain reserved v1 capabilities.
+Capability declaration is required for each actively gated operation.
 
 | Capability | Declaration means | Core behavior |
 | --- | --- | --- |
@@ -379,7 +378,7 @@ declaration is required for the actively gated operation.
 | `status` | Reserved v1 capability identifier. | No active Core dispatch path. |
 | `configure` | Reserved v1 capability identifier. | No active Core dispatch path. |
 | `interaction` | Reserved v1 capability identifier. | No active Core dispatch path; workflow challenges may carry interaction messages but do not invoke a separate interaction method. |
-| `events` | Reserved v1 capability identifier. | No active Core dispatch path. Notifications are not delivered. |
+| `events` | The plugin can provide a persistent platform-neutral timed event stream for an active recording. | Core starts, acknowledges, and stops the stream. Batches commit before acknowledgement; failure is isolated from media capture. |
 
 <!-- protocol-v1-capabilities:start -->
 resolve
@@ -406,6 +405,11 @@ interaction.begin
 interaction.continue
 metadata
 events
+events.start
+events.ack
+events.stop
+events.batch
+events.ended
 refresh
 resource.list
 resource.search
@@ -424,7 +428,11 @@ watch.check
 | `interaction.begin` | `interaction`; reserved, no active Core dispatch. | No active Core-defined params/result behavior. | Do not assume Core calls it. |
 | `interaction.continue` | `interaction`; reserved, no active Core dispatch. | No active Core-defined params/result behavior. | Do not assume Core calls it. |
 | `metadata` | `metadata`; recording metadata observer. | `MetadataParams`; result `MetadataResult`. | `title` and `description` are optional pointers: omitted/null is unknown, empty string is known empty. Optional source timestamp is metadata source time, not Core observation time. State mutations are committed only after caller persistence validation. Failures are isolated from media acquisition. |
-| `events` | `events`; reserved, no active Core dispatch. | No active Core-defined params/result behavior. | Parser-recognized notification syntax does not enable delivery. |
+| `events.start` | `events`; Core starts a recording-scoped stream. | `TimedEventStartParams`; result `TimedEventStartResult`. | Sends the latest durable opaque resume state; plugin owns cursor meaning and source catch-up. |
+| `events.batch` | `events`; plugin notification. | `TimedEventBatch` with up to 64 events and optional resume state. | Core commits the batch before `events.ack`; malformed/oversized data stops only the event stream. |
+| `events.ack` | `events`; Core acknowledges a committed batch. | `{stream_id,batch_id}`; empty result. | Plugin may advance its source cursor after the matching acknowledgement. One outstanding batch per stream. |
+| `events.stop` | Lifecycle; Core stops the stream. | `{stream_id}`; empty result. | Plugin cancels source reads and releases stream resources. |
+| `events.ended` | `events`; plugin notification. | `{stream_id,reason}`. | Core may reconnect using the latest durable cursor. |
 | `refresh` | `refresh`; Core asks for replacement media when adapter-defined refresh policy triggers. | `RefreshParams`; result `RefreshResult`. | Core validates replacement media and state mutation before use. A failed refresh does not make the adapter-provided current media disappear; callers determine recording error handling. |
 | `resource.list` | `resource_browse`; called for non-search browse. | `ResourceListParams`; result `ResourcePage`. | Core clamps page limit and validates parent/type membership, item count, cursor size, and duplicates. |
 | `resource.search` | `resource_browse`; called when a nonempty query is supplied. | `ResourceSearchParams`; result `ResourcePage`. | Same resource/page validation as list. |

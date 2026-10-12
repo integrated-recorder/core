@@ -77,7 +77,7 @@ Web UI 개발과 전체 검증 명령은 저장소의 Makefile 및 CI workflow�
 
 ## 현재 제한
 
-프로젝트는 active development 상태입니다. chat timeline, 다중 storage placement와 replication, DRM, 다중 사용자 역할 관리 등은 아직 제공하지 않습니다. 현재 기능과 제한은 위 상세 문서 및 release notes에서 확인하세요.
+프로젝트는 active development 상태입니다. Core는 platform-independent timed event archive와 replay 기반을 제공하지만 실제 platform chat/event integration은 아직 포함하지 않습니다. 다중 storage placement와 replication, DRM, 다중 사용자 role 관리 등도 제공하지 않습니다. 상세 기능과 제한은 문서를 참고하세요.
 
 ## 라이선스
 

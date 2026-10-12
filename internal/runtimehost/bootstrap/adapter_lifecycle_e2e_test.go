@@ -315,6 +315,26 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 		t.Fatalf("disarm source-drained boundary: %v", err)
 	}
 	leaseR = waitRecordingLeaseGeneration(t, dataDir, recordingR.ID, removedGeneration, updateOperationTimeout+10*time.Second, process.output.String)
+	type runtimeTimedEventPage struct {
+		Items []struct {
+			EventArchiveOrdinal uint64 `json:"event_archive_ordinal"`
+			SourceEventID       string `json:"source_event_id"`
+			Message             struct {
+				Text string `json:"text"`
+			} `json:"message"`
+		} `json:"items"`
+	}
+	var timedEvents runtimeTimedEventPage
+	if err := waitRuntimeConditionError(30*time.Second, func() bool {
+		var code int
+		timedEvents, code = getRuntimeJSON[runtimeTimedEventPage](t, client, baseURL, http.MethodGet, "/api/recordings/"+recordingR.ID+"/timed-events?limit=10", nil)
+		return code == http.StatusOK && len(timedEvents.Items) >= 2
+	}, "timed event resume across Runtime Host generation handover"); err != nil {
+		t.Fatalf("timed events did not resume after generation handover: %v; host=%s", err, process.output.String())
+	}
+	if len(timedEvents.Items) != 2 || timedEvents.Items[0].EventArchiveOrdinal != 1 || timedEvents.Items[0].SourceEventID != "fixture-chat-1" || timedEvents.Items[0].Message.Text != "generation A" || timedEvents.Items[1].EventArchiveOrdinal != 2 || timedEvents.Items[1].SourceEventID != "fixture-chat-2" || timedEvents.Items[1].Message.Text != "generation B" {
+		t.Fatalf("timed event handover produced a duplicate, gap, or ordering change: %+v", timedEvents.Items)
+	}
 
 	// Replace the original adapter identity with a new implementation. The new
 	// default sees v2, while R's Engine retains its v1 artifact and set.
@@ -367,9 +387,13 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	if err := adapterProcess.Kill(); err != nil {
 		t.Fatalf("kill old adapter fixture process: %v", err)
 	}
-	if err := waitProcessAbsent(t, immutableV1, 10*time.Second); err != nil {
+	if err := waitRuntimeConditionError(10*time.Second, func() bool { return !runtimePIDExists(v1AdapterPID) }, "injected adapter child exit"); err != nil {
 		t.Fatalf("old adapter process did not exit after injection: %v", err)
 	}
+	// The event monitor is expected to restart a killed optional event child
+	// independently of media acquisition. Observe the replacement by PID rather
+	// than requiring a process-wide quiet interval.
+	_ = waitDirectChildForBinaryDifferent(t, recordingREnginePID, immutableV1, v1AdapterPID, 10*time.Second)
 	refreshStarted, releaseRefresh := fixture.expireAndBlockRefresh(streamR)
 	t.Cleanup(releaseRefresh)
 	fixture.advance(streamR, 4)

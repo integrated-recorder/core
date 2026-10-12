@@ -147,6 +147,10 @@ func TestRuntimeGenerationProcessBoundaryContinuity(t *testing.T) {
 	if baselineR == 0 {
 		t.Fatal("recording R has no committed source sequence before update")
 	}
+	baselineEvents := latestTimedEventCount(t, managerA, startedR.ID, 12*time.Second)
+	if baselineEvents == 0 {
+		t.Fatal("recording R has no durable timed events before Control restart")
+	}
 
 	if err := postProcessCommand(adminURL+"/stage-b", 15*time.Second); err != nil {
 		t.Fatalf("stage generation B: %v (%s)", err, hostOutput.String())
@@ -176,8 +180,8 @@ func TestRuntimeGenerationProcessBoundaryContinuity(t *testing.T) {
 		t.Fatalf("old Engine was not retained after Control activation: active=%s old=%+v", state.ActiveControlGeneration, processGeneration(state, genA))
 	}
 	engineAAfterControlDeath, err := managerA.GetContext(context.Background(), startedR.ID)
-	if err != nil || engineAAfterControlDeath.ID != startedR.ID || engineAAfterControlDeath.State != domain.StateRecording {
-		t.Fatalf("recording R did not remain active on Engine A after Control A died: state=%v err=%v", recordingState(engineAAfterControlDeath), err)
+	if err != nil || engineAAfterControlDeath.ID != startedR.ID || engineAAfterControlDeath.State != domain.StateRecording || timedEventCount(engineAAfterControlDeath) < baselineEvents {
+		t.Fatalf("recording R state regressed on Engine A across Control A restart: state=%v events=%d baseline=%d err=%v", recordingState(engineAAfterControlDeath), timedEventCount(engineAAfterControlDeath), baselineEvents, err)
 	}
 	activeA, err := managerA.Inventory(context.Background())
 	if err != nil || len(activeA.Active) != 1 || activeA.Active[0].RecordingID != startedR.ID {
@@ -195,6 +199,10 @@ func TestRuntimeGenerationProcessBoundaryContinuity(t *testing.T) {
 
 	postActivationLatest := fixture.Latest("a")
 	waitProcessRecording(t, managerA, startedR.ID, func(r *domain.Recording) bool { return latestTrackSequence(r) >= postActivationLatest+3 }, 12*time.Second)
+	continuedEvents := waitProcessRecording(t, managerA, startedR.ID, func(r *domain.Recording) bool { return timedEventCount(r) > baselineEvents }, 12*time.Second)
+	if continuedEvents.ShardedArchive == nil {
+		t.Fatal("timed event summary disappeared after Control activation")
+	}
 	if fixture.countRequestsAfter("a", postActivationLatest+1, activatedAt) < 3 {
 		t.Fatalf("Engine A did not fetch new source sequence IDs after Control replacement; baseline=%d", postActivationLatest)
 	}
@@ -211,6 +219,7 @@ func TestRuntimeGenerationProcessBoundaryContinuity(t *testing.T) {
 		t.Fatalf("stop Engine A recording R: %v", err)
 	}
 	verifyProcessArchive(t, dataDir, stoppedR, "a", 100, finalA)
+	verifyProcessTimedEventArchive(t, dataDir, stoppedR, baselineEvents)
 	for sequence := uint64(100); sequence <= finalA; sequence++ {
 		if count := fixture.RequestCount("a", sequence); count != 1 {
 			t.Fatalf("source segment %d was fetched %d times across the Control update; want one", sequence, count)
@@ -480,7 +489,7 @@ func runProcessEngineHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := acquire.NewManagerWithMode(store, &http.Client{Timeout: 3 * time.Second}, nil, allowLoopbackFixtureURL, acquire.FreshGeneration)
+	manager, err := acquire.NewManagerWithMode(store, &http.Client{Timeout: 3 * time.Second}, processContinuityTimedEventResolver{}, allowLoopbackFixtureURL, acquire.FreshGeneration)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,6 +530,98 @@ func runProcessEngineHelper(t *testing.T) {
 		t.Fatal("Engine close did not drain within the test deadline")
 	}
 	_ = writePrivateProcessMarker(marker+".stopped", "stopped")
+}
+
+// processContinuityTimedEventResolver models a source plugin with a durable
+// sequence cursor. It emits one stable event ID per acknowledged batch so the
+// subprocess acceptance can prove event ingestion survives a Control restart
+// while the Engine process and recording remain active.
+type processContinuityTimedEventResolver struct{}
+
+func (processContinuityTimedEventResolver) Resolve(context.Context, string, json.RawMessage, *adapterproto.ResourceRef) (adapterproto.MediaSource, error) {
+	return adapterproto.MediaSource{}, nil
+}
+
+func (processContinuityTimedEventResolver) PrepareTimedEvents(ctx context.Context, _ string, recordingID string, _ *adapterproto.ResourceRef, _ adapterproto.MediaSource, resume json.RawMessage) (adapterproto.TimedEventStream, bool, error) {
+	var cursor struct {
+		Sequence uint64 `json:"sequence"`
+	}
+	if len(resume) > 0 {
+		if err := json.Unmarshal(resume, &cursor); err != nil {
+			return adapterproto.TimedEventStream{}, true, err
+		}
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	batches := make(chan adapterproto.TimedEventBatch, 1)
+	acks := make(chan adapterproto.TimedEventAckParams, 1)
+	done := make(chan struct{})
+	streamID := "process-continuity-" + recordingID
+	go func() {
+		defer close(done)
+		defer close(batches)
+		ticker := time.NewTicker(150 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
+			case <-ticker.C:
+				cursor.Sequence++
+				sequence := cursor.Sequence
+				batchID := fmt.Sprintf("batch-%d", sequence)
+				batch := adapterproto.TimedEventBatch{
+					StreamID: streamID,
+					BatchID:  batchID,
+					Events: []adapterproto.TimedEvent{{
+						EventType:      "chat.message",
+						SourceEventID:  fmt.Sprintf("continuity-event-%d", sequence),
+						SourceSequence: &sequence,
+						Message:        &adapterproto.TimedEventMessage{Text: "process continuity"},
+					}},
+					ResumeState: json.RawMessage(fmt.Sprintf(`{"sequence":%d}`, sequence)),
+				}
+				select {
+				case batches <- batch:
+				case <-streamCtx.Done():
+					return
+				}
+				for {
+					select {
+					case <-streamCtx.Done():
+						return
+					case ack := <-acks:
+						if ack.StreamID == streamID && ack.BatchID == batchID {
+							goto nextBatch
+						}
+					}
+				}
+			nextBatch:
+			}
+		}
+	}()
+	return adapterproto.TimedEventStream{
+		Batches: batches,
+		Errors:  make(chan error),
+		Done:    done,
+		Ack: func(ackCtx context.Context, ack adapterproto.TimedEventAckParams) error {
+			if ack.StreamID != streamID {
+				return errors.New("timed event stream acknowledgement mismatch")
+			}
+			select {
+			case acks <- ack:
+				return nil
+			case <-ackCtx.Done():
+				return ackCtx.Err()
+			case <-streamCtx.Done():
+				return streamCtx.Err()
+			}
+		},
+		Stop: func(context.Context) error {
+			cancel()
+			<-done
+			return nil
+		},
+	}, true, nil
 }
 
 // This validation exception is compiled only into this test binary and only
@@ -578,6 +679,18 @@ func latestRecordingSequence(t *testing.T, manager *recorderengine.ManagerClient
 	return latestTrackSequence(waitProcessRecording(t, manager, id, func(*domain.Recording) bool { return true }, time.Second))
 }
 
+func latestTimedEventCount(t *testing.T, manager *recorderengine.ManagerClient, id string, timeout time.Duration) uint64 {
+	t.Helper()
+	return timedEventCount(waitProcessRecording(t, manager, id, func(recording *domain.Recording) bool { return timedEventCount(recording) > 0 }, timeout))
+}
+
+func timedEventCount(recording *domain.Recording) uint64 {
+	if recording == nil || recording.ShardedArchive == nil {
+		return 0
+	}
+	return recording.ShardedArchive.TimedEventCount
+}
+
 func latestTrackSequence(recording *domain.Recording) uint64 {
 	if recording == nil || recording.Tracks["main"] == nil || len(recording.Tracks["main"].Segments) == 0 {
 		return 0
@@ -623,6 +736,37 @@ func verifyProcessArchive(t *testing.T, dataDir string, recording *domain.Record
 		if string(body) != string(wantBody) || segment.PayloadSize != int64(len(body)) || segment.SHA256 != hex.EncodeToString(digest[:]) {
 			t.Fatalf("stream %s canonical payload identity/hash mismatch at sequence %d", stream, segment.Sequence)
 		}
+	}
+}
+
+func verifyProcessTimedEventArchive(t *testing.T, dataDir string, recording *domain.Recording, baseline uint64) {
+	t.Helper()
+	if recording == nil || recording.ShardedArchive == nil {
+		t.Fatal("recording archive has no timed event summary")
+	}
+	store, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, _, err := store.VerifyShardedTimedEvents(context.Background(), recording.ID)
+	if err != nil || count != recording.ShardedArchive.TimedEventCount || count <= baseline {
+		t.Fatalf("timed event archive verification count=%d summary=%d baseline=%d err=%v", count, recording.ShardedArchive.TimedEventCount, baseline, err)
+	}
+	var ordinal uint64
+	seenIDs := make(map[string]struct{}, count)
+	err = store.IterateShardedTimedEvents(context.Background(), recording.ID, func(event storage.TimedEventRecord) error {
+		ordinal++
+		if event.EventArchiveOrdinal != ordinal || event.EventTimelineOrdinal != ordinal {
+			return fmt.Errorf("timed event ordinal mismatch: archive=%d timeline=%d want=%d", event.EventArchiveOrdinal, event.EventTimelineOrdinal, ordinal)
+		}
+		if _, exists := seenIDs[event.SourceEventID]; exists {
+			return fmt.Errorf("duplicate canonical source event ID %q", event.SourceEventID)
+		}
+		seenIDs[event.SourceEventID] = struct{}{}
+		return nil
+	})
+	if err != nil || ordinal != count {
+		t.Fatalf("timed event archive iteration count=%d expected=%d err=%v", ordinal, count, err)
 	}
 }
 

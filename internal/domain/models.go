@@ -57,16 +57,22 @@ type Recording struct {
 // ShardedArchiveSummary is the bounded root summary for a format-v2 archive.
 // Counts are high-water summaries; canonical records live in bounded shards.
 type ShardedArchiveSummary struct {
-	MediaCount               uint64  `json:"media_count,omitempty"`
-	InitCount                uint64  `json:"init_count,omitempty"`
-	GapCount                 uint64  `json:"gap_count,omitempty"`
-	ManifestSnapshotCount    uint64  `json:"manifest_snapshot_count,omitempty"`
-	MetadataRevisionCount    uint64  `json:"metadata_revision_count,omitempty"`
-	ClaimCount               uint64  `json:"claim_count,omitempty"`
-	CoverageObservationCount uint64  `json:"coverage_observation_count,omitempty"`
-	ClaimReconcilePending    bool    `json:"claim_reconcile_pending,omitempty"`
-	PayloadBytes             uint64  `json:"payload_bytes,omitempty"`
-	DurationSeconds          float64 `json:"duration_seconds,omitempty"`
+	MediaCount               uint64 `json:"media_count,omitempty"`
+	InitCount                uint64 `json:"init_count,omitempty"`
+	GapCount                 uint64 `json:"gap_count,omitempty"`
+	ManifestSnapshotCount    uint64 `json:"manifest_snapshot_count,omitempty"`
+	MetadataRevisionCount    uint64 `json:"metadata_revision_count,omitempty"`
+	ClaimCount               uint64 `json:"claim_count,omitempty"`
+	CoverageObservationCount uint64 `json:"coverage_observation_count,omitempty"`
+	TimedEventCount          uint64 `json:"timed_event_count,omitempty"`
+	TimedEventBatchCount     uint64 `json:"timed_event_batch_count,omitempty"`
+	// The fixed-size bucket high-water vector keeps identity-index metadata
+	// bounded regardless of the number of events retained in archive pages.
+	TimedEventIdentityHighWater []uint64 `json:"timed_event_identity_high_water,omitempty"`
+	TimedEventLastOffsetMillis  int64    `json:"timed_event_last_offset_ms,omitempty"`
+	ClaimReconcilePending       bool     `json:"claim_reconcile_pending,omitempty"`
+	PayloadBytes                uint64   `json:"payload_bytes,omitempty"`
+	DurationSeconds             float64  `json:"duration_seconds,omitempty"`
 }
 
 // MetadataRevision records a canonical snapshot of the known source title and

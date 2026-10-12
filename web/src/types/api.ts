@@ -215,6 +215,25 @@ export type SearchResult = { type: 'recording' | 'adapter' | 'resource' | 'workf
 export type ArchiveEntry = { kind: string; path: string; size: number; sha256?: string }
 export type ArchiveIndexPage = { recording_id: string; entries: ArchiveEntry[]; next_cursor?: string; has_more: boolean }
 export type RecordingEvent = { id: string; recording_id: string; type: string; at: string; count?: number; message?: string }
+export type TimedEvent = {
+  event_archive_ordinal: number
+  event_timeline_ordinal: number
+  event_type: string
+  source_event_id?: string
+  source_sequence?: number
+  source_timestamp?: string
+  observed_at: string
+  presentation_offset_ms: number
+  actor?: { source_id?: string; display_name?: string; badges?: string[] }
+  message?: { text?: string; fragments?: { type: string; text: string }[] }
+  reply_to?: { source_event_id?: string; actor?: { source_id?: string; display_name?: string; badges?: string[] }; text?: string }
+  amount?: string
+  currency?: string
+  related_event_id?: string
+  payload?: unknown
+  extension?: unknown
+}
+export type TimedEventPage = { items: TimedEvent[]; next_cursor: string; has_more: boolean; archive_revision: number; timeline_revision: number }
 export type LogEntry = { at: string; level: string; component: string; message: string }
 export type AuditEvent = { id: string; type: string; at: string; object_id?: string; actor?: { type: 'user' | 'system' | 'local_admin'; user_id?: string } }
 export type ApiSession = { auth_enabled: boolean; authenticated: boolean; needs_bootstrap: boolean; csrf_token?: string; expires_at?: string }

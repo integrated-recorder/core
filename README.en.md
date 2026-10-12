@@ -77,7 +77,7 @@ See the Makefile and CI workflows for Web UI development and validation commands
 
 ## Current limitations
 
-The project is under active development. Chat timelines, multi-pool storage placement and replication, DRM, and multi-user role management are not available yet. See the linked guides and release notes for current capabilities and limitations.
+The project is under active development. Core provides a platform-independent timed event archive and replay foundation, but does not include platform chat/event integrations. Multi-pool storage placement and replication, DRM, and multi-user role management are also not available yet. See the linked guides for current capabilities and limitations.
 
 ## License
 

@@ -4043,6 +4043,32 @@ func validateV2Header(recording *domain.Recording) error {
 			return ErrShardedArchiveInvalid
 		}
 	}
+	if recording.ShardedArchive.TimedEventLastOffsetMillis < 0 {
+		return ErrShardedArchiveInvalid
+	}
+	identityHighWater := recording.ShardedArchive.TimedEventIdentityHighWater
+	if len(identityHighWater) != 0 && len(identityHighWater) != timedEventIdentityBuckets {
+		return ErrShardedArchiveInvalid
+	}
+	if len(identityHighWater) == 0 {
+		if recording.ShardedArchive.TimedEventCount != 0 {
+			return ErrShardedArchiveInvalid
+		}
+	} else {
+		var identityCount uint64
+		for _, count := range identityHighWater {
+			if count > ^uint64(0)-identityCount {
+				return ErrShardedArchiveInvalid
+			}
+			identityCount += count
+		}
+		if identityCount != recording.ShardedArchive.TimedEventCount {
+			return ErrShardedArchiveInvalid
+		}
+	}
+	if (recording.ShardedArchive.TimedEventCount == 0) != (recording.ShardedArchive.TimedEventBatchCount == 0) {
+		return ErrShardedArchiveInvalid
+	}
 	data, err := json.Marshal(recording)
 	if err != nil || len(data)+1 > archiveRootMaxBytes {
 		return ErrShardedArchiveInvalid
@@ -4135,6 +4161,21 @@ func mergeV2HighWater(target, source *domain.Recording) {
 		mergeUint64(&target.ShardedArchive.MetadataRevisionCount, source.ShardedArchive.MetadataRevisionCount)
 		mergeUint64(&target.ShardedArchive.ClaimCount, source.ShardedArchive.ClaimCount)
 		mergeUint64(&target.ShardedArchive.CoverageObservationCount, source.ShardedArchive.CoverageObservationCount)
+		mergeUint64(&target.ShardedArchive.TimedEventCount, source.ShardedArchive.TimedEventCount)
+		mergeUint64(&target.ShardedArchive.TimedEventBatchCount, source.ShardedArchive.TimedEventBatchCount)
+		if len(source.ShardedArchive.TimedEventIdentityHighWater) > 0 {
+			if len(target.ShardedArchive.TimedEventIdentityHighWater) == 0 {
+				target.ShardedArchive.TimedEventIdentityHighWater = make([]uint64, len(source.ShardedArchive.TimedEventIdentityHighWater))
+			}
+			if len(target.ShardedArchive.TimedEventIdentityHighWater) == len(source.ShardedArchive.TimedEventIdentityHighWater) {
+				for i := range target.ShardedArchive.TimedEventIdentityHighWater {
+					mergeUint64(&target.ShardedArchive.TimedEventIdentityHighWater[i], source.ShardedArchive.TimedEventIdentityHighWater[i])
+				}
+			}
+		}
+		if source.ShardedArchive.TimedEventLastOffsetMillis > target.ShardedArchive.TimedEventLastOffsetMillis {
+			target.ShardedArchive.TimedEventLastOffsetMillis = source.ShardedArchive.TimedEventLastOffsetMillis
+		}
 		mergeUint64(&target.ShardedArchive.PayloadBytes, source.ShardedArchive.PayloadBytes)
 		if source.ShardedArchive.DurationSeconds > target.ShardedArchive.DurationSeconds {
 			target.ShardedArchive.DurationSeconds = source.ShardedArchive.DurationSeconds

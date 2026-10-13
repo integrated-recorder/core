@@ -66,6 +66,10 @@ type segmentTask struct {
 	bufferedPayload         *storage.IngestPayload
 	bufferedSegment         domain.Segment
 	bufferedInit            *initFlight
+	firstObservedAt         time.Time
+	lastAttemptStartedAt    time.Time
+	lastAttemptEndedAt      time.Time
+	lastFailure             *FetchError
 }
 
 type initFlight struct {
@@ -200,6 +204,7 @@ type segmentScheduler struct {
 	workers                  int
 	busy                     int
 	closed                   bool
+	liveAdmissionClosed      bool
 	fatal                    error
 	pendingSnapshots         int
 	pendingMetadata          int
@@ -304,6 +309,16 @@ func (s *segmentScheduler) growIfSaturatedLocked() {
 	}
 }
 
+// closeLiveAdmission prevents a concurrently fetched manifest from creating
+// new live media tasks after an operator Stop. Existing tasks remain eligible
+// to retry and drain on the scheduler's independent context.
+func (s *segmentScheduler) closeLiveAdmission() {
+	s.mu.Lock()
+	s.liveAdmissionClosed = true
+	s.signalLocked()
+	s.mu.Unlock()
+}
+
 func (s *segmentScheduler) discover(ctx context.Context, epoch uint64, playlist hls.MediaPlaylist) error {
 	_, generation := currentMediaVersion(s.e)
 	_, err := s.discoverAtGeneration(ctx, epoch, playlist, generation)
@@ -362,6 +377,13 @@ func (s *segmentScheduler) discoverAtGeneration(ctx context.Context, epoch uint6
 				s.mu.Unlock()
 				break
 			}
+			if s.liveAdmissionClosed {
+				s.mu.Unlock()
+				if err := s.manager.markRemainingPending(s.e, epoch, playlist.Segments[index:], context.Canceled); err != nil {
+					return false, err
+				}
+				return false, nil
+			}
 			if len(s.tasks) >= maxSegmentTasks {
 				changed := s.changed
 				s.mu.Unlock()
@@ -386,7 +408,7 @@ func (s *segmentScheduler) discoverAtGeneration(ctx context.Context, epoch uint6
 				return false, errors.New("archive ordinal overflow")
 			}
 			s.next++
-			task := &segmentTask{key: key, source: source, ordinal: ordinal, available: true, observed: true, observedGeneration: generation, state: segmentTaskQueued}
+			task := &segmentTask{key: key, source: source, ordinal: ordinal, available: true, observed: true, observedGeneration: generation, state: segmentTaskQueued, firstObservedAt: time.Now().UTC()}
 			s.tasks[key] = task
 			s.ready = append(s.ready, task)
 			s.growIfSaturatedLocked()
@@ -722,6 +744,15 @@ func (s *segmentScheduler) observeAtGeneration(epoch uint64, playlist hls.MediaP
 			if (task.state == segmentTaskRetryWait || task.state == segmentTaskQueued) && task.coordinatorRetryPending {
 				continue
 			}
+			// A source coordinate can leave a short live window while waiting
+			// behind other admitted fetches. Its last observed URI is still a
+			// bounded recovery opportunity: keep queued/retry-wait work alive
+			// until its fetch budget is exhausted. An explicit EXT-X-GAP and a
+			// refresh that never re-advertised the coordinate remain terminal.
+			explicitSourceGap := key.epoch == epoch && gaps[key.sequence]
+			if !explicitSourceGap && (task.state == segmentTaskQueued || task.state == segmentTaskRetryWait) && task.attempt < segmentAttempts {
+				continue
+			}
 			if task.state == segmentTaskRetryWait || task.state == segmentTaskQueued || task.state == segmentTaskAwaitManifest {
 				task.timerToken++
 				task.state = segmentTaskGapCommitting
@@ -876,6 +907,7 @@ func (s *segmentScheduler) worker(burst bool) {
 			continue
 		}
 		task.state = segmentTaskInFlight
+		task.lastAttemptStartedAt = time.Now().UTC()
 		task.coordinatorRetryPending = false
 		s.busy++
 		s.growIfSaturatedLocked()
@@ -886,6 +918,12 @@ func (s *segmentScheduler) worker(burst bool) {
 
 		s.mu.Lock()
 		s.busy--
+		task.lastAttemptEndedAt = time.Now().UTC()
+		var attemptFailure *FetchError
+		if errors.As(err, &attemptFailure) {
+			copy := *attemptFailure
+			task.lastFailure = &copy
+		}
 		if s.tasks[task.key] != task {
 			s.signalLocked()
 			s.mu.Unlock()
@@ -939,15 +977,6 @@ func (s *segmentScheduler) worker(burst bool) {
 			s.failFatal(err)
 			return
 		}
-		if !task.available {
-			task.state = segmentTaskGapCommitting
-			s.signalLocked()
-			s.mu.Unlock()
-			if gapErr := s.persistGap(task, "media left the live window after retries"); gapErr != nil {
-				s.failFatal(gapErr)
-			}
-			continue
-		}
 		if persistErr := s.manager.markPending(s.e, task.key.epoch, task.key.discontinuitySequence, task.key.sequence, err); persistErr != nil {
 			s.mu.Unlock()
 			s.failFatal(persistErr)
@@ -958,6 +987,15 @@ func (s *segmentScheduler) worker(burst bool) {
 			delete(s.tasks, task.key)
 			s.signalLocked()
 			s.mu.Unlock()
+			continue
+		}
+		if !task.available && task.attempt >= segmentAttempts {
+			task.state = segmentTaskGapCommitting
+			s.signalLocked()
+			s.mu.Unlock()
+			if gapErr := s.persistGap(task, "media left the live window after retries"); gapErr != nil {
+				s.failFatal(gapErr)
+			}
 			continue
 		}
 		if s.ending && task.attempt >= segmentAttempts {
@@ -1120,7 +1158,22 @@ func (s *segmentScheduler) awaitManifest(task *segmentTask) {
 }
 
 func (s *segmentScheduler) persistGap(task *segmentTask, reason string) error {
-	if err := s.manager.markGap(s.e, task.key.epoch, task.key.discontinuitySequence, task.key.sequence, reason); err != nil {
+	var diagnostic *domain.GapAcquisitionDiagnostic
+	if task != nil {
+		diagnostic = &domain.GapAcquisitionDiagnostic{
+			FirstObservedAt:      optionalUTC(task.firstObservedAt),
+			LastAttemptStartedAt: optionalUTC(task.lastAttemptStartedAt),
+			LastAttemptEndedAt:   optionalUTC(task.lastAttemptEndedAt),
+			Attempts:             task.attempt,
+			RefreshCycles:        task.refreshCycles,
+		}
+		if task.lastFailure != nil {
+			diagnostic.FailureClass = task.lastFailure.FailureClass
+			diagnostic.HTTPStatus = task.lastFailure.HTTPStatus
+			diagnostic.Retryable = task.lastFailure.Retryable
+		}
+	}
+	if err := s.manager.markGapWithAcquisition(s.e, task.key.epoch, task.key.discontinuitySequence, task.key.sequence, reason, diagnostic); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -1130,6 +1183,14 @@ func (s *segmentScheduler) persistGap(task *segmentTask, reason string) error {
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+func optionalUTC(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	copy := value.UTC()
+	return &copy
 }
 
 func retryDelay(attempt int) time.Duration {
@@ -1154,7 +1215,7 @@ func (s *segmentScheduler) retryTimer(ctx context.Context, cancel context.Cancel
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.ctx.Err() != nil || s.tasks[task.key] != task || task.timerToken != token || !task.available {
+	if s.closed || s.ctx.Err() != nil || s.tasks[task.key] != task || task.timerToken != token || task.state != segmentTaskRetryWait || (!task.available && task.attempt >= segmentAttempts) {
 		return
 	}
 	task.retryCancel = nil

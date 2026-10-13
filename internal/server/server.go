@@ -828,11 +828,16 @@ func publicLastError(value string) string {
 
 type recordingDetail struct {
 	*domain.Recording
-	TrackCount   int                  `json:"track_count"`
-	SegmentCount int                  `json:"segment_count"`
-	Duration     float64              `json:"duration_seconds"`
-	Statistics   *recordingStatistics `json:"statistics,omitempty"`
-	Preview      *preview.Summary     `json:"preview,omitempty"`
+	TrackCount          int                          `json:"track_count"`
+	SegmentCount        int                          `json:"segment_count"`
+	Duration            float64                      `json:"duration_seconds"`
+	Statistics          *recordingStatistics         `json:"statistics,omitempty"`
+	Preview             *preview.Summary             `json:"preview,omitempty"`
+	Gaps                []recordingGapView           `json:"gaps,omitempty"`
+	GapHistory          []domain.Gap                 `json:"gap_history,omitempty"`
+	GapHistoryStatus    string                       `json:"gap_history_status,omitempty"`
+	GapHistoryTruncated bool                         `json:"gap_history_truncated,omitempty"`
+	GapCoverage         *recordingGapCoverageSummary `json:"gap_coverage,omitempty"`
 }
 
 type recordingStatistics struct {

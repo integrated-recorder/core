@@ -1562,6 +1562,58 @@ func (s *Store) IterateShardedGaps(ctx context.Context, id string, visit func(do
 	})
 }
 
+const MaxShardedGapHistoryEntries = 50
+
+// LatestShardedGaps returns a bounded tail in canonical observation order.
+// It reads ordinal-indexed gap pages directly so recording detail does not
+// materialize or scan the full gap history to show recent diagnostics.
+func (s *Store) LatestShardedGaps(ctx context.Context, id string) ([]domain.Gap, bool, error) {
+	if err := checkV2Context(ctx); err != nil {
+		return nil, false, err
+	}
+	header, err := s.LoadRecordingHeader(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if header == nil || header.ShardedArchive == nil {
+		return nil, false, ErrShardedArchiveInvalid
+	}
+	count := header.ShardedArchive.GapCount
+	limit := uint64(MaxShardedGapHistoryEntries)
+	first := uint64(1)
+	truncated := count > limit
+	if truncated {
+		first = count - limit + 1
+	}
+	capacity := count
+	if capacity > limit {
+		capacity = limit
+	}
+	gaps := make([]domain.Gap, 0, int(capacity))
+	for ordinal := first; ordinal <= count; ordinal++ {
+		if err := checkV2Context(ctx); err != nil {
+			return nil, false, err
+		}
+		var observation v2Observation
+		path := trimJSONSuffix(v2ObservationOrdinalPath("gaps", ordinal))
+		if err := s.loadV2JSON(ctx, id, path, archiveShardMaxBytes, &observation); err != nil {
+			return nil, false, fmt.Errorf("load sharded gap history: %w", err)
+		}
+		if observation.Version != 1 || observation.Ordinal != ordinal || observation.Gap == nil || observation.Coverage != nil || observation.Gap.TrackID == "" || observation.Gap.ToSequence < observation.Gap.FromSequence || observation.Gap.DetectedAt.IsZero() {
+			return nil, false, fmt.Errorf("validate sharded gap history: %w", ErrShardedArchiveInvalid)
+		}
+		gaps = append(gaps, *observation.Gap)
+		if ordinal == ^uint64(0) {
+			break
+		}
+	}
+	current, err := s.LoadRecordingHeader(ctx, id)
+	if err != nil || current == nil || current.ShardedArchive == nil || current.ArchiveRevision != header.ArchiveRevision || current.TimelineRevision != header.TimelineRevision || current.ShardedArchive.GapCount != count {
+		return nil, false, ErrShardedArchiveConflict
+	}
+	return gaps, truncated, nil
+}
+
 func (s *Store) AppendShardedCoverage(ctx context.Context, id string, coverage archiveindex.Coverage) error {
 	_, err := s.AppendShardedCoverageWithRevision(ctx, id, coverage)
 	return err

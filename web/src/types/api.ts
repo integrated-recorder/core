@@ -56,7 +56,21 @@ export type PreviewFramesResponse = {
   frame_count: number; items: PreviewFrame[]
 }
 export type Segment = { sequence?: number; source_sequence?: number; source_epoch?: number; archive_ordinal?: number; duration?: number; storage_path?: string; payload_size?: number; sha256?: string; discontinuity?: boolean; init_segment_id?: string; program_date_time?: string }
-export type Gap = { track_id?: string; source_epoch?: number; from_sequence?: number; to_sequence?: number; duration_seconds?: number; reason?: string }
+export type GapAcquisitionDiagnostic = {
+  first_observed_at?: string; last_attempt_started_at?: string; last_attempt_ended_at?: string;
+  attempts?: number; refresh_cycles?: number; failure_class?: string; http_status?: number; retryable?: boolean
+}
+export type Gap = {
+  track_id?: string; source_epoch?: number; discontinuity_sequence?: number;
+  from_sequence?: number; to_sequence?: number; detected_at?: string; duration_seconds?: number; reason?: string;
+  live_presentation_ordinal?: number;
+  acquisition?: GapAcquisitionDiagnostic; coverage_status?: 'recovered' | 'partial' | 'unresolved' | 'unavailable';
+  sequence_count?: number; recovered_sequence_count?: number; unresolved_sequence_count?: number
+}
+export type GapCoverageSummary = {
+  status: 'available' | 'unavailable'; gap_records: number; unique_sequence_count?: number;
+  recovered_sequence_count?: number; unresolved_sequence_count?: number
+}
 export type Track = { id?: string; name?: string; type?: string; segments?: Segment[]; init_segments?: Segment[]; [key: string]: unknown }
 export type RecordingSummary = {
   id: string; title?: string; adapter_id?: string; adapter?: { id: string; name?: string; version?: string; protocol_version?: number; fingerprint?: string };
@@ -79,7 +93,8 @@ export type RecordingDetail = {
   adapter?: { id: string; name?: string; version: string; protocol_version: number; descriptor_fingerprint?: string };
   resource?: ResourceRef & { display_name?: string }; source_uri_classification?: string;
   source_url?: string; state: RecordingState; created_at: string; started_at: string; stopped_at?: string | null;
-  tracks?: Record<string, Track>; gaps?: Gap[];
+  tracks?: Record<string, Track>; gaps?: Gap[]; gap_coverage?: GapCoverageSummary;
+  gap_history?: Gap[]; gap_history_status?: 'available' | 'unavailable'; gap_history_truncated?: boolean;
   manifest_snapshots?: { storage_path?: string; size?: number; sha256?: string; captured_at?: string }[];
   last_error?: string; segment_count?: number; duration_seconds?: number; statistics?: RecordingStatistics; integrity?: IntegrityStatus; preview?: PreviewSummary;
   archive_sealed?: boolean; archive_revision?: number; timeline_revision?: number

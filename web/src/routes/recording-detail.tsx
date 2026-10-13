@@ -67,6 +67,7 @@ export function RecordingDetailPage() {
   if (recording.error || !recording.data) return <ErrorState title={t('common.loadFailed')} retryLabel={t('common.retry')} message={recording.error ? localizedErrorMessage(recording.error, locale) : t('detail.notFound')} retry={() => void recording.refetch()} />
   const item = recording.data; const stats = item.statistics ?? {}; const trackValues = Object.values(item.tracks ?? {}); const ffmpegAvailable = isFFmpegAvailable(exports.data); const hasCommittedMedia = recordingHasCommittedMedia(item); const segments = Object.entries(item.tracks ?? {}).flatMap(([trackId, track]) => (track.segments ?? []).map(segment => ({ ...segment, trackId }))).sort((a, b) => a.trackId.localeCompare(b.trackId) || (a.archive_ordinal ?? a.sequence ?? 0) - (b.archive_ordinal ?? b.sequence ?? 0))
   const gaps = item.gaps ?? []; const integrityState = integrity.data?.status ?? stats.integrity ?? 'unknown'
+  const gapCount = stats.gap_count ?? item.gap_coverage?.gap_records ?? gaps.length
   const timedEventItems = timedEvents.data?.pages.flatMap(page => page.items) ?? []
   const hasTimedEventItems = timedEventItems.length > 0
   const currentAdapter = adapters.data?.find(adapter => adapter.status.id === item.adapter_id)
@@ -114,6 +115,8 @@ export function RecordingDetailPage() {
               [t('detail.summary.initSegments'), stats.init_segment_count ?? trackValues.reduce((total, track) => total + (track.init_segments?.length ?? 0), 0)],
               [t('detail.summary.manifestSnapshots'), stats.manifest_snapshot_count ?? item.manifest_snapshots?.length ?? 0],
               [t('detail.summary.gaps'), stats.gap_count ?? item.gaps?.length ?? 0],
+              [t('detail.summary.gapRecovered'), item.gap_coverage?.recovered_sequence_count == null ? t('detail.notReported') : formatNumber(item.gap_coverage.recovered_sequence_count)],
+              [t('detail.summary.gapUnresolved'), item.gap_coverage?.unresolved_sequence_count == null ? t('detail.notReported') : formatNumber(item.gap_coverage.unresolved_sequence_count)],
               [t('detail.summary.gapDuration'), stats.gap_duration_seconds == null ? t('detail.notReported') : formatDuration(stats.gap_duration_seconds)],
             ].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}
           </div>
@@ -140,6 +143,7 @@ export function RecordingDetailPage() {
       <summary className="cursor-pointer py-3 text-sm font-medium">{t('detail.timeline.title')} <span className="ml-2 text-xs font-normal text-muted-foreground">{t('detail.timeline.summary', { segments: formatNumber(stats.segment_count ?? item.segment_count ?? segments.length), gaps: formatNumber(stats.gap_count ?? gaps.length) })}</span></summary>
       <div className="border-t border-border py-4">{timelineProjectionOmitted(item, segments.length, gaps.length) ? <p role="status" className="text-sm text-muted-foreground">{t('detail.timeline.omitted')}</p> : <Timeline segments={segments} gaps={gaps} />}</div>
     </details>
+    <GapHistory entries={item.gap_history} status={item.gap_history_status} truncated={item.gap_history_truncated} total={gapCount} />
     <div className="mt-4 grid gap-4 xl:grid-cols-[1fr_1fr]"><Card><CardHeader className="flex-row items-center justify-between"><CardTitle>{t('detail.tags.title')}</CardTitle><Tag className="h-4 w-4 text-muted-foreground" /></CardHeader><CardContent>{tagEditing ? <div className="flex gap-2"><Input aria-label={t('detail.tags.label')} value={tagInput} onChange={event => setTagInput(event.target.value)} placeholder="concert, important" maxLength={512} /><Button onClick={() => saveTags.mutate()} disabled={saveTags.isPending}>{t('detail.tags.save')}</Button><Button variant="outline" onClick={() => { setTagInput(tags.join(', ')); setTagEditing(false) }}>{t('detail.tags.cancel')}</Button></div> : <div className="flex min-h-10 flex-wrap items-center gap-2">{tags.length ? tags.map(tag => <Badge key={tag}>{tag}</Badge>) : <span className="text-sm text-muted-foreground">{t('detail.tags.empty')}</span>}<Button variant="ghost" size="sm" className="ml-auto" onClick={() => { setTagInput(tags.join(', ')); setTagEditing(true) }}>{t('detail.tags.edit')}</Button></div>}</CardContent></Card><Card><CardHeader className="flex-row items-center justify-between"><div><CardTitle>{t('detail.derivatives.title')}</CardTitle><p className="mt-1 text-xs text-muted-foreground">{t('detail.derivatives.description')}</p></div><FileArchive className="h-4 w-4 text-muted-foreground" /></CardHeader><CardContent><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm font-medium">{t('detail.derivatives.name')}</p><p className="text-xs text-muted-foreground">{exports.isLoading ? t('detail.derivatives.checking') : ffmpegAvailable ? t('detail.derivatives.copyMode') : t('detail.derivatives.unavailable')}</p></div><Button size="sm" onClick={() => exportStart.mutate()} disabled={!ffmpegAvailable || exportStart.isPending || item.state === 'recording'}><FileArchive className="h-4 w-4" />{t('detail.derivatives.start')}</Button></div><div className="mt-3 divide-y divide-border">{exports.data?.items.map(job => <ExportRow key={job.id} item={job} onDelete={() => removeExport.mutate(job.id)} deleting={removeExport.isPending} />)}{exports.data && !exports.data.items.length && <p className="py-3 text-xs text-muted-foreground">{t('detail.derivatives.empty')}</p>}</div></CardContent></Card></div>
     <Card className="mt-4">
       <div className="flex gap-1 border-b border-border px-4 pt-3" role="tablist" aria-label={t('detail.tabs.label')}>
@@ -161,6 +165,40 @@ export function RecordingDetailPage() {
   </div>
 }
 
+function GapHistory({ entries, status, truncated, total }: { entries?: Gap[]; status?: 'available' | 'unavailable'; truncated?: boolean; total: number }) {
+  const { t } = useI18n()
+  if (total <= 0) return null
+  return <details className="mt-4 rounded-lg border border-border px-4">
+    <summary className="cursor-pointer py-3 text-sm font-medium">{t('detail.gapHistory.title')} <span className="ml-2 text-xs font-normal text-muted-foreground">{formatNumber(total)}</span></summary>
+    <div className="border-t border-border py-3">
+      {status === 'unavailable' ? <p role="status" className="text-sm text-muted-foreground">{t('detail.gapHistory.unavailable')}</p> : <>
+        {truncated && <p className="mb-2 text-xs text-muted-foreground">{t('detail.gapHistory.recent', { shown: formatNumber(entries?.length ?? 0), total: formatNumber(total) })}</p>}
+        {entries?.length ? <ol className="divide-y divide-border">{entries.map((gap, index) => {
+          const diagnostic = gap.acquisition
+          const failureClass = diagnostic?.failure_class === 'http_status' ? t('detail.gapHistory.failure.http')
+            : diagnostic?.failure_class === 'timeout' ? t('detail.gapHistory.failure.timeout')
+              : diagnostic?.failure_class === 'canceled' ? t('detail.gapHistory.failure.canceled')
+                : diagnostic?.failure_class === 'transport_or_read' ? t('detail.gapHistory.failure.transport')
+                  : diagnostic?.failure_class === 'request' ? t('detail.gapHistory.failure.request')
+                    : diagnostic?.failure_class ? t('detail.gapHistory.failure.other') : undefined
+          return <li key={`${gap.track_id ?? 'track'}:${gap.source_epoch ?? 0}:${gap.discontinuity_sequence ?? 0}:${gap.from_sequence ?? 0}:${gap.detected_at ?? index}`} className="space-y-1.5 py-3 first:pt-1">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              <span className="tabular-nums">{t('detail.gapHistory.coordinate', { track: gap.track_id ?? 'main', epoch: formatNumber(gap.source_epoch ?? 0), from: formatNumber(gap.from_sequence ?? 0), to: formatNumber(gap.to_sequence ?? 0) })}</span>
+              {gap.detected_at && <time>{formatDate(gap.detected_at)}</time>}
+            </div>
+            <p className="text-sm">{gap.reason ?? t('detail.gapHistory.unknownReason')}</p>
+            {diagnostic ? <p className="text-xs text-muted-foreground">{[
+              diagnostic.attempts != null ? t('detail.gapHistory.attempts', { count: formatNumber(diagnostic.attempts) }) : undefined,
+              failureClass ? t('detail.gapHistory.failure', { classification: failureClass }) : undefined,
+              diagnostic.http_status != null ? t('detail.gapHistory.httpStatus', { status: diagnostic.http_status }) : undefined,
+            ].filter(Boolean).join(' · ')}</p> : <p className="text-xs text-muted-foreground">{t('detail.gapHistory.noDiagnostics')}</p>}
+          </li>
+        })}</ol> : <p className="text-sm text-muted-foreground">{t('detail.gapHistory.empty')}</p>}
+      </>}
+    </div>
+  </details>
+}
+
 export function MetadataTimeline({ data, loading, error, retry }: { data?: RecordingMetadata; loading: boolean; error: unknown; retry: () => void }) {
   const { t, locale } = useI18n()
   const valueLabel = (value?: string | null) => value == null ? t('metadata.unknown') : value === '' ? t('metadata.empty') : value
@@ -178,6 +216,14 @@ function Stat({ label, value }: { label: string; value: string | number }) { ret
 function Info({ label, value, mono }: { label: string; value: string; mono?: boolean }) { return <div><p className="text-[11px] text-muted-foreground">{label}</p><p className={`mt-1 break-all text-sm ${mono ? 'font-mono text-xs' : 'font-medium'}`}>{value}</p></div> }
 export function Timeline({ segments, gaps }: { segments: (Segment & { trackId: string })[]; gaps: Gap[] }) {
   const { t } = useI18n()
+  const coverageLabel = (status: Gap['coverage_status']) => {
+    switch (status) {
+      case 'recovered': return t('timeline.capture.gapStatus.recovered')
+      case 'partial': return t('timeline.capture.gapStatus.partial')
+      case 'unresolved': return t('timeline.capture.gapStatus.unresolved')
+      default: return t('timeline.capture.gapStatus.unavailable')
+    }
+  }
   if (!segments.length && !gaps.length) return <EmptyState title={t('timeline.capture.empty')} />
   const trackIds = [...new Set([...segments.map(item => item.trackId), ...gaps.map(item => item.track_id ?? t('timeline.capture.unknownTrack'))])].sort()
   return <div className="space-y-5">{trackIds.map(trackId => {
@@ -194,7 +240,7 @@ export function Timeline({ segments, gaps }: { segments: (Segment & { trackId: s
       </div>
       <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-muted-foreground"><span className="flex items-center gap-1.5"><i className="h-2 w-2 rounded-sm bg-blue-500" />{t('timeline.capture.stored')}</span><span className="flex items-center gap-1.5"><i className="h-2 w-2 rounded-sm bg-amber-500" />{t('timeline.capture.recordedGap')}</span>{trackSegments.some(item => item.discontinuity) && <span>{t('timeline.capture.discontinuityCount', { count: formatNumber(trackSegments.filter(item => item.discontinuity).length) })}</span>}</div>
       <div className="mt-3 max-h-48 overflow-y-auto rounded-md border border-border"><table className="w-full text-left text-xs"><thead className="sticky top-0 bg-muted"><tr><th className="px-3 py-2 font-medium">{t('timeline.capture.archiveOrdinal')}</th><th className="px-3 py-2 font-medium">{t('timeline.capture.sourceCoordinate')}</th><th className="px-3 py-2 font-medium">{t('timeline.capture.duration')}</th><th className="px-3 py-2 font-medium">{t('timeline.capture.status')}</th></tr></thead><tbody>{trackSegments.map((item, index) => <tr key={`${trackId}-${item.archive_ordinal ?? index}`} className="border-t border-border"><td className="px-3 py-2 font-mono">{item.archive_ordinal == null ? '—' : formatNumber(item.archive_ordinal)}</td><td className="px-3 py-2 font-mono">{formatNumber(item.source_epoch ?? 0)} / {item.sequence == null ? '—' : formatNumber(item.sequence)}</td><td className="px-3 py-2">{item.duration == null ? '—' : formatDuration(item.duration)}</td><td className="px-3 py-2">{item.discontinuity ? <Badge tone="amber">{t('timeline.capture.discontinuity')}</Badge> : <Badge tone="green">{t('timeline.capture.present')}</Badge>}</td></tr>)}</tbody></table></div>
-      {trackGaps.length > 0 && <ul className="mt-2 space-y-1 text-[11px] text-amber-700 dark:text-amber-300">{trackGaps.map((gap, index) => <li key={`${gap.source_epoch ?? 0}-${gap.from_sequence ?? 0}-${index}`}>{t('timeline.capture.gapLine', { epoch: formatNumber(gap.source_epoch ?? 0), start: gap.from_sequence == null ? '—' : formatNumber(gap.from_sequence), end: gap.to_sequence == null ? gap.from_sequence == null ? '—' : formatNumber(gap.from_sequence) : formatNumber(gap.to_sequence), reason: gap.reason ? t('timeline.capture.reasonSuffix', { reason: gap.reason }) : '' })}</li>)}</ul>}
+      {trackGaps.length > 0 && <ul className="mt-2 space-y-1 text-[11px] text-amber-700 dark:text-amber-300">{trackGaps.map((gap, index) => <li key={`${gap.source_epoch ?? 0}-${gap.from_sequence ?? 0}-${index}`}>{t('timeline.capture.gapLine', { status: coverageLabel(gap.coverage_status), epoch: formatNumber(gap.source_epoch ?? 0), start: gap.from_sequence == null ? '—' : formatNumber(gap.from_sequence), end: gap.to_sequence == null ? gap.from_sequence == null ? '—' : formatNumber(gap.from_sequence) : formatNumber(gap.to_sequence), reason: gap.reason ? t('timeline.capture.reasonSuffix', { reason: gap.reason }) : '' })}{gap.unresolved_sequence_count != null && <span className="ml-2 text-muted-foreground">{t('detail.summary.gapUnresolved')}: {formatNumber(gap.unresolved_sequence_count)}</span>}</li>)}</ul>}
     </section>
   })}</div>
 }

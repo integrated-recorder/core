@@ -1022,6 +1022,125 @@ func TestSlowHistoricalRequestDoesNotBlockLiveCanonicalCommit(t *testing.T) {
 	}
 }
 
+func TestHistoricalWriterLatencyDoesNotTurnBufferedLiveMediaIntoGap(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingest, err := store.IngestService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	historyPayloadBytes := []byte("historical-writer-block")
+	historyPayload, err := ingest.ReadPayload(context.Background(), "1123456789abcdef0123456789abcdef", bytes.NewReader(historyPayloadBytes), int64(len(historyPayloadBytes)), int64(len(historyPayloadBytes)), int64(len(historyPayloadBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalStarted := make(chan struct{})
+	releaseHistorical := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseHistorical) })
+	historicalDone := make(chan error, 1)
+	if err := ingest.SubmitWithKind(context.Background(), historyPayload, storage.IngestJobKindHistoricalMedia, func(data []byte) (storage.PayloadResult, error) {
+		close(historicalStarted)
+		<-releaseHistorical
+		return storage.PayloadResult{Size: int64(len(data))}, nil
+	}, func(_ storage.PayloadResult, err error) { historicalDone <- err }); err != nil {
+		historyPayload.Release()
+		t.Fatal(err)
+	}
+	waitSignal(t, historicalStarted, "historical canonical writer")
+
+	segmentRequested := make(chan struct{})
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/live.m3u8" {
+			_, _ = fmt.Fprintln(w, "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:8\n#EXTINF:2,\n8.ts")
+			return
+		}
+		select {
+		case <-segmentRequested:
+		default:
+			close(segmentRequested)
+		}
+		_, _ = w.Write([]byte("live-media-buffered-while-writer-was-busy"))
+	}))
+	defer server.Close()
+	manager, err := NewManager(store, server.Client(), emptyResolver{}, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeManager := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := manager.Close(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("close acquisition manager: %v", err)
+		}
+	}
+	defer closeManager()
+	recording, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/live.m3u8"}, nil, "historical writer contention", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, segmentRequested, "live HTTP media body")
+	e, _ := manager.entry(recording.ID)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		e.mu.Lock()
+		scheduler := e.scheduler
+		e.mu.Unlock()
+		if scheduler != nil {
+			scheduler.mu.Lock()
+			task := scheduler.tasks[segmentTaskKey{epoch: 0, discontinuitySequence: 0, sequence: 8}]
+			state := segmentTaskQueued
+			if task != nil {
+				state = task.state
+			}
+			scheduler.mu.Unlock()
+			if task != nil && (state == segmentTaskPersisting || state == segmentTaskBuffered) {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("live body did not reach the bounded canonical writer queue")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	blocked, err := manager.Get(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.SegmentCount() != 0 || len(blocked.Gaps) != 0 {
+		t.Fatalf("writer delay changed canonical state before commit: segments=%d gaps=%#v", blocked.SegmentCount(), blocked.Gaps)
+	}
+	releaseOnce.Do(func() { close(releaseHistorical) })
+	select {
+	case err := <-historicalDone:
+		if err != nil {
+			t.Fatalf("finish historical writer: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("historical writer did not complete after release")
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		current, getErr := manager.Get(recording.ID)
+		if getErr == nil && current.SegmentCount() == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live media did not publish after historical writer released: recording=%#v err=%v", current, getErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stopped, err := manager.Stop(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped.SegmentCount() != 1 || len(stopped.Gaps) != 0 {
+		t.Fatalf("historical writer wait created a persistent live gap: segments=%d gaps=%#v", stopped.SegmentCount(), stopped.Gaps)
+	}
+}
+
 func findSegmentBySequence(segments []domain.Segment, sequence uint64) (domain.Segment, bool) {
 	for _, segment := range segments {
 		if segment.Sequence == sequence {

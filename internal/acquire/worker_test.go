@@ -724,7 +724,7 @@ func TestEndListWinsRefreshAwaitManifestTransition(t *testing.T) {
 	}
 }
 
-func TestStopCancelsRetryWaitAndJoinsScheduler(t *testing.T) {
+func TestStopDrainsRetryWaitAndJoinsScheduler(t *testing.T) {
 	var requests atomic.Int32
 	failed := make(chan struct{})
 	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -769,8 +769,407 @@ func TestStopCancelsRetryWaitAndJoinsScheduler(t *testing.T) {
 	if active != nil {
 		t.Fatal("scheduler remained attached after Stop returned")
 	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("retry escaped cancellation: requests=%d", got)
+	if got := requests.Load(); got != segmentAttempts {
+		t.Fatalf("accepted media did not receive its bounded retry budget before Stop: requests=%d want=%d", got, segmentAttempts)
+	}
+	if len(stopped.Gaps) != 1 || stopped.Gaps[0].Reason != "stream ended after segment retries" {
+		t.Fatalf("only exhausted accepted media should become a gap: %#v", stopped.Gaps)
+	}
+	diagnostic := stopped.Gaps[0].Acquisition
+	if diagnostic == nil || diagnostic.Attempts != segmentAttempts || diagnostic.FailureClass != "http_status" || diagnostic.HTTPStatus != http.StatusServiceUnavailable || !diagnostic.Retryable {
+		t.Fatalf("gap did not preserve safe bounded retry diagnostics: %#v", diagnostic)
+	}
+	encodedGap, err := json.Marshal(stopped.Gaps[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encodedGap), "sig=") || strings.Contains(string(encodedGap), "expired source") {
+		t.Fatalf("gap diagnostics leaked a URL query or response body: %s", encodedGap)
+	}
+}
+
+func TestStopDrainsAlreadyDiscoveredMediaBeforeFinalizing(t *testing.T) {
+	segmentStarted := make(chan struct{}, 8)
+	releaseSegment := make(chan struct{})
+	var manifestRequests atomic.Int32
+	var segmentCanceled atomic.Bool
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/live.m3u8" {
+			manifestRequests.Add(1)
+			_, _ = fmt.Fprintln(w, "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:8\n#EXTINF:2,\n8.ts\n#EXTINF:2,\n9.ts\n#EXTINF:2,\n10.ts\n#EXTINF:2,\n11.ts\n#EXTINF:2,\n12.ts\n#EXTINF:2,\n13.ts")
+			return
+		}
+		segmentStarted <- struct{}{}
+		select {
+		case <-r.Context().Done():
+			segmentCanceled.Store(true)
+			return
+		case <-releaseSegment:
+			_, _ = w.Write([]byte("accepted-segment-bytes-" + r.URL.Path))
+		}
+	}))
+	defer server.Close()
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, server.Client(), emptyResolver{}, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/live.m3u8"}, nil, "stop drains accepted media", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < maxSegmentWorkers; index++ {
+		waitSignal(t, segmentStarted, "in-flight discovered media request")
+	}
+	e, _ := manager.entry(recording.ID)
+	discoveryDeadline := time.Now().Add(2 * time.Second)
+	for {
+		e.mu.Lock()
+		scheduler := e.scheduler
+		e.mu.Unlock()
+		if scheduler != nil {
+			scheduler.mu.Lock()
+			discovered := len(scheduler.tasks)
+			scheduler.mu.Unlock()
+			if discovered == 6 {
+				break
+			}
+		}
+		if time.Now().After(discoveryDeadline) {
+			t.Fatal("not all manifest tasks were discovered before Stop")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	result := make(chan struct {
+		recording *domain.Recording
+		err       error
+	}, 1)
+	go func() {
+		stopped, stopErr := manager.Stop(recording.ID)
+		result <- struct {
+			recording *domain.Recording
+			err       error
+		}{stopped, stopErr}
+	}()
+	select {
+	case stopped := <-result:
+		t.Fatalf("Stop returned before accepted media was allowed to finish: recording=%#v err=%v canceled=%v", stopped.recording, stopped.err, segmentCanceled.Load())
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(releaseSegment)
+	var stopped struct {
+		recording *domain.Recording
+		err       error
+	}
+	select {
+	case stopped = <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop did not complete after accepted media finished")
+	}
+	if stopped.err != nil {
+		t.Fatalf("Stop error: %v", stopped.err)
+	}
+	if stopped.recording == nil || stopped.recording.State != domain.StateStopped {
+		t.Fatalf("Stop state: %#v", stopped.recording)
+	}
+	if len(stopped.recording.Tracks["main"].Segments) != 6 || len(stopped.recording.Gaps) != 0 {
+		t.Fatalf("completed accepted media was not preserved: segments=%#v gaps=%#v", stopped.recording.Tracks["main"].Segments, stopped.recording.Gaps)
+	}
+	if segmentCanceled.Load() {
+		t.Fatal("Stop canceled the already admitted media body")
+	}
+	if got := manifestRequests.Load(); got != 1 {
+		t.Fatalf("Stop admitted another manifest after the stop request: requests=%d", got)
+	}
+	if len(stopped.recording.Tracks["main"].Segments) != 6 {
+		t.Fatalf("queued discovered media did not drain: segments=%d", len(stopped.recording.Tracks["main"].Segments))
+	}
+}
+
+func TestSlidingLiveWindowDoesNotGapQueuedUnattemptedMedia(t *testing.T) {
+	var manifests atomic.Int32
+	var sequenceFiveRequests atomic.Int32
+	secondManifestServed := make(chan struct{})
+	segmentStarted := make(chan string, 8)
+	releaseSegments := make(chan struct{})
+	var releaseOnce sync.Once
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/live.m3u8" {
+			if manifests.Add(1) == 1 {
+				_, _ = fmt.Fprintln(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,\n1.ts\n#EXTINF:1,\n2.ts\n#EXTINF:1,\n3.ts\n#EXTINF:1,\n4.ts\n#EXTINF:1,\n5.ts")
+				return
+			}
+			_, _ = fmt.Fprintln(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:1,\n10.ts\n#EXT-X-ENDLIST")
+			select {
+			case <-secondManifestServed:
+			default:
+				close(secondManifestServed)
+			}
+			return
+		}
+		segmentStarted <- r.URL.Path
+		if r.URL.Path == "/5.ts" {
+			sequenceFiveRequests.Add(1)
+		}
+		if r.URL.Path != "/10.ts" {
+			select {
+			case <-releaseSegments:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		_, _ = io.WriteString(w, "segment-payload-"+r.URL.Path)
+	}))
+	defer func() {
+		releaseOnce.Do(func() { close(releaseSegments) })
+		server.Close()
+	}()
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, server.Client(), emptyResolver{}, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/live.m3u8"}, nil, "queued media survives window movement", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedPaths := map[string]bool{}
+	for index := 0; index < maxSegmentWorkers; index++ {
+		select {
+		case path := <-segmentStarted:
+			startedPaths[path] = true
+		case <-time.After(3 * time.Second):
+			t.Fatal("live worker pool did not fill with the first playlist segments")
+		}
+	}
+	e, _ := manager.entry(recording.ID)
+	waitUntil(t, 2*time.Second, func() bool {
+		e.mu.Lock()
+		scheduler := e.scheduler
+		e.mu.Unlock()
+		if scheduler == nil {
+			return false
+		}
+		scheduler.mu.Lock()
+		defer scheduler.mu.Unlock()
+		return len(scheduler.tasks) == 5
+	}, "all first-playlist coordinates discovered")
+	select {
+	case <-secondManifestServed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("live playlist did not advance while earlier media requests were blocked")
+	}
+	waitUntil(t, 2*time.Second, func() bool {
+		current, getErr := manager.Get(recording.ID)
+		return getErr == nil && current.Tracks["main"].HasLastObservedSequence && current.Tracks["main"].LastObservedSequence == 10
+	}, "advanced live playlist observation")
+	releaseOnce.Do(func() { close(releaseSegments) })
+	waitForRecordingState(t, manager, recording.ID, domain.StateCompleted)
+	completed, err := manager.Get(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := findSegmentBySequence(completed.Tracks["main"].Segments, 5); !ok {
+		t.Fatalf("sequence 5 was discovered but never committed: started=%v gaps=%#v", startedPaths, completed.Gaps)
+	}
+	for _, gap := range completed.Gaps {
+		if gap.TrackID == "main" && gap.SourceEpoch == 0 && gap.DiscontinuitySequence == 0 && gap.FromSequence <= 5 && gap.ToSequence >= 5 {
+			t.Fatalf("successfully fetched queued sequence 5 was also recorded as a gap: %#v", gap)
+		}
+	}
+	if sequenceFiveRequests.Load() == 0 {
+		t.Fatal("queued sequence 5 was never given a live fetch attempt")
+	}
+}
+
+func TestSlidingLiveWindowBoundsRetriesForUnavailableQueuedMedia(t *testing.T) {
+	var manifests atomic.Int32
+	var sequenceFiveRequests atomic.Int32
+	secondManifestServed := make(chan struct{})
+	segmentStarted := make(chan struct{}, 8)
+	releaseSegments := make(chan struct{})
+	var releaseOnce sync.Once
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/live.m3u8" {
+			if manifests.Add(1) == 1 {
+				_, _ = fmt.Fprintln(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,\n1.ts\n#EXTINF:1,\n2.ts\n#EXTINF:1,\n3.ts\n#EXTINF:1,\n4.ts\n#EXTINF:1,\n5.ts")
+				return
+			}
+			_, _ = fmt.Fprintln(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:1,\n10.ts\n#EXT-X-ENDLIST")
+			select {
+			case <-secondManifestServed:
+			default:
+				close(secondManifestServed)
+			}
+			return
+		}
+		segmentStarted <- struct{}{}
+		if r.URL.Path == "/5.ts" {
+			sequenceFiveRequests.Add(1)
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		if r.URL.Path != "/10.ts" {
+			select {
+			case <-releaseSegments:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		_, _ = io.WriteString(w, "segment-payload-"+r.URL.Path)
+	}))
+	defer func() {
+		releaseOnce.Do(func() { close(releaseSegments) })
+		server.Close()
+	}()
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, server.Client(), emptyResolver{}, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/live.m3u8"}, nil, "bounded retries after live window", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < maxSegmentWorkers; index++ {
+		waitSignal(t, segmentStarted, "in-flight first-playlist media")
+	}
+	e, _ := manager.entry(recording.ID)
+	waitUntil(t, 2*time.Second, func() bool {
+		e.mu.Lock()
+		scheduler := e.scheduler
+		e.mu.Unlock()
+		if scheduler == nil {
+			return false
+		}
+		scheduler.mu.Lock()
+		defer scheduler.mu.Unlock()
+		return len(scheduler.tasks) == 5
+	}, "all first-playlist coordinates discovered")
+	select {
+	case <-secondManifestServed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("live playlist did not advance while earlier media requests were blocked")
+	}
+	waitUntil(t, 2*time.Second, func() bool {
+		current, getErr := manager.Get(recording.ID)
+		return getErr == nil && current.Tracks["main"].HasLastObservedSequence && current.Tracks["main"].LastObservedSequence == 10
+	}, "advanced live playlist observation")
+	releaseOnce.Do(func() { close(releaseSegments) })
+	waitForRecordingState(t, manager, recording.ID, domain.StateCompleted)
+	completed, err := manager.Get(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sequenceFiveRequests.Load(); got != segmentAttempts {
+		t.Fatalf("unavailable queued media requests=%d, want bounded retry count %d", got, segmentAttempts)
+	}
+	for _, gap := range completed.Gaps {
+		if gap.TrackID == "main" && gap.SourceEpoch == 0 && gap.DiscontinuitySequence == 0 && gap.FromSequence <= 5 && gap.ToSequence >= 5 {
+			if gap.Acquisition == nil || gap.Acquisition.Attempts != segmentAttempts || gap.Acquisition.FailureClass != "http_status" || gap.Acquisition.HTTPStatus != http.StatusServiceUnavailable {
+				t.Fatalf("unavailable queued media gap lacks bounded failure evidence: %#v", gap)
+			}
+			return
+		}
+	}
+	t.Fatalf("exhausted unavailable sequence 5 did not become a gap: %#v", completed.Gaps)
+}
+
+func TestReobservedSignedURIRescuesBoundedSegmentRetry(t *testing.T) {
+	oldURIStarted := make(chan struct{})
+	releaseOldFailure := make(chan struct{})
+	secondManifest := make(chan struct{})
+	var manifests atomic.Int32
+	var oldRequests atomic.Int32
+	var freshRequests atomic.Int32
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/live.m3u8":
+			count := manifests.Add(1)
+			uri := "8.ts?sig=old"
+			if count >= 2 {
+				uri = "8.ts?sig=fresh"
+				select {
+				case <-secondManifest:
+				default:
+					close(secondManifest)
+				}
+			}
+			_, _ = fmt.Fprintf(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:8\n#EXTINF:1,\n%s\n", uri)
+		case "/8.ts":
+			if r.URL.Query().Get("sig") == "old" {
+				oldRequests.Add(1)
+				select {
+				case <-oldURIStarted:
+				default:
+					close(oldURIStarted)
+				}
+				<-releaseOldFailure
+				http.Error(w, "expired source", http.StatusServiceUnavailable)
+				return
+			}
+			if r.URL.Query().Get("sig") != "fresh" {
+				t.Errorf("unexpected signed URI query value %q", r.URL.RawQuery)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			freshRequests.Add(1)
+			_, _ = w.Write([]byte("rescued-segment"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, server.Client(), emptyResolver{}, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/live.m3u8"}, nil, "refreshed signed source", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, oldURIStarted, "first signed media URI")
+	waitSignal(t, secondManifest, "refreshed manifest URI")
+	close(releaseOldFailure)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		current, getErr := manager.Get(recording.ID)
+		if getErr == nil && current.SegmentCount() == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refreshed signed URI was not committed: recording=%#v err=%v", current, getErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	current, err := manager.Stop(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.SegmentCount() != 1 || len(current.Gaps) != 0 {
+		t.Fatalf("refreshed signed URI did not preserve one canonical coordinate: segments=%d gaps=%#v", current.SegmentCount(), current.Gaps)
+	}
+	if got := oldRequests.Load(); got != 1 {
+		t.Fatalf("old signed URI requests=%d, want 1", got)
+	}
+	if got := freshRequests.Load(); got != 1 {
+		t.Fatalf("fresh signed URI requests=%d, want exactly one successful fetch", got)
+	}
+	if got := current.Tracks["main"].Segments; len(got) != 1 || got[0].Sequence != 8 || got[0].ArchiveOrdinal != 1 {
+		t.Fatalf("refreshed URI duplicated or moved the canonical coordinate: %#v", got)
 	}
 }
 
@@ -797,6 +1196,7 @@ func TestQueueBackpressureCancellationPreservesUndiscoveredManifestTail(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager.stopDrainTimeout = 30 * time.Millisecond
 	recording, err := manager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/live.m3u8"}, nil, "bounded queue", nil)
 	if err != nil {
 		t.Fatal(err)

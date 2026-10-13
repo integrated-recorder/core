@@ -205,18 +205,33 @@ type ByteRange struct {
 }
 
 type Gap struct {
-	TrackID                   string     `json:"track_id"`
-	SourceEpoch               uint64     `json:"source_epoch,omitempty"`
-	DiscontinuitySequence     uint64     `json:"discontinuity_sequence,omitempty"`
-	FromSequence              uint64     `json:"from_sequence"`
-	ToSequence                uint64     `json:"to_sequence"`
-	DetectedAt                time.Time  `json:"detected_at"`
-	Reason                    string     `json:"reason"`
-	LivePresentationOrdinal   uint64     `json:"live_presentation_ordinal,omitempty"`
-	LiveDiscontinuity         bool       `json:"live_discontinuity,omitempty"`
-	LiveDiscontinuitySequence uint64     `json:"live_discontinuity_sequence,omitempty"`
-	LiveDuration              float64    `json:"live_duration,omitempty"`
-	ProgramDateTime           *time.Time `json:"program_date_time,omitempty"`
+	TrackID                   string                    `json:"track_id"`
+	SourceEpoch               uint64                    `json:"source_epoch,omitempty"`
+	DiscontinuitySequence     uint64                    `json:"discontinuity_sequence,omitempty"`
+	FromSequence              uint64                    `json:"from_sequence"`
+	ToSequence                uint64                    `json:"to_sequence"`
+	DetectedAt                time.Time                 `json:"detected_at"`
+	Reason                    string                    `json:"reason"`
+	LivePresentationOrdinal   uint64                    `json:"live_presentation_ordinal,omitempty"`
+	LiveDiscontinuity         bool                      `json:"live_discontinuity,omitempty"`
+	LiveDiscontinuitySequence uint64                    `json:"live_discontinuity_sequence,omitempty"`
+	LiveDuration              float64                   `json:"live_duration,omitempty"`
+	ProgramDateTime           *time.Time                `json:"program_date_time,omitempty"`
+	Acquisition               *GapAcquisitionDiagnostic `json:"acquisition,omitempty"`
+}
+
+// GapAcquisitionDiagnostic preserves bounded, sanitized details about the
+// live fetch attempts that ended in this gap. It intentionally has no source
+// URI, transport error text, headers, or credentials.
+type GapAcquisitionDiagnostic struct {
+	FirstObservedAt      *time.Time `json:"first_observed_at,omitempty"`
+	LastAttemptStartedAt *time.Time `json:"last_attempt_started_at,omitempty"`
+	LastAttemptEndedAt   *time.Time `json:"last_attempt_ended_at,omitempty"`
+	Attempts             int        `json:"attempts,omitempty"`
+	RefreshCycles        int        `json:"refresh_cycles,omitempty"`
+	FailureClass         string     `json:"failure_class,omitempty"`
+	HTTPStatus           int        `json:"http_status,omitempty"`
+	Retryable            bool       `json:"retryable,omitempty"`
 }
 
 type ManifestSnapshot struct {

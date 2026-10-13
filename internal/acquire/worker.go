@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -25,9 +26,10 @@ import (
 )
 
 const (
-	manifestAttempts = 3
-	segmentAttempts  = 3
-	maxRefreshCycles = 3
+	manifestAttempts         = 3
+	segmentAttempts          = 3
+	maxRefreshCycles         = 3
+	operatorStopDrainTimeout = 15 * time.Second
 )
 
 func parseMaster(data []byte, url string) (hls.Master, error)       { return hls.ParseMaster(data, url) }
@@ -42,6 +44,7 @@ type FetchError struct {
 	HTTPStatus        int
 	Retryable         bool
 	URLClassification string
+	FailureClass      string
 
 	statusResponse bool
 }
@@ -89,7 +92,33 @@ func isRetryableStatus(status int) bool {
 }
 
 func newFetchError(operation string, status int, retryable, response bool) *FetchError {
-	return &FetchError{Operation: operation, HTTPStatus: status, Retryable: retryable, URLClassification: operation, statusResponse: response}
+	class := "request"
+	if response && status > 0 {
+		class = "http_status"
+	}
+	return &FetchError{Operation: operation, HTTPStatus: status, Retryable: retryable, URLClassification: operation, FailureClass: class, statusResponse: response}
+}
+
+func newFetchErrorCause(operation string, status int, retryable, response bool, cause error) *FetchError {
+	result := newFetchError(operation, status, retryable, response)
+	if response && status > 0 || cause == nil {
+		return result
+	}
+	if errors.Is(cause, context.DeadlineExceeded) {
+		result.FailureClass = "timeout"
+		return result
+	}
+	var networkError net.Error
+	if errors.As(cause, &networkError) && networkError.Timeout() {
+		result.FailureClass = "timeout"
+		return result
+	}
+	if errors.Is(cause, context.Canceled) {
+		result.FailureClass = "canceled"
+		return result
+	}
+	result.FailureClass = "transport_or_read"
+	return result
 }
 
 func fetchManifest(ctx context.Context, client *http.Client, uri string, headers map[string]string, manifestURL string, policy *adapterproto.RequestPolicy) ([]byte, error) {
@@ -447,6 +476,14 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 				continue
 			}
 			if !present[key] && maxByDS[item.DiscontinuitySequence] > item.Sequence {
+				if protectedByEpoch[epoch][key] {
+					// A scheduler-owned task already has a source URI and remains
+					// eligible for its bounded live fetch attempts even after it
+					// slides out of the playlist. Do not turn scheduler backlog
+					// into a canonical gap before that work is resolved.
+					pending = append(pending, item)
+					continue
+				}
 				addMissingRangesDS(r, t, epoch, item.DiscontinuitySequence, item.Sequence, item.Sequence, "media left the live window after retries", captured)
 				continue
 			}
@@ -503,6 +540,10 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 					continue
 				}
 				if !present[key] && maxByDS[0] > seq {
+					if protectedByEpoch[epoch][key] {
+						legacyPending = append(legacyPending, seq)
+						continue
+					}
 					addMissingRangesDS(r, t, epoch, 0, seq, seq, "media left the live window after retries", captured)
 					continue
 				}
@@ -794,7 +835,7 @@ func (m *Manager) downloadObjectBufferedOnceAtGenerationScope(ctx context.Contex
 			return nil, readErr
 		}
 		retryable := !errors.Is(readErr, storage.ErrIngestTooLarge) && !errors.Is(readErr, storage.ErrIngestClosed)
-		return nil, newFetchError("segment", 0, retryable, false)
+		return nil, newFetchErrorCause("segment", 0, retryable, false, readErr)
 	}
 	return payload, nil
 }
@@ -821,7 +862,7 @@ func (m *Manager) openObjectResponseAtGenerationScope(ctx context.Context, uri s
 		if errors.Is(err, errStaleMediaGeneration) {
 			return nil, -1, errStaleMediaGeneration
 		}
-		return nil, -1, newFetchError("segment", 0, true, false)
+		return nil, -1, newFetchErrorCause("segment", 0, true, false, err)
 	}
 	expectedStatus := http.StatusOK
 	expectedSize := int64(-1)
@@ -964,7 +1005,7 @@ func (m *Manager) downloadObjectAttemptsInternal(ctx context.Context, uri string
 					if err == nil {
 						return result, nil
 					}
-					last = newFetchError("segment", 0, tracked.err != nil || errors.Is(err, storage.ErrPayloadSizeMismatch), false)
+					last = newFetchErrorCause("segment", 0, tracked.err != nil || errors.Is(err, storage.ErrPayloadSizeMismatch), false, tracked.err)
 				}
 			} else {
 				var result storage.PayloadResult
@@ -974,7 +1015,7 @@ func (m *Manager) downloadObjectAttemptsInternal(ctx context.Context, uri string
 				if err == nil {
 					return result, nil
 				}
-				last = newFetchError("segment", 0, tracked.err != nil, false)
+				last = newFetchErrorCause("segment", 0, tracked.err != nil, false, tracked.err)
 			}
 		} else {
 			if errors.Is(err, errStaleMediaGeneration) {
@@ -1078,12 +1119,15 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		m.fail(e, schedulerErr)
 		return false
 	}
+	if e.stopWasRequested() {
+		scheduler.closeLiveAdmission()
+	}
 	defer func() {
 		if closeErr := scheduler.close(); closeErr != nil {
 			m.fail(e, closeErr)
 			return
 		}
-		if ctx.Err() == nil {
+		if ctx.Err() == nil && !e.stopWasRequested() {
 			return
 		}
 		if err := m.update(e, func(r *domain.Recording) error {
@@ -1144,6 +1188,22 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 	}
 	startObservers := func() { startMetadata(); startTimedEvents() }
 	stopObservers := func() { stopTimedEvents(); stopMetadata() }
+	stopAndDrain := func() {
+		stopObservers()
+		scheduler.closeLiveAdmission()
+		_, generation := currentMediaVersion(e)
+		scheduler.endList(generation)
+		timeout := m.stopDrainTimeout
+		if timeout <= 0 {
+			timeout = operatorStopDrainTimeout
+		}
+		drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		drainErr := scheduler.drain(drainCtx)
+		cancel()
+		if drainErr != nil && !errors.Is(drainErr, context.DeadlineExceeded) && !errors.Is(drainErr, context.Canceled) {
+			m.fail(e, drainErr)
+		}
+	}
 	startObservers()
 	// This defer is registered after scheduler cleanup, so the monitor is
 	// canceled and joined before acquisition shutdown drains the scheduler.
@@ -1161,7 +1221,12 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 	_, manifestGeneration := currentMediaVersion(e)
 	refreshCycles := 0
 	proactiveRefreshes := 0
+	stopSignal := e.stopSignal()
 	for ctx.Err() == nil {
+		if e.stopWasRequested() {
+			stopAndDrain()
+			return false
+		}
 		if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopObservers, startObservers); paused {
 			return true
 		} else if pauseErr != nil {
@@ -1202,7 +1267,18 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		}
 
 		fetchGeneration := generation
-		manifestPayload, requestedManifestURL, err := m.fetchManifestForMedia(ctx, recordingID(e), media, selectedBaseURL, selectedURL, selectedScope)
+		manifestCtx, manifestCancel := context.WithCancel(ctx)
+		e.setManifestCancel(manifestCancel)
+		manifestPayload, requestedManifestURL, err := m.fetchManifestForMedia(manifestCtx, recordingID(e), media, selectedBaseURL, selectedURL, selectedScope)
+		e.clearManifestCancel()
+		manifestCancel()
+		if e.stopWasRequested() {
+			if manifestPayload != nil {
+				manifestPayload.Release()
+			}
+			stopAndDrain()
+			return false
+		}
 		var body []byte
 		if manifestPayload != nil {
 			body = manifestPayload.Bytes()
@@ -1398,6 +1474,15 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		refreshCycles = 0
 		timer := time.NewTimer(pollDelay(playlist.TargetDuration))
 		select {
+		case <-stopSignal:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			stopAndDrain()
+			return false
 		case <-ctx.Done():
 			if !timer.Stop() {
 				select {
@@ -1966,13 +2051,28 @@ func (m *Manager) markPending(e *entry, epoch, discontinuitySequence, seq uint64
 }
 
 func (m *Manager) markGap(e *entry, epoch, discontinuitySequence, sequence uint64, reason string) error {
+	return m.markGapWithAcquisition(e, epoch, discontinuitySequence, sequence, reason, nil)
+}
+
+func (m *Manager) markGapWithAcquisition(e *entry, epoch, discontinuitySequence, sequence uint64, reason string, diagnostic *domain.GapAcquisitionDiagnostic) error {
 	updateErr := m.update(e, func(r *domain.Recording) error {
 		t := r.Tracks["main"]
 		if t == nil {
 			return errors.New("main track is missing")
 		}
 		captured := capturedSequenceSetDS(t, epoch, discontinuitySequence)
+		previousGapCount := len(r.Gaps)
 		addMissingRangesDS(r, t, epoch, discontinuitySequence, sequence, sequence, reason, captured)
+		if diagnostic != nil {
+			for index := len(r.Gaps) - 1; index >= previousGapCount; index-- {
+				gap := &r.Gaps[index]
+				if gap.TrackID == t.ID && gap.SourceEpoch == epoch && gap.DiscontinuitySequence == discontinuitySequence && sequence >= gap.FromSequence && sequence <= gap.ToSequence {
+					copy := *diagnostic
+					gap.Acquisition = &copy
+					break
+				}
+			}
+		}
 		t.PendingSegments = removePending(t.PendingSegments, epoch, discontinuitySequence, sequence)
 		if epoch == 0 {
 			t.PendingSequences = removeSequence(t.PendingSequences, sequence)

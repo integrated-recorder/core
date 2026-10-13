@@ -389,6 +389,20 @@ func (s *Server) recordingDetail(ctx context.Context, recording *domain.Recordin
 	}
 	response := detail(recording)
 	response.Statistics = &statistics
+	if recording.FormatVersion == storage.ShardedArchiveFormatVersion {
+		gapCoverage := s.projectShardedGapCoverage(ctx, recording.ID, recording)
+		response.GapCoverage = &gapCoverage
+		response.GapHistoryStatus = "unavailable"
+		if gaps, truncated, historyErr := s.storage.LatestShardedGaps(ctx, recording.ID); historyErr == nil {
+			response.GapHistory = gaps
+			response.GapHistoryTruncated = truncated
+			response.GapHistoryStatus = "available"
+		}
+	} else {
+		gapViews, gapCoverage := projectGapCoverage(recording)
+		response.Gaps = gapViews
+		response.GapCoverage = &gapCoverage
+	}
 	if s.previews != nil {
 		previewSummary := s.previews.Summary(recording)
 		response.Preview = &previewSummary

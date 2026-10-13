@@ -100,6 +100,9 @@ type entry struct {
 	deleted         bool
 	cancel          context.CancelFunc
 	done            chan struct{}
+	stopRequested   chan struct{}
+	stopOnce        sync.Once
+	manifestCancel  context.CancelFunc
 	media           adapterproto.MediaSource
 	mediaGeneration uint64
 	livePlayback    *livePlaybackProjection
@@ -193,6 +196,9 @@ type Manager struct {
 	metadataPollInterval time.Duration
 	// metadataClock is a deterministic test seam. Production leaves it nil.
 	metadataClock func() time.Time
+	// stopDrainTimeout bounds operator-requested draining of already admitted
+	// live work. Host shutdown continues to use its separate cancellation path.
+	stopDrainTimeout time.Duration
 }
 
 // StorageFailureDiagnosticRecorder is the private durable sink for the first
@@ -403,6 +409,7 @@ func newManagerWithMode(store *storage.Store, client *http.Client, resolver Reso
 		historicalFetch: historicalFetch, historicalSpools: processHistoricalSpools,
 		resolver: resolver, validate: validate, entries: map[string]*entry{}, prepared: make(map[string]preparedHandover),
 		freshGeneration: mode == FreshGeneration, startsDone: make(chan struct{}),
+		stopDrainTimeout: operatorStopDrainTimeout,
 	}
 	for _, recording := range loaded {
 		var metadataLatest *domain.MetadataRevision
@@ -1822,7 +1829,7 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 		copy := *owner
 		ownershipCopy = &copy
 	}
-	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), media: cloneMediaSource(media), livePlayback: newLivePlaybackProjection(), refreshGate: make(chan struct{}, 1), adapterID: adapterID, resource: cloneResourceRef(resource), ownership: ownershipCopy, recoveryGate: newArchiveRecoveryGate()}
+	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), stopRequested: make(chan struct{}), media: cloneMediaSource(media), livePlayback: newLivePlaybackProjection(), refreshGate: make(chan struct{}, 1), adapterID: adapterID, resource: cloneResourceRef(resource), ownership: ownershipCopy, recoveryGate: newArchiveRecoveryGate()}
 	if ownershipCopy != nil {
 		e.handoverGate = make(chan struct{}, 1)
 		e.handoverGate <- struct{}{}
@@ -1907,8 +1914,9 @@ func (m *Manager) Stop(id string) (*domain.Recording, error) {
 	return m.StopContext(context.Background(), id)
 }
 
-// StopContext requests cancellation immediately and then waits for the worker
-// only until ctx ends. A caller timeout does not undo the stop request.
+// StopContext closes live admission and lets already discovered media drain.
+// It then waits for the worker only until ctx ends. A caller timeout does not
+// undo the stop request or its bounded background drain.
 func (m *Manager) StopContext(ctx context.Context, id string) (*domain.Recording, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1928,11 +1936,23 @@ func (m *Manager) StopContext(ctx context.Context, id string) (*domain.Recording
 		e.mu.Unlock()
 		return nil, ErrHandoverConflict
 	}
-	cancel := e.cancel
+	active := e.recording != nil && e.recording.State == domain.StateRecording
+	if e.stopRequested == nil {
+		e.stopRequested = make(chan struct{})
+	}
+	stopRequested := e.stopRequested
+	manifestCancel := e.manifestCancel
+	scheduler := e.scheduler
 	done := e.done
 	e.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if active {
+		e.stopOnce.Do(func() { close(stopRequested) })
+		if scheduler != nil {
+			scheduler.closeLiveAdmission()
+		}
+		if manifestCancel != nil {
+			manifestCancel()
+		}
 	}
 	select {
 	case <-done:
@@ -1956,6 +1976,45 @@ func (m *Manager) StopContext(ctx context.Context, id string) (*domain.Recording
 		return recording, terminalErr
 	}
 	return recording, err
+}
+
+func (e *entry) stopSignal() <-chan struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.stopRequested
+}
+
+func (e *entry) stopWasRequested() bool {
+	stop := e.stopSignal()
+	if stop == nil {
+		return false
+	}
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *entry) setManifestCancel(cancel context.CancelFunc) {
+	e.mu.Lock()
+	e.manifestCancel = cancel
+	stop := e.stopRequested
+	e.mu.Unlock()
+	if stop != nil {
+		select {
+		case <-stop:
+			cancel()
+		default:
+		}
+	}
+}
+
+func (e *entry) clearManifestCancel() {
+	e.mu.Lock()
+	e.manifestCancel = nil
+	e.mu.Unlock()
 }
 
 // Delete removes one inactive recording from the manager registry and its

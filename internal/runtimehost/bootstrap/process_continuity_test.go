@@ -211,7 +211,9 @@ func TestRuntimeGenerationProcessBoundaryContinuity(t *testing.T) {
 	}
 
 	finalA := fixture.Freeze("a")
-	waitProcessRecording(t, managerA, startedR.ID, func(r *domain.Recording) bool { return len(r.Tracks["main"].Segments) == int(finalA-100+1) }, 15*time.Second)
+	// Keep the exact frozen-fixture count assertion, but allow the race-instrumented
+	// Engine more time to commit segments already advertised before Freeze.
+	waitProcessRecording(t, managerA, startedR.ID, func(r *domain.Recording) bool { return len(r.Tracks["main"].Segments) == int(finalA-100+1) }, 45*time.Second)
 	ctx, cancel = context.WithTimeout(context.Background(), 12*time.Second)
 	stoppedR, err := managerA.StopContext(ctx, startedR.ID)
 	cancel()
@@ -242,7 +244,7 @@ func TestRuntimeGenerationProcessBoundaryContinuity(t *testing.T) {
 	}
 
 	finalB := fixture.Freeze("b")
-	waitProcessRecording(t, managerB, startedS.ID, func(r *domain.Recording) bool { return len(r.Tracks["main"].Segments) == int(finalB-1000+1) }, 15*time.Second)
+	waitProcessRecording(t, managerB, startedS.ID, func(r *domain.Recording) bool { return len(r.Tracks["main"].Segments) == int(finalB-1000+1) }, 45*time.Second)
 	ctx, cancel = context.WithTimeout(context.Background(), 12*time.Second)
 	stoppedS, err := managerB.StopContext(ctx, startedS.ID)
 	cancel()

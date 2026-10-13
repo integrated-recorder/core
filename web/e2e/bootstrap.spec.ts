@@ -151,7 +151,7 @@ test('administrator can log in, use the application, and log out', async ({ page
   await page.getByRole('button', { name: '로그인' }).click()
   await expect(page).toHaveURL('/')
   await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
-  await page.getByRole('button', { name: /관리자/ }).click()
+  await page.getByRole('button', { name: /내 계정|My account/ }).click()
   await page.getByRole('button', { name: '로그아웃' }).click()
   await expect(page).toHaveURL('/login')
   expect(logoutCSRF).toBe('session-csrf')

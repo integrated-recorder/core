@@ -2,13 +2,14 @@ import { lazy } from 'react'
 import { createRootRouteWithContext, createRoute, createRouter, redirect } from '@tanstack/react-router'
 import type { QueryClient } from '@tanstack/react-query'
 import { RootComponent, RootError } from '@/components/route-shell'
-import { installationQuery, sessionQuery } from '@/api/queries'
+import { accountQuery, installationQuery, sessionQuery } from '@/api/queries'
 import { installationRouteRedirect } from '@/lib/installation-routing'
 const DashboardPage = lazy(() => import('@/routes/dashboard').then(module => ({ default: module.DashboardPage })))
 const RecordingsPage = lazy(() => import('@/routes/recordings').then(module => ({ default: module.RecordingsPage })))
 const RecordingDetailPage = lazy(() => import('@/routes/recording-detail').then(module => ({ default: module.RecordingDetailPage })))
 const NewRecordingPage = lazy(() => import('@/routes/new-recording').then(module => ({ default: module.NewRecordingPage })))
 const AdaptersPage = lazy(() => import('@/routes/adapters').then(module => ({ default: module.AdaptersPage })))
+const PluginsPage = lazy(() => import('@/routes/adapters').then(module => ({ default: module.PluginsPage })))
 const AdapterDetailPage = lazy(() => import('@/routes/adapter-detail').then(module => ({ default: module.AdapterDetailPage })))
 const WorkflowsPage = lazy(() => import('@/routes/workflows').then(module => ({ default: module.WorkflowsPage })))
 const WorkflowDetailPage = lazy(() => import('@/routes/workflow-detail').then(module => ({ default: module.WorkflowDetailPage })))
@@ -17,6 +18,7 @@ const WatchesPage = lazy(() => import('@/routes/watches').then(module => ({ defa
 const WatchNewPage = lazy(() => import('@/routes/watch-new').then(module => ({ default: module.WatchNewPage })))
 const WatchDetailPage = lazy(() => import('@/routes/watch-detail').then(module => ({ default: module.WatchDetailPage })))
 const StoragePage = lazy(() => import('@/routes/storage').then(module => ({ default: module.StoragePage })))
+const StorageLocationsPage = lazy(() => import('@/routes/storage').then(module => ({ default: module.StorageLocationsPage })))
 const StoragePoolDetailPage = lazy(() => import('@/routes/storage').then(module => ({ default: module.StoragePoolDetailPage })))
 const LoginPage = lazy(() => import('@/routes/login').then(module => ({ default: module.LoginPage })))
 const SetupPage = lazy(() => import('@/routes/setup').then(module => ({ default: module.SetupPage })))
@@ -40,6 +42,11 @@ const rootRoute = createRootRouteWithContext<RouterContext>()({
     const session = await context.queryClient.ensureQueryData(sessionQuery)
     const destination = installationRouteRedirect(path, installation, installation.auth_disabled || session.authenticated)
     if (destination) throw redirect({ to: destination })
+    const ownerOnly = ['/storage', '/system', '/plugins', '/watches'].some(prefix => path === prefix || path.startsWith(`${prefix}/`))
+    if (ownerOnly && session.auth_enabled && session.authenticated) {
+      const account = await context.queryClient.ensureQueryData(accountQuery)
+      if (account.role !== 'owner') throw redirect({ to: '/' })
+    }
   },
   component: RootComponent,
   notFoundComponent: NotFoundPage,
@@ -61,17 +68,31 @@ const recordingsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/r
 }), component: RecordingsPage })
 const recordingRoute = createRoute({ getParentRoute: () => rootRoute, path: '/recordings/$recordingId', component: RecordingDetailPage })
 const newRoute = createRoute({ getParentRoute: () => rootRoute, path: '/new', component: NewRecordingPage })
-const adaptersRoute = createRoute({ getParentRoute: () => rootRoute, path: '/adapters', component: AdaptersPage })
-const adapterRoute = createRoute({ getParentRoute: () => rootRoute, path: '/adapters/$adapterId', validateSearch: (search: Record<string, unknown>) => ({ tab: search.tab === 'resources' ? 'resources' as const : undefined }), component: AdapterDetailPage })
+const adaptersRoute = createRoute({ getParentRoute: () => rootRoute, path: '/adapters', beforeLoad: () => { throw redirect({ to: '/sources' }) } })
+const legacyAdapterRoute = createRoute({ getParentRoute: () => rootRoute, path: '/adapters/$adapterId', validateSearch: (search: Record<string, unknown>) => ({ tab: search.tab === 'settings' || search.tab === 'configuration' || search.tab === 'resources' || search.tab === 'workflows' ? search.tab as 'settings' | 'configuration' | 'resources' | 'workflows' : undefined }), beforeLoad: ({ params, search }) => { throw redirect({ to: '/sources/$adapterId', params, search }) } })
+const sourcesRoute = createRoute({ getParentRoute: () => rootRoute, path: '/sources', component: AdaptersPage })
+const adapterRoute = createRoute({ getParentRoute: () => rootRoute, path: '/sources/$adapterId', validateSearch: (search: Record<string, unknown>) => ({ tab: search.tab === 'configuration' || search.tab === 'settings' || search.tab === 'resources' || search.tab === 'workflows' ? search.tab as 'configuration' | 'settings' | 'resources' | 'workflows' : undefined }), component: AdapterDetailPage })
+const pluginsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/plugins', component: PluginsPage })
 const workflowsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/workflows', component: WorkflowsPage })
 const workflowRoute = createRoute({ getParentRoute: () => rootRoute, path: '/workflows/$workflowId', component: WorkflowDetailPage })
-const settingsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/settings', component: SettingsPage })
+const settingsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/settings', beforeLoad: () => { throw redirect({ to: '/account/preferences' }) } })
+const preferencesRoute = createRoute({ getParentRoute: () => rootRoute, path: '/account/preferences', component: () => <SettingsPage section="preferences" /> })
+const accountRoute = createRoute({ getParentRoute: () => rootRoute, path: '/account/security', component: () => <SettingsPage section="security" /> })
+const sessionsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/account/sessions', component: () => <SettingsPage section="sessions" /> })
+const systemRoute = createRoute({ getParentRoute: () => rootRoute, path: '/system', component: () => <SettingsPage section="runtime" /> })
+const systemUsersRoute = createRoute({ getParentRoute: () => rootRoute, path: '/system/users', component: () => <SettingsPage section="users" /> })
+const systemUpdatesRoute = createRoute({ getParentRoute: () => rootRoute, path: '/system/updates', component: () => <SettingsPage section="updates" /> })
+const systemDiagnosticsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/system/diagnostics', component: () => <SettingsPage section="diagnostics" /> })
+const systemAuditRoute = createRoute({ getParentRoute: () => rootRoute, path: '/system/audit', component: () => <SettingsPage section="audit" /> })
 const watchesRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches', component: WatchesPage })
 const watchNewRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches/new', component: WatchNewPage })
 const watchDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches/$watchId', component: WatchDetailPage })
 const storageRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage', component: StoragePage })
+const storageLocationsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage/locations', component: StorageLocationsPage })
+const storageRetentionRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage/retention', component: () => <SettingsPage section="retention" /> })
+const storageAdvancedRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage/advanced', component: () => <SettingsPage section="advanced-storage" /> })
 const storagePoolRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage/$poolId', component: StoragePoolDetailPage })
 
-const routeTree = rootRoute.addChildren([loginRoute, setupRoute, dashboardRoute, recordingsRoute, recordingRoute, newRoute, adaptersRoute, adapterRoute, workflowsRoute, workflowRoute, watchesRoute, watchNewRoute, watchDetailRoute, storageRoute, storagePoolRoute, settingsRoute])
+const routeTree = rootRoute.addChildren([loginRoute, setupRoute, dashboardRoute, recordingsRoute, recordingRoute, newRoute, adaptersRoute, legacyAdapterRoute, sourcesRoute, adapterRoute, pluginsRoute, workflowsRoute, workflowRoute, watchesRoute, watchNewRoute, watchDetailRoute, storageRoute, storageLocationsRoute, storageRetentionRoute, storageAdvancedRoute, storagePoolRoute, settingsRoute, preferencesRoute, accountRoute, sessionsRoute, systemRoute, systemUsersRoute, systemUpdatesRoute, systemDiagnosticsRoute, systemAuditRoute])
 export const router = createRouter({ routeTree, context: { queryClient: undefined! }, defaultPreload: 'intent', defaultPreloadStaleTime: 0 })
 declare module '@tanstack/react-router' { interface Register { router: typeof router } }

@@ -303,14 +303,42 @@ func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
 			t.Errorf("recording source read %s permission=%q; recording members need source inputs to start captures", path, got)
 		}
 	}
-	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls", nil)); got != authn.PermissionPluginManage || authn.HasPermission(member, got) {
-		t.Fatalf("adapter management detail permission=%q; members must not manage plugins", got)
+	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls", nil)); got != authn.PermissionRecordingControl || !authn.HasPermission(member, got) {
+		t.Fatalf("source detail read permission=%q; recording members need read-only source metadata", got)
 	}
 	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls/config", nil)); got != authn.PermissionPluginManage || authn.HasPermission(member, got) {
 		t.Fatalf("adapter configuration permission=%q; members must not read plugin configuration", got)
 	}
 	if got := permissionForRequest(httptest.NewRequest(http.MethodPut, "/api/adapters/hls/config", nil)); got != authn.PermissionPluginManage || authn.HasPermission(member, got) {
 		t.Fatalf("adapter configuration mutation permission=%q; members must not manage plugin configuration", got)
+	}
+}
+
+func TestWorkflowContinuationSeparatesInputFromPersistentConfiguration(t *testing.T) {
+	server := &Server{}
+	member := authn.Principal{UserID: "usr-1123456789abcdef0123456789abcdef", Login: "member", Role: authn.RoleMember}
+	owner := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	for _, tc := range []struct {
+		name      string
+		principal authn.Principal
+		body      string
+		want      int
+	}{
+		{name: "member can submit one-time values", principal: member, body: `{"values":{"choice":"one-time"}}`, want: http.StatusServiceUnavailable},
+		{name: "member cannot request persistent fields", principal: member, body: `{"values":{"choice":"saved"},"persist_fields":["choice"]}`, want: http.StatusForbidden},
+		{name: "member cannot request blanket persistence", principal: member, body: `{"values":{"choice":"saved"},"persist":true}`, want: http.StatusForbidden},
+		{name: "owner may request persistence", principal: owner, body: `{"values":{"choice":"saved"},"persist_fields":["choice"]}`, want: http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/resolve-workflows/workflow-1/continue", strings.NewReader(tc.body))
+			req.SetPathValue("id", "workflow-1")
+			req = req.WithContext(authn.WithPrincipal(req.Context(), tc.principal))
+			response := httptest.NewRecorder()
+			server.workflowContinue(response, req)
+			if response.Code != tc.want {
+				t.Fatalf("status=%d body=%s want=%d", response.Code, response.Body.String(), tc.want)
+			}
+		})
 	}
 }
 

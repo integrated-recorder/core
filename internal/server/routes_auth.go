@@ -341,7 +341,9 @@ func adapterPermission(method, path string) (authn.Permission, bool) {
 	}
 	parts := strings.Split(strings.TrimPrefix(path, "/api/adapters/"), "/")
 	if len(parts) == 1 && parts[0] != "" && method == http.MethodGet {
-		return authn.PermissionPluginManage, true
+		// Source metadata is needed to choose an adapter and resource while
+		// starting a recording. Persistent configuration remains owner-only.
+		return authn.PermissionRecordingControl, true
 	}
 	if len(parts) == 2 && parts[0] != "" {
 		switch {
@@ -367,17 +369,17 @@ func adapterPermission(method, path string) (authn.Permission, bool) {
 
 func workflowPermission(method, path string) (authn.Permission, bool) {
 	if path == "/api/resolve-workflows" && method == http.MethodGet || path == "/api/workflow-history" && method == http.MethodGet {
-		return authn.PermissionPluginManage, true
+		return authn.PermissionRecordingControl, true
 	}
 	if strings.HasPrefix(path, "/api/workflow-history/") && method == http.MethodGet && strings.TrimPrefix(path, "/api/workflow-history/") != "" && strings.Count(strings.TrimPrefix(path, "/api/workflow-history/"), "/") == 0 {
-		return authn.PermissionPluginManage, true
+		return authn.PermissionRecordingControl, true
 	}
 	if !strings.HasPrefix(path, "/api/resolve-workflows/") {
 		return "", false
 	}
 	parts := strings.Split(strings.TrimPrefix(path, "/api/resolve-workflows/"), "/")
 	if len(parts) == 1 && parts[0] != "" && (method == http.MethodGet || method == http.MethodDelete) || len(parts) == 2 && parts[0] != "" && method == http.MethodPost && parts[1] == "continue" {
-		return authn.PermissionPluginManage, true
+		return authn.PermissionRecordingControl, true
 	}
 	return "", false
 }

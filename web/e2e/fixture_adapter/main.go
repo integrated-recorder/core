@@ -141,7 +141,7 @@ func describe() adapterproto.Descriptor {
 		ID: "workflow-fixture", Name: "Workflow Fixture", Version: "0.1.0", ProtocolVersion: adapterproto.Version,
 		Capabilities:        []string{adapterproto.CapabilityResolveWorkflow, adapterproto.CapabilityWatch},
 		InputSchema:         adapterproto.Schema{Fields: []adapterproto.Field{{Key: "source_url", Control: "text", Label: "Fixture source URL", Required: true}}},
-		ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{}},
+		ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "session_value", Control: "secret", Label: "Stored fixture secret"}}},
 		ResourceTypes:       []adapterproto.ResourceType{}, MediaTypes: []string{"hls"},
 	}
 }

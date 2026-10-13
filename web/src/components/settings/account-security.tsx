@@ -1,6 +1,7 @@
 import { useState } from 'react'
+import { Link } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { KeyRound, RefreshCw, Shield, UserPlus, Users } from 'lucide-react'
+import { KeyRound, RefreshCw, UserPlus } from 'lucide-react'
 import { accountAPI } from '@/api'
 import { APIError, invalidateCSRFToken } from '@/api/client'
 import { accountSessionsQuery, qk, usersQuery } from '@/api/queries'
@@ -16,16 +17,15 @@ import { EmptyState, ErrorState, LoadingState } from '@/components/query-state'
 import { useToast } from '@/components/ui/use-toast'
 import { errorMessage } from '@/lib/errors'
 
-export function AccountSecurityPanel({ account }: { account: AccountUser }) {
+export function AccountSecurityPanel({ account, section = 'security' }: { account: AccountUser; section?: 'security' | 'sessions' }) {
   const { t } = useI18n()
-  return <div role="tabpanel" id="settings-panel-account" aria-labelledby="settings-tab-account" tabIndex={0} className="space-y-4">
+  if (section === 'sessions') return <div className="page-enter"><SessionsCard /></div>
+  return <div className="space-y-4">
     <Card>
-      <CardHeader><CardTitle className="flex items-center gap-2"><Shield className="h-4 w-4 text-primary" />{t('account.profile')}</CardTitle></CardHeader>
-      <CardContent><dl className="grid gap-4 sm:grid-cols-3"><ProfileValue label={t('account.login')} value={account.login} /><ProfileValue label={t('account.role')} value={account.role === 'owner' ? t('account.role.owner') : t('account.role.member')} /><ProfileValue label={t('account.status')} value={account.status === 'active' ? t('account.status.active') : t('account.status.disabled')} /></dl></CardContent>
+      <CardContent className="pt-4"><dl className="grid gap-4 sm:grid-cols-3"><ProfileValue label={t('account.login')} value={account.login} /><ProfileValue label={t('account.role')} value={account.role === 'owner' ? t('account.role.owner') : t('account.role.member')} /><ProfileValue label={t('account.status')} value={account.status === 'active' ? t('account.status.active') : t('account.status.disabled')} /></dl></CardContent>
     </Card>
     <PasswordCard />
-    <SessionsCard />
-    {account.role === 'owner' && <UsersCard currentUser={account} />}
+    <Link to="/account/sessions" className="block rounded-lg border border-border px-4 py-3 text-sm font-medium hover:bg-muted/50">{t('account.sessions')} →</Link>
     <Card><CardHeader><CardTitle>{t('account.localRecovery')}</CardTitle></CardHeader><CardContent className="space-y-2 text-sm text-muted-foreground"><p>{t('account.localRecoveryHelp')}</p><code className="block rounded bg-muted px-3 py-2 text-xs">docker compose exec -it archiver runtime-host reset-password &lt;login&gt;</code></CardContent></Card>
   </div>
 }
@@ -87,12 +87,12 @@ function SessionsCard() {
   const revokeOthers = useMutation({ mutationFn: accountAPI.revokeOthers, onSuccess: async result => { toast(t('account.sessionsRevoked', { count: result.revoked_count })); await refresh() }, onError: error => toast(t('account.sessionActionFailed'), errorMessage(error), 'error') })
   const currentCount = sessions.data?.items.filter(item => !item.current).length ?? 0
   return <Card>
-    <CardHeader className="flex flex-row items-start justify-between gap-3"><div><CardTitle>{t('account.sessions')}</CardTitle><p className="mt-1 text-xs text-muted-foreground">{t('account.sessionsHelp')}</p></div><div className="flex gap-2"><Button variant="outline" size="sm" onClick={() => void refresh()} aria-label={t('account.refreshSessions')}><RefreshCw className="h-4 w-4" /></Button><Button variant="outline" size="sm" disabled={!currentCount || revokeOthers.isPending} onClick={() => revokeOthers.mutate()}>{t('account.revokeOthers')}</Button></div></CardHeader>
+    <CardHeader className="flex flex-row items-start justify-between gap-3"><div><p className="text-xs text-muted-foreground">{t('account.sessionsHelp')}</p></div><div className="flex gap-2"><Button variant="outline" size="sm" onClick={() => void refresh()} aria-label={t('account.refreshSessions')}><RefreshCw className="h-4 w-4" /></Button><Button variant="outline" size="sm" disabled={!currentCount || revokeOthers.isPending} onClick={() => revokeOthers.mutate()}>{t('account.revokeOthers')}</Button></div></CardHeader>
     <CardContent>{sessions.isLoading ? <LoadingState /> : sessions.error ? <ErrorState message={errorMessage(sessions.error)} retry={() => void sessions.refetch()} /> : sessions.data?.items.length ? <ul className="divide-y divide-border">{sessions.data.items.map(session => <li key={session.id} className="flex flex-wrap items-center justify-between gap-3 py-3"><div className="flex items-center gap-2"><span className="text-sm">{t('account.sessionExpires', { date: formatDate(session.expires_at) })}</span>{session.current && <Badge tone="green">{t('account.currentSession')}</Badge>}</div><Button size="sm" variant="outline" disabled={revoke.isPending} onClick={() => revoke.mutate(session.id)}>{t('account.revoke')}</Button></li>)}</ul> : <EmptyState title={t('account.noSessions')} />}</CardContent>
   </Card>
 }
 
-function UsersCard({ currentUser }: { currentUser: AccountUser }) {
+export function UsersManagementPanel({ currentUser }: { currentUser: AccountUser }) {
   const client = useQueryClient()
   const { t } = useI18n()
   const { toast } = useToast()
@@ -110,7 +110,7 @@ function UsersCard({ currentUser }: { currentUser: AccountUser }) {
     create.mutate({ login: login.trim(), password })
   }
   return <Card>
-    <CardHeader><CardTitle className="flex items-center gap-2"><Users className="h-4 w-4 text-primary" />{t('account.users')}</CardTitle><p className="text-xs text-muted-foreground">{t('account.usersHelp')}</p></CardHeader>
+    <CardHeader><p className="text-xs text-muted-foreground">{t('account.usersHelp')}</p></CardHeader>
     <CardContent className="space-y-5">
       <form className="grid gap-3 rounded-lg border border-border p-4 sm:grid-cols-2" onSubmit={submit}>
         <label className="space-y-1.5 text-sm">{t('account.login')}<Input autoComplete="off" minLength={1} maxLength={64} required value={login} onChange={event => setLogin(event.target.value)} /></label>

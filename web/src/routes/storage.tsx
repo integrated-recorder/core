@@ -1,9 +1,9 @@
 import { useState, type ReactNode } from 'react'
 import { Link, useParams } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, ArrowRight, Check, Database, Gauge, HardDrive, Layers3, RefreshCw, Server, ShieldCheck, Timer, TriangleAlert, Waves } from 'lucide-react'
-import { storageMetricsQuery, storagePoolsQuery } from '@/api/queries'
-import { storageProvidersAPI, type StorageMetricWindow } from '@/api'
+import { ArrowLeft, ArrowRight, Check, Database, Gauge, HardDrive, Layers3, Server, ShieldCheck, Timer, TriangleAlert, Waves } from 'lucide-react'
+import { dashboardAPI, storageProvidersAPI, type StorageMetricWindow } from '@/api'
+import { qk, storageMetricsQuery, storagePoolsQuery } from '@/api/queries'
 import type { Schema, StorageInstanceCreateBody, StorageInstanceSummary, StoragePool, StorageProviderConfigBody, StorageProviderSummary, StorageProviderStatus } from '@/types/api'
 import { MetricChart } from '@/components/storage/metric-chart'
 import { EmptyState, ErrorState, LoadingState } from '@/components/query-state'
@@ -24,35 +24,23 @@ import { useI18n } from '@/i18n/provider'
 export function StoragePage() {
   const { t } = useI18n()
   const pools = useQuery(storagePoolsQuery)
-  return <div className="page-enter">
-    <PageHeading title={t('storage.pageTitle')} actions={<Button variant="outline" onClick={() => void pools.refetch()}><RefreshCw className="h-4 w-4" />{t('storage.refresh')}</Button>} />
-    <StorageProviderManagement />
+  const status = useQuery({ queryKey: ['runtime-storage-provider'], queryFn: storageProvidersAPI.status, staleTime: 5_000 })
+  const usage = useQuery({ queryKey: qk.storage, queryFn: dashboardAPI.storage, staleTime: 20_000 })
+  return <div className="page-enter space-y-5">
+    <PageHeading title={t('storage.pageTitle')} actions={<Link to="/storage/locations"><Button><HardDrive className="h-4 w-4" />{t('storage.instances')}</Button></Link>} />
+    {status.isLoading ? <LoadingState label={t('storage.primaryLoading')} /> : status.error ? <ErrorState message={errorMessage(status.error)} retry={() => void status.refetch()} /> : status.data && <>
+      <Card><CardHeader><CardTitle>{t('storage.primary')}</CardTitle></CardHeader><CardContent className="space-y-4"><PrimaryStorageSummary status={status.data} /><div className="flex flex-wrap gap-2 border-t border-border pt-3"><Link to="/storage/retention" className="text-sm font-medium text-primary hover:underline">{t('settings.retentionTitle')} <ArrowRight className="inline h-3.5 w-3.5" /></Link><Link to="/storage/advanced" className="ml-4 text-sm font-medium text-primary hover:underline">{t('settings.advancedStorageTitle')} <ArrowRight className="inline h-3.5 w-3.5" /></Link></div></CardContent></Card>
+      <section aria-labelledby="storage-drivers-title"><div className="flex items-center justify-between gap-3"><h2 id="storage-drivers-title" className="text-sm font-semibold">{t('storage.providers')}</h2><Link to="/plugins" className="text-xs font-medium text-primary hover:underline">{t('nav.plugins')}</Link></div>{status.data.providers.length ? <ul className="mt-2 divide-y divide-border border-y border-border">{status.data.providers.map(provider => <li key={provider.id} className="flex items-center justify-between gap-3 py-3"><span className="min-w-0"><span className="block truncate text-sm font-medium">{provider.id === 'local' ? 'Local Storage' : provider.name}</span><span className="mt-1 block truncate font-mono text-[11px] text-muted-foreground">{provider.id} · {provider.version}</span></span><Badge tone={provider.distribution === 'bundled' ? 'green' : 'neutral'}>{provider.distribution === 'bundled' ? t('plugins.trust.bundled') : t('storage.providerInstalled')}</Badge></li>)}</ul> : <EmptyState title={t('storage.noProviders')} />}</section>
+    </>}
+    {usage.isLoading ? <LoadingState /> : usage.error ? <ErrorState message={errorMessage(usage.error)} retry={() => void usage.refetch()} /> : usage.data && <Card><CardContent className="grid grid-cols-2 gap-4 pt-4 sm:grid-cols-4">{[[t('settings.archiveBytes'), usage.data.recordings_bytes_known === false ? '—' : formatBytes(usage.data.recordings_bytes)], [t('settings.filesystemUsed'), formatBytes(usage.data.filesystem_used_bytes)], [t('settings.availableSpace'), formatBytes(usage.data.filesystem_available_bytes)], [t('settings.recordingCount'), String(usage.data.recording_count)]].map(([label, value]) => <div key={label}><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-lg font-semibold tabular-nums">{value}</p></div>)}</CardContent></Card>}
     {pools.isLoading ? <LoadingState label={t('storage.loading')} /> : pools.error ? <ErrorState message={errorMessage(pools.error)} retry={() => void pools.refetch()} /> : <StoragePoolList pools={pools.data?.items ?? []} />}
   </div>
 }
 
-function StorageProviderManagement() {
+export function StorageLocationsPage() {
   const { t } = useI18n()
-  const client = useQueryClient()
-  const queryKey = ['runtime-storage-provider'] as const
-  const query = useQuery({ queryKey, queryFn: storageProvidersAPI.status, staleTime: 5_000 })
-  const retry = () => void query.refetch()
-  return <section aria-labelledby="primary-storage-title" className="mb-8 space-y-4">
-    <Card>
-      <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border/70">
-        <div><CardTitle id="primary-storage-title" className="flex items-center gap-2"><HardDrive className="h-4 w-4 text-primary" />{t('storage.primary')}</CardTitle></div>
-        <Button variant="outline" onClick={() => { retry(); void client.invalidateQueries({ queryKey }) }} disabled={query.isFetching}><RefreshCw className={`h-4 w-4 ${query.isFetching ? 'animate-spin' : ''}`} />{t('storage.refresh')}</Button>
-      </CardHeader>
-      <CardContent className="pt-4">
-        {query.isLoading ? <LoadingState label={t('storage.primaryLoading')} /> : query.error ? <div role="alert" className="space-y-2"><p className="text-sm text-muted-foreground">{t('storage.primaryFailed')}</p><Button variant="outline" onClick={retry}>{t('storage.retry')}</Button></div> : query.data ? <PrimaryStorageSummary status={query.data} /> : null}
-      </CardContent>
-    </Card>
-    {query.data && <div className="space-y-3">
-      <div><h2 className="text-base font-semibold">{t('storage.providers')}</h2><p className="mt-1 text-xs text-muted-foreground">{t('storage.providerHelp')}</p></div>
-      {query.data.providers.length ? <div className="grid min-w-0 gap-4 xl:grid-cols-2">{query.data.providers.map(provider => <StorageProviderCard key={provider.id} provider={provider} />)}</div> : <EmptyState title={t('storage.noProviders')} description={t('storage.noProvidersHelp')} />}
-    </div>}
-    {query.data && <StorageInstanceManagement providers={query.data.providers} />}
-  </section>
+  const status = useQuery({ queryKey: ['runtime-storage-provider'], queryFn: storageProvidersAPI.status, staleTime: 5_000 })
+  return <div className="page-enter space-y-4"><PageHeading title={t('storage.instances')} actions={<Link to="/plugins"><Button variant="outline">{t('nav.plugins')} <ArrowRight className="h-4 w-4" /></Button></Link>} />{status.isLoading ? <LoadingState /> : status.error ? <ErrorState message={errorMessage(status.error)} retry={() => void status.refetch()} /> : status.data?.providers.length ? <StorageInstanceManagement providers={status.data.providers} /> : <EmptyState title={t('storage.noProviders')} description={t('storage.noProvidersHelp')} />}</div>
 }
 
 function localInstanceSchema(t: ReturnType<typeof useI18n>['t']): Schema { return { fields: [{ key: 'root', control: 'text', label: t('storage.localRoot'), required: true, constraints: { max_length: 4096 } }] } }
@@ -124,78 +112,6 @@ function PrimaryStorageSummary({ status }: { status: StorageProviderStatus }) {
   </div>
 }
 
-function StorageProviderCard({ provider }: { provider: StorageProviderSummary }) {
-  const { t } = useI18n()
-  const client = useQueryClient()
-  const { toast } = useToast()
-  const [confirmOpen, setConfirmOpen] = useState(false)
-  const [actionMessage, setActionMessage] = useState('')
-  const configKey = ['storage-provider-config', provider.id] as const
-  const configQuery = useQuery({ queryKey: configKey, queryFn: () => storageProvidersAPI.config(provider.id), staleTime: 10_000, enabled: !provider.configuration_managed })
-  const invalidate = async () => {
-    await Promise.all([
-      client.invalidateQueries({ queryKey: ['runtime-storage-provider'] }),
-      client.invalidateQueries({ queryKey: configKey }),
-      client.invalidateQueries({ queryKey: ['storage', 'pools'] }),
-    ])
-  }
-  const save = useMutation({
-    mutationFn: (body: StorageProviderConfigBody) => storageProvidersAPI.saveConfig(provider.id, body),
-    onSuccess: async () => { setActionMessage(t('storage.configSaved')); toast(t('storage.configSavedToast')); await invalidate() },
-    onError: error => setActionMessage(storageActionError(error, t)),
-  })
-  const probe = useMutation({
-    mutationFn: () => storageProvidersAPI.probe(provider.id),
-    onSuccess: async () => { setActionMessage(t('storage.probeSuccess')); toast(t('storage.probeProviderToast')); await invalidate() },
-    onError: error => setActionMessage(storageActionError(error, t)),
-  })
-  const activate = useMutation({
-    mutationFn: () => storageProvidersAPI.activate(provider.id),
-    onSuccess: async () => { setConfirmOpen(false); setActionMessage(t('storage.providerGenerationActivated')); toast(t('storage.defaultChanged')); await invalidate() },
-    onError: error => { setConfirmOpen(false); setActionMessage(storageActionError(error, t)) },
-  })
-  const busy = save.isPending || probe.isPending || activate.isPending
-  const configuredSecrets = Object.fromEntries((configQuery.data?.configured_secrets ?? []).map(name => [name, true]))
-  const bundled = provider.distribution === 'bundled'
-  return <Card className="min-w-0">
-    <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border/70">
-      <div className="min-w-0"><CardTitle className="truncate text-base">{provider.id === 'local' ? 'Local Storage' : provider.name}</CardTitle><p className="mt-1 font-mono text-[11px] text-muted-foreground">{provider.id} · {provider.version}</p></div>
-      <div className="flex flex-wrap gap-1.5">{bundled && <><Badge tone="neutral">{t('plugins.trust.bundled')}</Badge><Badge tone="green">{t('storage.providerInstalled')}</Badge></>}<Badge tone={provider.configured ? 'green' : 'amber'}>{provider.configured ? t('storage.providerConfigured') : t('storage.providerNeedsConfig')}</Badge><Badge tone={healthTone(provider.health)}>{healthLabel(provider.health, t)}</Badge>{provider.active && <Badge tone="blue">{t('storage.default')}</Badge>}</div>
-    </CardHeader>
-    <CardContent className="space-y-5 pt-4">
-      {provider.configuration_managed ? <p className="text-sm text-muted-foreground">{t('storage.providerManagedConfig')}</p> : configQuery.isLoading ? <LoadingState label={t('storage.providerConfigLoading')} /> : configQuery.error ? <div role="alert" className="space-y-2"><p className="text-sm text-muted-foreground">{t('storage.instanceConfigFailed')}</p><Button variant="outline" onClick={() => void configQuery.refetch()}>{t('storage.retry')}</Button></div> : <SchemaForm
-        key={`${provider.id}-${JSON.stringify(configQuery.data?.values ?? {})}-${(configQuery.data?.configured_secrets ?? []).join(',')}`}
-        schema={provider.configuration_schema}
-        initialValues={configQuery.data?.values}
-        initialSecrets={configuredSecrets}
-        mode="config"
-        submitLabel={t('storage.saveProviderConfig')}
-        busy={busy}
-        onSubmit={({ values, secrets }) => { setActionMessage(''); save.mutate({ values, secrets }) }}
-      />}
-      <div className="flex flex-wrap gap-2 border-t border-border/70 pt-4">
-        <Button variant="outline" disabled={!provider.configured || busy} onClick={() => { setActionMessage(''); probe.mutate() }}>{probe.isPending ? t('storage.checking') : t('storage.checkConnection')}</Button>
-        <Button disabled={provider.active || !provider.configured || provider.health !== 'ready' || busy} onClick={() => { setActionMessage(''); setConfirmOpen(true) }}>{provider.active ? <><Check className="h-4 w-4" />{t('storage.default')}</> : t('storage.activateAsDefault')}</Button>
-      </div>
-      {!provider.configuration_managed && !provider.configured && <p className="text-xs text-muted-foreground">{t('storage.configBeforeActivate')}</p>}
-      {actionMessage && <p role={actionMessage === t('storage.configSaved') || actionMessage === t('storage.probeSuccess') || actionMessage === t('storage.providerGenerationActivated') ? 'status' : 'alert'} className="text-sm text-muted-foreground">{actionMessage}</p>}
-      <Dialog open={confirmOpen} onOpenChange={open => { if (!activate.isPending) setConfirmOpen(open) }}>
-        <DialogContent aria-describedby={`storage-activate-description-${provider.id}`}>
-          <DialogTitle>{t('storage.confirmDefaultTitle')}</DialogTitle>
-          <DialogDescription id={`storage-activate-description-${provider.id}`} className="mt-2 text-sm leading-6 text-muted-foreground">{t('storage.confirmDefaultBody', { name: provider.name })}</DialogDescription>
-          <div className="mt-5 flex justify-end gap-2"><Button variant="outline" disabled={activate.isPending} onClick={() => setConfirmOpen(false)}>{t('storage.cancel')}</Button><Button disabled={activate.isPending} onClick={() => activate.mutate()}>{activate.isPending ? t('storage.activating') : t('storage.confirmActivate')}</Button></div>
-        </DialogContent>
-      </Dialog>
-    </CardContent>
-  </Card>
-}
-
-function healthTone(health: StorageProviderSummary['health']): 'green' | 'amber' | 'red' | 'neutral' {
-  return health === 'ready' ? 'green' : health === 'failed' ? 'red' : 'neutral'
-}
-function healthLabel(health: StorageProviderSummary['health'], t: ReturnType<typeof useI18n>['t']) {
-  return health === 'ready' ? t('state.ready') : health === 'failed' ? t('state.failed') : t('storage.needsCheck')
-}
 function storageActionError(error: unknown, t: ReturnType<typeof useI18n>['t']): string {
   return errorMessage(error) || t('errors.server')
 }

@@ -20,8 +20,9 @@ type Props = {
   submitLabel?: string
   onSubmit: (result: { values: Record<string, unknown>; secrets: Record<string, string>; clearValues: string[]; clearSecrets: string[]; persistFields: string[] }) => void | Promise<void>
   busy?: boolean
+  allowPersistence?: boolean
 }
-export function SchemaForm({ schema, initialValues, storedValues, initialSecrets, valueSources, secretSources, mode = 'input', submitLabel, onSubmit, busy }: Props) {
+export function SchemaForm({ schema, initialValues, storedValues, initialSecrets, valueSources, secretSources, mode = 'input', submitLabel, onSubmit, busy, allowPersistence = true }: Props) {
   const { t } = useI18n()
   const initial = useMemo(() => ({ ...defaultValues(schema), ...(initialValues ?? {}) }), [schema, initialValues])
   const [values, setValues] = useState<Record<string, unknown>>(initial)
@@ -58,7 +59,7 @@ export function SchemaForm({ schema, initialValues, storedValues, initialSecrets
       if (field.control === 'secret') { if (secrets[field.key]) submittedSecrets[field.key] = secrets[field.key] }
       else if (values[field.key] !== undefined && !clearValues.includes(field.key) && (mode !== 'config' || dirtyFields.includes(field.key))) submittedValues[field.key] = values[field.key]
     }
-    const requiredPersistence = schema.fields.filter(field => field.persistence?.mode === 'required').map(field => field.key)
+    const requiredPersistence = allowPersistence ? schema.fields.filter(field => field.persistence?.mode === 'required').map(field => field.key) : []
     await onSubmit({ values: submittedValues, secrets: submittedSecrets, clearValues, clearSecrets, persistFields: Array.from(new Set([...requiredPersistence, ...persistFields])) })
   }
 
@@ -92,7 +93,7 @@ export function SchemaForm({ schema, initialValues, storedValues, initialSecrets
           {field.control === 'secret' && configured && (mode === 'config' || mode === 'watch') && <div className="flex items-center justify-between text-xs"><span className="text-muted-foreground">● {t('schema.configured')}{secretSources?.[field.key] ? ` · ${secretSources[field.key]}` : ''}</span><button type="button" className="font-medium text-destructive hover:underline" onClick={() => { setClearSecrets(current => current.includes(field.key) ? current.filter(x => x !== field.key) : [...current, field.key]); setSecrets(current => ({ ...current, [field.key]: '' })) }}>{clearSecrets.includes(field.key) ? t('schema.cancelClear') : mode === 'watch' ? t('schema.clearSecretWatch') : t('schema.clearSecret')}</button></div>}
           {mode === 'config' && field.control !== 'secret' && <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">{source && !localValue ? <span>{t('schema.inheritedValue')}</span> : localValue ? <span>{t('schema.savedHere')}</span> : <span>{t('schema.defaultOrUnset')}</span>}{localValue && <button type="button" className="inline-flex items-center gap-1 font-medium text-primary hover:underline" onClick={() => { setClearValues(current => current.includes(field.key) ? current.filter(x => x !== field.key) : [...current, field.key]); setDirtyFields(current => current.filter(x => x !== field.key)); if (!clearValues.includes(field.key)) setValues(current => ({ ...current, [field.key]: initialValues?.[field.key] ?? defaultValues(schema)[field.key] })) }}><RotateCcw className="h-3 w-3" />{clearValues.includes(field.key) ? t('schema.keepOverride') : t('schema.useInherited')}</button>}</div>}
           {mode === 'challenge' && field.persistence?.mode === 'required' && <p className="text-xs text-muted-foreground">{t('schema.requiredPersistence', { target: persistenceTarget(field, t) })}</p>}
-          {mode === 'challenge' && optionalPersistence(field) && <label className="flex items-center gap-2 text-xs text-muted-foreground"><input type="checkbox" checked={persistFields.includes(field.key)} onChange={event => setPersistFields(current => event.target.checked ? [...current, field.key] : current.filter(key => key !== field.key))} className="accent-primary" />{t('schema.optionalPersistence', { target: persistenceTarget(field, t) })}</label>}
+          {mode === 'challenge' && allowPersistence && optionalPersistence(field) && <label className="flex items-center gap-2 text-xs text-muted-foreground"><input type="checkbox" checked={persistFields.includes(field.key)} onChange={event => setPersistFields(current => event.target.checked ? [...current, field.key] : current.filter(key => key !== field.key))} className="accent-primary" />{t('schema.optionalPersistence', { target: persistenceTarget(field, t) })}</label>}
           {errors[field.key] && <p id={errorId} className="text-xs text-destructive" role="alert">{errors[field.key]}</p>}
         </>}
       </div>

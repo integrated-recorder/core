@@ -37,7 +37,12 @@ func TestEmbeddedSPAHasLocalProductionAssets(t *testing.T) {
 
 func TestSPARoutesAreRestrictedAndDirectLoadsWork(t *testing.T) {
 	handler := New(nil, nil, nil)
-	for _, path := range []string{"/", "/login", "/recordings", "/recordings/abc123", "/adapters/example", "/workflows/id", "/settings", "/storage", "/storage/local-primary"} {
+	for _, path := range []string{
+		"/", "/login", "/recordings", "/recordings/abc123", "/adapters/example", "/sources", "/sources/example",
+		"/plugins", "/workflows/id", "/settings", "/account/preferences", "/account/security", "/account/sessions",
+		"/system", "/system/users", "/system/updates", "/system/diagnostics", "/system/audit",
+		"/storage", "/storage/locations", "/storage/retention", "/storage/advanced", "/storage/local-primary",
+	} {
 		response := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.Header.Set("Accept", "text/html")
@@ -53,7 +58,7 @@ func TestSPARoutesAreRestrictedAndDirectLoadsWork(t *testing.T) {
 			t.Errorf("unknown route %s received status %d", path, response.Code)
 		}
 	}
-	for _, path := range []string{"/recordings/a/b", "/recordings/..", "/adapters/", "/workflows/id/extra", "/storage/a/b", "/storage/.."} {
+	for _, path := range []string{"/recordings/a/b", "/recordings/..", "/adapters/", "/sources/", "/sources/a/b", "/workflows/id/extra", "/storage/a/b", "/storage/..", "/system/users/extra", "/account/security/extra"} {
 		if isSPARoute(path) {
 			t.Errorf("unexpected SPA route match for %s", path)
 		}
@@ -68,7 +73,12 @@ func TestSPARoutesAreRestrictedAndDirectLoadsWork(t *testing.T) {
 }
 
 func TestAuthPublicRoutesExposeOnlySPAAndStaticGetRequests(t *testing.T) {
-	for _, path := range []string{"/", "/login", "/recordings", "/recordings/id", "/adapters/id", "/workflows/id", "/settings", "/storage", "/storage/local-primary", "/static/ui/assets/app.js"} {
+	for _, path := range []string{
+		"/", "/login", "/recordings", "/recordings/id", "/adapters/id", "/sources", "/sources/id", "/plugins",
+		"/workflows/id", "/settings", "/account/preferences", "/account/security", "/account/sessions",
+		"/system", "/system/users", "/system/updates", "/system/diagnostics", "/system/audit",
+		"/storage", "/storage/locations", "/storage/retention", "/storage/advanced", "/storage/local-primary", "/static/ui/assets/app.js",
+	} {
 		if !authRoutePublic(httptest.NewRequest(http.MethodGet, path, nil)) {
 			t.Errorf("expected GET %s to be public for SPA bootstrap", path)
 		}

@@ -2,7 +2,7 @@ import { Link } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRight, CircleAlert, Download, PackageOpen, RefreshCw, Trash2, Upload } from 'lucide-react'
 import { adaptersAPI, pluginsAPI } from '@/api'
-import { adaptersQuery, pluginsQuery, qk } from '@/api/queries'
+import { accountQuery, adaptersQuery, pluginsQuery, qk } from '@/api/queries'
 import { PageHeading } from '@/components/page-heading'
 import { errorMessage } from '@/lib/errors'
 import { StatusBadge } from '@/components/status-badge'
@@ -18,7 +18,8 @@ import { useI18n } from '@/i18n/provider'
 export function AdaptersPage() {
   const { t } = useI18n()
   const query = useQuery(adaptersQuery)
-  const registryQuery = useQuery(pluginsQuery)
+  const account = useQuery(accountQuery)
+  const owner = account.data?.role === 'owner'
   const client = useQueryClient()
   const { toast } = useToast()
   const reconcile = useMutation({
@@ -32,15 +33,18 @@ export function AdaptersPage() {
     },
     onError: error => toast(t('plugins.scanFailed'), errorMessage(error), 'error'),
   })
-  const actions = <div className="flex flex-wrap gap-2"><Button variant="outline" disabled={reconcile.isPending} onClick={() => reconcile.mutate()}><RefreshCw className={`h-4 w-4 ${reconcile.isPending ? 'animate-spin' : ''}`} />{t('plugins.rescan')}</Button><Button variant="ghost" onClick={() => void query.refetch()}><RefreshCw className="h-4 w-4" />{t('plugins.refresh')}</Button></div>
+  const actions = <div className="flex flex-wrap gap-2">{owner && <Button variant="outline" disabled={reconcile.isPending} onClick={() => reconcile.mutate()}><RefreshCw className={`h-4 w-4 ${reconcile.isPending ? 'animate-spin' : ''}`} />{t('plugins.rescan')}</Button>}<Button variant="ghost" onClick={() => void query.refetch()}><RefreshCw className="h-4 w-4" />{t('plugins.refresh')}</Button></div>
   const unreviewedInstalled = query.data?.some(adapter => isUnreviewed(adapter.trust)) ?? false
-  const unreviewedAvailable = registryQuery.data?.plugins.some(plugin => isUnreviewed(plugin.trust)) ?? false
-  return <div className="page-enter space-y-8">
-    <PageHeading title={t('plugins.title')} actions={actions} />
-    {unreviewedInstalled || unreviewedAvailable ? <div role="note" className="flex items-start gap-2 rounded-md border border-amber-300/60 bg-amber-50/60 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100"><CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />{t('plugins.trust.pageWarning')}</div> : null}
+  return <div className="page-enter space-y-4">
+    <PageHeading title={t('nav.sources')} actions={actions} />
+    {unreviewedInstalled ? <div role="note" className="flex items-start gap-2 rounded-md border border-amber-300/60 bg-amber-50/60 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100"><CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />{t('plugins.trust.pageWarning')}</div> : null}
     {query.isLoading ? <LoadingState /> : query.error ? <ErrorState message={errorMessage(query.error)} retry={() => void query.refetch()} /> : query.data?.length ? <div className="overflow-hidden rounded-lg border border-border bg-card"><div className="divide-y divide-border">{query.data.map(adapter => <AdapterRow key={adapter.status.id} adapter={adapter} />)}</div></div> : <EmptyState title={t('plugins.empty')} />}
-    <PluginRegistrySection />
   </div>
+}
+
+export function PluginsPage() {
+  const { t } = useI18n()
+  return <div className="page-enter space-y-4"><PageHeading title={t('nav.plugins')} /><PluginRegistrySection /></div>
 }
 
 function isUnreviewed(trust: Adapter['trust']): boolean {
@@ -91,7 +95,7 @@ function PluginRegistrySection() {
       <PluginGroup title={t('plugins.group.sources')} plugins={sourcePlugins} busy={busy} onInstall={plugin => install.mutate(plugin)} onUpdate={plugin => update.mutate(plugin)} onUninstall={plugin => uninstall.mutate(plugin)} registryState={status?.state} />
       <div className="border-t border-border">
         <PluginGroup title={t('plugins.group.storage')} description={t('plugins.group.storageHelp')} plugins={storagePlugins} busy={busy} onInstall={plugin => install.mutate(plugin)} onUpdate={plugin => update.mutate(plugin)} onUninstall={plugin => uninstall.mutate(plugin)} registryState={status?.state} storage />
-        <div className="px-4 pb-4"><Link to="/storage" className="text-xs font-medium text-primary hover:underline">{t('plugins.storageSettings')} <ArrowRight className="inline h-3 w-3" /></Link></div>
+        <div className="px-4 pb-4"><Link to="/storage/locations" className="text-xs font-medium text-primary hover:underline">{t('plugins.storageSettings')} <ArrowRight className="inline h-3 w-3" /></Link></div>
       </div>
     </>}
   </section>
@@ -117,7 +121,7 @@ function AdapterRow({ adapter }: { adapter: Adapter }) {
   const { t } = useI18n()
   const descriptor = adapter.descriptor
   const name = descriptor?.name ?? adapter.status.name ?? adapter.status.id
-  return <Link to="/adapters/$adapterId" params={{ adapterId: adapter.status.id }} search={{ tab: undefined }} className="flex min-w-0 items-center justify-between gap-3 px-4 py-3 transition-colors hover:bg-muted/30">
+  return <Link to="/sources/$adapterId" params={{ adapterId: adapter.status.id }} search={{ tab: undefined }} className="flex min-w-0 items-center justify-between gap-3 px-4 py-3 transition-colors hover:bg-muted/30">
     <span className="flex min-w-0 items-center gap-3"><AdapterMark adapter={adapter} size="md" /><span className="min-w-0"><span className="block truncate text-sm font-semibold" title={name}>{name}</span>{adapter.status.error && <span className="mt-1 flex items-center gap-1 text-xs text-muted-foreground"><CircleAlert className="h-3 w-3" />{t('plugins.statusDetails')}</span>}</span></span>
     <span className="flex shrink-0 items-center gap-2"><StatusBadge state={adapter.status.state} /><ArrowRight className="h-3.5 w-3.5 text-muted-foreground" /></span>
   </Link>

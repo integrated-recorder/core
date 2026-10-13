@@ -52,6 +52,10 @@ func (s *Server) settingsPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid settings request")
 		return
 	}
+	if request.UI != nil {
+		writeCodedError(w, http.StatusBadRequest, "theme_is_user_preference", "Theme is managed in user preferences.")
+		return
+	}
 	if request.UI != nil && request.UI.Theme == nil ||
 		request.Integrity != nil && request.Integrity.Concurrency == nil ||
 		request.Retention != nil && request.Retention.Enabled == nil && request.Retention.CompletedAfterDays == nil ||
@@ -60,9 +64,6 @@ func (s *Server) settingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	patch := systemsettings.Patch{}
-	if request.UI != nil {
-		patch.UITheme = request.UI.Theme
-	}
 	if request.Integrity != nil {
 		patch.IntegrityConcurrency = request.Integrity.Concurrency
 	}

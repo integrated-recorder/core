@@ -1,12 +1,13 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createMemoryHistory, createRootRoute, createRoute, createRouter, Outlet, RouterProvider } from '@tanstack/react-router'
 import { accountAPI, authAPI, dashboardAPI, productAPI, runtimeUpdateAPI, userPreferencesAPI } from '@/api'
 import { ToastProvider } from '@/components/ui/toast'
 import { APIError } from '@/api/client'
 import type { RuntimeUpdateStatus, StorageSettings, SystemSettings } from '@/types/api'
 import type { UserPreferences } from '@/types/api'
-import { SettingsPage } from './settings'
+import { SettingsPage, type SettingsSection } from './settings'
 import { I18nProvider } from '@/i18n/provider'
 
 const storageDefaults: StorageSettings = {
@@ -35,17 +36,23 @@ const updateStatus: RuntimeUpdateStatus = {
   verification_state: 'not_checked', updates_available: true,
 }
 
-function renderSettings() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={client}><ToastProvider><SettingsPage /></ToastProvider></QueryClientProvider>)
+function settingsRouter(section: SettingsSection) {
+  const root = createRootRoute({ component: Outlet })
+  const paths = ['/test-settings', '/account/preferences', '/account/security', '/account/sessions', '/system', '/system/users', '/system/updates', '/system/diagnostics', '/system/audit', '/storage', '/storage/locations', '/storage/retention', '/storage/advanced'] as const
+  const routes = paths.map(path => createRoute({ getParentRoute: () => root, path, component: path === '/test-settings' ? () => <SettingsPage section={section} /> : () => null }))
+  return createRouter({ routeTree: root.addChildren(routes), history: createMemoryHistory({ initialEntries: ['/test-settings'] }) })
 }
-function renderLocalizedSettings() {
+function renderSettings(section: SettingsSection = 'preferences') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={client}><I18nProvider><ToastProvider><SettingsPage /></ToastProvider></I18nProvider></QueryClientProvider>)
+  return render(<QueryClientProvider client={client}><ToastProvider><RouterProvider router={settingsRouter(section)} /></ToastProvider></QueryClientProvider>)
 }
-async function openStorageTab() { fireEvent.click(await screen.findByRole('tab', { name: '저장소' })) }
+function renderLocalizedSettings(section: SettingsSection = 'preferences') {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  return render(<QueryClientProvider client={client}><I18nProvider><ToastProvider><RouterProvider router={settingsRouter(section)} /></ToastProvider></I18nProvider></QueryClientProvider>)
+}
 
 beforeEach(() => {
+  vi.stubGlobal('scrollTo', vi.fn())
   vi.spyOn(accountAPI, 'self').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000001', login: 'owner', role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' })
   vi.spyOn(accountAPI, 'sessions').mockResolvedValue({ items: [{ id: 'opaque-session-id', expires_at: '2026-10-12T00:00:00Z', current: true }] })
   vi.spyOn(accountAPI, 'users').mockResolvedValue({ items: [{ user_id: 'usr-00000000000000000000000000000001', login: 'owner', role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' }] })
@@ -77,11 +84,12 @@ describe('storage ingest settings UI', () => {
     saved.effective_storage.observability.sampling_interval_ms = 5_000
     saved.restart_required = ['storage.observability.sampling_interval_ms']
     vi.mocked(productAPI.saveSettings).mockResolvedValue(saved)
-    renderSettings()
-    await openStorageTab()
+    renderSettings('advanced-storage')
 
     expect(await screen.findByRole('heading', { name: '고급 수집·저장 설정' })).toBeInTheDocument()
-    expect(screen.getByLabelText('전체 버퍼 한도')).toHaveValue(1024)
+    await waitFor(() => expect(accountAPI.self).toHaveBeenCalled())
+    await waitFor(() => expect(productAPI.settings).toHaveBeenCalled())
+    expect(await screen.findByLabelText('전체 버퍼 한도')).toHaveValue(1024)
     expect(screen.getByLabelText('녹화별 버퍼 한도')).toHaveValue(768)
     expect(screen.getByLabelText('단일 페이로드 최대 크기')).toHaveValue(512)
     expect(screen.getByLabelText('측정 간격')).toHaveValue(5)
@@ -114,10 +122,10 @@ describe('storage ingest settings UI', () => {
 
   it('shows an authoritative server validation error for invalid related limits', async () => {
     vi.mocked(productAPI.saveSettings).mockRejectedValue(new APIError(400, 'untrusted backend detail', undefined, 'invalid_argument'))
-    renderSettings()
-    await openStorageTab()
+    renderSettings('advanced-storage')
     await screen.findByRole('heading', { name: '고급 수집·저장 설정' })
-    fireEvent.change(screen.getByLabelText('녹화별 버퍼 한도'), { target: { value: '1100' } })
+    await waitFor(() => expect(productAPI.settings).toHaveBeenCalled())
+    fireEvent.change(await screen.findByLabelText('녹화별 버퍼 한도'), { target: { value: '1100' } })
     fireEvent.click(screen.getByRole('button', { name: '수집·저장 설정 저장' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('입력 값을 확인한 뒤 다시 시도하세요.')
     expect(screen.getByRole('alert')).not.toHaveTextContent('untrusted backend detail')
@@ -125,8 +133,6 @@ describe('storage ingest settings UI', () => {
 })
 
 describe('runtime update settings UI', () => {
-  async function openUpdatesTab() { fireEvent.click(await screen.findByRole('tab', { name: '업데이트' })) }
-
   it('renders only stable, sanitized handover diagnostics', async () => {
     const diagnostic = {
       recording_id: 'recording-123', phase: 'prepare_target', reason_code: 'target_start_timeout',
@@ -135,8 +141,7 @@ describe('runtime update settings UI', () => {
       ownership_retained: true, raw_error: 'token=super-secret private-path=/srv/archive',
     } as NonNullable<RuntimeUpdateStatus['handover_diagnostic']>
     vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({ ...structuredClone(updateStatus), handover_diagnostic: diagnostic })
-    renderSettings()
-    await openUpdatesTab()
+    renderSettings('updates')
     expect(await screen.findByRole('heading', { name: '최근 세대 전환 진단' })).toBeInTheDocument()
     expect(screen.getByText(/가장 최근 진단 하나만 보관합니다/)).toBeInTheDocument()
     expect(screen.getByText('대상 시작 시간 초과 · target_start_timeout')).toBeInTheDocument()
@@ -146,8 +151,7 @@ describe('runtime update settings UI', () => {
   })
 
   it('loads release state, runs update actions and refreshes the displayed status', async () => {
-    const { container } = renderSettings()
-    await openUpdatesTab()
+    const { container } = renderSettings('updates')
     expect(await screen.findByRole('heading', { name: '애플리케이션 업데이트' })).toBeInTheDocument()
     await waitFor(() => expect(runtimeUpdateAPI.status).toHaveBeenCalledTimes(1))
     expect(screen.getAllByText('1.0.0').length).toBeGreaterThan(0)
@@ -174,8 +178,7 @@ describe('runtime update settings UI', () => {
 
   it('shows update action errors', async () => {
     vi.mocked(runtimeUpdateAPI.check).mockRejectedValue(new APIError(502, 'private backend details'))
-    renderSettings()
-    await openUpdatesTab()
+    renderSettings('updates')
     await screen.findByText('1.1.0')
     fireEvent.click(screen.getByRole('button', { name: '업데이트 확인' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('서버가 요청을 처리하지 못했습니다.')
@@ -184,8 +187,7 @@ describe('runtime update settings UI', () => {
 
   it('shows unavailable reason and disables update operations for a development build', async () => {
     vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({ ...structuredClone(updateStatus), application: { ...runtimeIdentity, version: 'dev', commit: 'unknown', build_time: 'unknown', release_channel: 'development' }, update_unavailable_reason: 'development_build' })
-    renderSettings()
-    await openUpdatesTab()
+    renderSettings('updates')
     expect(await screen.findByText('개발 빌드에서는 애플리케이션 업데이트를 사용할 수 없습니다.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '업데이트 확인' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '다운로드 및 검증' })).toBeDisabled()
@@ -205,8 +207,7 @@ describe('per-user preferences', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save preferences' }))
     expect(await screen.findByText('환경 설정을 저장했습니다.')).toBeInTheDocument()
     await waitFor(() => expect(document.documentElement.lang).toBe('ko-KR'))
-    expect(screen.getByRole('tab', { name: '사용자 환경' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '환경 설정 저장' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '환경설정' })).toBeInTheDocument()
   })
 
   it('applies en-US to document lang immediately after saving from ko-KR', async () => {
@@ -223,7 +224,7 @@ describe('per-user preferences', () => {
     fireEvent.click(screen.getByRole('button', { name: '환경 설정 저장' }))
     await waitFor(() => expect(userPreferencesAPI.update).toHaveBeenLastCalledWith({ locale: 'en-US', theme: 'system', timezone: 'system' }, expect.objectContaining({ client: expect.anything() })))
     await waitFor(() => expect(document.documentElement.lang).toBe('en-US'))
-    expect(screen.getByRole('tab', { name: 'Preferences' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Preferences' })).toBeInTheDocument()
   })
 
   it('loads and persists locale, theme, and time zone together', async () => {
@@ -251,21 +252,20 @@ describe('per-user preferences', () => {
 })
 
 describe('account and security settings', () => {
-  it('shows account identity, recovery guidance, and owner user management in Korean', async () => {
-    renderSettings()
-    fireEvent.click(screen.getByRole('tab', { name: '계정·보안' }))
+  it('shows account identity and local recovery guidance without user administration', async () => {
+    renderSettings('security')
+    await waitFor(() => expect(accountAPI.self).toHaveBeenCalled())
     expect(await screen.findByRole('heading', { name: '계정 정보' })).toBeInTheDocument()
-    expect(screen.getAllByText('owner')[0]).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: '활성 세션' })).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: '사용자 관리' })).toBeInTheDocument()
+    expect(await screen.findByText('owner')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '활성 세션 →' })).toHaveAttribute('href', '/account/sessions')
+    expect(screen.queryByRole('heading', { name: '사용자 관리' })).not.toBeInTheDocument()
     expect(screen.getByText(/runtime-host reset-password/)).toBeInTheDocument()
   })
 
   it('forces the browser back to login after a successful password change', async () => {
     const unauthorized = vi.fn()
     window.addEventListener('ir:unauthorized', unauthorized)
-    renderSettings()
-    fireEvent.click(screen.getByRole('tab', { name: '계정·보안' }))
+    renderSettings('security')
     fireEvent.change(await screen.findByLabelText('현재 비밀번호'), { target: { value: 'old-password-123' } })
     fireEvent.change(screen.getByLabelText('새 비밀번호'), { target: { value: 'new-password-123' } })
     fireEvent.change(screen.getAllByLabelText('새 비밀번호 확인')[0]!, { target: { value: 'new-password-123' } })
@@ -275,13 +275,17 @@ describe('account and security settings', () => {
     window.removeEventListener('ir:unauthorized', unauthorized)
   })
 
+  it('keeps owner user administration on its dedicated route', async () => {
+    renderSettings('users')
+    expect(await screen.findByRole('heading', { name: '사용자 관리' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: '사용자 생성' })).toBeInTheDocument()
+  })
+
   it('hides owner user management from a member account', async () => {
     vi.mocked(accountAPI.self).mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', role: 'member', status: 'active', created_at: '2026-10-01T00:00:00Z' })
-    renderSettings()
-    fireEvent.click(screen.getByRole('tab', { name: '계정·보안' }))
+    renderSettings('security')
     expect(await screen.findByRole('heading', { name: '계정 정보' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: '사용자 관리' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('tab', { name: '저장소' })).not.toBeInTheDocument()
     expect(accountAPI.users).not.toHaveBeenCalled()
   })
 })

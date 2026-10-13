@@ -478,6 +478,13 @@ func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid workflow continuation")
 		return
 	}
+	if request.Persist || len(request.PersistFields) > 0 {
+		principal, ok := authn.PrincipalFromContext(r.Context())
+		if !ok || !authn.HasPermission(principal, authn.PermissionPluginManage) {
+			writeCodedError(w, http.StatusForbidden, "workflow_persistence_requires_plugin_manage", "Saving source settings requires an administrator.")
+			return
+		}
+	}
 	if s.adapters == nil {
 		writeError(w, http.StatusServiceUnavailable, "adapter workflows are unavailable")
 		return

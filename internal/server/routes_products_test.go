@@ -766,11 +766,19 @@ func TestSystemSettingsAPIReportsRestartRequiredAndValidatesStrictly(t *testing.
 
 	update := httptest.NewRecorder()
 	handler.ServeHTTP(update, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"ui":{"theme":"dark"},"integrity":{"concurrency":3}}`)))
-	if update.Code != http.StatusOK || !strings.Contains(update.Body.String(), `"restart_required":["integrity.concurrency"]`) {
-		t.Fatalf("settings update=%d %s", update.Code, update.Body.String())
+	if update.Code != http.StatusBadRequest || !strings.Contains(update.Body.String(), `"error_code":"theme_is_user_preference"`) {
+		t.Fatalf("deprecated system theme mutation=%d %s", update.Code, update.Body.String())
 	}
-	if current := settings.Current(); current.UI.Theme != "dark" || current.Integrity.Concurrency != 3 {
-		t.Fatalf("settings were not persisted: %+v", current)
+	if current := settings.Current(); current.UI.Theme != "system" || current.Integrity.Concurrency != 2 {
+		t.Fatalf("deprecated theme request changed stored settings: %+v", current)
+	}
+	integrityUpdate := httptest.NewRecorder()
+	handler.ServeHTTP(integrityUpdate, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"integrity":{"concurrency":3}}`)))
+	if integrityUpdate.Code != http.StatusOK || !strings.Contains(integrityUpdate.Body.String(), `"restart_required":["integrity.concurrency"]`) {
+		t.Fatalf("integrity settings update=%d %s", integrityUpdate.Code, integrityUpdate.Body.String())
+	}
+	if current := settings.Current(); current.UI.Theme != "system" || current.Integrity.Concurrency != 3 {
+		t.Fatalf("system settings were not persisted independently: %+v", current)
 	}
 
 	storageSettings := settings.Current().Storage

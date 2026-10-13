@@ -89,16 +89,20 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   await expect(primaryNav.getByRole('link', { name: /Dashboard|대시보드/ })).toBeVisible()
   await expect(primaryNav.getByRole('link', { name: /^(Recordings|녹화)$/ })).toBeVisible()
   await expect(primaryNav.getByRole('link', { name: /^(New recording|새 녹화)$/ })).toHaveAttribute('href', '/new')
-  const settingsNav = page.getByRole('navigation', { name: /Settings navigation|설정 메뉴/ })
-  await expect(settingsNav.getByRole('link', { name: /Source plugins|소스 플러그인/ })).toBeVisible()
-  await expect(settingsNav.getByRole('link', { name: /Workflows|워크플로/ })).toBeVisible()
+  const managementNav = page.getByRole('navigation', { name: /Operations|운영/ })
+  await expect(managementNav.getByRole('link', { name: /Sources|소스/ })).toHaveAttribute('href', '/sources')
+  await expect(managementNav.getByRole('link', { name: /Auto recording|자동 녹화/ })).toHaveAttribute('href', '/watches')
+  await expect(managementNav.getByRole('link', { name: /Storage|저장소/ })).toHaveAttribute('href', '/storage')
+  await expect(page.getByRole('navigation', { name: /System|시스템/ }).getByRole('link', { name: /Plugins|플러그인/ })).toHaveAttribute('href', '/plugins')
+  await expect(managementNav.getByRole('link', { name: /Workflows|워크플로/ })).toHaveCount(0)
   expect(requests.some(path => path.includes('bootstrap-token'))).toBe(false)
 
-  for (const route of ['/', '/recordings', '/new', '/adapters', '/adapters/hls', '/workflows', '/settings', '/storage', '/storage/local-primary']) {
+  const screenshotRoutes = new Set(['/', '/recordings', '/sources', '/account/preferences', '/storage', '/plugins'])
+  for (const route of ['/', '/recordings', '/new', '/sources', '/sources/hls', '/workflows', '/account/preferences', '/account/security', '/account/sessions', '/system', '/system/users', '/system/updates', '/system/diagnostics', '/system/audit', '/storage', '/storage/locations', '/storage/retention', '/storage/advanced', '/storage/local-primary', '/plugins']) {
     await page.goto(route)
     await assertResponsive(page)
     await assertNoCSPViolations(cspViolations)
-    if (['/', '/recordings', '/adapters', '/settings', '/storage'].includes(route)) {
+    if (screenshotRoutes.has(route)) {
       await expect(page.locator('#main-content h1').first()).toBeVisible()
       const name = route === '/' ? 'dashboard' : route.slice(1)
       await page.screenshot({ path: testInfo.outputPath(`${name}-ko-desktop.png`), fullPage: true })
@@ -107,11 +111,29 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
       await page.setViewportSize({ width: 1440, height: 900 })
     }
   }
-  await page.goto('/adapters/hls')
-  await page.screenshot({ path: testInfo.outputPath('adapter-detail-ko-desktop.png'), fullPage: true })
+  await page.goto('/system/users')
+  await page.reload()
+  await expect(page).toHaveURL('/system/users')
+  await expect(page.locator('#main-content h1')).toBeVisible()
+  await page.getByRole('navigation', { name: /System|시스템/ }).getByRole('link', { name: /Updates|업데이트/ }).click()
+  await expect(page).toHaveURL('/system/updates')
+  await page.goBack()
+  await expect(page).toHaveURL('/system/users')
+  await page.goto('/storage/retention')
+  await page.reload()
+  await expect(page).toHaveURL('/storage/retention')
+  await page.getByRole('navigation', { name: /Storage|저장소/ }).getByRole('link', { name: /Advanced|고급/ }).click()
+  await expect(page).toHaveURL('/storage/advanced')
+  await page.goto('/adapters')
+  await expect(page).toHaveURL('/sources')
+  await page.goto('/adapters/hls?tab=configuration')
+  await expect(page).toHaveURL(/\/sources\/hls\?tab=configuration$/)
+  await page.screenshot({ path: testInfo.outputPath('source-detail-ko-desktop.png'), fullPage: true })
   await page.setViewportSize({ width: 390, height: 844 })
-  await page.screenshot({ path: testInfo.outputPath('adapter-detail-ko-mobile.png'), fullPage: true })
+  await page.screenshot({ path: testInfo.outputPath('source-detail-ko-mobile.png'), fullPage: true })
   await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/settings')
+  await expect(page).toHaveURL('/account/preferences')
   await page.goto('/storage')
   await expect(page.getByRole('heading', { name: '저장소', exact: true })).toBeVisible()
   await expect(page.getByText('local-primary', { exact: false }).first()).toBeVisible()
@@ -127,14 +149,11 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   const recordingAdapter = page.getByRole('combobox', { name: '소스 플러그인 필터' })
   await exerciseNativeSelect(recordingState)
   await exerciseNativeSelect(recordingAdapter)
-  await page.goto('/settings')
-  const runtimeDetails = page.locator('details').filter({ hasText: '진단 정보' })
-  await expect(runtimeDetails).toBeVisible()
-  await expect(runtimeDetails).not.toHaveAttribute('open', '')
-  await runtimeDetails.locator('summary').click()
+  await page.goto('/system')
   await expect(page.getByText('커밋', { exact: true })).toBeVisible()
-  const settingsSelects = page.locator('#settings-panel-preferences select')
-  await expect(settingsSelects).toHaveCount(3)
+  await page.goto('/account/preferences')
+  const settingsSelects = page.locator('#user-locale, #user-theme')
+  await expect(settingsSelects).toHaveCount(2)
   const localeSelect = page.locator('#user-locale')
   await localeSelect.selectOption('ko-KR')
   const koreanPreferencesResponsePromise = page.waitForResponse(response => response.url().endsWith('/api/user/preferences') && response.request().method() === 'PUT')
@@ -163,7 +182,15 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   await themeSelect.selectOption(originalTheme)
   await page.getByRole('button', { name: /Save preferences|환경 설정 저장/ }).click()
   await exerciseNativeSelect(themeSelect)
-  const concurrencySelect = settingsSelects.nth(2)
+  await page.getByRole('button', { name: /Theme|테마/ }).click()
+  const themeChooser = page.getByRole('dialog').last()
+  await expect(themeChooser).toBeVisible()
+  const themeSave = page.waitForResponse(response => response.url().endsWith('/api/user/preferences') && response.request().method() === 'PUT')
+  await themeChooser.getByRole('button', { name: /System|시스템/ }).click()
+  expect((await themeSave).status()).toBe(200)
+  expect((await getJSON<UserPreferencesWire>(page, '/api/user/preferences')).theme).toBe('system')
+  await page.goto('/system')
+  const concurrencySelect = page.getByRole('combobox', { name: /무결성 검사 동시 실행 수|Concurrent integrity checks/ })
   const originalConcurrency = await concurrencySelect.inputValue()
   const alternateConcurrency = originalConcurrency === '1' ? '2' : '1'
   await concurrencySelect.selectOption(alternateConcurrency)
@@ -321,7 +348,7 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   await expect(page.getByText('Browser E2E HLS capture')).toHaveCount(0)
   expect((await page.request.get(`/api/recordings/${recordingID}`)).status()).toBe(404)
 
-  for (const path of ['/login', '/', '/recordings', '/recordings/demo', '/new', '/adapters', '/adapters/hls', '/workflows', '/workflows/demo', '/settings', '/storage', '/storage/local-primary']) {
+  for (const path of ['/login', '/', '/recordings', '/recordings/demo', '/new', '/sources', '/sources/hls', '/workflows', '/workflows/demo', '/account/preferences', '/account/security', '/account/sessions', '/settings', '/storage', '/storage/locations', '/storage/retention', '/storage/advanced', '/storage/local-primary', '/system', '/system/users', '/system/updates', '/system/diagnostics', '/system/audit', '/plugins']) {
     const response = await page.request.get(path, { headers: { accept: 'text/html' } })
     expect(response.status(), `${path} should be served as an SPA route`).toBe(200)
     expect(response.headers()['content-type']).toContain('text/html')
@@ -439,7 +466,7 @@ test('actual browser HLS decode: active live playback and terminal VOD seeks', a
 
 test('actual Go backend: locale preference save updates the current document language', async ({ page }, testInfo) => {
   await login(page)
-  await page.goto('/settings')
+  await page.goto('/account/preferences')
   const localeSelect = page.locator('#user-locale')
   await expect(localeSelect).toHaveValue('ko-KR')
   const previous = await getJSON<UserPreferencesWire>(page, '/api/user/preferences')
@@ -493,8 +520,7 @@ test('actual Go backend: metadata fixture changes are archived and rendered as a
 
 test('actual Go backend: storage ingest settings persist, show restart state, and reject invalid values', async ({ page }) => {
   await login(page)
-  await page.goto('/settings')
-  await page.getByRole('tab', { name: '저장소' }).click()
+  await page.goto('/storage/advanced')
   await expect(page.getByRole('heading', { name: '고급 수집·저장 설정' })).toBeVisible()
   await expect(page.getByLabel('총 저장 시도 횟수')).toHaveValue('5')
   await expect(page.getByText('최초 저장 시도를 포함한 최대 시도 횟수입니다.')).toBeVisible()
@@ -559,7 +585,7 @@ async function exerciseNativeSelect(select: Locator) {
 async function exerciseTopbarPopovers(page: Page) {
   for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
     await page.setViewportSize(viewport)
-    for (const trigger of [page.getByRole('button', { name: /^(Notifications|알림)$/ }), page.getByRole('button', { name: /IR/ }).last()]) {
+    for (const trigger of [page.getByRole('button', { name: /Notifications|알림/ }), page.getByRole('button', { name: /owner|OW|내 계정|My account/ })]) {
       await trigger.click()
       const content = page.getByRole('dialog').last()
       await expect(content).toBeVisible()
@@ -745,13 +771,13 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
   await expect(persistSecret).toBeVisible()
   await persistSecret.check()
   await expect(persistSecret).toBeChecked()
-  await persistSecret.uncheck()
-  await expect(persistSecret).not.toBeChecked()
   await page.getByRole('button', { name: '계속 진행' }).click()
   await expect.poll(() => continuationBody).not.toBe('')
   const submitted = JSON.parse(continuationBody) as { secrets?: Record<string, string>; persist_fields?: string[] }
   expect(submitted.secrets?.session_value).toBe(ephemeralSecret)
-  expect(submitted.persist_fields ?? []).not.toContain('session_value')
+  expect(submitted.persist_fields ?? []).toContain('session_value')
+  const persisted = await getJSON<{ stored: { secrets: Record<string, { configured: boolean }> } }>(page, '/api/adapters/workflow-fixture/config')
+  expect(persisted.stored.secrets.session_value?.configured).toBe(true)
   await expect(page).toHaveURL(/\/recordings\/[^/]+$/)
   const recordingID = page.url().split('/').at(-1)!
   await expect.poll(async () => segmentCount(await getJSON<RecordingWire>(page, `/api/recordings/${recordingID}`))).toBeGreaterThan(0)
@@ -760,6 +786,9 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
   await page.getByRole('button', { name: '중지', exact: true }).click()
   await page.getByRole('alertdialog').getByRole('button', { name: '중지', exact: true }).click()
   await expect.poll(async () => (await getJSON<RecordingWire>(page, `/api/recordings/${recordingID}`)).state).toBe('stopped')
+  await page.goto('/sources/workflow-fixture?tab=configuration')
+  await expect(page.getByLabel('Stored fixture secret')).toBeVisible()
+  await expect(page.getByText(/설정됨|Configured/)).toBeVisible()
 
   await page.goto(`/workflows/${firstWorkflowID}`)
   await expect(page.getByRole('alert')).toContainText('요청한 항목을 찾을 수 없습니다.')
@@ -784,10 +813,9 @@ test('actual Go backend: account password, sessions, and owner user management',
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
   await setLocaleForCurrentUser(page, 'ko-KR')
-  await page.goto('/settings')
-  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await page.goto('/account/security')
   await expect(page.getByRole('heading', { name: /Account information|계정 정보/ })).toBeVisible()
-  await expect(page.getByRole('heading', { name: /User management|사용자 관리/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /User management|사용자 관리/ })).toHaveCount(0)
   await page.screenshot({ path: testInfo.outputPath('account-security-ko-desktop.png'), fullPage: true })
   await page.setViewportSize({ width: 390, height: 844 })
   await page.screenshot({ path: testInfo.outputPath('account-security-ko-mobile.png'), fullPage: true })
@@ -800,12 +828,14 @@ test('actual Go backend: account password, sessions, and owner user management',
   await page.getByLabel(/Confirm new password|새 비밀번호 확인/).first().fill(changedPassword)
   await page.getByRole('button', { name: /Change password|비밀번호 변경/ }).click()
   await expect(page).toHaveURL('/login')
+  await expect(page.getByRole('heading', { name: /Sign in|로그인/ })).toBeVisible()
 
-  await page.getByLabel(/Password|비밀번호/).fill(currentPassword)
+  const loginPassword = page.getByLabel(/^(Password|비밀번호)$/)
+  await loginPassword.fill(currentPassword)
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page.getByRole('alert')).toBeVisible()
   await page.getByLabel(/Account name|계정 이름/).fill('owner')
-  await page.getByLabel(/Password|비밀번호/).fill(changedPassword)
+  await page.getByLabel(/^(Password|비밀번호)$/).fill(changedPassword)
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
 
@@ -818,12 +848,12 @@ test('actual Go backend: account password, sessions, and owner user management',
   await expect(otherPage).toHaveURL('/')
   await otherContext.close()
 
-  await page.goto('/settings')
-  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await page.goto('/account/sessions')
   await expect(page.getByText(/Expires|만료/).first()).toBeVisible()
   await page.getByRole('button', { name: /Revoke other sessions|다른 세션 취소/ }).click()
   await expect(page.getByText(/Revoked 1 sessions|세션 1개를 취소했습니다/)).toBeVisible()
 
+  await page.goto('/system/users')
   await page.getByLabel(/Login name|로그인 이름/).fill('stage7-member')
   await page.getByLabel(/Initial password|초기 비밀번호/).fill('stage7-member-password')
   await page.getByLabel(/Confirm new password|새 비밀번호 확인/).last().fill('stage7-member-password')
@@ -837,16 +867,15 @@ test('actual Go backend: account password, sessions, and owner user management',
   await memberPage.getByLabel(/Password|비밀번호/).fill('stage7-member-password')
   await memberPage.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(memberPage).toHaveURL('/')
-  await memberPage.goto('/settings')
-  await memberPage.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await memberPage.goto('/account/security')
   await expect(memberPage.getByRole('heading', { name: /Account information|계정 정보/ })).toBeVisible()
   await expect(memberPage.getByRole('heading', { name: /User management|사용자 관리/ })).toHaveCount(0)
-  await memberPage.getByRole('tab', { name: /Preferences|사용자 환경/ }).click()
+  await memberPage.goto('/account/preferences')
   await memberPage.getByLabel(/Language|언어/).selectOption('en-US')
   await memberPage.getByRole('button', { name: /Save preferences|환경 설정 저장/ }).click()
   await expect(memberPage.locator('html')).toHaveAttribute('lang', 'en-US')
 
-  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await page.goto('/system/users')
   await page.getByRole('button', { name: /Disable|비활성화/ }).last().click()
   await page.getByRole('alertdialog').getByRole('button', { name: /Disable|비활성화/ }).click()
   await expect(page.getByText(/Disabled|비활성/).last()).toBeVisible()
@@ -858,6 +887,7 @@ test('actual Go backend: account password, sessions, and owner user management',
 
   await page.getByRole('button', { name: /Disable|비활성화/ }).last().click()
   await page.getByRole('alertdialog').getByRole('button', { name: /Disable|비활성화/ }).click()
+  await page.goto('/account/security')
   await page.getByLabel(/Current password|현재 비밀번호/).fill(changedPassword)
   await page.getByLabel(/New password|새 비밀번호$/).fill(currentPassword)
   await page.getByLabel(/Confirm new password|새 비밀번호 확인/).first().fill(currentPassword)
@@ -876,8 +906,7 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   expect(initialOwner).toMatchObject({ login: 'owner', role: 'owner' })
   await saveUserPreferences(page, { locale: 'ko-KR', theme: 'dark', timezone: 'Asia/Seoul' })
 
-  await page.goto('/settings')
-  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await page.goto('/system/users')
   await page.getByLabel(/Login name|로그인 이름/).fill(memberLogin)
   await page.getByLabel(/Initial password|초기 비밀번호/).fill(memberPassword)
   await page.getByLabel(/Confirm new password|새 비밀번호 확인/).last().fill(memberPassword)
@@ -891,21 +920,22 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   await loginAs(memberPage, memberLogin, memberPassword)
   const member = await getJSON<{ user_id: string; login: string; role: string; status: string }>(memberPage, '/api/user')
   expect(member).toMatchObject({ login: memberLogin, role: 'member', status: 'active' })
-  await memberPage.goto('/settings')
-  await memberPage.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  const memberManagementNav = memberPage.getByRole('navigation', { name: /Operations|운영/ })
+  await expect(memberManagementNav.getByRole('link', { name: /Sources|소스/ })).toBeVisible()
+  await expect(memberManagementNav.getByRole('link', { name: /Auto recording|자동 녹화/ })).toHaveCount(0)
+  await expect(memberManagementNav.getByRole('link', { name: /Storage|저장소/ })).toHaveCount(0)
+  await expect(memberPage.getByRole('navigation', { name: /System|시스템/ })).toHaveCount(0)
+  await memberPage.goto('/account/security')
   await expect(memberPage.getByRole('heading', { name: /Account information|계정 정보/ })).toBeVisible()
-  await expect(memberPage.getByText(memberLogin, { exact: true })).toBeVisible()
-  await expect(memberPage.getByText('Member', { exact: true })).toBeVisible()
+  await expect(memberPage.locator('#main-content').getByText(memberLogin, { exact: true })).toBeVisible()
+  await expect(memberPage.locator('#main-content').getByText('Member', { exact: true })).toBeVisible()
   await expect(memberPage.getByRole('heading', { name: /User management|사용자 관리/ })).toHaveCount(0)
-  for (const ownerTab of ['Storage', 'Updates', 'Logs', 'Audit log']) {
-    await expect(memberPage.getByRole('tab', { name: ownerTab, exact: true })).toHaveCount(0)
-  }
   expect((await memberPage.request.get('/api/user')).status()).toBe(200)
   expect((await memberPage.request.get('/api/user/preferences')).status()).toBe(200)
   expect((await memberPage.request.get('/api/user/sessions')).status()).toBe(200)
 
   // Preferences are saved through the member UI and remain bound to this user.
-  await memberPage.getByRole('tab', { name: /Preferences|사용자 환경/ }).click()
+  await memberPage.goto('/account/preferences')
   await memberPage.locator('#user-locale').selectOption('en-US')
   await memberPage.locator('#user-theme').selectOption('light')
   await memberPage.locator('#user-timezone').fill('America/Los_Angeles')
@@ -914,6 +944,34 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   const memberPreferences = await getJSON<UserPreferencesWire>(memberPage, '/api/user/preferences')
   expect(memberPreferences).toEqual({ locale: 'en-US', theme: 'light', timezone: 'America/Los_Angeles' })
 
+  const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
+  await memberPage.goto('/new')
+  await expect(memberPage.getByLabel('Stored fixture secret')).toHaveCount(0)
+  await memberPage.getByRole('button', { name: /Workflow Fixture/ }).click()
+  await expect(memberPage.getByLabel('Stored fixture secret')).toHaveCount(0)
+  await memberPage.getByRole('button', { name: /Input settings|입력 설정|Next|다음/ }).click()
+  await memberPage.getByLabel('Fixture source URL').fill(`${sourceURL}/hls/stream.m3u8`)
+  await memberPage.getByRole('button', { name: /Confirm inputs|입력 확인|Next|다음/ }).click()
+  await memberPage.getByRole('button', { name: /Start recording|녹화 시작/ }).click()
+  await expect(memberPage).toHaveURL(/\/workflows\/[^/]+$/)
+  const memberWorkflowID = memberPage.url().split('/').at(-1)!
+  await expect(memberPage.getByRole('checkbox', { name: /다음에도 저장|Save this value/ })).toHaveCount(0)
+  const workflowSession = await getJSON<{ csrf_token: string }>(memberPage, '/api/auth/session')
+  const persistenceEscalation = await memberPage.request.post(`/api/resolve-workflows/${memberWorkflowID}/continue`, {
+    headers: { 'X-CSRF-Token': workflowSession.csrf_token },
+    data: { values: { answer: 'continue' }, secrets: { session_value: 'member-ephemeral-secret' }, persist_fields: ['session_value'] },
+  })
+  expect(persistenceEscalation.status()).toBe(403)
+  await memberPage.getByLabel('Fixture answer').fill('continue')
+  await memberPage.getByLabel('Fixture secret').fill('member-ephemeral-secret')
+  await memberPage.getByRole('button', { name: /Continue|계속 진행/ }).click()
+  await expect(memberPage).toHaveURL(/\/recordings\/[^/]+$/)
+  const workflowRecordingID = memberPage.url().split('/').at(-1)!
+  await expect.poll(async () => segmentCount(await getJSON<RecordingWire>(memberPage, `/api/recordings/${workflowRecordingID}`))).toBeGreaterThan(0)
+  await memberPage.getByRole('button', { name: /Stop|중지/, exact: true }).click()
+  await memberPage.getByRole('alertdialog').getByRole('button', { name: /Stop|중지/, exact: true }).click()
+  await expect.poll(async () => (await getJSON<RecordingWire>(memberPage, `/api/recordings/${workflowRecordingID}`)).state).toBe('stopped')
+
   const recordingsRead = await memberPage.request.get('/api/v2/recordings?limit=10')
   expect(recordingsRead.status()).toBe(200)
   const adapterCatalog = await memberPage.request.get('/api/adapters')
@@ -921,11 +979,11 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   expect(await adapterCatalog.json()).toEqual(expect.arrayContaining([
     expect.objectContaining({ status: expect.objectContaining({ id: 'hls' }) }),
   ]))
+  expect((await memberPage.request.get('/api/adapters/hls')).status()).toBe(200)
   expect((await memberPage.request.get('/api/adapters/hls/schema')).status()).toBe(200)
   expect((await memberPage.request.get('/api/adapters/hls/config')).status()).toBe(403)
 
   // Exercise recording control through the browser, not only an authorization probe.
-  const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
   await memberPage.goto('/new')
   await memberPage.getByRole('button', { name: /HLS/ }).click()
   await memberPage.getByRole('button', { name: /Input settings|입력 설정|Next|다음/ }).click()
@@ -947,10 +1005,10 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
     '/api/settings',
     '/api/system/storage',
     '/api/storage/pools',
-    '/api/adapters/hls',
     '/api/adapters/hls/config',
     '/api/runtime/plugins',
     '/api/runtime/storage/provider',
+    '/api/runtime/storage/instances',
     '/api/runtime/update',
     '/api/audit',
     '/api/users',
@@ -963,6 +1021,10 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
     headers: { 'X-CSRF-Token': session.csrf_token }, data: {},
   })
   expect(pluginMutation.status()).toBe(403)
+  const sourceConfigMutation = await memberPage.request.put('/api/adapters/hls/config', {
+    headers: { 'X-CSRF-Token': session.csrf_token }, data: { values: { example: 'member' } },
+  })
+  expect(sourceConfigMutation.status()).toBe(403)
   const updateMutation = await memberPage.request.post('/api/runtime/update/check', {
     headers: { 'X-CSRF-Token': session.csrf_token }, data: {},
   })
@@ -971,6 +1033,11 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
     headers: { 'X-CSRF-Token': session.csrf_token },
   })
   expect(recordingDelete.status()).toBe(403)
+
+  for (const route of ['/storage', '/storage/locations', '/storage/retention', '/storage/advanced', '/system', '/system/users', '/system/updates', '/system/diagnostics', '/system/audit', '/plugins', '/watches']) {
+    await memberPage.goto(route)
+    await expect(memberPage).toHaveURL('/', { timeout: 10_000 })
+  }
 
   // Keep owner and member sessions live together and prove identity, session,
   // and preference records do not cross user boundaries.
@@ -989,6 +1056,9 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   const ownerSessions = await getJSON<{ items: { id: string; current: boolean }[] }>(ownerPage, '/api/user/sessions')
   const memberSessions = await getJSON<{ items: { id: string; current: boolean }[] }>(memberPage, '/api/user/sessions')
   const memberSecondSessions = await getJSON<{ items: { id: string; current: boolean }[] }>(memberSecondPage, '/api/user/sessions')
+  const ownerCSRF = await getJSON<{ csrf_token: string }>(ownerPage, '/api/auth/session')
+  const memberCSRF = await getJSON<{ csrf_token: string }>(memberPage, '/api/auth/session')
+  expect(ownerCSRF.csrf_token).not.toBe(memberCSRF.csrf_token)
   expect(ownerSessions.items).toHaveLength(1)
   expect(memberSessions.items).toHaveLength(2)
   expect(memberSecondSessions.items).toHaveLength(2)
@@ -1019,8 +1089,7 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   // Establish a fresh member session so disable proves immediate invalidation,
   // after the prior member logout and owner re-login have both completed.
   await loginAs(memberSecondPage, memberLogin, memberPassword)
-  await page.goto('/settings')
-  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await page.goto('/system/users')
   const memberRowAfterLogin = page.getByRole('listitem').filter({ hasText: memberLogin })
   await memberRowAfterLogin.getByRole('button', { name: /Disable|비활성화/ }).click()
   await page.getByRole('alertdialog').getByRole('button', { name: /Disable|비활성화/ }).click()
@@ -1045,8 +1114,7 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   expect(await missingIdentity.text()).toBe(await disabledIdentity.text())
   expect(await wrongPassword.text()).toBe(await disabledIdentity.text())
 
-  await page.goto('/settings')
-  await page.getByRole('tab', { name: /Account & security|계정·보안/ }).click()
+  await page.goto('/system/users')
   await memberRowAfterLogin.getByRole('button', { name: /Enable|활성화/ }).click()
   await expect(memberRowAfterLogin).toContainText(/Active|활성/)
   await loginAs(memberPage, memberLogin, memberPassword)
@@ -1076,7 +1144,7 @@ async function loginAs(page: Page, login: string, password: string) {
 }
 
 async function logoutFromApplication(page: Page) {
-  await page.getByRole('button', { name: /Administrator|관리자/ }).click()
+  await page.getByRole('button').filter({ hasText: /owner|stage7-member|browser-multi-member/ }).last().click()
   await page.getByRole('button', { name: /Sign out|로그아웃/ }).click()
   await expect(page).toHaveURL('/login')
 }

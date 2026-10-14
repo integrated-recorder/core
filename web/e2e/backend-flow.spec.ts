@@ -12,6 +12,12 @@ type RecordingWire = {
   segment_count?: number
   tracks?: Record<string, { segments?: unknown[] }>
 }
+type AcquisitionFlowWire = {
+  recording_id: string; live: boolean; first_ordinal: number; total_ordinals: number; start_ordinal: number;
+  window?: { first_sequence: number; last_sequence: number; first_ordinal?: number; last_ordinal?: number; segment_count: number };
+  segments: { sequence: number; presentation_ordinal: number; state: string; observed: boolean; inferred?: boolean; retrying?: boolean }[];
+  actors: { worker_id: string; acquisition_class: string; sequence: number; presentation_ordinal?: number; state: string }[]
+}
 type UserPreferencesWire = { locale: string; theme: string; timezone: string }
 type IntegrityWire = { status: string; objects_total: number; objects_corrupt: number }
 type TagsWire = { tags: string[] }
@@ -222,6 +228,35 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   await expect.poll(async () => segmentCount(await getJSON<RecordingWire>(page, `/api/recordings/${encodeURIComponent(recordingID)}`))).toBeGreaterThan(0)
   const activeRecording = await getJSON<RecordingWire>(page, `/api/recordings/${encodeURIComponent(recordingID)}`)
   expect(activeRecording.state).toBe('recording')
+  const flowResponse = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}/acquisition-flow?limit=96`)
+  expect(flowResponse.status()).toBe(200)
+  const flow = await flowResponse.json() as AcquisitionFlowWire
+  expect(flow).toMatchObject({ recording_id: recordingID, live: true })
+  expect(flow.segments.length).toBeLessThanOrEqual(112)
+  expect(flow.segments.length).toBeGreaterThan(0)
+  expect(flow.window?.segment_count).toBeGreaterThan(0)
+  expect(flowResponse.url()).not.toContain('token=')
+  const flowBody = await flowResponse.text()
+  expect(flowBody).not.toContain(manifestURL)
+  expect(flowBody).not.toContain('source_uri')
+  await expect(page.getByTestId('segment-acquisition-flow')).toBeVisible()
+  await expect.poll(async () => {
+    const latestResponse = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}/acquisition-flow?limit=96`)
+    if (latestResponse.status() !== 200) return false
+    const latest = await latestResponse.json() as AcquisitionFlowWire
+    const rendered = await page.getByTestId('flow-segment').evaluateAll(elements => elements.map(element => ({
+      sequence: Number(element.getAttribute('data-sequence')),
+      state: element.getAttribute('data-state'),
+    })))
+    return latest.segments.length === rendered.length && latest.segments.every(segment => rendered.some(item => item.sequence === segment.sequence && item.state === segment.state))
+  }, { timeout: 12_000, intervals: [200, 500, 1000] }).toBe(true)
+  for (const actor of flow.actors) await expect(page.getByTestId(`flow-worker-ring-${actor.worker_id}`)).toBeVisible()
+  await page.setViewportSize({ width: 390, height: 844 })
+  const mobileFlowBox = await page.getByTestId('segment-acquisition-flow').boundingBox()
+  expect(mobileFlowBox).not.toBeNull()
+  expect(mobileFlowBox!.x).toBeGreaterThanOrEqual(0)
+  expect(mobileFlowBox!.x + mobileFlowBox!.width).toBeLessThanOrEqual(390)
+  await page.setViewportSize({ width: 1440, height: 900 })
   await expect(page.getByRole('group', { name: '녹화 중 표시 방식' })).toBeVisible()
   await expect(page.getByRole('button', { name: '실시간 HLS' })).toHaveAttribute('aria-pressed', 'true')
   const liveVideo = page.locator('#vod-player video')

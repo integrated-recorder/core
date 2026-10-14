@@ -70,6 +70,27 @@ type segmentTask struct {
 	lastAttemptStartedAt    time.Time
 	lastAttemptEndedAt      time.Time
 	lastFailure             *FetchError
+	workerID                string
+	actorID                 string
+}
+
+type liveManifestCoordinate struct {
+	key                 segmentTaskKey
+	presentationOrdinal uint64
+	duration            time.Duration
+	programDateTime     *time.Time
+}
+
+type liveManifestWindow struct {
+	trackID               string
+	epoch                 uint64
+	discontinuitySequence uint64
+	firstSequence         uint64
+	lastSequence          uint64
+	firstOrdinal          uint64
+	lastOrdinal           uint64
+	observedAt            time.Time
+	coordinates           []liveManifestCoordinate
 }
 
 type initFlight struct {
@@ -208,6 +229,9 @@ type segmentScheduler struct {
 	fatal                    error
 	pendingSnapshots         int
 	pendingMetadata          int
+	liveWorkerSlots          map[int]struct{}
+	nextWorkerActorID        uint64
+	latestManifestWindow     *liveManifestWindow
 	ending                   bool
 	endingGeneration         uint64
 	latestManifestGeneration uint64
@@ -298,9 +322,20 @@ func (s *segmentScheduler) spawnLocked(burst bool) {
 	if s.closed || s.workers >= maxSegmentWorkers {
 		return
 	}
+	if s.liveWorkerSlots == nil {
+		s.liveWorkerSlots = make(map[int]struct{}, maxSegmentWorkers)
+	}
+	workerSlot := 1
+	for {
+		if _, occupied := s.liveWorkerSlots[workerSlot]; !occupied {
+			break
+		}
+		workerSlot++
+	}
+	s.liveWorkerSlots[workerSlot] = struct{}{}
 	s.workers++
 	s.wg.Add(1)
-	go s.worker(burst)
+	go s.workerWithID(burst, fmt.Sprintf("W%d", workerSlot), workerSlot)
 }
 
 func (s *segmentScheduler) growIfSaturatedLocked() {
@@ -708,6 +743,7 @@ func (s *segmentScheduler) observe(epoch uint64, playlist hls.MediaPlaylist) err
 func (s *segmentScheduler) observeAtGeneration(epoch uint64, playlist hls.MediaPlaylist, generation uint64) error {
 	present := make(map[uint64]bool, len(playlist.Segments))
 	gaps := make(map[uint64]bool)
+	window := s.manifestWindow(epoch, playlist)
 	var max uint64
 	for i, source := range playlist.Segments {
 		present[source.Sequence] = true
@@ -723,6 +759,9 @@ func (s *segmentScheduler) observeAtGeneration(epoch uint64, playlist hls.MediaP
 	if !s.manifestGenerationCurrentLocked(generation) {
 		s.mu.Unlock()
 		return nil
+	}
+	if window != nil {
+		s.latestManifestWindow = window
 	}
 	ending := s.ending
 	for key, task := range s.tasks {
@@ -790,6 +829,56 @@ func (s *segmentScheduler) observeAtGeneration(epoch uint64, playlist hls.MediaP
 		}
 	}
 	return nil
+}
+
+// manifestWindow retains only the coordinates and durations from the most
+// recently accepted media playlist. Source URIs and playlist bytes never enter
+// the visualization projection.
+func (s *segmentScheduler) manifestWindow(epoch uint64, playlist hls.MediaPlaylist) *liveManifestWindow {
+	if s == nil || s.e == nil || len(playlist.Segments) == 0 {
+		return nil
+	}
+	window := &liveManifestWindow{
+		trackID: "main", epoch: epoch,
+		firstSequence:         playlist.Segments[0].Sequence,
+		lastSequence:          playlist.Segments[0].Sequence,
+		discontinuitySequence: playlist.Segments[0].DiscontinuitySequence,
+		observedAt:            time.Now().UTC(),
+		coordinates:           make([]liveManifestCoordinate, 0, len(playlist.Segments)),
+	}
+	s.e.mu.Lock()
+	var track *domain.Track
+	if s.e.recording != nil {
+		track = s.e.recording.Tracks[window.trackID]
+	}
+	for _, source := range playlist.Segments {
+		if source.Sequence < window.firstSequence {
+			window.firstSequence = source.Sequence
+		}
+		if source.Sequence > window.lastSequence {
+			window.lastSequence = source.Sequence
+		}
+		coordinate := liveManifestCoordinate{
+			key:             segmentTaskKey{epoch: epoch, discontinuitySequence: source.DiscontinuitySequence, sequence: source.Sequence},
+			duration:        time.Duration(source.Duration * float64(time.Second)),
+			programDateTime: cloneLiveTime(source.ProgramTime),
+		}
+		if track != nil {
+			ordinal, _, _, ok := livePresentationForCoordinate(track, epoch, source.DiscontinuitySequence, source.Sequence, source.Discontinuity)
+			if ok {
+				coordinate.presentationOrdinal = ordinal
+				if window.firstOrdinal == 0 || ordinal < window.firstOrdinal {
+					window.firstOrdinal = ordinal
+				}
+				if ordinal > window.lastOrdinal {
+					window.lastOrdinal = ordinal
+				}
+			}
+		}
+		window.coordinates = append(window.coordinates, coordinate)
+	}
+	s.e.mu.Unlock()
+	return window
 }
 
 func (s *segmentScheduler) protectedSequences(epoch uint64) map[uint64]bool {
@@ -874,13 +963,23 @@ func (s *segmentScheduler) wakeManifestPoll() {
 	}
 }
 
+// worker is retained as the scheduler's direct worker entry point for focused
+// tests. Production workers are assigned an explicit runtime-local slot by
+// spawnLocked.
 func (s *segmentScheduler) worker(burst bool) {
+	s.workerWithID(burst, "W1", 0)
+}
+
+func (s *segmentScheduler) workerWithID(burst bool, workerID string, workerSlot int) {
 	defer s.wg.Done()
 	for {
 		s.mu.Lock()
 		for len(s.ready) == 0 && !s.closed && s.ctx.Err() == nil {
 			if burst {
 				s.workers--
+				if workerSlot > 0 {
+					delete(s.liveWorkerSlots, workerSlot)
+				}
 				s.signalLocked()
 				s.mu.Unlock()
 				return
@@ -895,6 +994,9 @@ func (s *segmentScheduler) worker(burst bool) {
 		}
 		if s.closed || s.ctx.Err() != nil {
 			s.workers--
+			if workerSlot > 0 {
+				delete(s.liveWorkerSlots, workerSlot)
+			}
 			s.signalLocked()
 			s.mu.Unlock()
 			return
@@ -907,6 +1009,9 @@ func (s *segmentScheduler) worker(burst bool) {
 			continue
 		}
 		task.state = segmentTaskInFlight
+		task.workerID = workerID
+		s.nextWorkerActorID++
+		task.actorID = fmt.Sprintf("local:live:%s:%d", workerID, s.nextWorkerActorID)
 		task.lastAttemptStartedAt = time.Now().UTC()
 		task.coordinatorRetryPending = false
 		s.busy++
@@ -919,6 +1024,11 @@ func (s *segmentScheduler) worker(burst bool) {
 		s.mu.Lock()
 		s.busy--
 		task.lastAttemptEndedAt = time.Now().UTC()
+		// The worker slot is released as soon as this fetch attempt ends. A
+		// retry timer may keep the task pending, but it does not own a worker
+		// ring until a worker picks it up again.
+		task.workerID = ""
+		task.actorID = ""
 		var attemptFailure *FetchError
 		if errors.As(err, &attemptFailure) {
 			copy := *attemptFailure
@@ -930,6 +1040,8 @@ func (s *segmentScheduler) worker(burst bool) {
 			continue
 		}
 		if errors.Is(err, errPersistQueued) || errors.Is(err, errPayloadBuffered) {
+			task.workerID = ""
+			task.actorID = ""
 			s.signalLocked()
 			s.mu.Unlock()
 			continue

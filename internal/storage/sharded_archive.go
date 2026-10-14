@@ -88,9 +88,21 @@ type V2ClaimSet struct {
 // V2LiveSlot is one bounded active-live presentation position. Exactly one of
 // Segment or Gap is set. Gap records are narrowed to one presentation slot.
 type V2LiveSlot struct {
-	Ordinal uint64          `json:"ordinal"`
-	Segment *domain.Segment `json:"segment,omitempty"`
-	Gap     *domain.Gap     `json:"gap,omitempty"`
+	Ordinal   uint64          `json:"ordinal"`
+	Segment   *domain.Segment `json:"segment,omitempty"`
+	Gap       *domain.Gap     `json:"gap,omitempty"`
+	Recovered bool            `json:"recovered,omitempty"`
+}
+
+// V2LiveSlotPage is a bounded read of the live presentation index. TotalSlots
+// is the last durable presentation coordinate; callers may add their own
+// currently observed, not-yet-published work without reading archive history.
+type V2LiveSlotPage struct {
+	Slots        []V2LiveSlot
+	FirstOrdinal uint64
+	StartOrdinal uint64
+	TotalSlots   uint64
+	HasOlder     bool
 }
 
 type V2SidecarPage struct {
@@ -1366,6 +1378,101 @@ func (s *Store) LookupShardedLiveSlot(ctx context.Context, id, trackID string, o
 	segment := record.Segment
 	slot.Segment = &segment
 	return slot, nil
+}
+
+// ReadShardedLiveSlotPage returns presentation slots by their stable live
+// ordinal. It reads only the requested bounded window and never constructs an
+// all-recording slice. A zero start selects the latest window.
+func (s *Store) ReadShardedLiveSlotPage(ctx context.Context, id, trackID string, start uint64, limit int) (V2LiveSlotPage, error) {
+	if err := checkV2Context(ctx); err != nil {
+		return V2LiveSlotPage{}, err
+	}
+	if limit < 1 || limit > archiveLiveTailMax || trackID == "" {
+		return V2LiveSlotPage{}, ErrShardedArchiveInvalid
+	}
+	header, err := s.LoadRecordingHeader(ctx, id)
+	if err != nil {
+		return V2LiveSlotPage{}, err
+	}
+	track := header.Tracks[trackID]
+	if track == nil {
+		return V2LiveSlotPage{}, ErrNotFound
+	}
+	first := uint64(1)
+	if track.LivePresentation != nil && track.LivePresentation.FirstPresentationOrdinal > first {
+		first = track.LivePresentation.FirstPresentationOrdinal
+	}
+	total := track.LiveSlotHighWater
+	if track.LivePresentation != nil && track.LivePresentation.NextOrdinal > 1 && track.LivePresentation.NextOrdinal-1 > total {
+		total = track.LivePresentation.NextOrdinal - 1
+	}
+	page := V2LiveSlotPage{FirstOrdinal: first, TotalSlots: total}
+	if total < first {
+		return page, nil
+	}
+	if start == 0 {
+		start = first
+		if total-first+1 > uint64(limit) {
+			start = total - uint64(limit) + 1
+		}
+	}
+	if start < first {
+		start = first
+	}
+	if start > total {
+		page.StartOrdinal = start
+		page.HasOlder = start > first
+		return page, nil
+	}
+	end := start + uint64(limit) - 1
+	if end < start || end > total {
+		end = total
+	}
+	page.StartOrdinal = start
+	page.HasOlder = start > first
+	page.Slots = make([]V2LiveSlot, 0, end-start+1)
+	for ordinal := start; ordinal <= end; ordinal++ {
+		if err := checkV2Context(ctx); err != nil {
+			return V2LiveSlotPage{}, err
+		}
+		if ordinal > track.LiveSlotHighWater {
+			continue // observed/pending slots are supplied by the acquisition manager
+		}
+		entry, err := s.loadLiveEntry(ctx, id, trackID, ordinal)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return V2LiveSlotPage{}, ErrShardedArchiveInvalid
+			}
+			return V2LiveSlotPage{}, err
+		}
+		if entry.Reserved {
+			continue
+		}
+		slot := V2LiveSlot{Ordinal: ordinal}
+		if entry.Gap != nil {
+			gap := *entry.Gap
+			slot.Gap = &gap
+		} else {
+			if entry.ArchiveOrdinal == 0 || entry.Coordinate.TrackID != trackID || entry.Coordinate.Kind != archiveindex.ObjectMedia {
+				return V2LiveSlotPage{}, ErrShardedArchiveInvalid
+			}
+			record, lookupErr := s.lookupCoordinateLocked(ctx, header, entry.Coordinate)
+			if lookupErr != nil {
+				return V2LiveSlotPage{}, lookupErr
+			}
+			if record.Segment.ArchiveOrdinal != entry.ArchiveOrdinal || record.Segment.LivePresentationOrdinal != ordinal {
+				return V2LiveSlotPage{}, ErrShardedArchiveInvalid
+			}
+			segment := record.Segment
+			slot.Segment = &segment
+			slot.Recovered = record.SelectedClaim != nil && record.SelectedClaim.Source == archiveindex.ClaimHistorical
+		}
+		page.Slots = append(page.Slots, slot)
+		if ordinal == ^uint64(0) {
+			break
+		}
+	}
+	return page, nil
 }
 
 // IterateShardedLiveSlots returns bounded live presentation slots in ordinal

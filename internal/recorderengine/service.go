@@ -33,6 +33,7 @@ const (
 	OperationInvalidateManagementRootCache = "invalidate_management_root_cache"
 	OperationLifecycleSnapshot             = "lifecycle_snapshot"
 	OperationLivePlaybackSnapshot          = "live_playback_snapshot"
+	OperationAcquisitionFlowSnapshot       = "acquisition_flow_snapshot"
 	OperationList                          = "list"
 	OperationListPage                      = "list_page"
 	OperationStop                          = "stop"
@@ -64,6 +65,12 @@ type StartResolvedRequest struct {
 
 type RecordingIDRequest struct {
 	RecordingID string `json:"recording_id"`
+}
+
+type AcquisitionFlowRequest struct {
+	RecordingID string `json:"recording_id"`
+	Start       uint64 `json:"start,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
 }
 
 // HandoverOwnerRequest is accepted only from the Runtime Host over the
@@ -429,6 +436,22 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 				return nil, publicError("not_found", "recording was not found")
 			}
 			return nil, publicError("read_failed", "live playback snapshot could not be read")
+		}
+		return result, nil
+	case OperationAcquisitionFlowSnapshot:
+		var request AcquisitionFlowRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" || request.Limit < 0 || request.Limit > acquire.MaxAcquisitionFlowLimit {
+			return nil, publicError("invalid_request", "acquisition flow request is invalid")
+		}
+		result, err := e.manager.AcquisitionFlowSnapshot(ctx, request.RecordingID, request.Start, request.Limit)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, publicError("not_found", "recording was not found")
+			}
+			if errors.Is(err, acquire.ErrAcquisitionFlowLimit) {
+				return nil, publicError("invalid_request", "acquisition flow request is invalid")
+			}
+			return nil, publicError("read_failed", "recording acquisition state could not be read")
 		}
 		return result, nil
 	case OperationList:

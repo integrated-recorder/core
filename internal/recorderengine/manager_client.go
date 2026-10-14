@@ -352,6 +352,38 @@ func (m *ManagerClient) LivePlaybackSnapshot(ctx context.Context, id string) (ac
 	return view, nil
 }
 
+// AcquisitionFlowSnapshot reads a bounded, sanitized view for the Recording
+// Detail segment visualization. The IPC contract contains only coordinates,
+// status, and ephemeral actor identities.
+func (m *ManagerClient) AcquisitionFlowSnapshot(ctx context.Context, id string, start uint64, limit int) (acquire.AcquisitionFlowSnapshot, error) {
+	var view acquire.AcquisitionFlowSnapshot
+	request := AcquisitionFlowRequest{RecordingID: id, Start: start, Limit: limit}
+	if err := m.client.Call(ctx, OperationAcquisitionFlowSnapshot, request, &view); err != nil {
+		return acquire.AcquisitionFlowSnapshot{}, normalizeEngineError(err)
+	}
+	if err := validateAcquisitionFlowSnapshot(view, id); err != nil {
+		return acquire.AcquisitionFlowSnapshot{}, err
+	}
+	return view, nil
+}
+
+func validateAcquisitionFlowSnapshot(view acquire.AcquisitionFlowSnapshot, id string) error {
+	if view.RecordingID != id || len(view.Segments) > acquire.MaxAcquisitionFlowLimit+16 || len(view.Actors) > 16 || view.StartOrdinal == 0 && view.TotalOrdinals > 0 {
+		return errors.New("recorder engine acquisition flow snapshot is invalid")
+	}
+	for _, segment := range view.Segments {
+		if segment.PresentationOrdinal == 0 || segment.State != "present" && segment.State != "pending" && segment.State != "unresolved" {
+			return errors.New("recorder engine acquisition flow segment is invalid")
+		}
+	}
+	for _, actor := range view.Actors {
+		if actor.ActorID == "" || actor.WorkerID == "" || actor.State != "fetching" && actor.State != "retry_wait" && actor.State != "refreshing" || actor.AcquisitionClass != "live" && actor.AcquisitionClass != "historical" {
+			return errors.New("recorder engine acquisition flow actor is invalid")
+		}
+	}
+	return nil
+}
+
 // Inventory returns the active recordings owned by this exact Engine process.
 // The transport envelope pins the generation; the result is checked as well
 // so callers do not accidentally associate another Engine's inventory.

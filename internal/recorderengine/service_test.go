@@ -111,6 +111,22 @@ func TestResolvedStartGetStopOverIPC(t *testing.T) {
 	if err != nil || header.ID != started.ID || header.FormatVersion != storage.ShardedArchiveFormatVersion || header.SegmentCount() != 1 || len(header.Tracks["main"].Segments) != 0 {
 		t.Fatalf("manager client management header=%#v err=%v", header, err)
 	}
+	flowDeadline := time.Now().Add(3 * time.Second)
+	var flow acquire.AcquisitionFlowSnapshot
+	for {
+		flow, err = managerClient.AcquisitionFlowSnapshot(context.Background(), started.ID, 0, 96)
+		if err == nil && flow.Live && flow.Window != nil && len(flow.Segments) > 0 {
+			break
+		}
+		if time.Now().After(flowDeadline) {
+			t.Fatalf("engine IPC acquisition flow view=%#v err=%v", flow, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	flowJSON, err := json.Marshal(flow)
+	if err != nil || strings.Contains(string(flowJSON), "fixture.example") || strings.Contains(string(flowJSON), "source_uri") {
+		t.Fatalf("engine IPC flow view exposed source data: json=%s err=%v", flowJSON, err)
+	}
 	const fixedID = "1123456789abcdef0123456789abcdef"
 	fixed, err := managerClient.StartResolvedWithID(context.Background(), fixedID, "fixture", media, nil, "fixed id", nil)
 	if err != nil || fixed.ID != fixedID {

@@ -394,10 +394,14 @@ func (m *Manager) fetchHistoricalWindow(ctx context.Context, recordingID string,
 		return nil, nil, errors.Join(retryableHistorical(errHistoricalScratch), releaseSlots())
 	}
 	spools := make([]*historicalPayloadSpool, 0, len(candidates))
+	actorFinishers := make([]func(), 0, len(candidates))
 	var cleanupOnce sync.Once
 	var cleanupErr error
 	cleanup := func() error {
 		cleanupOnce.Do(func() {
+			for _, finishActor := range actorFinishers {
+				finishActor()
+			}
 			for _, spool := range spools {
 				if err := spool.close(); err != nil && cleanupErr == nil {
 					cleanupErr = errHistoricalScratch
@@ -426,6 +430,8 @@ func (m *Manager) fetchHistoricalWindow(ctx context.Context, recordingID string,
 	completed := make(chan completion, len(candidates))
 	for index, candidate := range candidates {
 		spool := spools[index]
+		finishActor := m.beginHistoricalActor(e, candidate)
+		actorFinishers = append(actorFinishers, finishActor)
 		go func(index int, candidate historicalRecoveryWork, spool *historicalPayloadSpool) {
 			completed <- completion{index: index, err: m.downloadHistoricalToSpool(ctx, candidate.source, media, e, generation, spool)}
 		}(index, candidate, spool)

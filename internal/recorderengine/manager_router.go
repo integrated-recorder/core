@@ -383,6 +383,56 @@ func (r *ManagerRouter) LivePlaybackSnapshot(ctx context.Context, id string) (ac
 	return acquire.LivePlaybackView{RecordingID: id, State: recording.State}, nil
 }
 
+// AcquisitionFlowSnapshot routes the ephemeral actor projection to the Engine
+// that currently owns the recording. Terminal archives are read from the
+// active generation, with a bounded fallback for archives visible only to a
+// draining generation.
+func (r *ManagerRouter) AcquisitionFlowSnapshot(ctx context.Context, id string, start uint64, limit int) (acquire.AcquisitionFlowSnapshot, error) {
+	r.mutation.RLock()
+	defer r.mutation.RUnlock()
+	clients, activeID := r.clientsAndActive()
+	inventories := make([]GenerationInventory, 0, len(clients))
+	for _, attached := range clients {
+		inventory, err := attached.client.Inventory(ctx)
+		if err != nil {
+			return acquire.AcquisitionFlowSnapshot{}, fmt.Errorf("engine inventory is required to identify the recording owner: %w", err)
+		}
+		if inventory.GenerationID != attached.generationID {
+			return acquire.AcquisitionFlowSnapshot{}, errors.New("engine inventory generation identity mismatch")
+		}
+		inventories = append(inventories, inventory)
+	}
+	owners, err := ownerMap(inventories)
+	if err != nil {
+		return acquire.AcquisitionFlowSnapshot{}, err
+	}
+	if ownerID := owners[id]; ownerID != "" {
+		owner := findAttached(clients, ownerID)
+		if owner == nil {
+			return acquire.AcquisitionFlowSnapshot{}, ErrGenerationNotAttached
+		}
+		return owner.client.AcquisitionFlowSnapshot(ctx, id, start, limit)
+	}
+	active := findAttached(clients, activeID)
+	if active == nil {
+		return acquire.AcquisitionFlowSnapshot{}, ErrGenerationNotAttached
+	}
+	view, err := active.client.AcquisitionFlowSnapshot(ctx, id, start, limit)
+	if err == nil || !errors.Is(err, storage.ErrNotFound) {
+		return view, err
+	}
+	for _, attached := range clients {
+		if attached.generationID == activeID {
+			continue
+		}
+		view, err = attached.client.AcquisitionFlowSnapshot(ctx, id, start, limit)
+		if err == nil || !errors.Is(err, storage.ErrNotFound) {
+			return view, err
+		}
+	}
+	return acquire.AcquisitionFlowSnapshot{}, storage.ErrNotFound
+}
+
 func (r *ManagerRouter) List() []*domain.Recording {
 	rows, err := r.ListForManagement(context.Background(), DefaultListLimit)
 	if err != nil {

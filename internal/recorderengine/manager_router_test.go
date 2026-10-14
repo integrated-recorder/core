@@ -230,6 +230,13 @@ func TestManagerRouterGenerationRoutingAndDetachAfterInventoryDrains(t *testing.
 	if engineA.count.count(recorderengine.OperationLivePlaybackSnapshot) != 1 || engineB.count.count(recorderengine.OperationLivePlaybackSnapshot) != 0 {
 		t.Fatalf("live snapshot did not route to the owning generation: A=%d B=%d", engineA.count.count(recorderengine.OperationLivePlaybackSnapshot), engineB.count.count(recorderengine.OperationLivePlaybackSnapshot))
 	}
+	flow, err := router.AcquisitionFlowSnapshot(context.Background(), recordingAID, 0, 96)
+	if err != nil || flow.RecordingID != recordingAID || len(flow.Actors) > 16 || flow.Window == nil {
+		t.Fatalf("owner-routed acquisition flow=%#v err=%v", flow, err)
+	}
+	if engineA.count.count(recorderengine.OperationAcquisitionFlowSnapshot) != 1 || engineB.count.count(recorderengine.OperationAcquisitionFlowSnapshot) != 0 {
+		t.Fatalf("acquisition flow did not route to the owner: A=%d B=%d", engineA.count.count(recorderengine.OperationAcquisitionFlowSnapshot), engineB.count.count(recorderengine.OperationAcquisitionFlowSnapshot))
+	}
 	if err := router.SetActive("engine-b"); err != nil {
 		t.Fatal(err)
 	}

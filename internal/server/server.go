@@ -251,6 +251,7 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 	s.mux.HandleFunc("POST /api/recordings/{id}/complete", s.completeRecording)
 	s.mux.HandleFunc("POST /api/recordings/{id}/seal", s.sealRecordingArchive)
 	s.mux.HandleFunc("GET /api/recordings/{id}/lifecycle", s.recordingLifecycle)
+	s.mux.HandleFunc("GET /api/recordings/{id}/acquisition-flow", s.acquisitionFlow)
 	s.registerWatchRoutes()
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/master.m3u8", s.masterPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/tracks/{track}/playlist.m3u8", s.trackPlaylist)
@@ -1006,6 +1007,45 @@ func (s *Server) recordingLifecycle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, recordingLifecycleProjection(snapshot))
+}
+
+type acquisitionFlowManager interface {
+	AcquisitionFlowSnapshot(context.Context, string, uint64, int) (acquire.AcquisitionFlowSnapshot, error)
+}
+
+func (s *Server) acquisitionFlow(w http.ResponseWriter, r *http.Request) {
+	manager, ok := s.manager.(acquisitionFlowManager)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "recording acquisition view is unavailable")
+		return
+	}
+	var start uint64
+	var limit int
+	var err error
+	if raw := r.URL.Query().Get("start"); raw != "" {
+		start, err = strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "acquisition flow start is invalid")
+			return
+		}
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		limit, err = strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > acquire.MaxAcquisitionFlowLimit {
+			writeError(w, http.StatusBadRequest, "acquisition flow limit is invalid")
+			return
+		}
+	}
+	view, err := manager.AcquisitionFlowSnapshot(r.Context(), r.PathValue("id"), start, limit)
+	if err != nil {
+		if errors.Is(err, acquire.ErrAcquisitionFlowLimit) {
+			writeError(w, http.StatusBadRequest, "acquisition flow limit is invalid")
+			return
+		}
+		writeStorageError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 func writeLifecycleError(w http.ResponseWriter, err error) {

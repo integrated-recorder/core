@@ -129,6 +129,8 @@ type entry struct {
 	recoveryReleaseDue      time.Time
 	recoveryReleaseAttempts int
 	recoveryAfterRelease    bool
+	nextHistoricalWorkerID  uint64
+	historicalWorkers       map[segmentTaskKey]historicalAcquisitionActor
 	handoverGate            chan struct{}
 	handoverWake            chan struct{}
 	// recoveryGate serializes historical commits with source handover. The

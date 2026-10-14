@@ -99,9 +99,25 @@ export type RecordingDetail = {
   last_error?: string; segment_count?: number; duration_seconds?: number; statistics?: RecordingStatistics; integrity?: IntegrityStatus; preview?: PreviewSummary;
   archive_sealed?: boolean; archive_revision?: number; timeline_revision?: number
 }
+export type AcquisitionFlowSegment = {
+  track_id: string; source_epoch: number; discontinuity_sequence: number; sequence: number;
+  presentation_ordinal: number; duration_ms?: number; state: 'present' | 'pending' | 'unresolved'; attempt?: number;
+  observed: boolean; inferred?: boolean; recovered?: boolean; retrying?: boolean
+}
+export type AcquisitionFlowActor = {
+  actor_id: string; node_id: string; node_label: string; worker_id: string; acquisition_class: 'live' | 'historical' | string;
+  track_id: string; source_epoch: number; discontinuity_sequence: number; sequence: number;
+  presentation_ordinal?: number; state: 'fetching' | 'retry_wait' | 'refreshing'; attempt?: number
+}
+export type AcquisitionFlowSnapshot = {
+  recording_id: string; capture_state: RecordingState; live: boolean; archive_revision: number; timeline_revision: number;
+  first_ordinal: number; total_ordinals: number; start_ordinal: number; has_older: boolean;
+  window?: { track_id: string; source_epoch: number; discontinuity_sequence: number; first_sequence: number; last_sequence: number; first_ordinal?: number; last_ordinal?: number; segment_count: number; observed_at: string };
+  segments: AcquisitionFlowSegment[]; actors: AcquisitionFlowActor[]
+}
 export type RecordingLifecycle = {
   recording_id: string; capture_state: RecordingState; archive_sealed: boolean; repairable: boolean;
-  recovery_state: 'active' | 'idle' | 'sealed'; archive_revision: number; timeline_revision: number
+  recovery_state: 'active' | 'idle' | 'sealed' | 'running' | 'scheduled' | 'backoff'; archive_revision: number; timeline_revision: number
 }
 export type SourceMetadataRevision = { observed_at: string; source_updated_at?: string; title?: string | null; description?: string | null }
 export type RecordingMetadata = { current?: SourceMetadataRevision; items: SourceMetadataRevision[]; truncated: boolean }

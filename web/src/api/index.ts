@@ -40,6 +40,7 @@ function encodeRef(ref: ResourceRef) { return btoa(unescape(encodeURIComponent(J
 export const recordingsAPI = {
   list: (query: RecordingQuery) => api<RecordingPage>(`/api/v2/recordings${queryString(query)}`),
   get: (id: string) => api<RecordingDetail>(`/api/recordings/${encodeURIComponent(id)}`),
+  acquisitionFlow: (id: string, start = 0, limit = 96) => api<import('@/types/api').AcquisitionFlowSnapshot>(`/api/recordings/${encodeURIComponent(id)}/acquisition-flow${queryString({ start: start || undefined, limit })}`),
   lifecycle: (id: string) => api<import('@/types/api').RecordingLifecycle>(`/api/recordings/${encodeURIComponent(id)}/lifecycle`),
   start: (body: { adapter_id: string; input: Record<string, unknown>; resource?: ResourceRef; title?: string; preview_mode: 'disabled' | 'segment' }) => api<RecordingDetail | WorkflowProgress>('/api/recordings', { method: 'POST', body }),
   stop: (id: string) => api<RecordingDetail>(`/api/recordings/${encodeURIComponent(id)}/stop`, { method: 'POST' }),

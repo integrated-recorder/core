@@ -151,7 +151,7 @@ func TestHistoricalWindowFetchesConcurrentlyAndPublishesInManifestOrder(t *testi
 	}
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(transport.releaseFirst) })
-	manager, _, owner := newManifestWindowTestManager(t, transport, "cccccccccccccccccccccccccccccccc")
+	manager, e, owner := newManifestWindowTestManager(t, transport, "cccccccccccccccccccccccccccccccc")
 	passDone := make(chan error, 1)
 	go func() {
 		passDone <- manager.RepairDeclaredHistory(context.Background(), owner, owner.RecordingID)
@@ -165,6 +165,12 @@ func TestHistoricalWindowFetchesConcurrentlyAndPublishesInManifestOrder(t *testi
 	case <-transport.secondStarted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("second historical fetch did not run concurrently")
+	}
+	e.mu.Lock()
+	activeActors := len(e.historicalWorkers)
+	e.mu.Unlock()
+	if activeActors != initialHistoricalFetchConcurrency {
+		t.Fatalf("historical actor ownership count=%d while fetch window is active, want %d", activeActors, initialHistoricalFetchConcurrency)
 	}
 	select {
 	case err := <-passDone:
@@ -193,6 +199,12 @@ func TestHistoricalWindowFetchesConcurrentlyAndPublishesInManifestOrder(t *testi
 		}
 	case <-time.After(60 * time.Second):
 		t.Fatal("repair manifest window did not finish")
+	}
+	e.mu.Lock()
+	activeActors = len(e.historicalWorkers)
+	e.mu.Unlock()
+	if activeActors != 0 {
+		t.Fatalf("historical actor ownership remained after canonical recovery completed: %d", activeActors)
 	}
 	current, err = manager.Get(owner.RecordingID)
 	if err != nil {

@@ -2783,7 +2783,9 @@ func (m *Manager) fail(e *entry, err error) {
 				track.PendingSegments = nil
 			}
 		} else {
-			m.finalizePending(r, "recording ended with uncaptured media")
+			if err := m.finalizePending(r, "recording ended with uncaptured media"); err != nil {
+				return err
+			}
 		}
 		r.State = domain.StateInterrupted
 		r.LastError = safe

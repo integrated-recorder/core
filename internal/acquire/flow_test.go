@@ -248,6 +248,16 @@ func TestShardedAcquisitionFlowProjectsGapThenHistoricalRecovery(t *testing.T) {
 	if len(view.Actors) != 0 || len(view.Segments) != 4 || view.Segments[3].State != "present" || !view.Segments[3].Recovered {
 		t.Fatalf("historical recovery did not transition unresolved to present: actors=%#v segments=%#v", view.Actors, view.Segments)
 	}
+	var rawGapCount int
+	if err := manager.store.IterateShardedGaps(context.Background(), e.recording.ID, func(domain.Gap) error {
+		rawGapCount++
+		return nil
+	}); err != nil {
+		t.Fatalf("read raw gap history after recovery: %v", err)
+	}
+	if rawGapCount != 1 {
+		t.Fatalf("historical recovery rewrote immutable gap observations: count=%d", rawGapCount)
+	}
 	if view.TotalOrdinals != 4 {
 		t.Fatalf("projection invented a coordinate beyond the observed archive/window: total=%d", view.TotalOrdinals)
 	}

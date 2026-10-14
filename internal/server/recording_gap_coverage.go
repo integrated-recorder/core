@@ -6,24 +6,29 @@ import (
 	"math"
 	"sort"
 
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
 type recordingGapView struct {
 	domain.Gap
-	CoverageStatus          string  `json:"coverage_status"`
-	SequenceCount           *uint64 `json:"sequence_count,omitempty"`
-	RecoveredSequenceCount  *uint64 `json:"recovered_sequence_count,omitempty"`
-	UnresolvedSequenceCount *uint64 `json:"unresolved_sequence_count,omitempty"`
+	CoverageStatus                   string  `json:"coverage_status"`
+	SequenceCount                    *uint64 `json:"sequence_count,omitempty"`
+	PresentSequenceCount             *uint64 `json:"present_sequence_count,omitempty"`
+	RecoveredSequenceCount           *uint64 `json:"recovered_sequence_count,omitempty"`
+	HistoricalRecoveredSequenceCount *uint64 `json:"historical_recovered_sequence_count,omitempty"`
+	UnresolvedSequenceCount          *uint64 `json:"unresolved_sequence_count,omitempty"`
 }
 
 type recordingGapCoverageSummary struct {
-	Status                  string  `json:"status"`
-	GapRecords              int     `json:"gap_records"`
-	UniqueSequenceCount     *uint64 `json:"unique_sequence_count,omitempty"`
-	RecoveredSequenceCount  *uint64 `json:"recovered_sequence_count,omitempty"`
-	UnresolvedSequenceCount *uint64 `json:"unresolved_sequence_count,omitempty"`
+	Status                           string  `json:"status"`
+	GapRecords                       int     `json:"gap_records"`
+	UniqueSequenceCount              *uint64 `json:"unique_sequence_count,omitempty"`
+	PresentSequenceCount             *uint64 `json:"present_sequence_count,omitempty"`
+	RecoveredSequenceCount           *uint64 `json:"recovered_sequence_count,omitempty"`
+	HistoricalRecoveredSequenceCount *uint64 `json:"historical_recovered_sequence_count,omitempty"`
+	UnresolvedSequenceCount          *uint64 `json:"unresolved_sequence_count,omitempty"`
 }
 
 type gapCoordinateKey struct {
@@ -90,15 +95,19 @@ func projectGapCoverage(recording *domain.Recording) ([]recordingGapView, record
 		sequences := present[key]
 		first := sort.Search(len(sequences), func(i int) bool { return sequences[i] >= gap.FromSequence })
 		last := sort.Search(len(sequences), func(i int) bool { return sequences[i] > gap.ToSequence })
-		recovered := uint64(last - first)
-		unresolved := sequenceCount - recovered
+		presentCount := uint64(last - first)
+		unresolved := sequenceCount - presentCount
 		view.SequenceCount = uint64Pointer(sequenceCount)
-		view.RecoveredSequenceCount = uint64Pointer(recovered)
+		view.PresentSequenceCount = uint64Pointer(presentCount)
+		// Keep recovered_sequence_count as its original current-presence alias.
+		// Legacy V1 media has no selected-claim provenance, so the additive
+		// historical count is omitted rather than inferred.
+		view.RecoveredSequenceCount = uint64Pointer(presentCount)
 		view.UnresolvedSequenceCount = uint64Pointer(unresolved)
 		switch {
 		case unresolved == 0:
-			view.CoverageStatus = "recovered"
-		case recovered == 0:
+			view.CoverageStatus = "present"
+		case presentCount == 0:
 			view.CoverageStatus = "unresolved"
 		default:
 			view.CoverageStatus = "partial"
@@ -117,23 +126,24 @@ func projectGapCoverage(recording *domain.Recording) ([]recordingGapView, record
 		summary.Status = "unavailable"
 		return views, summary
 	}
-	var recoveredTotal uint64
+	var presentTotal uint64
 	for key, ranges := range merged {
 		sequences := present[key]
 		for _, interval := range ranges {
 			first := sort.Search(len(sequences), func(i int) bool { return sequences[i] >= interval.from })
 			last := sort.Search(len(sequences), func(i int) bool { return sequences[i] > interval.to })
-			countRecovered := uint64(last - first)
-			if math.MaxUint64-recoveredTotal < countRecovered {
+			countPresent := uint64(last - first)
+			if math.MaxUint64-presentTotal < countPresent {
 				summary.Status = "unavailable"
 				return views, summary
 			}
-			recoveredTotal += countRecovered
+			presentTotal += countPresent
 		}
 	}
 	summary.UniqueSequenceCount = uint64Pointer(total)
-	summary.RecoveredSequenceCount = uint64Pointer(recoveredTotal)
-	summary.UnresolvedSequenceCount = uint64Pointer(total - recoveredTotal)
+	summary.PresentSequenceCount = uint64Pointer(presentTotal)
+	summary.RecoveredSequenceCount = uint64Pointer(presentTotal)
+	summary.UnresolvedSequenceCount = uint64Pointer(total - presentTotal)
 	return views, summary
 }
 
@@ -202,7 +212,9 @@ func (s *Server) projectShardedGapCoverage(ctx context.Context, recordingID stri
 		zero := uint64(0)
 		summary.Status = "available"
 		summary.UniqueSequenceCount = uint64Pointer(zero)
+		summary.PresentSequenceCount = uint64Pointer(zero)
 		summary.RecoveredSequenceCount = uint64Pointer(zero)
+		summary.HistoricalRecoveredSequenceCount = uint64Pointer(zero)
 		summary.UnresolvedSequenceCount = uint64Pointer(zero)
 		return summary
 	}
@@ -230,7 +242,7 @@ func (s *Server) projectShardedGapCoverage(ctx context.Context, recordingID stri
 	if !ok {
 		return summary
 	}
-	var recovered uint64
+	var present, recovered uint64
 	for trackID := range header.Tracks {
 		hasTrackRanges := false
 		for key := range merged {
@@ -248,10 +260,16 @@ func (s *Server) projectShardedGapCoverage(ctx context.Context, recordingID stri
 			ranges := merged[key]
 			index := sort.Search(len(ranges), func(i int) bool { return ranges[i].to >= coordinate.Sequence })
 			if index < len(ranges) && ranges[index].from <= coordinate.Sequence {
-				if recovered == math.MaxUint64 {
+				if present == math.MaxUint64 {
 					return errGapCoverageLimit
 				}
-				recovered++
+				present++
+				if record.SelectedClaim != nil && record.SelectedClaim.Source == archiveindex.ClaimHistorical {
+					if recovered == math.MaxUint64 {
+						return errGapCoverageLimit
+					}
+					recovered++
+				}
 			}
 			return nil
 		})
@@ -263,12 +281,16 @@ func (s *Server) projectShardedGapCoverage(ctx context.Context, recordingID stri
 	if err != nil || current == nil || current.ArchiveRevision != header.ArchiveRevision || current.TimelineRevision != header.TimelineRevision || current.ShardedArchive == nil || current.ShardedArchive.GapCount != header.ShardedArchive.GapCount || current.ShardedArchive.MediaCount != header.ShardedArchive.MediaCount {
 		return summary
 	}
-	if recovered > total {
+	if recovered > present || present > total {
 		return summary
 	}
 	summary.Status = "available"
 	summary.UniqueSequenceCount = uint64Pointer(total)
-	summary.RecoveredSequenceCount = uint64Pointer(recovered)
-	summary.UnresolvedSequenceCount = uint64Pointer(total - recovered)
+	summary.PresentSequenceCount = uint64Pointer(present)
+	// Preserve the existing API field as an alias for any present coordinate;
+	// the new historical field carries provenance-aware recovery semantics.
+	summary.RecoveredSequenceCount = uint64Pointer(present)
+	summary.HistoricalRecoveredSequenceCount = uint64Pointer(recovered)
+	summary.UnresolvedSequenceCount = uint64Pointer(total - present)
 	return summary
 }

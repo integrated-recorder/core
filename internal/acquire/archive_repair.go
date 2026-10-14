@@ -1159,16 +1159,21 @@ func (m *Manager) recordHistoricalCoverage(e *entry, owner *OwnershipToken, term
 		}
 		coverage := recordHistoricalCoverage(coordinate, state, reason, time.Now().UTC())
 		if isShardedRecording(root) {
+			var gapOutcome gapCommitOutcome
 			if state == archiveindex.CoverageKnownMissing {
 				if err := m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
-					track := recording.Tracks[coordinate.TrackID]
-					if track == nil {
-						return errors.New("main track is missing")
-					}
-					addMissingRangesDS(recording, track, coordinate.SourceEpoch, coordinate.DiscontinuitySequence, coordinate.Sequence, coordinate.Sequence, reason, capturedSequenceSetDS(track, coordinate.SourceEpoch, coordinate.DiscontinuitySequence))
-					return nil
+					var err error
+					gapOutcome, err = m.commitGapIfStillMissing(recording, canonicalGapCandidate{
+						trackID: coordinate.TrackID, sourceEpoch: coordinate.SourceEpoch,
+						discontinuitySequence: coordinate.DiscontinuitySequence,
+						fromSequence:          coordinate.Sequence, toSequence: coordinate.Sequence, reason: reason,
+					})
+					return err
 				}); err != nil {
 					return err
+				}
+				if gapOutcome.present {
+					return nil
 				}
 			}
 			result, err := m.store.AppendShardedCoverageWithRevision(context.Background(), root.ID, coverage)
@@ -1194,20 +1199,26 @@ func (m *Manager) recordHistoricalCoverage(e *entry, owner *OwnershipToken, term
 		currentCoverageState := archiveindex.CoverageAt(inventory, coordinate)
 		coverageStateChanged := currentCoverageState != previousCoverageState && currentCoverageState == archiveindex.CoverageKnownMissing
 		if state == archiveindex.CoverageKnownMissing {
+			var gapOutcome gapCommitOutcome
 			if err := m.updateWithinAuthorizedCommit(e, func(recording *domain.Recording) error {
-				track := recording.Tracks[coordinate.TrackID]
-				if track == nil {
-					return errors.New("main track is missing")
+				var err error
+				gapOutcome, err = m.commitGapIfStillMissing(recording, canonicalGapCandidate{
+					trackID: coordinate.TrackID, sourceEpoch: coordinate.SourceEpoch,
+					discontinuitySequence: coordinate.DiscontinuitySequence,
+					fromSequence:          coordinate.Sequence, toSequence: coordinate.Sequence, reason: reason,
+				})
+				if err != nil {
+					return err
 				}
-				previousGapCount := len(recording.Gaps)
-				previousRevision := recording.ArchiveRevision
-				addMissingRangesDS(recording, track, coordinate.SourceEpoch, coordinate.DiscontinuitySequence, coordinate.Sequence, coordinate.Sequence, reason, capturedSequenceSetDS(track, coordinate.SourceEpoch, coordinate.DiscontinuitySequence))
-				if coverageStateChanged && len(recording.Gaps) == previousGapCount && recording.ArchiveRevision == previousRevision {
+				if !gapOutcome.present && coverageStateChanged && gapOutcome.appended == 0 && recording.ArchiveRevision == root.ArchiveRevision {
 					return advanceArchiveRevision(recording)
 				}
 				return nil
 			}); err != nil {
 				return err
+			}
+			if gapOutcome.present {
+				return nil
 			}
 		}
 		return m.persistCoverage(root.ID, inventory)

@@ -1077,7 +1077,9 @@ func TestCancellationFinalizesUnattemptedManifestSegmentsAsGaps(t *testing.T) {
 		t.Fatalf("unattempted segments were not retained as pending: %#v", e.recording.Tracks["main"].PendingSegments)
 	}
 	if err = manager.update(e, func(r *domain.Recording) error {
-		manager.finalizePending(r, "recording stopped before pending media could be captured")
+		if err := manager.finalizePending(r, "recording stopped before pending media could be captured"); err != nil {
+			return err
+		}
 		r.State = domain.StateStopped
 		now := time.Now().UTC()
 		r.StoppedAt = &now

@@ -77,6 +77,25 @@ describe('recording segment acquisition flow', () => {
     expect(screen.getByTestId('flow-live-window')).toBeInTheDocument()
   })
 
+  it('shows live-origin media as present without a historical recovery marker', async () => {
+    const snapshot: AcquisitionFlowSnapshot = {
+      ...baseSnapshot,
+      segments: baseSnapshot.segments.map(segment => segment.sequence === 503
+        ? { ...segment, state: 'present', recovered: false }
+        : segment),
+      actors: [],
+    }
+    renderFlow(snapshot)
+    await waitFor(() => expect(screen.getAllByTestId('flow-segment')).toHaveLength(3))
+    const cell = screen.getAllByTestId('flow-segment')[2]
+    expect(cell).toHaveAttribute('data-state', 'present')
+    expect(cell.className).toContain('bg-emerald-500')
+    expect(cell.className).not.toContain('bg-destructive')
+    fireEvent.click(cell!)
+    expect(screen.getByTestId('flow-selection')).toHaveTextContent('Status: Saved')
+    expect(screen.getByTestId('flow-selection')).not.toHaveTextContent('Recovered')
+  })
+
   it('keeps a short live strip at the right edge so newly observed segments move it forward', async () => {
     const resizeCallbacks: ResizeObserverCallback[] = []
     vi.stubGlobal('ResizeObserver', class {

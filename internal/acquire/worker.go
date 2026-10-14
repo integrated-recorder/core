@@ -267,7 +267,9 @@ func (m *Manager) processWithSchedulerGeneration(e *entry, ctx context.Context, 
 			return false, nil
 		}
 		updated, err := m.updateAtMediaGeneration(e, generation, func(r *domain.Recording) error {
-			m.finalizePending(r, "stream ended with uncaptured media")
+			if err := m.finalizePending(r, "stream ended with uncaptured media"); err != nil {
+				return err
+			}
 			r.State = domain.StateCompleted
 			now := time.Now().UTC()
 			r.StoppedAt = &now
@@ -314,7 +316,9 @@ func (m *Manager) processWithSchedulerGeneration(e *entry, ctx context.Context, 
 			return false, nil
 		}
 		updated, err := m.updateAtMediaGeneration(e, generation, func(r *domain.Recording) error {
-			m.finalizePending(r, "stream ended with uncaptured media")
+			if err := m.finalizePending(r, "stream ended with uncaptured media"); err != nil {
+				return err
+			}
 			r.State = domain.StateCompleted
 			now := time.Now().UTC()
 			r.StoppedAt = &now
@@ -375,6 +379,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	}
 	baseGapRevision := gapRevisionSnapshot(r)
 	priorGaps := append([]domain.Gap(nil), r.Gaps...)
+	var gapCandidates []canonicalGapCandidate
 	var observedEpoch uint64
 	if err := func() error {
 		t := r.Tracks["main"]
@@ -420,7 +425,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			}
 		}
 		if sequenceReset {
-			m.finalizePendingEpochExcept(r, t, t.SourceEpoch, "source sequence reset before pending media was captured", protectedByEpoch[t.SourceEpoch])
+			gapCandidates = append(gapCandidates, m.finalizePendingEpochExcept(r, t, t.SourceEpoch, "source sequence reset before pending media was captured", protectedByEpoch[t.SourceEpoch])...)
 			if t.SourceEpoch == ^uint64(0) {
 				return errors.New("source sequence epoch overflow")
 			}
@@ -434,21 +439,32 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		}
 		for _, seg := range playlist.Segments {
 			if seg.Gap {
-				addMissingRangesDS(r, t, epoch, seg.DiscontinuitySequence, seg.Sequence, seg.Sequence, "source manifest marked segment as a gap", capturedSequenceSetDS(t, epoch, seg.DiscontinuitySequence))
-				annotateLiveGap(r, t, epoch, seg.DiscontinuitySequence, seg.Sequence, seg.Duration, seg.ProgramTime, seg.Discontinuity)
+				gapCandidates = append(gapCandidates, canonicalGapCandidate{
+					trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: seg.DiscontinuitySequence,
+					fromSequence: seg.Sequence, toSequence: seg.Sequence, reason: "source manifest marked segment as a gap",
+					annotation: &liveGapAnnotation{duration: seg.Duration, programDateTime: cloneLiveTime(seg.ProgramTime), discontinuity: seg.Discontinuity},
+				})
 			}
 		}
 		if t.HasLastObservedSequence && t.LastObservedSequence < ^uint64(0) && minSeq > t.LastObservedSequence && minSeq-t.LastObservedSequence > 1 {
 			lastDS, known := lastObservedDiscontinuitySequence(t, epoch, t.LastObservedSequence)
 			if known && len(playlist.Segments) > 0 && playlist.Segments[0].DiscontinuitySequence == lastDS {
-				addMissingRangesDS(r, t, epoch, lastDS, t.LastObservedSequence+1, minSeq-1, "sequence advanced past uncaptured media", capturedSequenceSetDS(t, epoch, lastDS))
+				gapCandidates = append(gapCandidates, canonicalGapCandidate{
+					trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: lastDS,
+					fromSequence: t.LastObservedSequence + 1, toSequence: minSeq - 1,
+					reason: "sequence advanced past uncaptured media",
+				})
 			}
 		}
 		for i := 1; i < len(playlist.Segments); i++ {
 			previous, next := playlist.Segments[i-1], playlist.Segments[i]
 			prevSeq := previous.Sequence
 			if previous.DiscontinuitySequence == next.DiscontinuitySequence && prevSeq < ^uint64(0) && next.Sequence > prevSeq && next.Sequence-prevSeq > 1 {
-				addMissingRangesDS(r, t, epoch, next.DiscontinuitySequence, prevSeq+1, next.Sequence-1, "sequence skipped in manifest", capturedSequenceSetDS(t, epoch, next.DiscontinuitySequence))
+				gapCandidates = append(gapCandidates, canonicalGapCandidate{
+					trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: next.DiscontinuitySequence,
+					fromSequence: prevSeq + 1, toSequence: next.Sequence - 1,
+					reason: "sequence skipped in manifest",
+				})
 			}
 		}
 		present := map[segmentTaskKey]bool{}
@@ -484,7 +500,12 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 					pending = append(pending, item)
 					continue
 				}
-				addMissingRangesDS(r, t, epoch, item.DiscontinuitySequence, item.Sequence, item.Sequence, "media left the live window after retries", captured)
+				gapCandidates = append(gapCandidates, canonicalGapCandidate{
+					trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: item.DiscontinuitySequence,
+					fromSequence: item.Sequence, toSequence: item.Sequence,
+					reason: "media left the live window after retries",
+				})
+				pending = append(pending, item)
 				continue
 			}
 			pending = append(pending, item)
@@ -529,7 +550,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			}
 		}
 		if epoch == 0 {
-			legacyPending := t.PendingSequences[:0]
+			legacyPending := make([]uint64, 0, len(t.PendingSequences))
 			for _, seq := range t.PendingSequences {
 				captured := capturedSequenceSetDS(t, epoch, 0)
 				key := segmentTaskKey{epoch: epoch, sequence: seq}
@@ -544,7 +565,12 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 						legacyPending = append(legacyPending, seq)
 						continue
 					}
-					addMissingRangesDS(r, t, epoch, 0, seq, seq, "media left the live window after retries", captured)
+					gapCandidates = append(gapCandidates, canonicalGapCandidate{
+						trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: 0,
+						fromSequence: seq, toSequence: seq,
+						reason: "media left the live window after retries",
+					})
+					legacyPending = append(legacyPending, seq)
 					continue
 				}
 				legacyPending = append(legacyPending, seq)
@@ -559,11 +585,6 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	}(); err != nil {
 		return false, err
 	}
-	if !isShardedRecording(r) {
-		if err := applyLegacyGapRevisions(baseGapRevision, r); err != nil {
-			return false, err
-		}
-	}
 	if isShardedRecording(r) {
 		pruneShardedRuntimeTail(r)
 	}
@@ -575,15 +596,27 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	asyncCommit := scheduler != nil && !scheduler.directMode
 	if asyncCommit {
 		e.mu.Unlock()
-		if isShardedRecording(r) {
-			// Live media jobs may publish higher presentation ordinals as soon
-			// as this observation returns to discovery. Publish any newly
-			// reserved gap slots first so the live index never sees a hole.
-			if err := m.withCanonicalCommit(e, func() error {
-				return m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps, r)
-			}); err != nil {
-				return false, newStorageStageError("persist sharded live gap reservations", err)
+		// Candidate checks and any gap publication share the canonical fence
+		// with media writes. The playlist observation alone never establishes
+		// that a V2 coordinate is absent from the archive.
+		if err := m.withCanonicalCommit(e, func() error {
+			if err := m.commitGapCandidates(r, gapCandidates); err != nil {
+				return err
 			}
+			if !isShardedRecording(r) {
+				if err := applyLegacyGapRevisions(baseGapRevision, r); err != nil {
+					return err
+				}
+			}
+			if isShardedRecording(r) {
+				// Live media jobs may publish higher presentation ordinals as soon
+				// as this observation returns to discovery. Publish any newly
+				// reserved gap slots first so the live index never sees a hole.
+				return m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps, r)
+			}
+			return nil
+		}); err != nil {
+			return false, newStorageStageError("persist live gap reservations", err)
 		}
 		// Publish only the in-memory observation before discovery. The queued
 		// writer persists the latest root projection after any earlier segment
@@ -605,6 +638,14 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	}
 	e.mu.Unlock()
 	if err := m.withCanonicalCommit(e, func() error {
+		if err := m.commitGapCandidates(r, gapCandidates); err != nil {
+			return err
+		}
+		if !isShardedRecording(r) {
+			if err := applyLegacyGapRevisions(baseGapRevision, r); err != nil {
+				return err
+			}
+		}
 		if isShardedRecording(r) {
 			if err := m.appendShardedGapsSince(r.ID, priorGaps, r.Gaps, r); err != nil {
 				return newStorageStageError("persist sharded gaps", err)
@@ -1132,7 +1173,9 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		}
 		if err := m.update(e, func(r *domain.Recording) error {
 			if r.State == domain.StateRecording {
-				m.finalizePending(r, "recording stopped before pending media could be captured")
+				if err := m.finalizePending(r, "recording stopped before pending media could be captured"); err != nil {
+					return err
+				}
 				r.State = domain.StateStopped
 				now := time.Now().UTC()
 				r.StoppedAt = &now
@@ -2055,31 +2098,16 @@ func (m *Manager) markGap(e *entry, epoch, discontinuitySequence, sequence uint6
 }
 
 func (m *Manager) markGapWithAcquisition(e *entry, epoch, discontinuitySequence, sequence uint64, reason string, diagnostic *domain.GapAcquisitionDiagnostic) error {
+	var outcome gapCommitOutcome
 	updateErr := m.update(e, func(r *domain.Recording) error {
-		t := r.Tracks["main"]
-		if t == nil {
-			return errors.New("main track is missing")
-		}
-		captured := capturedSequenceSetDS(t, epoch, discontinuitySequence)
-		previousGapCount := len(r.Gaps)
-		addMissingRangesDS(r, t, epoch, discontinuitySequence, sequence, sequence, reason, captured)
-		if diagnostic != nil {
-			for index := len(r.Gaps) - 1; index >= previousGapCount; index-- {
-				gap := &r.Gaps[index]
-				if gap.TrackID == t.ID && gap.SourceEpoch == epoch && gap.DiscontinuitySequence == discontinuitySequence && sequence >= gap.FromSequence && sequence <= gap.ToSequence {
-					copy := *diagnostic
-					gap.Acquisition = &copy
-					break
-				}
-			}
-		}
-		t.PendingSegments = removePending(t.PendingSegments, epoch, discontinuitySequence, sequence)
-		if epoch == 0 {
-			t.PendingSequences = removeSequence(t.PendingSequences, sequence)
-		}
-		return nil
+		var err error
+		outcome, err = m.commitGapIfStillMissing(r, canonicalGapCandidate{
+			trackID: "main", sourceEpoch: epoch, discontinuitySequence: discontinuitySequence,
+			fromSequence: sequence, toSequence: sequence, reason: reason, acquisition: diagnostic,
+		})
+		return err
 	})
-	if updateErr == nil {
+	if updateErr == nil && outcome.missing {
 		if recording := m.recordingSnapshotForArchive(e); recording != nil {
 			for _, gap := range recording.Gaps {
 				if gap.TrackID == "main" && gap.SourceEpoch == epoch && gap.DiscontinuitySequence == discontinuitySequence && sequence >= gap.FromSequence && sequence <= gap.ToSequence {
@@ -2133,7 +2161,8 @@ func (m *Manager) markRemainingPending(e *entry, epoch uint64, segments []hls.Me
 	})
 }
 
-func (m *Manager) finalizePending(r *domain.Recording, reason string) {
+func (m *Manager) finalizePending(r *domain.Recording, reason string) error {
+	var candidates []canonicalGapCandidate
 	for _, t := range r.Tracks {
 		epochs := map[uint64]struct{}{t.SourceEpoch: {}}
 		for _, pending := range t.PendingSegments {
@@ -2148,41 +2177,43 @@ func (m *Manager) finalizePending(r *domain.Recording, reason string) {
 		}
 		sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
 		for _, epoch := range ordered {
-			m.finalizePendingEpoch(r, t, epoch, reason)
+			candidates = append(candidates, m.finalizePendingEpochExcept(r, t, epoch, reason, nil)...)
 		}
 	}
+	return m.commitGapCandidates(r, candidates)
 }
 
-func (m *Manager) finalizePendingEpoch(r *domain.Recording, t *domain.Track, epoch uint64, reason string) {
-	m.finalizePendingEpochExcept(r, t, epoch, reason, nil)
+func (m *Manager) finalizePendingEpoch(r *domain.Recording, t *domain.Track, epoch uint64, reason string) error {
+	return m.commitGapCandidates(r, m.finalizePendingEpochExcept(r, t, epoch, reason, nil))
 }
 
-func (m *Manager) finalizePendingEpochExcept(r *domain.Recording, t *domain.Track, epoch uint64, reason string, protected map[segmentTaskKey]bool) {
-	remaining := t.PendingSegments[:0]
+func (m *Manager) finalizePendingEpochExcept(r *domain.Recording, t *domain.Track, epoch uint64, reason string, protected map[segmentTaskKey]bool) []canonicalGapCandidate {
+	var candidates []canonicalGapCandidate
 	for _, item := range t.PendingSegments {
 		if item.SourceEpoch != epoch {
-			remaining = append(remaining, item)
 			continue
 		}
 		key := segmentTaskKey{epoch: item.SourceEpoch, discontinuitySequence: item.DiscontinuitySequence, sequence: item.Sequence}
 		if protected[key] {
-			remaining = append(remaining, item)
 			continue
 		}
-		addMissingRangesDS(r, t, epoch, item.DiscontinuitySequence, item.Sequence, item.Sequence, reason, capturedSequenceSetDS(t, epoch, item.DiscontinuitySequence))
+		candidates = append(candidates, canonicalGapCandidate{
+			trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: item.DiscontinuitySequence,
+			fromSequence: item.Sequence, toSequence: item.Sequence, reason: reason,
+		})
 	}
-	t.PendingSegments = remaining
 	if epoch == 0 {
-		legacy := t.PendingSequences[:0]
 		for _, seq := range t.PendingSequences {
 			if protected[segmentTaskKey{epoch: epoch, sequence: seq}] {
-				legacy = append(legacy, seq)
 				continue
 			}
-			addMissingRangesDS(r, t, epoch, 0, seq, seq, reason, capturedSequenceSetDS(t, epoch, 0))
+			candidates = append(candidates, canonicalGapCandidate{
+				trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: 0,
+				fromSequence: seq, toSequence: seq, reason: reason,
+			})
 		}
-		t.PendingSequences = legacy
 	}
+	return candidates
 }
 
 func capturedSequenceSet(t *domain.Track, epoch uint64) map[uint64]bool {
@@ -2241,10 +2272,10 @@ func lastObservedDiscontinuitySequence(track *domain.Track, epoch, sequence uint
 	return 0, false
 }
 
-func addMissingRanges(r *domain.Recording, t *domain.Track, epoch, from, to uint64, reason string, captured map[uint64]bool) {
-	addMissingRangesDS(r, t, epoch, 0, from, to, reason, captured)
-}
-
+// addMissingRangesDS is only the low-level Recording projection mutator.
+// Canonical absence must already have been established by
+// Manager.commitGapIfStillMissing while persistMu and the ownership fence are
+// held; callers must not infer absence from Track.Segments alone for V2.
 func addMissingRangesDS(r *domain.Recording, t *domain.Track, epoch, discontinuitySequence, from, to uint64, reason string, captured map[uint64]bool) {
 	if to < from {
 		return

@@ -117,7 +117,8 @@ export function RecordingDetailPage() {
               [t('detail.summary.initSegments'), stats.init_segment_count ?? trackValues.reduce((total, track) => total + (track.init_segments?.length ?? 0), 0)],
               [t('detail.summary.manifestSnapshots'), stats.manifest_snapshot_count ?? item.manifest_snapshots?.length ?? 0],
               [t('detail.summary.gaps'), stats.gap_count ?? item.gaps?.length ?? 0],
-              [t('detail.summary.gapRecovered'), item.gap_coverage?.recovered_sequence_count == null ? t('detail.notReported') : formatNumber(item.gap_coverage.recovered_sequence_count)],
+              [t('detail.summary.gapPresent'), item.gap_coverage?.present_sequence_count == null ? t('detail.notReported') : formatNumber(item.gap_coverage.present_sequence_count)],
+              [t('detail.summary.gapRecovered'), item.gap_coverage?.historical_recovered_sequence_count == null ? t('detail.notReported') : formatNumber(item.gap_coverage.historical_recovered_sequence_count)],
               [t('detail.summary.gapUnresolved'), item.gap_coverage?.unresolved_sequence_count == null ? t('detail.notReported') : formatNumber(item.gap_coverage.unresolved_sequence_count)],
               [t('detail.summary.gapDuration'), stats.gap_duration_seconds == null ? t('detail.notReported') : formatDuration(stats.gap_duration_seconds)],
             ].map(([label, value]) => <Stat key={String(label)} label={String(label)} value={String(value)} />)}
@@ -221,6 +222,7 @@ export function Timeline({ segments, gaps }: { segments: (Segment & { trackId: s
   const coverageLabel = (status: Gap['coverage_status']) => {
     switch (status) {
       case 'recovered': return t('timeline.capture.gapStatus.recovered')
+      case 'present': return t('timeline.capture.gapStatus.present')
       case 'partial': return t('timeline.capture.gapStatus.partial')
       case 'unresolved': return t('timeline.capture.gapStatus.unresolved')
       default: return t('timeline.capture.gapStatus.unavailable')

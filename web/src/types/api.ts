@@ -64,12 +64,12 @@ export type Gap = {
   track_id?: string; source_epoch?: number; discontinuity_sequence?: number;
   from_sequence?: number; to_sequence?: number; detected_at?: string; duration_seconds?: number; reason?: string;
   live_presentation_ordinal?: number;
-  acquisition?: GapAcquisitionDiagnostic; coverage_status?: 'recovered' | 'partial' | 'unresolved' | 'unavailable';
-  sequence_count?: number; recovered_sequence_count?: number; unresolved_sequence_count?: number
+  acquisition?: GapAcquisitionDiagnostic; coverage_status?: 'present' | 'recovered' | 'partial' | 'unresolved' | 'unavailable';
+  sequence_count?: number; present_sequence_count?: number; recovered_sequence_count?: number; historical_recovered_sequence_count?: number; unresolved_sequence_count?: number
 }
 export type GapCoverageSummary = {
   status: 'available' | 'unavailable'; gap_records: number; unique_sequence_count?: number;
-  recovered_sequence_count?: number; unresolved_sequence_count?: number
+  present_sequence_count?: number; recovered_sequence_count?: number; historical_recovered_sequence_count?: number; unresolved_sequence_count?: number
 }
 export type Track = { id?: string; name?: string; type?: string; segments?: Segment[]; init_segments?: Segment[]; [key: string]: unknown }
 export type RecordingSummary = {

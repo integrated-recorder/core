@@ -701,6 +701,259 @@ func newShardedLivePresentationFixture(t *testing.T) (*Manager, *entry, func(*te
 	return manager, entry, closeManager
 }
 
+func TestShardedPresentCoordinateDoesNotBecomeWindowEvictionGap(t *testing.T) {
+	manager, e, closeManager := newShardedLivePresentationFixture(t)
+	defer closeManager(t)
+
+	const sequence = uint64(751)
+	segment := commitLivePresentationSegment(t, manager, e, archiveindex.ClaimLiveOrigin, 0, 0, sequence, "")
+	e.mu.Lock()
+	track := e.recording.Tracks["main"]
+	// A V2 runtime root only keeps a bounded segment tail. Model the canonical
+	// media coordinate being older than that tail while an old pending
+	// projection still awaits playlist-window reconciliation.
+	track.Segments = nil
+	track.PendingSegments = append(track.PendingSegments, domain.PendingSequence{
+		SourceEpoch: 0, DiscontinuitySequence: 0, Sequence: sequence,
+		LivePresentationOrdinal: segment.LivePresentationOrdinal, Duration: segment.Duration,
+	})
+	track.HasLastObservedSequence = true
+	track.LastObservedSequence = sequence
+	generation := e.mediaGeneration
+	recordingID := e.recording.ID
+	sessionID := e.recording.SourceSessionID
+	e.mu.Unlock()
+
+	playlist := hls.MediaPlaylist{TargetDuration: 2, MediaSequence: sequence + 1, Segments: []hls.MediaSegment{{
+		Sequence: sequence + 1, DiscontinuitySequence: 0,
+		URI: "https://source.invalid/752.ts", Duration: 2,
+	}}}
+	if _, err := manager.observePlaylistAtGeneration(e, playlist, generation); err != nil {
+		t.Fatalf("observe playlist after present coordinate left the window: %v", err)
+	}
+
+	stored, err := manager.store.LookupShardedMediaByCoordinate(context.Background(), recordingID, archiveindex.Coordinate{
+		SessionID: sessionID, TrackID: "main", SourceEpoch: 0,
+		DiscontinuitySequence: 0, Sequence: sequence, Kind: archiveindex.ObjectMedia,
+	})
+	if err != nil || stored.Segment.ArchiveOrdinal == 0 {
+		t.Fatalf("canonical media coordinate was not still present: record=%#v err=%v", stored, err)
+	}
+
+	var rawGaps []domain.Gap
+	if err := manager.store.IterateShardedGaps(context.Background(), recordingID, func(gap domain.Gap) error {
+		rawGaps = append(rawGaps, gap)
+		return nil
+	}); err != nil {
+		t.Fatalf("read raw gap observations: %v", err)
+	}
+	if len(rawGaps) != 0 {
+		t.Fatalf("canonical PRESENT coordinate received a false raw gap observation: %#v", rawGaps)
+	}
+
+	current, err := manager.Get(recordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pending := range current.Tracks["main"].PendingSegments {
+		if pending.SourceEpoch == 0 && pending.DiscontinuitySequence == 0 && pending.Sequence == sequence {
+			t.Fatalf("stale pending projection for canonical media was not healed: %#v", pending)
+		}
+	}
+}
+
+func TestShardedMissingCoordinateCommitsGapAndHealsPending(t *testing.T) {
+	manager, e, closeManager := newShardedLivePresentationFixture(t)
+	defer closeManager(t)
+
+	commitLivePresentationSegment(t, manager, e, archiveindex.ClaimLiveOrigin, 0, 0, 760, "")
+	const sequence = uint64(761)
+	e.mu.Lock()
+	track := e.recording.Tracks["main"]
+	ordinal, disc, boundary, ok := livePresentationForCoordinate(track, 0, 0, sequence, false)
+	if !ok {
+		e.mu.Unlock()
+		t.Fatal("missing coordinate did not receive a stable live ordinal")
+	}
+	track.PendingSegments = append(track.PendingSegments, domain.PendingSequence{
+		SourceEpoch: 0, DiscontinuitySequence: 0, Sequence: sequence,
+		LivePresentationOrdinal: ordinal, LiveDiscontinuitySequence: disc,
+		LiveDiscontinuity: boundary, Duration: 2,
+	})
+	e.mu.Unlock()
+
+	if err := manager.update(e, func(recording *domain.Recording) error {
+		_, err := manager.commitGapIfStillMissing(recording, canonicalGapCandidate{
+			trackID: "main", sourceEpoch: 0, discontinuitySequence: 0,
+			fromSequence: sequence, toSequence: sequence, reason: "fixture terminal miss",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("commit genuinely missing coordinate: %v", err)
+	}
+
+	var rawGaps []domain.Gap
+	if err := manager.store.IterateShardedGaps(context.Background(), e.recording.ID, func(gap domain.Gap) error {
+		rawGaps = append(rawGaps, gap)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rawGaps) != 1 || rawGaps[0].FromSequence != sequence || rawGaps[0].Reason != "fixture terminal miss" {
+		t.Fatalf("genuine missing coordinate did not create one gap: %#v", rawGaps)
+	}
+	current, err := manager.Get(e.recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending := current.Tracks["main"].PendingSegments; len(pending) != 0 {
+		t.Fatalf("committed gap did not heal its exact pending coordinate: %#v", pending)
+	}
+}
+
+func TestFinalizePendingDoesNotGapCanonicalPresentOnStopOrEndList(t *testing.T) {
+	for _, reason := range []string{
+		"recording stopped before pending media could be captured",
+		"stream ended with uncaptured media",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			manager, e, closeManager := newShardedLivePresentationFixture(t)
+			defer closeManager(t)
+			const sequence = uint64(791)
+			segment := commitLivePresentationSegment(t, manager, e, archiveindex.ClaimLiveOrigin, 0, 0, sequence, "")
+			e.mu.Lock()
+			track := e.recording.Tracks["main"]
+			track.Segments = nil // V2 runtime root tail no longer contains this canonical media.
+			track.PendingSegments = append(track.PendingSegments, domain.PendingSequence{
+				SourceEpoch: 0, DiscontinuitySequence: 0, Sequence: sequence,
+				LivePresentationOrdinal: segment.LivePresentationOrdinal, Duration: segment.Duration,
+			})
+			e.mu.Unlock()
+
+			if err := manager.update(e, func(recording *domain.Recording) error {
+				return manager.finalizePending(recording, reason)
+			}); err != nil {
+				t.Fatalf("finalize pending media: %v", err)
+			}
+			var rawGapCount int
+			if err := manager.store.IterateShardedGaps(context.Background(), e.recording.ID, func(domain.Gap) error {
+				rawGapCount++
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if rawGapCount != 0 {
+				t.Fatalf("finalization committed a gap for canonical present media: count=%d", rawGapCount)
+			}
+			current, err := manager.Get(e.recording.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(current.Tracks["main"].PendingSegments) != 0 {
+				t.Fatalf("finalization did not heal stale pending media: %#v", current.Tracks["main"].PendingSegments)
+			}
+		})
+	}
+}
+
+func TestShardedCanonicalMediaWinsGapCandidateRace(t *testing.T) {
+	manager, e, closeManager := newShardedLivePresentationFixture(t)
+	defer closeManager(t)
+
+	const sequence = uint64(771)
+	candidate := canonicalGapCandidate{
+		trackID: "main", sourceEpoch: 0, discontinuitySequence: 0,
+		fromSequence: sequence, toSequence: sequence, reason: "racing gap candidate",
+	}
+	identified := make(chan struct{})
+	resume := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(identified)
+		<-resume
+		result <- manager.update(e, func(recording *domain.Recording) error {
+			_, err := manager.commitGapIfStillMissing(recording, candidate)
+			return err
+		})
+	}()
+	<-identified
+	commitLivePresentationSegment(t, manager, e, archiveindex.ClaimLiveOrigin, 0, 0, sequence, "")
+	close(resume)
+	if err := <-result; err != nil {
+		t.Fatalf("apply gap candidate after media commit: %v", err)
+	}
+	var rawGapCount int
+	if err := manager.store.IterateShardedGaps(context.Background(), e.recording.ID, func(domain.Gap) error {
+		rawGapCount++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rawGapCount != 0 {
+		t.Fatalf("canonical media won but a later raw gap was committed: count=%d", rawGapCount)
+	}
+}
+
+func TestSchedulerGapCandidateIsSuppressedAfterCanonicalMediaPublication(t *testing.T) {
+	manager, e, closeManager := newShardedLivePresentationFixture(t)
+	defer closeManager(t)
+	const sequence = uint64(776)
+	commitLivePresentationSegment(t, manager, e, archiveindex.ClaimLiveOrigin, 0, 0, sequence, "")
+	diagnostic := &domain.GapAcquisitionDiagnostic{Attempts: 3, FailureClass: "http_status", HTTPStatus: 503, Retryable: true}
+	if err := manager.markGapWithAcquisition(e, 0, 0, sequence, "scheduler terminal failure", diagnostic); err != nil {
+		t.Fatalf("apply scheduler gap candidate after media publication: %v", err)
+	}
+	var rawGapCount int
+	if err := manager.store.IterateShardedGaps(context.Background(), e.recording.ID, func(domain.Gap) error {
+		rawGapCount++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rawGapCount != 0 {
+		t.Fatalf("scheduler terminal candidate created a gap despite canonical media: count=%d", rawGapCount)
+	}
+}
+
+func TestShardedLiveOriginPresentWithRawGapStaysPresentNotRecovered(t *testing.T) {
+	manager, e, closeManager := newShardedLivePresentationFixture(t)
+	defer closeManager(t)
+
+	const sequence = uint64(781)
+	segment := commitLivePresentationSegment(t, manager, e, archiveindex.ClaimLiveOrigin, 0, 0, sequence, "")
+	if err := manager.store.AppendShardedGap(context.Background(), e.recording.ID, domain.Gap{
+		TrackID: "main", SourceEpoch: 0, DiscontinuitySequence: 0,
+		FromSequence: sequence, ToSequence: sequence, DetectedAt: time.Now().UTC(),
+		Reason: "older gap observation", LivePresentationOrdinal: segment.LivePresentationOrdinal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.refreshShardedHeader(e.recording); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.loadShardedRuntimeTail(e.recording); err != nil {
+		t.Fatal(err)
+	}
+
+	var rawGapCount int
+	if err := manager.store.IterateShardedGaps(context.Background(), e.recording.ID, func(domain.Gap) error {
+		rawGapCount++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rawGapCount != 1 {
+		t.Fatalf("raw gap history was rewritten after media recovery: count=%d", rawGapCount)
+	}
+	view, err := manager.AcquisitionFlowSnapshot(context.Background(), e.recording.ID, 0, 96)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Segments) != 1 || view.Segments[0].State != "present" || view.Segments[0].Recovered {
+		t.Fatalf("live-origin present coordinate was confused with old gap history: %#v", view.Segments)
+	}
+}
+
 func newShardedRuntimeEntry(recording *domain.Recording) *entry {
 	return &entry{recording: recording}
 }

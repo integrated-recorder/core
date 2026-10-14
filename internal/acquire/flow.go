@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/storage"
 )
@@ -232,6 +233,23 @@ func (m *Manager) AcquisitionFlowSnapshot(ctx context.Context, id string, start 
 				}
 				key := segmentTaskKey{epoch: gap.SourceEpoch, discontinuitySequence: gap.DiscontinuitySequence, sequence: sequence}
 				coordinateOrdinals[key] = slot.Ordinal
+				// A live slot is a bounded presentation projection, while the
+				// coordinate index is the canonical current-state authority. A
+				// stale/legacy gap slot must not make already-published media look
+				// unresolved in the Segment Flow UI.
+				media, lookupErr := m.store.LookupShardedMediaByCoordinate(ctx, id, archiveindex.Coordinate{
+					SessionID: recording.SourceSessionID, TrackID: gap.TrackID,
+					SourceEpoch: gap.SourceEpoch, DiscontinuitySequence: gap.DiscontinuitySequence,
+					Sequence: sequence, Kind: archiveindex.ObjectMedia,
+				})
+				if lookupErr == nil {
+					segments[slot.Ordinal] = flowSegmentFromMedia(media.Segment, slot.Ordinal,
+						media.SelectedClaim != nil && media.SelectedClaim.Source == archiveindex.ClaimHistorical)
+					continue
+				}
+				if !errors.Is(lookupErr, storage.ErrNotFound) {
+					return AcquisitionFlowSnapshot{}, lookupErr
+				}
 				observed := gap.LiveDuration > 0 || flowWindowHas(window, key)
 				flowSegment := AcquisitionFlowSegment{
 					TrackID: "main", SourceEpoch: gap.SourceEpoch, DiscontinuitySequence: gap.DiscontinuitySequence,

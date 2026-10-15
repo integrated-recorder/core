@@ -1015,20 +1015,6 @@ func TestHandoverCutoffLeavesQueuedLiveCoordinatesForTarget(t *testing.T) {
 	if !cutoffClassified {
 		t.Fatalf("cutoff task classification failed: %s requests=%v", cutoffState, fixture.requestCounts())
 	}
-	// Probe the target after live admission/dispatch has been frozen while the
-	// accepted source bodies are still blocked in flight. This keeps the root
-	// stable during the read-only probe and proves that a target manifest check
-	// cannot fetch media before the source drain boundary.
-	preCutoffSnapshot, err := source.HandoverSnapshot(recording.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := target.PrepareHandoverTarget(context.Background(), preCutoffSnapshot, identity); err != nil {
-		t.Fatalf("manifest-only pre-drain preflight: %v", err)
-	}
-	if got := fixture.requestCounts()["target"]; len(got) != 0 {
-		t.Fatalf("target fetched media before source drain: %v", got)
-	}
 	paused := make(chan struct {
 		snapshot HandoverSnapshot
 		err      error

@@ -59,6 +59,9 @@ func (m *Manager) runMetadataMonitor(ctx context.Context, e *entry) {
 			observedAt = m.metadataNow().UTC()
 		}
 		if err == nil && ctx.Err() == nil {
+			if !e.beginObserverCanonicalCommit() {
+				return
+			}
 			active, truncated, commitErr := m.commitMetadataObservation(e, generation, observedAt, result, commit)
 			if commitErr != nil {
 				err = commitErr

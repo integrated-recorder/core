@@ -233,6 +233,59 @@ func TestHistoricalWindowFetchesConcurrentlyAndPublishesInManifestOrder(t *testi
 	}
 }
 
+func TestHandoverStopsHistoricalRecoveryAfterAlreadyAdmittedFetchWindow(t *testing.T) {
+	manifest := "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n" +
+		"#EXTINF:2,\nsegment-1.ts\n#EXTINF:2,\nsegment-2.ts\n#EXTINF:2,\nsegment-3.ts\n#EXT-X-ENDLIST\n"
+	transport := &orderedHistoricalTransport{
+		manifest: []byte(manifest), firstStarted: make(chan struct{}), secondStarted: make(chan struct{}), releaseFirst: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(transport.releaseFirst) })
+	manager, e, owner := newManifestWindowTestManager(t, transport, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+	passDone := make(chan error, 1)
+	go func() { passDone <- manager.RepairDeclaredHistory(context.Background(), owner, owner.RecordingID) }()
+	select {
+	case <-transport.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first admitted historical body did not start")
+	}
+	select {
+	case <-transport.secondStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second admitted historical body did not start")
+	}
+	// This entry marker is the same serialized cutoff observed by the HTTP
+	// admission callback. The two already-started bodies remain untouched; the
+	// next recovery window must stay parked for the target Engine.
+	e.mu.Lock()
+	e.handover = &handoverOperation{state: handoverRequested}
+	e.mu.Unlock()
+	releaseOnce.Do(func() { close(transport.releaseFirst) })
+	select {
+	case err := <-passDone:
+		if !errors.Is(err, errHistoricalHandoverAdmissionClosed) {
+			t.Fatalf("historical pass error=%v, want handover deferral", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("historical pass did not stop after its admitted fetch window")
+	}
+	transport.mu.Lock()
+	calls := append([]string(nil), transport.calls...)
+	transport.mu.Unlock()
+	for _, path := range calls {
+		if path == "/archive/segment-3.ts" {
+			t.Fatalf("historical work started after cutoff: calls=%v", calls)
+		}
+	}
+	current, err := manager.Get(owner.RecordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := current.SegmentCount(); got != 2 {
+		t.Fatalf("already-admitted historical bodies committed count=%d, want 2; calls=%v", got, calls)
+	}
+}
+
 func TestHistoricalWindowCancellationWaitsForFetchesAndReleasesSpoolSlots(t *testing.T) {
 	manifest := "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n" +
 		"#EXTINF:2,\nsegment-1.ts\n#EXTINF:2,\nsegment-2.ts\n#EXT-X-ENDLIST\n"

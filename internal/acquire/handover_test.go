@@ -303,7 +303,7 @@ func (t *blockingHistoricalHandoverTransport) RoundTrip(request *http.Request) (
 	return t.base.RoundTrip(request)
 }
 
-func TestHandoverPauseDrainsAutomaticHistoricalRecovery(t *testing.T) {
+func TestHandoverPauseDefersHistoricalWorkUntilSourceResumes(t *testing.T) {
 	store, owners, _ := newHandoverStores(t)
 	fixture := &handoverFixture{max: 1, metadata: "title"}
 	transport := &blockingHistoricalHandoverTransport{
@@ -383,8 +383,8 @@ func TestHandoverPauseDrainsAutomaticHistoricalRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.SegmentCount() != 2 || segmentAtSequence(t, current.Tracks["main"].Segments, 0).TimelineOrdinal != 1 || segmentAtSequence(t, current.Tracks["main"].Segments, 1).TimelineOrdinal != 2 {
-		t.Fatalf("recovery was not drained before snapshot: %#v", current.Tracks["main"].Segments)
+	if current.SegmentCount() != 1 || segmentAtSequence(t, current.Tracks["main"].Segments, 1).TimelineOrdinal != 1 {
+		t.Fatalf("historical media not yet admitted at cutoff was committed on source: %#v", current.Tracks["main"].Segments)
 	}
 	rootAtPause := recordingRootBytes(t, store, recording.ID)
 	time.Sleep(80 * time.Millisecond)
@@ -393,6 +393,17 @@ func TestHandoverPauseDrainsAutomaticHistoricalRecovery(t *testing.T) {
 	}
 	if err := manager.ResumeHandover(recording.ID, owner, result.snapshot); err != nil {
 		t.Fatal(err)
+	}
+	waitHandover(t, func() bool {
+		current, err := manager.Get(recording.ID)
+		return err == nil && current.SegmentCount() == 2
+	}, "historical recovery after source resume")
+	current, err = manager.Get(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if segmentAtSequence(t, current.Tracks["main"].Segments, 0).TimelineOrdinal != 1 || segmentAtSequence(t, current.Tracks["main"].Segments, 1).TimelineOrdinal != 2 {
+		t.Fatalf("historical recovery did not resume in canonical order: %#v", current.Tracks["main"].Segments)
 	}
 }
 
@@ -778,7 +789,7 @@ func TestHandoverWaitsForBlockedSegmentBodyThenTargetContinues(t *testing.T) {
 		}
 	})
 	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
-	if err := target.PrepareHandoverTarget(context.Background(), sourceSnapshot, identity); err != nil {
+	if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), sourceSnapshot, identity); err != nil {
 		t.Fatalf("prepare target: %v", err)
 	}
 	if !bytes.Equal(rootBeforeTarget, recordingRootBytes(t, store, recording.ID)) {
@@ -817,6 +828,280 @@ func TestHandoverWaitsForBlockedSegmentBodyThenTargetContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertHandoverFixtureArchive(t, store, current, 3)
+}
+
+type cutoffHTTPFixture struct {
+	mu       sync.Mutex
+	max      int
+	started  chan int
+	release  chan struct{}
+	released sync.Once
+	requests map[string]map[int]int
+}
+
+func (f *cutoffHTTPFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.URL.Path == "/live.m3u8":
+		f.mu.Lock()
+		max := f.max
+		f.mu.Unlock()
+		_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n")
+		for sequence := 1; sequence <= max; sequence++ {
+			_, _ = fmt.Fprintf(w, "#EXTINF:1.0,\nsegment-%06d.ts\n", sequence)
+		}
+	case strings.HasPrefix(r.URL.Path, "/segment-"):
+		var sequence int
+		if _, err := fmt.Sscanf(r.URL.Path, "/segment-%06d.ts", &sequence); err != nil {
+			http.Error(w, "invalid segment path", http.StatusBadRequest)
+			return
+		}
+		engine := r.Header.Get("X-Handover-Engine")
+		f.mu.Lock()
+		if f.requests[engine] == nil {
+			f.requests[engine] = make(map[int]int)
+		}
+		f.requests[engine][sequence]++
+		f.mu.Unlock()
+		if engine == "source" && sequence <= 4 {
+			select {
+			case f.started <- sequence:
+			default:
+			}
+			select {
+			case <-f.release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		_, _ = io.WriteString(w, fmt.Sprintf("source-segment-%06d", sequence))
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+type handoverEngineTransport struct {
+	base  http.RoundTripper
+	label string
+}
+
+func (t handoverEngineTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	copy := request.Clone(request.Context())
+	copy.Header = request.Header.Clone()
+	copy.Header.Set("X-Handover-Engine", t.label)
+	return t.base.RoundTrip(copy)
+}
+
+func (f *cutoffHTTPFixture) requestCounts() map[string]map[int]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := make(map[string]map[int]int, len(f.requests))
+	for engine, requests := range f.requests {
+		result[engine] = make(map[int]int, len(requests))
+		for sequence, count := range requests {
+			result[engine][sequence] = count
+		}
+	}
+	return result
+}
+
+func TestHandoverCutoffLeavesQueuedLiveCoordinatesForTarget(t *testing.T) {
+	fixture := &cutoffHTTPFixture{max: 10, started: make(chan int, 16), release: make(chan struct{}), requests: make(map[string]map[int]int)}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	baseClient := server.Client()
+	sourceClient := &http.Client{Transport: handoverEngineTransport{base: baseClient.Transport, label: "source"}}
+	targetClient := &http.Client{Transport: handoverEngineTransport{base: baseClient.Transport, label: "target"}}
+	store, owners, _ := newHandoverStores(t)
+	resolver := &handoverMetadataResolver{fixture: &handoverFixture{metadata: "title"}}
+	source, err := NewManagerWithMode(store, sourceClient, resolver, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ConfigureCanonicalCommitFence(owners); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		fixture.released.Do(func() { close(fixture.release) })
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := source.Close(ctx); err != nil {
+			t.Errorf("close source manager: %v", err)
+		}
+	})
+	owner := claimHandoverOwner(t, owners, handoverGenA, handoverWorkerA)
+	recording, err := source.StartResolvedWithIDOwned(context.Background(), owner, handoverRecordingID, "fixture", adapterproto.MediaSource{
+		Type: "hls", ManifestURL: server.URL + "/live.m3u8",
+	}, nil, "cutoff fixture", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(map[int]bool)
+	for len(started) < 4 {
+		select {
+		case sequence := <-fixture.started:
+			started[sequence] = true
+		case <-time.After(5 * time.Second):
+			t.Fatalf("source did not claim four initial live attempts before cutoff: started=%v requests=%v", started, fixture.requestCounts())
+		}
+	}
+	if len(started) != 4 {
+		t.Fatalf("in-flight source cohort=%v, want sequences 1..4", started)
+	}
+
+	target, err := NewManagerWithMode(store, targetClient, resolver, func(context.Context, string) error { return nil }, FreshGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ConfigureCanonicalCommitFence(owners); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := target.Close(ctx); err != nil {
+			t.Errorf("close target manager: %v", err)
+		}
+	})
+	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
+	preCutoffSnapshot, err := source.HandoverSnapshot(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.PrepareHandoverTarget(context.Background(), preCutoffSnapshot, identity); err != nil {
+		t.Fatalf("manifest-only preflight before cutoff: %v", err)
+	}
+	if got := fixture.requestCounts()["target"]; len(got) != 0 {
+		t.Fatalf("target fetched media before source drain: %v", got)
+	}
+	if err := source.RequestHandoverCutoff(context.Background(), recording.ID, owner); err != nil {
+		t.Fatalf("request source cutoff: %v", err)
+	}
+	e, _ := source.entry(recording.ID)
+	cutoffDeadline := time.Now().Add(3 * time.Second)
+	cutoffClassified := false
+	var cutoffState string
+	for time.Now().Before(cutoffDeadline) {
+		e.mu.Lock()
+		scheduler := e.scheduler
+		e.mu.Unlock()
+		if scheduler == nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		scheduler.mu.Lock()
+		var taskStates strings.Builder
+		for key, task := range scheduler.tasks {
+			fmt.Fprintf(&taskStates, "%d:%d ", key.sequence, task.state)
+		}
+		cutoffState = fmt.Sprintf("cutoff=%v busy=%d workers=%d tasks={%s}", scheduler.handoverCutoff, scheduler.busy, scheduler.workers, taskStates.String())
+		cutoffClassified = true
+		for sequence := 1; sequence <= 4; sequence++ {
+			task := scheduler.tasks[segmentTaskKey{epoch: 0, discontinuitySequence: 0, sequence: uint64(sequence)}]
+			if task == nil || task.state != segmentTaskInFlight {
+				cutoffClassified = false
+				break
+			}
+		}
+		// The scheduler's bounded outstanding window can admit a variable number
+		// of queued tasks behind the in-flight worker cohort (especially under
+		// race instrumentation). Every admitted post-cohort task must be parked;
+		// later manifest coordinates are reconstructed by the target.
+		parked := 0
+		for sequence := 5; sequence <= 10; sequence++ {
+			task := scheduler.tasks[segmentTaskKey{epoch: 0, discontinuitySequence: 0, sequence: uint64(sequence)}]
+			if task == nil {
+				continue
+			}
+			if task.state != segmentTaskHandoverParked {
+				cutoffClassified = false
+				break
+			}
+			parked++
+		}
+		if parked == 0 {
+			cutoffClassified = false
+		}
+		scheduler.mu.Unlock()
+		if cutoffClassified {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !cutoffClassified {
+		t.Fatalf("cutoff task classification failed: %s requests=%v", cutoffState, fixture.requestCounts())
+	}
+	paused := make(chan struct {
+		snapshot HandoverSnapshot
+		err      error
+	}, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		snapshot, pauseErr := source.PauseForHandover(ctx, recording.ID, owner)
+		paused <- struct {
+			snapshot HandoverSnapshot
+			err      error
+		}{snapshot: snapshot, err: pauseErr}
+	}()
+	fixture.released.Do(func() { close(fixture.release) })
+	var finalSnapshot HandoverSnapshot
+	select {
+	case result := <-paused:
+		if result.err != nil {
+			t.Fatalf("drain source cohort: %v", result.err)
+		}
+		finalSnapshot = result.snapshot
+	case <-time.After(10 * time.Second):
+		t.Fatal("source did not finish the accepted in-flight cohort")
+	}
+	current, err := source.Get(recording.ID)
+	if err != nil || current.SegmentCount() != 4 || len(current.Gaps) != 0 {
+		t.Fatalf("source cutoff did not commit exactly its accepted cohort without gaps: count=%d gaps=%+v err=%v", current.SegmentCount(), current.Gaps, err)
+	}
+	if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), finalSnapshot, identity); err != nil {
+		t.Fatalf("stage first target continuation after drain: %v", err)
+	}
+	if got := fixture.requestCounts()["target"][5]; got != 1 {
+		t.Fatalf("target did not stage the first canonically missing sequence 5 exactly once: count=%d requests=%v", got, fixture.requestCounts())
+	}
+	newOwner, err := owners.Transfer(owner, handoverGenB, handoverWorkerB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ActivatePreparedHandover(newOwner); err != nil {
+		t.Fatalf("activate target after source drain: %v", err)
+	}
+	if err := source.CompleteHandover(recording.ID, owner); err != nil {
+		t.Fatalf("detach source after owner transfer: %v", err)
+	}
+	waitHandover(t, func() bool {
+		current, err := target.Get(recording.ID)
+		return err == nil && current.SegmentCount() == 10
+	}, "target continues parked coordinates")
+	counts := fixture.requestCounts()
+	for sequence := 1; sequence <= 10; sequence++ {
+		wantEngine := "source"
+		if sequence >= 5 {
+			wantEngine = "target"
+		}
+		if counts[wantEngine][sequence] != 1 {
+			t.Fatalf("sequence %d requests on %s = %d, want exactly one; all=%v", sequence, wantEngine, counts[wantEngine][sequence], counts)
+		}
+		otherEngine := "source"
+		if wantEngine == "source" {
+			otherEngine = "target"
+		}
+		if counts[otherEngine][sequence] != 0 {
+			t.Fatalf("sequence %d was fetched by both generations: source=%d target=%d all=%v", sequence, counts["source"][sequence], counts["target"][sequence], counts)
+		}
+	}
+	final, err := target.Get(recording.ID)
+	if err != nil || final.SegmentCount() != 10 || len(final.Gaps) != 0 {
+		t.Fatalf("target continuation archive is incomplete: count=%d gaps=%+v err=%v", final.SegmentCount(), final.Gaps, err)
+	}
+	if _, err := target.Stop(recording.ID); err != nil {
+		t.Fatalf("stop continued target recording: %v", err)
+	}
 }
 
 func TestHandoverWaitsForCanonicalCommitBarrier(t *testing.T) {
@@ -905,7 +1190,7 @@ func TestHandoverWaitsForCanonicalCommitBarrier(t *testing.T) {
 		}
 	})
 	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
-	if err := target.PrepareHandoverTarget(context.Background(), snapshot, identity); err != nil {
+	if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), snapshot, identity); err != nil {
 		t.Fatalf("prepare target after canonical commit: %v", err)
 	}
 	newOwner, err := owners.Transfer(oldOwner, handoverGenB, handoverWorkerB)
@@ -1352,7 +1637,7 @@ func TestHandoverPrepareFetchesFirstUncommittedMediaWithoutMutation(t *testing.T
 	before := recordingRootBytes(t, store, recording.ID)
 	segmentRequests := fixture.segmentRequests.Load()
 	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
-	if err := target.PrepareHandoverTarget(context.Background(), snapshot, identity); err != nil {
+	if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), snapshot, identity); err != nil {
 		t.Fatalf("matching live tail plus next media preflight: %v", err)
 	}
 	if !bytes.Equal(before, recordingRootBytes(t, store, recording.ID)) {
@@ -1398,8 +1683,12 @@ func TestHandoverLiveTailRequiresDrainAndStagesNextCandidate(t *testing.T) {
 	target := newHandoverManager(t, store, owners, fixture, true)
 	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
 	beforeRoot := recordingRootBytes(t, store, recording.ID)
+	segmentRequestsBefore := fixture.segmentRequests.Load()
 	if err := target.PrepareHandoverTarget(context.Background(), snapshot, identity); !errors.Is(err, ErrHandoverSourceBoundaryRequired) {
 		t.Fatalf("live tail preflight = %v, want source-boundary retry", err)
+	}
+	if got := fixture.segmentRequests.Load(); got != segmentRequestsBefore {
+		t.Fatalf("pre-cutoff target probe fetched media payload: before=%d after=%d", segmentRequestsBefore, got)
 	}
 	if target.ingest.Snapshot().BufferUsedBytes != 0 {
 		t.Fatal("live-tail retry reserved candidate memory")
@@ -1591,7 +1880,7 @@ func TestHandoverPreflightRefreshAndCandidateFailuresReleaseReservations(t *test
 			test.mutate(fixture)
 			target := newHandoverManager(t, store, owners, fixture, true)
 			before := recordingRootBytes(t, store, recording.ID)
-			if err := target.PrepareHandoverTarget(context.Background(), snapshot, HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}); !errors.Is(err, ErrHandoverUnavailable) {
+			if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), snapshot, HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}); !errors.Is(err, ErrHandoverUnavailable) {
 				t.Fatalf("candidate preflight failure = %v, want unavailable", err)
 			}
 			if got := target.ingest.Snapshot().BufferUsedBytes; got != 0 {
@@ -1730,7 +2019,7 @@ func TestHandoverPrepareValidatesMediaURLs(t *testing.T) {
 	}
 }
 
-func TestHandoverPrepareProbesMasterVariantAndStagesCandidate(t *testing.T) {
+func TestHandoverPrepareProbesMasterVariantWithoutMediaThenStagesAfterDrain(t *testing.T) {
 	fixture := &handoverFixture{max: 1, metadata: "title"}
 	store, owners, source, owner, recording, snapshot := pausedHandoverRecording(t, fixture, "https://fixture.invalid/master.m3u8", 1)
 	defer func() {
@@ -1742,14 +2031,14 @@ func TestHandoverPrepareProbesMasterVariantAndStagesCandidate(t *testing.T) {
 	requestsBefore := fixture.requests.Load()
 	segmentRequests := fixture.segmentRequests.Load()
 	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
-	if err := target.PrepareHandoverTarget(context.Background(), snapshot, identity); err != nil {
+	if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), snapshot, identity); err != nil {
 		t.Fatalf("master/variant continuation probe: %v", err)
 	}
 	if got := fixture.requests.Load() - requestsBefore; got < 2 {
 		t.Fatalf("master playlist requests added=%d, want master and selected media playlist", got)
 	}
 	if got := fixture.segmentRequests.Load() - segmentRequests; got != 1 {
-		t.Fatalf("candidate media fetches=%d, want exactly one", got)
+		t.Fatalf("post-drain candidate media fetches=%d, want exactly one", got)
 	}
 	if !bytes.Equal(before, recordingRootBytes(t, store, recording.ID)) {
 		t.Fatal("master/variant continuation probe mutated the canonical root")
@@ -1897,7 +2186,7 @@ func TestHandoverTargetAdoptsAfterTransferWithoutRootRewriteAndContinuesOrdinal(
 	// already committed source window.
 	setHandoverFixtureMax(fixture, 4)
 	segmentRequestsBeforePrepare := fixture.segmentRequests.Load()
-	if err = target.PrepareHandoverTarget(context.Background(), snapshot, identity); err != nil {
+	if err = target.PrepareHandoverTargetAfterSourceDrain(context.Background(), snapshot, identity); err != nil {
 		t.Fatal(err)
 	}
 	segmentRequestsAfterPrepare := fixture.segmentRequests.Load()
@@ -2010,7 +2299,7 @@ func TestShardedHandoverPreflightSkipsCommittedPlaylistPrefixOutsideLiveTail(t *
 	target := newHandoverManager(t, store, owners, fixture, true)
 	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
 	setHandoverFixtureMax(fixture, 14)
-	if err := target.PrepareHandoverTarget(context.Background(), snapshot, identity); err != nil {
+	if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), snapshot, identity); err != nil {
 		t.Fatalf("prepare V2 target from a playlist retaining its committed prefix: %v", err)
 	}
 	target.mu.RLock()
@@ -2024,6 +2313,53 @@ func TestShardedHandoverPreflightSkipsCommittedPlaylistPrefixOutsideLiveTail(t *
 	}
 	if got := fixture.segmentRequests.Load(); got != 14 {
 		t.Fatalf("target candidate fetch count=%d, want exactly one fetch beyond the 13 committed objects", got)
+	}
+}
+
+func TestShardedHandoverContinuesAtFirstCanonicalMissingCoordinateBelowObservedHighWater(t *testing.T) {
+	fixture := &handoverFixture{max: 1, metadata: "before"}
+	store, owners, source, owner, recording, snapshot := pausedHandoverRecording(t, fixture, "https://fixture.invalid/live.m3u8", 1)
+	defer func() { resumeAndStopHandoverSource(t, source, owner, snapshot) }()
+
+	e, ok := source.entry(recording.ID)
+	if !ok {
+		t.Fatal("source entry disappeared")
+	}
+	if err := source.update(e, func(root *domain.Recording) error {
+		track := root.Tracks["main"]
+		track.HasLastObservedSequence = true
+		track.LastObservedSequence = 10
+		for sequence := uint64(2); sequence <= 10; sequence++ {
+			track.PendingSegments = append(track.PendingSegments, domain.PendingSequence{
+				SourceEpoch: 0, DiscontinuitySequence: 0, Sequence: sequence,
+				LivePresentationOrdinal: sequence, Duration: 1,
+			})
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("persist observed-but-uncommitted projection: %v", err)
+	}
+	snapshot, err := source.HandoverSnapshot(recording.ID)
+	if err != nil {
+		t.Fatalf("refresh paused handover snapshot: %v", err)
+	}
+	setHandoverFixtureMax(fixture, 10)
+	target := newHandoverManager(t, store, owners, fixture, true)
+	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
+	if err := target.PrepareHandoverTargetAfterSourceDrain(context.Background(), snapshot, identity); err != nil {
+		t.Fatalf("prepare V2 target from canonical missing coordinate: %v", err)
+	}
+	target.mu.RLock()
+	prepared := target.prepared[recording.ID]
+	target.mu.RUnlock()
+	if prepared.continuation == nil || prepared.continuation.source.Sequence != 2 {
+		t.Fatalf("target skipped observed-but-uncommitted coordinates: prepared=%+v", prepared.continuation)
+	}
+	if prepared.continuation.ordinal != 2 {
+		t.Fatalf("target archive ordinal=%d, want first canonical continuation ordinal 2", prepared.continuation.ordinal)
+	}
+	if got := fixture.segmentRequests.Load(); got != 2 {
+		t.Fatalf("source payload fetches=%d, want source sequence 1 and one target fetch for sequence 2", got)
 	}
 }
 

@@ -42,6 +42,7 @@ const (
 	segmentTaskRetryWait
 	segmentTaskAwaitManifest
 	segmentTaskGapCommitting
+	segmentTaskHandoverParked
 )
 
 type segmentTask struct {
@@ -58,8 +59,10 @@ type segmentTask struct {
 	coordinatorRetryPending bool
 	refreshCycles           int
 	state                   segmentTaskState
+	handoverParkedState     segmentTaskState
 	timerToken              uint64
 	retryCancel             context.CancelFunc
+	refreshCancel           context.CancelFunc
 	preloaded               bool
 	stagedInitPayload       *storage.IngestPayload
 	stagedMediaPayload      *storage.IngestPayload
@@ -226,6 +229,7 @@ type segmentScheduler struct {
 	busy                     int
 	closed                   bool
 	liveAdmissionClosed      bool
+	handoverCutoff           bool
 	fatal                    error
 	pendingSnapshots         int
 	pendingMetadata          int
@@ -354,6 +358,104 @@ func (s *segmentScheduler) closeLiveAdmission() {
 	s.mu.Unlock()
 }
 
+// beginHandoverCutoff defines the source Engine's exact dispatch boundary.
+// Worker claims and this transition both hold s.mu: a task is either already
+// worker-owned and may finish, or it remains unstarted and is parked for the
+// target. No source-body attempt can begin after this method returns.
+func (s *segmentScheduler) beginHandoverCutoff() {
+	s.mu.Lock()
+	if s.closed || s.handoverCutoff {
+		s.mu.Unlock()
+		return
+	}
+	s.handoverCutoff = true
+	s.liveAdmissionClosed = true
+	s.ready = nil
+	for _, task := range s.tasks {
+		if handoverDrainCohort(task) {
+			continue
+		}
+		task.handoverParkedState = task.state
+		task.state = segmentTaskHandoverParked
+		task.awaitingManifest = false
+		task.timerToken++
+		if task.retryCancel != nil {
+			task.retryCancel()
+			task.retryCancel = nil
+		}
+		if task.refreshCancel != nil {
+			task.refreshCancel()
+			task.refreshCancel = nil
+		}
+		task.workerID = ""
+		task.actorID = ""
+	}
+	s.signalLocked()
+	s.mu.Unlock()
+}
+
+func handoverDrainCohort(task *segmentTask) bool {
+	if task == nil {
+		return false
+	}
+	if task.bufferedPayload != nil || task.stagedMediaPayload != nil || task.stagedInitPayload != nil || task.bufferedInit != nil {
+		return true
+	}
+	switch task.state {
+	case segmentTaskInFlight, segmentTaskBuffered, segmentTaskPersisting, segmentTaskGapCommitting:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *segmentScheduler) handoverCutoffRequested() bool {
+	s.mu.Lock()
+	cutoff := s.handoverCutoff
+	s.mu.Unlock()
+	return cutoff
+}
+
+// beginHandoverSourceAdmission serializes a source-control request (refresh or
+// manifest request) against the cutoff. A request that wins this lock is
+// considered already admitted; a cutoff that wins prevents it from starting.
+func (s *segmentScheduler) beginHandoverSourceAdmission() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.closed && !s.handoverCutoff && !s.liveAdmissionClosed && s.ctx.Err() == nil
+}
+
+func (s *segmentScheduler) resumeAfterHandoverAbort() {
+	s.mu.Lock()
+	if s.closed || !s.handoverCutoff {
+		s.mu.Unlock()
+		return
+	}
+	s.handoverCutoff = false
+	s.liveAdmissionClosed = false
+	for _, task := range s.tasks {
+		if task.state != segmentTaskHandoverParked {
+			continue
+		}
+		parkedState := task.handoverParkedState
+		wasAwaitingManifest := parkedState == segmentTaskAwaitManifest
+		task.state = parkedState
+		task.handoverParkedState = segmentTaskQueued
+		if (task.state == segmentTaskRetryWait && task.retryCancel == nil) || parkedState == segmentTaskRefreshing {
+			task.state = segmentTaskQueued
+		}
+		if task.state == segmentTaskQueued {
+			s.ready = append(s.ready, task)
+		} else if wasAwaitingManifest {
+			s.wakeManifestPoll()
+		}
+	}
+	sort.Slice(s.ready, func(i, j int) bool { return s.ready[i].ordinal < s.ready[j].ordinal })
+	s.growIfSaturatedLocked()
+	s.signalLocked()
+	s.mu.Unlock()
+}
+
 func (s *segmentScheduler) discover(ctx context.Context, epoch uint64, playlist hls.MediaPlaylist) error {
 	_, generation := currentMediaVersion(s.e)
 	_, err := s.discoverAtGeneration(ctx, epoch, playlist, generation)
@@ -371,9 +473,9 @@ func (s *segmentScheduler) discoverAtGeneration(ctx context.Context, epoch uint6
 		key := segmentTaskKey{epoch: epoch, discontinuitySequence: source.DiscontinuitySequence, sequence: source.Sequence}
 		for {
 			s.mu.Lock()
-			if s.closed {
+			if s.closed || s.handoverCutoff {
 				s.mu.Unlock()
-				return false, errors.New("segment scheduler is closed")
+				return false, nil
 			}
 			if !s.manifestGenerationCurrentLocked(generation) {
 				s.mu.Unlock()
@@ -756,6 +858,10 @@ func (s *segmentScheduler) observeAtGeneration(epoch uint64, playlist hls.MediaP
 	}
 	var expired []*segmentTask
 	s.mu.Lock()
+	if s.handoverCutoff {
+		s.mu.Unlock()
+		return nil
+	}
 	if !s.manifestGenerationCurrentLocked(generation) {
 		s.mu.Unlock()
 		return nil
@@ -914,6 +1020,10 @@ func activeScheduler(e *entry) *segmentScheduler {
 
 func (s *segmentScheduler) endList(generation uint64) bool {
 	s.mu.Lock()
+	if s.handoverCutoff {
+		s.mu.Unlock()
+		return false
+	}
 	if !s.manifestGenerationCurrentLocked(generation) {
 		s.mu.Unlock()
 		return false
@@ -974,7 +1084,16 @@ func (s *segmentScheduler) workerWithID(burst bool, workerID string, workerSlot 
 	defer s.wg.Done()
 	for {
 		s.mu.Lock()
-		for len(s.ready) == 0 && !s.closed && s.ctx.Err() == nil {
+		if s.handoverCutoff {
+			s.workers--
+			if workerSlot > 0 {
+				delete(s.liveWorkerSlots, workerSlot)
+			}
+			s.signalLocked()
+			s.mu.Unlock()
+			return
+		}
+		for len(s.ready) == 0 && !s.closed && !s.handoverCutoff && s.ctx.Err() == nil {
 			if burst {
 				s.workers--
 				if workerSlot > 0 {
@@ -992,7 +1111,7 @@ func (s *segmentScheduler) workerWithID(burst bool, workerID string, workerSlot 
 			}
 			s.mu.Lock()
 		}
-		if s.closed || s.ctx.Err() != nil {
+		if s.closed || s.handoverCutoff || s.ctx.Err() != nil {
 			s.workers--
 			if workerSlot > 0 {
 				delete(s.liveWorkerSlots, workerSlot)
@@ -1001,22 +1120,11 @@ func (s *segmentScheduler) workerWithID(burst bool, workerID string, workerSlot 
 			s.mu.Unlock()
 			return
 		}
-		task := s.ready[0]
-		s.ready[0] = nil
-		s.ready = s.ready[1:]
-		if task.state != segmentTaskQueued || s.tasks[task.key] != task {
+		task := s.claimReadyTaskLocked(workerID)
+		if task == nil {
 			s.mu.Unlock()
 			continue
 		}
-		task.state = segmentTaskInFlight
-		task.workerID = workerID
-		s.nextWorkerActorID++
-		task.actorID = fmt.Sprintf("local:live:%s:%d", workerID, s.nextWorkerActorID)
-		task.lastAttemptStartedAt = time.Now().UTC()
-		task.coordinatorRetryPending = false
-		s.busy++
-		s.growIfSaturatedLocked()
-		s.signalLocked()
 		s.mu.Unlock()
 
 		err := s.acquire(task)
@@ -1039,6 +1147,28 @@ func (s *segmentScheduler) workerWithID(burst bool, workerID string, workerSlot 
 			s.mu.Unlock()
 			continue
 		}
+		if s.handoverCutoff {
+			switch {
+			case errors.Is(err, errPersistQueued), errors.Is(err, errPayloadBuffered):
+				// These states own complete bytes or an admitted canonical callback;
+				// the handover drain waits for their durable boundary.
+			case errors.Is(err, errStorageCommit):
+				s.signalLocked()
+				s.mu.Unlock()
+				s.failStorage("segment acquisition commit", err)
+				continue
+			case err == nil:
+				delete(s.tasks, task.key)
+			default:
+				// A failed or refresh-wait attempt has finished, but cutoff forbids
+				// retry/gap publication on the source. The target resumes this
+				// coordinate from canonical state after owner transfer.
+				parkTaskForHandoverLocked(task)
+			}
+			s.signalLocked()
+			s.mu.Unlock()
+			continue
+		}
 		if errors.Is(err, errPersistQueued) || errors.Is(err, errPayloadBuffered) {
 			task.workerID = ""
 			task.actorID = ""
@@ -1057,6 +1187,12 @@ func (s *segmentScheduler) workerWithID(burst bool, workerID string, workerSlot 
 		if errors.Is(err, errStorageCommit) {
 			s.mu.Unlock()
 			s.failStorage("segment acquisition commit", err)
+			continue
+		}
+		if s.handoverCutoff {
+			parkTaskForHandoverLocked(task)
+			s.signalLocked()
+			s.mu.Unlock()
 			continue
 		}
 		if err == nil {
@@ -1133,6 +1269,30 @@ func (s *segmentScheduler) workerWithID(burst bool, workerID string, workerSlot 
 	}
 }
 
+// claimReadyTaskLocked is the worker side of the cutoff linearization point.
+// Callers hold s.mu while transitioning a queued task to an in-flight attempt.
+func (s *segmentScheduler) claimReadyTaskLocked(workerID string) *segmentTask {
+	if s.closed || s.handoverCutoff || s.ctx.Err() != nil || len(s.ready) == 0 {
+		return nil
+	}
+	task := s.ready[0]
+	s.ready[0] = nil
+	s.ready = s.ready[1:]
+	if task.state != segmentTaskQueued || s.tasks[task.key] != task {
+		return nil
+	}
+	task.state = segmentTaskInFlight
+	task.workerID = workerID
+	s.nextWorkerActorID++
+	task.actorID = fmt.Sprintf("local:live:%s:%d", workerID, s.nextWorkerActorID)
+	task.lastAttemptStartedAt = time.Now().UTC()
+	task.coordinatorRetryPending = false
+	s.busy++
+	s.growIfSaturatedLocked()
+	s.signalLocked()
+	return task
+}
+
 // submitBufferedInOrder is the V2 media publication lane. It submits only the
 // earliest discovered task once its complete source object is buffered. Fetch
 // workers can therefore continue acquiring later segments while canonical
@@ -1147,6 +1307,9 @@ func (s *segmentScheduler) submitBufferedInOrder() {
 		}
 		var first *segmentTask
 		for _, candidate := range s.tasks {
+			if candidate.state == segmentTaskHandoverParked {
+				continue
+			}
 			if first == nil || candidate.ordinal < first.ordinal {
 				first = candidate
 			}
@@ -1230,6 +1393,12 @@ func (s *segmentScheduler) submitBufferedInOrder() {
 func (s *segmentScheduler) awaitManifest(task *segmentTask) {
 	s.mu.Lock()
 	if s.tasks[task.key] != task {
+		s.mu.Unlock()
+		return
+	}
+	if s.handoverCutoff {
+		parkTaskForHandoverLocked(task)
+		s.signalLocked()
 		s.mu.Unlock()
 		return
 	}
@@ -1343,6 +1512,12 @@ func (s *segmentScheduler) retryCoordinatorTask(task *segmentTask) {
 	}
 	s.mu.Lock()
 	if s.closed || s.ctx.Err() != nil || s.tasks[task.key] != task {
+		s.mu.Unlock()
+		return
+	}
+	if s.handoverCutoff && task.bufferedPayload == nil && task.stagedMediaPayload == nil {
+		parkTaskForHandoverLocked(task)
+		s.signalLocked()
 		s.mu.Unlock()
 		return
 	}
@@ -1667,39 +1842,44 @@ func (s *segmentScheduler) handleFetchFailure(task *segmentTask, media adapterpr
 	if refreshCycles >= maxRefreshCycles {
 		return makeSegmentRefreshTrigger(task.key.epoch, task.key.discontinuitySequence, task.key.sequence, err)
 	}
-	if !s.markRefreshing(task) {
+	refreshCtx, refreshCancel, ok := s.markRefreshing(task)
+	if !ok {
 		return errAwaitManifest
 	}
-	_, nextGeneration, refreshErr := s.manager.refreshMediaAtGeneration(s.ctx, s.e, media, generation)
-	if refreshErr != nil {
-		return makeSegmentRefreshTrigger(task.key.epoch, task.key.discontinuitySequence, task.key.sequence, err)
-	}
+	defer refreshCancel()
+	_, nextGeneration, refreshErr := s.manager.refreshMediaAtGeneration(refreshCtx, s.e, media, generation)
 	s.mu.Lock()
 	if s.tasks[task.key] == task {
-		if nextGeneration > task.requiredGeneration {
+		task.refreshCancel = nil
+		if refreshErr == nil && nextGeneration > task.requiredGeneration {
 			task.requiredGeneration = nextGeneration
 		}
-		if nextGeneration > generation {
+		if refreshErr == nil && nextGeneration > generation {
 			task.refreshCycles++
 		}
 	}
 	s.mu.Unlock()
+	if refreshErr != nil {
+		return makeSegmentRefreshTrigger(task.key.epoch, task.key.discontinuitySequence, task.key.sequence, err)
+	}
 	// Resolve a current segment URI from the refreshed playlist before retrying;
 	// awaitManifest wakes the poller only after the task is no longer in its
 	// protected Refreshing state.
 	return errAwaitManifest
 }
 
-func (s *segmentScheduler) markRefreshing(task *segmentTask) bool {
+func (s *segmentScheduler) markRefreshing(task *segmentTask) (context.Context, context.CancelFunc, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.tasks[task.key] != task {
-		return false
+	if s.closed || s.handoverCutoff || s.tasks[task.key] != task {
+		return nil, nil, false
 	}
 	task.state = segmentTaskRefreshing
 	task.awaitingManifest = false
+	refreshCtx, cancel := context.WithCancel(s.ctx)
+	task.refreshCancel = cancel
 	s.signalLocked()
-	return true
+	return refreshCtx, cancel, true
 }
 
 func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource, generation uint64) (string, *initFlight, error) {
@@ -1946,18 +2126,56 @@ func (s *segmentScheduler) drain(ctx context.Context) error {
 	}
 }
 
-// drainForHandover is called only after the manifest worker has stopped
-// admitting manifests. It uses the same task accounting as normal drain; a
-// timeout leaves the scheduler open so the source worker can resume without
-// converting queued work into gaps.
+// drainForHandover is called only after cutoff stopped manifest/task admission.
+// It waits for the in-flight/canonical cohort and already-admitted callbacks;
+// parked unstarted tasks do not prolong the source drain or become gaps. A
+// timeout leaves the scheduler open so the source can resume under its owner.
 func (s *segmentScheduler) drainForHandover(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return errors.New("segment scheduler is closed")
 	}
+	if !s.handoverCutoff {
+		s.mu.Unlock()
+		return errors.New("handover cutoff was not established")
+	}
 	s.mu.Unlock()
-	return s.drain(ctx)
+	for {
+		s.mu.Lock()
+		if s.fatal != nil {
+			err := s.fatal
+			s.mu.Unlock()
+			return err
+		}
+		pending := s.pendingSnapshots != 0 || s.pendingMetadata != 0 || s.busy != 0
+		for _, task := range s.tasks {
+			if handoverDrainCohort(task) {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			s.mu.Unlock()
+			return nil
+		}
+		changed := s.changed
+		drainWaitHook := s.drainWaitHook
+		s.mu.Unlock()
+		if drainWaitHook != nil {
+			drainWaitHook()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ctx.Done():
+			if err := s.failure(); err != nil {
+				return err
+			}
+			return s.ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 // drainEndList drains only while ENDLIST still belongs to this media source
@@ -2007,7 +2225,9 @@ func (s *segmentScheduler) close() error {
 	var staged []*storage.IngestPayload
 	s.mu.Lock()
 	for key, task := range s.tasks {
-		pending = append(pending, key)
+		if task.state != segmentTaskHandoverParked {
+			pending = append(pending, key)
+		}
 		if task.stagedInitPayload != nil {
 			staged = append(staged, task.stagedInitPayload)
 			task.stagedInitPayload = nil
@@ -2043,4 +2263,24 @@ func (s *segmentScheduler) close() error {
 	}
 	s.e.mu.Unlock()
 	return s.failure()
+}
+
+func parkTaskForHandoverLocked(task *segmentTask) {
+	if task == nil || task.state == segmentTaskHandoverParked {
+		return
+	}
+	task.handoverParkedState = task.state
+	task.state = segmentTaskHandoverParked
+	task.awaitingManifest = false
+	task.timerToken++
+	if task.retryCancel != nil {
+		task.retryCancel()
+		task.retryCancel = nil
+	}
+	if task.refreshCancel != nil {
+		task.refreshCancel()
+		task.refreshCancel = nil
+	}
+	task.workerID = ""
+	task.actorID = ""
 }

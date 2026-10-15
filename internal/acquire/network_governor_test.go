@@ -2,6 +2,7 @@ package acquire
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -167,6 +168,56 @@ func TestHistoricalHTTPAdmissionLetsLiveProceedAndPausesNewHistory(t *testing.T)
 	}
 	if got := <-arrivals; got != "/history-2" {
 		t.Fatalf("resumed arrival=%q", got)
+	}
+}
+
+func TestHistoricalRequestWaitingForGlobalSlotIsRejectedAfterHandoverCutoff(t *testing.T) {
+	arrivals := make(chan string, 1)
+	base := testRoundTripper(func(request *http.Request) (*http.Response, error) {
+		arrivals <- request.URL.Path
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("body")), Request: request}, nil
+	})
+	governor := newHistoricalFetchGovernor(nil)
+	first, err := governor.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := governor.acquire(context.Background())
+	if err != nil {
+		first()
+		t.Fatal(err)
+	}
+	defer second()
+	transport := historicalPriorityRoundTripper{base: base, governor: governor}
+	e := &entry{}
+	ctx := withHistoricalSourceAdmission(withHistoricalAcquisitionPriority(context.Background()), e)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://media.example/queued-history", nil)
+	if err != nil {
+		first()
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, roundTripErr := transport.RoundTrip(request)
+		result <- roundTripErr
+	}()
+	time.Sleep(25 * time.Millisecond)
+	e.mu.Lock()
+	e.handover = &handoverOperation{state: handoverRequested}
+	e.mu.Unlock()
+	first()
+	select {
+	case roundTripErr := <-result:
+		if !errors.Is(roundTripErr, errHistoricalHandoverAdmissionClosed) {
+			t.Fatalf("queued historical request error=%v, want cutoff rejection", roundTripErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued historical request did not leave the governor")
+	}
+	select {
+	case path := <-arrivals:
+		t.Fatalf("historical request crossed cutoff after waiting for a slot: %s", path)
+	default:
 	}
 }
 

@@ -43,6 +43,8 @@ const (
 	OperationDeleteTerminal                = "delete_terminal_archive"
 	OperationInventory                     = "inventory"
 	OperationHandoverSnapshot              = "handover_snapshot"
+	OperationHandoverCutoff                = "handover_cutoff"
+	OperationHandoverCancelCutoff          = "handover_cancel_cutoff"
 	OperationHandoverPause                 = "handover_pause"
 	OperationHandoverResume                = "handover_resume"
 	OperationHandoverComplete              = "handover_complete"
@@ -621,6 +623,30 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 			return nil, publicError("handover_rejected", "recording continuation snapshot is invalid")
 		}
 		return HandoverSnapshotResult{RecordingID: request.RecordingID, GenerationID: e.generation, InstanceID: e.instance, Snapshot: snapshot}, nil
+	case OperationHandoverCutoff:
+		var request HandoverOwnerRequest
+		if err := decodePayload(payload, &request); err != nil || !e.validOwnerForThisEngine(request.RecordingID, request.Owner) {
+			return nil, publicError("invalid_request", "recording ownership identity is invalid")
+		}
+		if !e.hasCurrentOwner(request.Owner) {
+			return nil, publicError("stale_owner", "recording ownership changed")
+		}
+		if err := e.manager.RequestHandoverCutoff(ctx, request.RecordingID, request.Owner); err != nil {
+			return nil, handoverPublicError(err)
+		}
+		return handoverAck(request.RecordingID, e, &request.Owner), nil
+	case OperationHandoverCancelCutoff:
+		var request HandoverOwnerRequest
+		if err := decodePayload(payload, &request); err != nil || !e.validOwnerForThisEngine(request.RecordingID, request.Owner) {
+			return nil, publicError("invalid_request", "recording ownership identity is invalid")
+		}
+		if !e.hasCurrentOwner(request.Owner) {
+			return nil, publicError("stale_owner", "recording ownership changed")
+		}
+		if err := e.manager.CancelHandoverCutoff(ctx, request.RecordingID, request.Owner); err != nil {
+			return nil, handoverPublicError(err)
+		}
+		return handoverAck(request.RecordingID, e, &request.Owner), nil
 	case OperationHandoverPause:
 		var request HandoverOwnerRequest
 		if err := decodePayload(payload, &request); err != nil || !e.validOwnerForThisEngine(request.RecordingID, request.Owner) {

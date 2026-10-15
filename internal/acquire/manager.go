@@ -96,6 +96,8 @@ type entry struct {
 	// Callers always acquire it before mu, and never hold mu across storage I/O.
 	persistMu       sync.Mutex
 	mu              sync.Mutex
+	observerMu      sync.Mutex
+	observerCutoff  bool
 	recording       *domain.Recording
 	deleted         bool
 	cancel          context.CancelFunc
@@ -103,6 +105,7 @@ type entry struct {
 	stopRequested   chan struct{}
 	stopOnce        sync.Once
 	manifestCancel  context.CancelFunc
+	observerCancel  context.CancelFunc
 	media           adapterproto.MediaSource
 	mediaGeneration uint64
 	livePlayback    *livePlaybackProjection
@@ -551,6 +554,7 @@ const (
 
 type handoverOperation struct {
 	ctx              context.Context
+	cancel           context.CancelFunc
 	expected         OwnershipToken
 	state            handoverOperationState
 	snapshot         HandoverSnapshot
@@ -594,6 +598,10 @@ const maxHandoverSnapshotBytes = 1 << 20
 // caller's larger orchestration deadline.
 const handoverProbeTimeout = 15 * time.Second
 
+// handoverCutoffTimeout bounds an orphaned cutoff if the Host loses the
+// corresponding migration attempt before it can explicitly resume the source.
+const handoverCutoffTimeout = 2 * time.Minute
+
 func (m *Manager) HandoverSnapshot(id string) (HandoverSnapshot, error) {
 	e, ok := m.entry(id)
 	if !ok {
@@ -608,9 +616,142 @@ func (m *Manager) HandoverSnapshot(id string) (HandoverSnapshot, error) {
 	return makeHandoverSnapshot(id, *e.ownership, e.adapterID, e.media, e.resource)
 }
 
-// PauseForHandover parks an owned Recording only after its current manifest
-// boundary and all accepted canonical writes have drained. A timeout aborts
-// the pause request and leaves the source worker running under its old token.
+// RequestHandoverCutoff closes source admission promptly without waiting for
+// the already-started source cohort to drain. The Host can issue this to every
+// eligible Recording before it starts bounded migration work.
+func (m *Manager) RequestHandoverCutoff(ctx context.Context, id string, expected OwnershipToken) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	e, ok := m.entry(id)
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if err := acquireHandoverGate(ctx, e); err != nil {
+		return err
+	}
+	defer releaseHandoverGate(e)
+	_, err := m.requestHandoverCutoff(e, id, expected)
+	return err
+}
+
+// CancelHandoverCutoff releases a source admission cutoff when Host-side
+// preflight fails before ownership transfer. It is idempotent for a source
+// that has not yet begun its worker-boundary pause.
+func (m *Manager) CancelHandoverCutoff(ctx context.Context, id string, expected OwnershipToken) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	e, ok := m.entry(id)
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if err := acquireHandoverGate(ctx, e); err != nil {
+		return err
+	}
+	defer releaseHandoverGate(e)
+	e.mu.Lock()
+	op := e.handover
+	if op == nil {
+		e.mu.Unlock()
+		return nil
+	}
+	if !sameOwner(&op.expected, expected) {
+		e.mu.Unlock()
+		return ErrHandoverOwnerMismatch
+	}
+	e.mu.Unlock()
+	m.abortOrResumeTimedOutPause(e, op)
+	return nil
+}
+
+func (m *Manager) requestHandoverCutoff(e *entry, id string, expected OwnershipToken) (*handoverOperation, error) {
+	e.mu.Lock()
+	if !sameOwner(e.ownership, expected) || e.recording == nil || e.recording.State != domain.StateRecording || e.cancel == nil || e.handoverWake == nil {
+		e.mu.Unlock()
+		return nil, ErrHandoverOwnerMismatch
+	}
+	if op := e.handover; op != nil {
+		if !sameOwner(&op.expected, expected) || op.state == handoverResuming || op.state == handoverCompleted || op.state == handoverAborted {
+			e.mu.Unlock()
+			return nil, ErrHandoverConflict
+		}
+		if op.state == handoverPaused {
+			e.mu.Unlock()
+			return op, nil
+		}
+		scheduler := e.scheduler
+		e.mu.Unlock()
+		if scheduler == nil {
+			return nil, ErrHandoverUnavailable
+		}
+		establishHandoverCutoff(e, scheduler)
+		return op, nil
+	}
+	opCtx, cancel := context.WithTimeout(context.Background(), handoverCutoffTimeout)
+	op := &handoverOperation{
+		ctx: opCtx, cancel: cancel, expected: expected, state: handoverRequested,
+		paused: make(chan struct{}), resumed: make(chan struct{}),
+		resume: make(chan struct{}), complete: make(chan struct{}),
+	}
+	e.handover = op
+	scheduler := e.scheduler
+	e.mu.Unlock()
+	if scheduler == nil {
+		cancel()
+		e.mu.Lock()
+		if e.handover == op {
+			e.handover = nil
+		}
+		e.mu.Unlock()
+		return nil, ErrHandoverUnavailable
+	}
+	establishHandoverCutoff(e, scheduler)
+	return op, nil
+}
+
+func establishHandoverCutoff(e *entry, scheduler *segmentScheduler) {
+	// The scheduler lock acquisition is the cutoff linearization point shared
+	// with worker task claims. Once set, only the separately tracked manifest
+	// and source observers are canceled; segment response bodies are untouched.
+	scheduler.beginHandoverCutoff()
+	e.closeObserverCommitAdmission()
+	e.mu.Lock()
+	manifestCancel, observerCancel := e.manifestCancel, e.observerCancel
+	e.mu.Unlock()
+	if manifestCancel != nil {
+		manifestCancel()
+	}
+	if observerCancel != nil {
+		observerCancel()
+	}
+	signalHandover(e)
+}
+
+// Observer canonical callbacks use this small admission gate so a callback
+// that began before cutoff can finish its durable write while a later batch or
+// metadata observation cannot advance state on the old Engine.
+func (e *entry) beginObserverCanonicalCommit() bool {
+	e.observerMu.Lock()
+	defer e.observerMu.Unlock()
+	return !e.observerCutoff
+}
+
+func (e *entry) closeObserverCommitAdmission() {
+	e.observerMu.Lock()
+	e.observerCutoff = true
+	e.observerMu.Unlock()
+}
+
+func (e *entry) openObserverCommitAdmission() {
+	e.observerMu.Lock()
+	e.observerCutoff = false
+	e.observerMu.Unlock()
+}
+
+// PauseForHandover waits for the already-requested source cutoff cohort and
+// admitted canonical callbacks to drain. A timeout aborts the pause and
+// resumes the source under its old token.
 func (m *Manager) PauseForHandover(ctx context.Context, id string, expected OwnershipToken) (HandoverSnapshot, error) {
 	if ctx == nil {
 		return HandoverSnapshot{}, context.Canceled
@@ -629,22 +770,17 @@ func (m *Manager) PauseForHandover(ctx context.Context, id string, expected Owne
 		e.mu.Unlock()
 		return HandoverSnapshot{}, ErrHandoverOwnerMismatch
 	}
-	if e.handover != nil {
-		if sameOwner(&e.handover.expected, expected) && e.handover.state == handoverPaused {
-			snapshot := cloneHandoverSnapshot(e.handover.snapshot)
-			e.mu.Unlock()
-			return snapshot, nil
-		}
+	e.mu.Unlock()
+	op, err := m.requestHandoverCutoff(e, id, expected)
+	if err != nil {
+		return HandoverSnapshot{}, err
+	}
+	e.mu.Lock()
+	if op.state == handoverPaused {
+		snapshot := cloneHandoverSnapshot(op.snapshot)
 		e.mu.Unlock()
-		return HandoverSnapshot{}, ErrHandoverConflict
+		return snapshot, nil
 	}
-	op := &handoverOperation{
-		ctx: ctx, expected: expected, state: handoverRequested,
-		paused: make(chan struct{}), resumed: make(chan struct{}),
-		resume: make(chan struct{}), complete: make(chan struct{}),
-	}
-	e.handover = op
-	signalHandover(e)
 	e.mu.Unlock()
 
 	select {
@@ -659,6 +795,9 @@ func (m *Manager) PauseForHandover(ctx context.Context, id string, expected Owne
 		return HandoverSnapshot{}, ErrHandoverUnavailable
 	case <-e.done:
 		return HandoverSnapshot{}, ErrHandoverUnavailable
+	case <-op.ctx.Done():
+		m.abortOrResumeTimedOutPause(e, op)
+		return HandoverSnapshot{}, op.ctx.Err()
 	case <-ctx.Done():
 		m.abortOrResumeTimedOutPause(e, op)
 		return HandoverSnapshot{}, ctx.Err()
@@ -674,6 +813,9 @@ func (m *Manager) abortOrResumeTimedOutPause(e *entry, op *handoverOperation) {
 	if op.state == handoverPaused {
 		op.state = handoverResuming
 		e.handover = nil
+		if op.cancel != nil {
+			op.cancel()
+		}
 		op.resumeOnce.Do(func() { close(op.resume) })
 		resumed := op.resumed
 		e.mu.Unlock()
@@ -681,11 +823,15 @@ func (m *Manager) abortOrResumeTimedOutPause(e *entry, op *handoverOperation) {
 		m.releaseHandoverRecoveryGate(e, op)
 		return
 	}
-	// The worker's drain is using op.ctx and will unwind as soon as the
-	// caller's context is canceled. Leave the operation installed until the
-	// worker observes that cancellation and republishes its normal poll loop.
+	// The worker's bounded cohort drain observes op.ctx and resumes the source
+	// scheduler before publishing the normal poll loop.
+	if op.cancel != nil {
+		op.cancel()
+	}
+	resumed := op.resumed
 	e.mu.Unlock()
 	signalHandover(e)
+	<-resumed
 }
 
 // ResumeHandover restarts a parked source under the current Host owner token.
@@ -723,6 +869,9 @@ func (m *Manager) ResumeHandover(id string, newOwner OwnershipToken, snapshot Ha
 	e.media = cloneMediaSource(snapshot.Media)
 	e.resource = cloneResourceRef(snapshot.Resource)
 	op.state = handoverResuming
+	if op.cancel != nil {
+		op.cancel()
+	}
 	op.resumeOnce.Do(func() { close(op.resume) })
 	e.mu.Unlock()
 	<-op.resumed
@@ -769,6 +918,9 @@ func (m *Manager) CompleteHandover(id string, expectedOld OwnershipToken) error 
 		return ErrHandoverConflict
 	}
 	op.state = handoverCompleted
+	if op.cancel != nil {
+		op.cancel()
+	}
 	op.completeOnce.Do(func() { close(op.complete) })
 	e.mu.Unlock()
 	<-e.done
@@ -776,17 +928,16 @@ func (m *Manager) CompleteHandover(id string, expectedOld OwnershipToken) error 
 	return nil
 }
 
-// PrepareHandoverTarget makes a read-only target candidate and proves that a
-// fresh manifest contains a source segment the canonical recording can
-// continue from. It never creates or mutates the canonical archive and never
-// starts acquisition.
+// PrepareHandoverTarget performs a read-only manifest readiness probe. Before
+// source drain it never fetches init/media payloads or stages a continuation.
 func (m *Manager) PrepareHandoverTarget(ctx context.Context, snapshot HandoverSnapshot, target HandoverTargetIdentity) error {
 	return m.PrepareHandoverTargetWithSourceState(ctx, snapshot, target, false)
 }
 
-// PrepareHandoverTargetAfterSourceDrain allows refresh only after the trusted
-// Runtime Host has paused and drained the source Engine. The candidate remains
-// read-only and is staged in bounded ingest memory until ownership transfers.
+// PrepareHandoverTargetAfterSourceDrain allows target refresh and next-payload
+// staging only after the trusted Runtime Host has paused and drained the
+// source Engine. The candidate remains read-only and is held in bounded ingest
+// memory until ownership transfers.
 func (m *Manager) PrepareHandoverTargetAfterSourceDrain(ctx context.Context, snapshot HandoverSnapshot, target HandoverTargetIdentity) error {
 	return m.PrepareHandoverTargetWithSourceState(ctx, snapshot, target, true)
 }
@@ -844,12 +995,11 @@ func (m *Manager) PrepareHandoverTargetWithSourceState(ctx context.Context, snap
 		}
 	}
 	if preparedExists {
-		if sameHandoverSnapshot(existing.snapshot, validated) && existing.rootFingerprint == rootFingerprint {
+		if sameHandoverSnapshot(existing.snapshot, validated) && existing.rootFingerprint == rootFingerprint && existing.continuation != nil && existing.continuation.mediaPayload != nil {
 			return nil
 		}
-		// Source recording may continue between target preparation and source
-		// drain. Discard stale staged bytes before preparing against a newer
-		// canonical tail; never retain reservations from a replaced attempt.
+		// Discard stale manifest-only preparation or staged bytes before
+		// preparing against the final canonical boundary.
 		m.mu.Lock()
 		if current, exists := m.prepared[validated.RecordingID]; exists && !current.active {
 			delete(m.prepared, validated.RecordingID)
@@ -919,7 +1069,7 @@ func (m *Manager) PrepareHandoverTargetWithSourceState(ctx context.Context, snap
 }
 
 // probeHandoverContinuation proves read-only continuation readiness against a
-// fresh playlist and the next actual, uncommitted media payload. Adapter v1
+// fresh playlist and, after source drain, the next actual uncommitted payload. Adapter v1
 // does not retain the original resolve input/workflow answers in a recording,
 // so continuation uses the current ResourceRef/MediaSource refresh contract;
 // it must not fabricate a resolve/continue request.
@@ -974,6 +1124,11 @@ func (m *Manager) probeHandoverContinuation(ctx context.Context, snapshot Handov
 		if err = m.validate(ctx, source.URI); err != nil {
 			return adapterproto.MediaSource{}, nil, nil, ErrHandoverUnavailable
 		}
+		if !sourceDrained {
+			// A pre-cutoff readiness probe may inspect the manifest, but only the
+			// source-drained phase may fetch an actual media/init body.
+			return media, refreshCommit, nil, nil
+		}
 		candidate, fetchErr := m.stageHandoverCandidate(ctx, probeEntry, recording, source, epoch, media, rootFingerprint)
 		if fetchErr != nil {
 			releaseHandoverContinuation(candidate)
@@ -995,15 +1150,19 @@ func (m *Manager) probeHandoverContinuation(ctx context.Context, snapshot Handov
 }
 
 // findHandoverCandidateForArchive preserves the v1 in-memory lookup and uses
-// V2's bounded source high-water plus coordinate index for sharded recordings.
+// V2's canonical coordinate index for sharded recordings.
 // A V2 handover snapshot contains only the live tail; the source playlist may
 // retain a much longer prefix. Treating media outside that tail as absent
 // would stage an already committed object and make activation fail after the
 // Host has transferred the owner token.
 func (m *Manager) findHandoverCandidateForArchive(ctx context.Context, recording *domain.Recording, playlist hls.MediaPlaylist) (uint64, hls.MediaSegment, bool, error) {
-	epoch, candidate, ok := findHandoverCandidate(recording, playlist)
-	if !ok || !isShardedRecording(recording) {
+	if !isShardedRecording(recording) {
+		epoch, candidate, ok := findHandoverCandidate(recording, playlist)
 		return epoch, candidate, ok, nil
+	}
+	epoch, epochErr := handoverSourceEpoch(recording, playlist)
+	if epochErr != nil {
+		return 0, hls.MediaSegment{}, false, epochErr
 	}
 	track := recording.Tracks["main"]
 	if track == nil {
@@ -1013,13 +1172,9 @@ func (m *Manager) findHandoverCandidateForArchive(ctx context.Context, recording
 		if source.Gap || gapCoversCoordinate(recording, "main", epoch, source.DiscontinuitySequence, source.Sequence) {
 			continue
 		}
-		// In the current source epoch, the monotonic observed-sequence high-water
-		// excludes the potentially large committed prefix without reading it.
-		// Source-identity resets are already detected by findHandoverCandidate
-		// against the bounded live tail and use a new epoch here.
-		if epoch == track.SourceEpoch && track.HasLastObservedSequence && source.Sequence <= track.LastObservedSequence {
-			continue
-		}
+		// LastObservedSequence is an observation high-water, not proof that a
+		// media coordinate was committed. The playlist is already bounded, so
+		// resolve each advertised coordinate through the canonical V2 index.
 		coordinate := archiveindex.Coordinate{
 			SessionID: recording.SourceSessionID, TrackID: track.ID,
 			SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence,
@@ -1214,12 +1369,43 @@ func releasePreparedHandover(prepared preparedHandover) {
 // mutating the archive. A live-tail cursor is not enough: preflight must prove
 // that an actual media object can be fetched before ownership moves.
 func findHandoverCandidate(recording *domain.Recording, playlist hls.MediaPlaylist) (uint64, hls.MediaSegment, bool) {
-	if recording == nil || len(playlist.Segments) == 0 {
+	epoch, err := handoverSourceEpoch(recording, playlist)
+	if err != nil {
 		return 0, hls.MediaSegment{}, false
 	}
 	track := recording.Tracks["main"]
+	for _, incoming := range playlist.Segments {
+		if incoming.Gap || gapCoversCoordinate(recording, "main", epoch, incoming.DiscontinuitySequence, incoming.Sequence) {
+			continue
+		}
+		captured := false
+		for i := range track.Segments {
+			segment := &track.Segments[i]
+			if segment.SourceEpoch == epoch && segment.DiscontinuitySequence == incoming.DiscontinuitySequence && segment.Sequence == incoming.Sequence {
+				captured = true
+				break
+			}
+		}
+		if !captured {
+			return epoch, cloneHandoverMediaSegment(incoming), true
+		}
+	}
+	return 0, hls.MediaSegment{}, false
+}
+
+func handoverSourceEpoch(recording *domain.Recording, playlist hls.MediaPlaylist) (uint64, error) {
+	if recording == nil {
+		return 0, ErrHandoverUnavailable
+	}
+	track := recording.Tracks["main"]
 	if track == nil {
-		return 0, hls.MediaSegment{}, false
+		return 0, storage.ErrShardedArchiveInvalid
+	}
+	if len(playlist.Segments) == 0 {
+		// An empty live window has no coordinate from which to infer a source
+		// reset. Keep the current epoch so the caller can request a post-drain
+		// fresh manifest instead of treating this as an invalid archive.
+		return track.SourceEpoch, nil
 	}
 	maxSequence := playlist.Segments[0].Sequence
 	for _, segment := range playlist.Segments[1:] {
@@ -1248,27 +1434,11 @@ func findHandoverCandidate(recording *domain.Recording, playlist hls.MediaPlayli
 	epoch := track.SourceEpoch
 	if newEpoch {
 		if epoch == ^uint64(0) {
-			return 0, hls.MediaSegment{}, false
+			return 0, errors.New("source epoch overflow")
 		}
 		epoch++
 	}
-	for _, incoming := range playlist.Segments {
-		if incoming.Gap || gapCoversCoordinate(recording, "main", epoch, incoming.DiscontinuitySequence, incoming.Sequence) {
-			continue
-		}
-		captured := false
-		for i := range track.Segments {
-			segment := &track.Segments[i]
-			if segment.SourceEpoch == epoch && segment.DiscontinuitySequence == incoming.DiscontinuitySequence && segment.Sequence == incoming.Sequence {
-				captured = true
-				break
-			}
-		}
-		if !captured {
-			return epoch, cloneHandoverMediaSegment(incoming), true
-		}
-	}
-	return 0, hls.MediaSegment{}, false
+	return epoch, nil
 }
 
 // hasHandoverContinuationCandidate is retained for focused identity tests; a

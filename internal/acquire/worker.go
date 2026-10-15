@@ -1205,51 +1205,55 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			m.setTerminalError(e, sanitizedPersistenceError(err))
 		}
 	}()
-	var metadataCancel context.CancelFunc
-	var metadataDone chan struct{}
-	var timedEventsCancel context.CancelFunc
-	var timedEventsDone chan struct{}
+	var observerCancel context.CancelFunc
+	var observerDone []chan struct{}
 	startMetadata := func() {
-		if _, ok := m.resolver.(MetadataPreparer); !ok || metadataCancel != nil {
+		if observerCancel != nil {
 			return
 		}
-		metadataCtx, cancel := context.WithCancel(ctx)
-		metadataCancel = cancel
-		metadataDone = make(chan struct{})
-		go func(done chan struct{}) {
-			defer close(done)
-			m.runMetadataMonitor(metadataCtx, e)
-		}(metadataDone)
-	}
-	startTimedEvents := func() {
-		if _, ok := m.resolver.(TimedEventPreparer); !ok || timedEventsCancel != nil {
+		_, metadataEnabled := m.resolver.(MetadataPreparer)
+		_, timedEventsEnabled := m.resolver.(TimedEventPreparer)
+		if !metadataEnabled && !timedEventsEnabled {
 			return
 		}
-		eventCtx, cancel := context.WithCancel(ctx)
-		timedEventsCancel = cancel
-		timedEventsDone = make(chan struct{})
-		go func(done chan struct{}) { defer close(done); m.runTimedEventMonitor(eventCtx, e) }(timedEventsDone)
+		observerCtx, cancel := context.WithCancel(ctx)
+		e.mu.Lock()
+		if e.handover != nil {
+			e.mu.Unlock()
+			cancel()
+			return
+		}
+		observerCancel = cancel
+		e.observerCancel = cancel
+		e.openObserverCommitAdmission()
+		e.mu.Unlock()
+		if metadataEnabled {
+			done := make(chan struct{})
+			observerDone = append(observerDone, done)
+			go func() { defer close(done); m.runMetadataMonitor(observerCtx, e) }()
+		}
+		if timedEventsEnabled {
+			done := make(chan struct{})
+			observerDone = append(observerDone, done)
+			go func() { defer close(done); m.runTimedEventMonitor(observerCtx, e) }()
+		}
 	}
 	stopMetadata := func() {
-		if metadataCancel == nil {
+		if observerCancel == nil {
 			return
 		}
-		metadataCancel()
-		<-metadataDone
-		metadataCancel = nil
-		metadataDone = nil
-	}
-	stopTimedEvents := func() {
-		if timedEventsCancel == nil {
-			return
+		observerCancel()
+		for _, done := range observerDone {
+			<-done
 		}
-		timedEventsCancel()
-		<-timedEventsDone
-		timedEventsCancel = nil
-		timedEventsDone = nil
+		e.mu.Lock()
+		e.observerCancel = nil
+		e.mu.Unlock()
+		observerCancel = nil
+		observerDone = nil
 	}
-	startObservers := func() { startMetadata(); startTimedEvents() }
-	stopObservers := func() { stopTimedEvents(); stopMetadata() }
+	startObservers := func() { startMetadata() }
+	stopObservers := func() { stopMetadata() }
 	stopAndDrain := func() {
 		stopObservers()
 		scheduler.closeLiveAdmission()
@@ -1295,6 +1299,11 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			m.fail(e, pauseErr)
 			return false
 		}
+		if !scheduler.beginHandoverSourceAdmission() {
+			// Cutoff won the scheduler lock. Re-enter the boundary handler before
+			// any proactive source refresh or manifest request can begin.
+			continue
+		}
 		media, generation := currentMediaVersion(e)
 		if generation != manifestGeneration {
 			resetPlaylistRequest(media)
@@ -1306,7 +1315,20 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 				m.fail(e, errors.New("media refresh retry limit reached"))
 				return
 			}
-			refreshed, err := m.refreshMedia(ctx, e, media)
+			refreshed, err := m.refreshMediaForLiveWorker(ctx, e, scheduler, media)
+			if e.stopWasRequested() {
+				stopAndDrain()
+				return false
+			}
+			if scheduler.handoverCutoffRequested() {
+				if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopObservers, startObservers); paused {
+					return true
+				} else if pauseErr != nil {
+					m.fail(e, pauseErr)
+					return false
+				}
+				continue
+			}
 			if err != nil {
 				m.fail(e, errors.New("media source refresh failed"))
 				return
@@ -1331,6 +1353,11 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		fetchGeneration := generation
 		manifestCtx, manifestCancel := context.WithCancel(ctx)
 		e.setManifestCancel(manifestCancel)
+		if !scheduler.beginHandoverSourceAdmission() {
+			e.clearManifestCancel()
+			manifestCancel()
+			continue
+		}
 		manifestPayload, requestedManifestURL, err := m.fetchManifestForMedia(manifestCtx, recordingID(e), media, selectedBaseURL, selectedURL, selectedScope)
 		e.clearManifestCancel()
 		manifestCancel()
@@ -1340,6 +1367,18 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 			}
 			stopAndDrain()
 			return false
+		}
+		if scheduler.handoverCutoffRequested() {
+			if manifestPayload != nil {
+				manifestPayload.Release()
+			}
+			if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopObservers, startObservers); paused {
+				return true
+			} else if pauseErr != nil {
+				m.fail(e, pauseErr)
+				return false
+			}
+			continue
 		}
 		var body []byte
 		if manifestPayload != nil {
@@ -1372,7 +1411,20 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 					m.fail(e, errors.New("media refresh retry limit reached"))
 					return
 				}
-				refreshed, refreshErr := m.refreshMedia(ctx, e, media)
+				refreshed, refreshErr := m.refreshMediaForLiveWorker(ctx, e, scheduler, media)
+				if e.stopWasRequested() {
+					stopAndDrain()
+					return false
+				}
+				if scheduler.handoverCutoffRequested() {
+					if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopObservers, startObservers); paused {
+						return true
+					} else if pauseErr != nil {
+						m.fail(e, pauseErr)
+						return false
+					}
+					continue
+				}
 				if refreshErr == nil {
 					refreshCycles++
 					if due, _ := proactiveRefreshDue(refreshed, time.Now()); due {
@@ -1485,7 +1537,20 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 					m.fail(e, errors.New("media refresh retry limit reached"))
 					return
 				}
-				refreshed, refreshErr := m.refreshMedia(ctx, e, media)
+				refreshed, refreshErr := m.refreshMediaForLiveWorker(ctx, e, scheduler, media)
+				if e.stopWasRequested() {
+					stopAndDrain()
+					return false
+				}
+				if scheduler.handoverCutoffRequested() {
+					if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopObservers, startObservers); paused {
+						return true
+					} else if pauseErr != nil {
+						m.fail(e, pauseErr)
+						return false
+					}
+					continue
+				}
 				if refreshErr == nil {
 					refreshCycles++
 					if due, _ := proactiveRefreshDue(refreshed, time.Now()); due {
@@ -1581,10 +1646,9 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 	return false
 }
 
-// pauseAtWorkerBoundary runs only on the manifest worker goroutine. That gives
-// the request a precise boundary: the manifest already being handled may
-// finish discovery, but no later manifest is admitted before the scheduler is
-// drained and closed.
+// pauseAtWorkerBoundary runs only on the manifest worker goroutine. The
+// scheduler cutoff has already stopped new task admission and dispatch; this
+// boundary joins source observers and waits only for the accepted drain cohort.
 func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler *segmentScheduler, stopObservers, startObservers func()) (bool, error) {
 	e.mu.Lock()
 	op := e.handover
@@ -1596,6 +1660,9 @@ func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler
 		op.state = handoverAborted
 		e.handover = nil
 		e.mu.Unlock()
+		scheduler.beginHandoverCutoff()
+		scheduler.resumeAfterHandoverAbort()
+		startObservers()
 		op.resumedOnce.Do(func() { close(op.resumed) })
 		return false, nil
 	}
@@ -1605,6 +1672,7 @@ func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler
 	// before releasing it for the test barrier and drain operations.
 	recordingID := e.recording.ID
 	e.mu.Unlock()
+	scheduler.beginHandoverCutoff()
 	if err := runtimehook.Pause(runtimehook.AfterSourceAdmissionStop, recordingID); err != nil {
 		return false, err
 	}
@@ -1617,17 +1685,19 @@ func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler
 	}
 	if err := scheduler.drainForHandover(op.ctx); err != nil {
 		if ctx.Err() == nil && op.ctx.Err() != nil {
-			startObservers()
+			scheduler.resumeAfterHandoverAbort()
 			e.mu.Lock()
 			if e.handover == op {
 				op.state = handoverAborted
 				e.handover = nil
 			}
 			e.mu.Unlock()
+			startObservers()
 			op.resumedOnce.Do(func() { close(op.resumed) })
 			return false, nil
 		}
 		if ctx.Err() != nil {
+			scheduler.resumeAfterHandoverAbort()
 			e.mu.Lock()
 			if e.handover == op {
 				op.state = handoverAborted
@@ -1646,18 +1716,23 @@ func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler
 		return false, err
 	}
 	if err := acquireArchiveRecoveryGate(op.ctx, e); err != nil {
-		startObservers()
 		e.mu.Lock()
 		if e.handover == op {
 			op.state = handoverAborted
 			e.handover = nil
 		}
 		e.mu.Unlock()
+		if op.cancel != nil {
+			op.cancel()
+		}
 		op.resumedOnce.Do(func() { close(op.resumed) })
 		if ctx.Err() == nil && op.ctx.Err() == nil {
 			return false, err
 		}
-		return false, nil
+		// The scheduler is already closed. Returning true with the operation
+		// cleared makes runWorker start a fresh source scheduler without waiting
+		// for a target or transferring ownership.
+		return true, nil
 	}
 	e.mu.Lock()
 	if e.handover != op || e.recording == nil || e.recording.State != domain.StateRecording || !sameOwner(e.ownership, op.expected) {
@@ -1694,6 +1769,28 @@ func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler
 func (m *Manager) refreshMedia(ctx context.Context, e *entry, current adapterproto.MediaSource) (adapterproto.MediaSource, error) {
 	_, generation := currentMediaVersion(e)
 	refreshed, _, err := m.refreshMediaAtGeneration(ctx, e, current, generation)
+	return refreshed, err
+}
+
+// refreshMediaForLiveWorker treats a refresh as source-control I/O: it must
+// be admitted before the handover cutoff and is cancelable by that cutoff.
+// Unlike a segment response body, a refresh is not part of the accepted media
+// drain cohort; the target refreshes again after the source reaches its
+// canonical boundary.
+func (m *Manager) refreshMediaForLiveWorker(ctx context.Context, e *entry, scheduler *segmentScheduler, current adapterproto.MediaSource) (adapterproto.MediaSource, error) {
+	if scheduler == nil || !scheduler.beginHandoverSourceAdmission() {
+		return adapterproto.MediaSource{}, context.Canceled
+	}
+	refreshCtx, cancel := context.WithCancel(ctx)
+	e.setManifestCancel(cancel)
+	if !scheduler.beginHandoverSourceAdmission() {
+		e.clearManifestCancel()
+		cancel()
+		return adapterproto.MediaSource{}, context.Canceled
+	}
+	refreshed, err := m.refreshMedia(refreshCtx, e, current)
+	e.clearManifestCancel()
+	cancel()
 	return refreshed, err
 }
 

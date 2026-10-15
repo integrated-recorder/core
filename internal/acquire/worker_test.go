@@ -1258,9 +1258,11 @@ func TestRefreshingTaskQueuesOnlyAfterPostRefreshManifest(t *testing.T) {
 		manifestGenerationSet:    true,
 	}
 
-	if !scheduler.markRefreshing(task) {
+	_, refreshCancel, refreshing := scheduler.markRefreshing(task)
+	if !refreshing {
 		t.Fatal("in-flight task did not enter Refreshing state")
 	}
+	defer refreshCancel()
 	stale := hls.MediaPlaylist{TargetDuration: 1, Segments: []hls.MediaSegment{{Sequence: 42, URI: "https://old.example/old.ts", Duration: 1}}}
 	if accepted, discoverErr := scheduler.discoverAtGeneration(ctx, 0, stale, 0); discoverErr != nil || accepted {
 		t.Fatalf("stale discovery accepted=%v err=%v", accepted, discoverErr)

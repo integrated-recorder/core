@@ -831,6 +831,11 @@ func TestUpdateControllerActivateAndRollbackKeepEngineGenerationAttachments(t *t
 	if err != nil {
 		t.Fatalf("Activate(): %v", err)
 	}
+	select {
+	case <-fixture.controller.handoverWake:
+	default:
+		t.Fatal("committed application activation did not signal immediate handover orchestration")
+	}
 	if active.DefaultEngine == nil || active.DefaultEngine.Version != fixture.manifest.ReleaseVersion || len(fixture.controller.EngineAttachments()) != 2 {
 		t.Fatalf("candidate activation did not retain both Engine attachments: status=%+v engines=%d", active, len(fixture.controller.EngineAttachments()))
 	}
@@ -888,6 +893,74 @@ func TestUpdateControllerActivateAndRollbackKeepEngineGenerationAttachments(t *t
 	}
 	if leaseAfter, ok := fixture.registry.Snapshot().Leases[lease.RecordingID]; !ok || leaseAfter.EngineGeneration != fixture.initialID {
 		t.Fatalf("rollback moved an existing Recording lease: %+v", leaseAfter)
+	}
+}
+
+func TestBoundedHandoverMigrationContinuesAfterFirstRecordingFails(t *testing.T) {
+	candidates := []recordingHandoverCandidate{
+		{lease: generation.Lease{RecordingID: "recording-1"}},
+		{lease: generation.Lease{RecordingID: "recording-2"}},
+		{lease: generation.Lease{RecordingID: "recording-3"}},
+	}
+	var mu sync.Mutex
+	seen := make(map[string]int)
+	active, maxActive := 0, 0
+	firstFailure := errors.New("target preparation failed")
+	err := runBoundedHandoverCandidates(context.Background(), candidates, 2, func(candidate recordingHandoverCandidate) error {
+		id := candidate.lease.RecordingID
+		mu.Lock()
+		seen[id]++
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+		defer func() {
+			mu.Lock()
+			active--
+			mu.Unlock()
+		}()
+		if id == "recording-1" {
+			return firstFailure
+		}
+		return nil
+	})
+	if !errors.Is(err, firstFailure) {
+		t.Fatalf("migration errors=%v, want first Recording failure retained", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 3 || seen["recording-1"] != 1 || seen["recording-2"] != 1 || seen["recording-3"] != 1 {
+		t.Fatalf("one failed candidate starved its peers: seen=%v", seen)
+	}
+	if maxActive > 2 {
+		t.Fatalf("handover concurrency=%d, want configured bound 2", maxActive)
+	}
+}
+
+func TestHandoverRetryBackoffIsPerRecordingAndClearsOnSuccess(t *testing.T) {
+	controller := &updateController{handoverRetries: make(map[string]handoverRetryState)}
+	start := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+	controller.noteHandoverRetryFailure("recording-1", start)
+	if controller.handoverRetryAllowed("recording-1", start.Add(9*time.Second)) {
+		t.Fatal("failed Recording became eligible before its first retry delay")
+	}
+	if !controller.handoverRetryAllowed("recording-1", start.Add(10*time.Second)) {
+		t.Fatal("failed Recording did not become eligible at its retry deadline")
+	}
+	if !controller.handoverRetryAllowed("recording-2", start.Add(time.Second)) {
+		t.Fatal("one failed Recording blocked an unrelated eligible Recording")
+	}
+	controller.noteHandoverRetryFailure("recording-1", start.Add(10*time.Second))
+	if controller.handoverRetryAllowed("recording-1", start.Add(29*time.Second)) {
+		t.Fatal("second failure did not extend the per-Recording backoff")
+	}
+	if !controller.handoverRetryAllowed("recording-1", start.Add(30*time.Second)) {
+		t.Fatal("second retry deadline did not become eligible")
+	}
+	controller.clearHandoverRetry("recording-1")
+	if !controller.handoverRetryAllowed("recording-1", start.Add(11*time.Second)) {
+		t.Fatal("successful migration left a stale handover retry backoff")
 	}
 }
 

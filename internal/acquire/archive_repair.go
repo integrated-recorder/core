@@ -15,6 +15,8 @@ import (
 
 const maxHistoricalRecoveryWorkPerPass = 128
 
+var errHistoricalHandoverAdmissionClosed = errors.New("historical source admission closed for handover")
+
 type historicalRepairProgress struct {
 	failed       int
 	acquired     int
@@ -68,6 +70,17 @@ func retryableHistoricalFetch(err error) bool {
 // stopped archive requires a fresh Host owner; an active archive requires its
 // exact live worker token.
 func (m *Manager) RepairDeclaredHistory(ctx context.Context, owner OwnershipToken, id string) (returnErr error) {
+	if ctx == nil {
+		return context.Canceled
+	}
+	e, ok := m.entry(id)
+	if !ok {
+		return storage.ErrNotFound
+	}
+	if err := acquireArchiveRecoveryGate(ctx, e); err != nil {
+		return err
+	}
+	defer releaseArchiveRecoveryGate(e)
 	return m.repairDeclaredHistoryCore(ctx, owner, id, nil, true)
 }
 
@@ -88,6 +101,10 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 	e, ok := m.entry(id)
 	if !ok {
 		return storage.ErrNotFound
+	}
+	ctx = withHistoricalSourceAdmission(ctx, e)
+	if !historicalSourceAdmissionOpen(e) {
+		return errHistoricalHandoverAdmissionClosed
 	}
 	media, generation, active, err := m.repairMediaContext(e, owner)
 	if err != nil {
@@ -131,6 +148,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 		return ErrHistoricalUnavailable
 	}
 	if due, _ := proactiveRefreshDue(media, time.Now()); due {
+		if !historicalSourceAdmissionOpen(e) {
+			return errHistoricalHandoverAdmissionClosed
+		}
 		media, generation, err = m.refreshMediaAtGenerationOwned(ctx, e, media, generation, &owner, terminalRepairMutationAllowed(e, !active))
 		if err != nil {
 			return retryableHistorical(errors.New("historical source refresh failed"))
@@ -155,7 +175,13 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 	historicalMedia.ManifestURL = manifestURL
 	manifest, requestedManifestURL, err := m.fetchManifestForMedia(ctx, id, historicalMedia, manifestURL, manifestURL, adapterproto.RequestScopeManifest)
 	if err != nil {
+		if errors.Is(err, errHistoricalHandoverAdmissionClosed) {
+			return errHistoricalHandoverAdmissionClosed
+		}
 		if m.shouldRefresh(historicalMedia, err) {
+			if !historicalSourceAdmissionOpen(e) {
+				return errHistoricalHandoverAdmissionClosed
+			}
 			if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, media, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
 				return retryableHistorical(errors.New("historical source refresh failed"))
 			}
@@ -187,7 +213,13 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 			if manifest != nil {
 				manifest.Release()
 			}
+			if errors.Is(err, errHistoricalHandoverAdmissionClosed) {
+				return errHistoricalHandoverAdmissionClosed
+			}
 			if m.shouldRefresh(historicalMedia, err) {
+				if !historicalSourceAdmissionOpen(e) {
+					return errHistoricalHandoverAdmissionClosed
+				}
 				if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, media, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
 					return retryableHistorical(errors.New("historical source refresh failed"))
 				}
@@ -329,6 +361,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 			}
 		}
 		if candidate.gap {
+			if !historicalSourceAdmissionOpen(e) {
+				return errHistoricalHandoverAdmissionClosed
+			}
 			if err := m.recordHistoricalCoverage(e, &owner, terminalRepairMutationAllowed(e, !active), candidate.coordinate, archiveindex.CoverageKnownMissing, "source manifest declared media missing"); err != nil {
 				return err
 			}
@@ -344,6 +379,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 		if err != nil {
 			return err
 		}
+		if !historicalSourceAdmissionOpen(e) {
+			return errHistoricalHandoverAdmissionClosed
+		}
 		windowEnd := cursor
 		for windowEnd < len(candidates) && windowEnd-cursor < windowSize && !candidates[windowEnd].gap {
 			windowEnd++
@@ -358,6 +396,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				result := results[offset]
 				source, epoch, coordinate := candidate.source, candidate.epoch, candidate.coordinate
 				if result.err != nil {
+					if errors.Is(result.err, errHistoricalHandoverAdmissionClosed) {
+						return errHistoricalHandoverAdmissionClosed
+					}
 					if errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded) {
 						return result.err
 					}
@@ -368,6 +409,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 						return retryableHistorical(errHistoricalScratch)
 					}
 					if m.shouldRefresh(historicalMedia, result.err) {
+						if !historicalSourceAdmissionOpen(e) {
+							return errHistoricalHandoverAdmissionClosed
+						}
 						if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, historicalMedia, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
 							return retryableHistorical(errors.New("historical source refresh failed"))
 						}
@@ -383,6 +427,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 				}
 				initID, initErr := m.acquireHistoricalInit(ctx, e, owner, terminalRepairMutationAllowed(e, !active), historicalMedia, generation, identity.ID, rootTrack, source, epoch)
 				if initErr != nil {
+					if errors.Is(initErr, errHistoricalHandoverAdmissionClosed) {
+						return errHistoricalHandoverAdmissionClosed
+					}
 					if errors.Is(initErr, storage.ErrIngestCoordinatorUnavailable) {
 						return retryableHistorical(initErr)
 					}
@@ -390,6 +437,9 @@ func (m *Manager) repairDeclaredHistoryCore(ctx context.Context, owner Ownership
 						return initErr
 					}
 					if m.shouldRefresh(historicalMedia, initErr) {
+						if !historicalSourceAdmissionOpen(e) {
+							return errHistoricalHandoverAdmissionClosed
+						}
 						if _, _, refreshErr := m.refreshMediaAtGenerationOwned(ctx, e, historicalMedia, generation, &owner, terminalRepairMutationAllowed(e, !active)); refreshErr != nil {
 							return retryableHistorical(errors.New("historical source refresh failed"))
 						}
@@ -477,6 +527,19 @@ func terminalRepairMutationAllowed(e *entry, alreadyTerminal bool) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.recording != nil && e.recording.State != domain.StateRecording
+}
+
+// historicalSourceAdmissionOpen shares the handover request marker's entry
+// lock. A source request that observes an open gate is admitted before the
+// handover cutoff; after the marker is installed, subsequent requests and
+// recovery windows stay parked for the target Engine.
+func historicalSourceAdmissionOpen(e *entry) bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return !e.deleted && e.handover == nil
 }
 
 func (m *Manager) refreshMediaAtGenerationOwned(ctx context.Context, e *entry, current adapterproto.MediaSource, expectedGeneration uint64, owner *OwnershipToken, terminal bool) (adapterproto.MediaSource, uint64, error) {

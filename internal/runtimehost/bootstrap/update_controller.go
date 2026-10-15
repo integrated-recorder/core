@@ -152,6 +152,8 @@ type updateController struct {
 	gate chan struct{}
 	mu   sync.RWMutex
 
+	handoverWake chan struct{}
+
 	engines            map[string]engineAttachment
 	manifests          map[string]release.Manifest
 	releaseNotes       map[string]string
@@ -164,6 +166,12 @@ type updateController struct {
 	verification       string
 	lastFailureCode    string
 	handoverDiagnostic *httpapi.HandoverDiagnostic
+	handoverRetries    map[string]handoverRetryState
+}
+
+type handoverRetryState struct {
+	failures uint8
+	nextTry  time.Time
 }
 
 var _ httpapi.Controller = (*updateController)(nil)
@@ -229,10 +237,11 @@ func newUpdateController(options updateControllerOptions) (*updateController, er
 		catalogWriter:     options.CatalogWriter,
 		resourceTokenPath: options.ResourceTokenPath, operationTimeout: options.OperationTimeout,
 		controlTarget:     options.ControlTarget,
-		unavailableReason: options.UnavailableReason, gate: make(chan struct{}, 1),
+		unavailableReason: options.UnavailableReason, gate: make(chan struct{}, 1), handoverWake: make(chan struct{}, 1),
 		engines: make(map[string]engineAttachment), manifests: make(map[string]release.Manifest), buildIdentities: make(map[string]buildinfo.Info),
-		bundleBuild:  options.ApplicationBuild,
-		verification: "not_checked",
+		handoverRetries: make(map[string]handoverRetryState),
+		bundleBuild:     options.ApplicationBuild,
+		verification:    "not_checked",
 	}
 	for _, attachment := range options.Engines {
 		if !generationPattern.MatchString(attachment.generationID) || !filepath.IsAbs(attachment.releaseDir) || !filepath.IsAbs(attachment.socketPath) || !filepath.IsAbs(attachment.tokenPath) || attachment.instanceID == "" {
@@ -396,7 +405,12 @@ func (c *updateController) Activate(ctx context.Context) (httpapi.Status, error)
 	if err := c.acquireOperation(ctx); err != nil {
 		return httpapi.Status{}, err
 	}
-	defer c.releaseOperation()
+	operationHeld := true
+	defer func() {
+		if operationHeld {
+			c.releaseOperation()
+		}
+	}()
 	if err := c.availableForUpdates(); err != nil {
 		return httpapi.Status{}, err
 	}
@@ -450,9 +464,19 @@ func (c *updateController) Activate(ctx context.Context) (httpapi.Status, error)
 		c.buildIdentities[candidate.ID] = c.applicationBuild
 		c.verification, c.lastFailureCode = "verified", ""
 		c.mu.Unlock()
-		// A bounded old-Control drain may remain pending after the route and new
-		// epoch are active. The candidate is still the committed default.
-		return c.status(), nil
+		status := c.status()
+		// Release the update operation gate before publishing the wake. Otherwise
+		// the lease worker could consume the event while ReconcileLeases is still
+		// excluded, lose it, and wait for the periodic fallback tick.
+		c.releaseOperation()
+		operationHeld = false
+		// Activation is the primary trigger for live Recording handover. The
+		// lease ticker remains a recovery/retry fallback.
+		select {
+		case c.handoverWake <- struct{}{}:
+		default:
+		}
+		return status, nil
 	}
 	if activateErr != nil {
 		c.failCandidate(ctx, candidate.ID)
@@ -739,10 +763,21 @@ func (c *updateController) applicationFiles(active generation.Generation) (strin
 // running active or draining Engine. A failed Engine inventory leaves the
 // previous durable lease projection unchanged.
 func (c *updateController) ReconcileLeases(ctx context.Context) error {
+	return c.reconcileLeases(ctx, false)
+}
+
+// ReconcileLeasesAfterActivation waits for the operation that committed the
+// activation to release the Host gate, ensuring its wake cannot be lost to a
+// nonblocking reconciliation attempt.
+func (c *updateController) ReconcileLeasesAfterActivation(ctx context.Context) error {
+	return c.reconcileLeases(ctx, true)
+}
+
+func (c *updateController) reconcileLeases(ctx context.Context, waitForOperation bool) error {
 	if ctx == nil {
 		return errors.New("lease reconciliation context is required")
 	}
-	if err := c.lockOperation(ctx, false); err != nil {
+	if err := c.lockOperation(ctx, waitForOperation); err != nil {
 		return err
 	}
 	defer c.releaseOperation()
@@ -762,6 +797,17 @@ func (c *updateController) ReconcileLeases(ctx context.Context) error {
 			eligible[attachment.generationID] = attachment
 		}
 	}
+	// A committed application activation wakes this reconciliation immediately.
+	// Request source cutoffs before any Engine inventory IPC so slow inventory
+	// cannot leave the previous Engine fetching media while the Host catches up.
+	handoverCandidates := c.collectDrainingHandoverCandidates(eligible)
+	cutoffReady, cutoffFailures := c.requestHandoverCutoffs(ctx, handoverCandidates)
+	cutoffsHandedToMigration := false
+	defer func() {
+		if !cutoffsHandedToMigration {
+			c.cancelHandoverCutoffs(cutoffReady)
+		}
+	}()
 	source := c.inventorySource
 	if source == nil {
 		source = leases.InventorySourceFunc(func(ctx context.Context, engine generation.Generation) (generation.EngineInventory, error) {
@@ -853,22 +899,33 @@ func (c *updateController) ReconcileLeases(ctx context.Context) error {
 		return err
 	}
 	// Application activation and per-Recording handover are separate failure
-	// domains. Try at most one eligible Recording per inventory pass; a failed
-	// target leaves the source Engine as owner and does not roll back the active
-	// application generation.
-	if err := c.handoverOneDrainingRecording(ctx, eligible); err != nil {
-		slog.Warn("active recording handover failed; source ownership retained when provable",
+	// domains. The compatible sources have already received their cutoffs;
+	// migration completion now runs with bounded concurrency. One failed
+	// Recording does not block its peers.
+	cutoffsHandedToMigration = true
+	if err := c.migrateHandoverCandidates(ctx, cutoffReady); err != nil {
+		cutoffFailures = append(cutoffFailures, err)
+	}
+	if err := errors.Join(cutoffFailures...); err != nil {
+		slog.Warn("one or more active recording handovers failed; source ownership retained when provable",
 			"stage", "orchestration", "code", "handover_failed")
 	}
 	return c.retireSafeGenerations(ctx)
 }
 
-// handoverOneDrainingRecording transfers at most one Recording from a draining
-// Engine to the active Engine during a reconciliation pass. Adapter Protocol
-// v1 has no compatibility declaration for changing an adapter binary while a
-// Recording is live, so the immutable adapter-set identity must be identical.
-func (c *updateController) handoverOneDrainingRecording(ctx context.Context, ready map[string]engineAttachment) error {
-	if c.ownerAuthority == nil || ctx == nil {
+type recordingHandoverCandidate struct {
+	source engineAttachment
+	target engineAttachment
+	lease  generation.Lease
+	owner  recordingowner.Owner
+}
+
+// collectDrainingHandoverCandidates snapshots active Recording leases whose
+// source and target generations carry the exact same immutable adapter and
+// storage sets. The registry is durable and current under the Host operation
+// gate; Engine inventory is confirmed later before ownership transfer.
+func (c *updateController) collectDrainingHandoverCandidates(ready map[string]engineAttachment) []recordingHandoverCandidate {
+	if c.ownerAuthority == nil {
 		return nil
 	}
 	registryState := c.registry.Snapshot()
@@ -884,7 +941,7 @@ func (c *updateController) handoverOneDrainingRecording(ctx context.Context, rea
 
 	sourceIDs := make([]string, 0, len(registryState.Generations))
 	for id, sourceGeneration := range registryState.Generations {
-		if id == targetID || sourceGeneration.State != generation.StateDraining || sourceGeneration.AdapterSetID == "" || sourceGeneration.AdapterSetID != targetGeneration.AdapterSetID || sourceGeneration.StorageProviderSetID != targetGeneration.StorageProviderSetID {
+		if id == targetID || sourceGeneration.State != generation.StateDraining || sourceGeneration.AdapterSetID == "" || sourceGeneration.AdapterSetID != targetGeneration.AdapterSetID || sourceGeneration.StorageProviderSetID != targetGeneration.StorageProviderSetID || sourceGeneration.StorageInstanceID != targetGeneration.StorageInstanceID {
 			continue
 		}
 		if _, live := ready[id]; live {
@@ -892,30 +949,246 @@ func (c *updateController) handoverOneDrainingRecording(ctx context.Context, rea
 		}
 	}
 	sort.Strings(sourceIDs)
+	candidates := make([]recordingHandoverCandidate, 0)
 	for _, sourceID := range sourceIDs {
 		leases := make([]generation.Lease, 0)
 		for _, lease := range registryState.Leases {
+			if !c.handoverRetryAllowed(lease.RecordingID, time.Now()) {
+				continue
+			}
 			if lease.EngineGeneration == sourceID {
 				leases = append(leases, lease)
 			}
 		}
 		sort.Slice(leases, func(i, j int) bool { return leases[i].RecordingID < leases[j].RecordingID })
 		for _, lease := range leases {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
 			owner, err := c.ownerAuthority.CurrentOwner(lease.RecordingID)
 			if err != nil || owner.EngineGeneration != sourceID || owner.WorkerInstance != lease.WorkerInstance {
 				continue
 			}
-			source := ready[sourceID]
-			if err := c.handoverRecording(ctx, source, target, lease, owner); err != nil {
-				return err
-			}
-			return nil
+			candidates = append(candidates, recordingHandoverCandidate{source: ready[sourceID], target: target, lease: lease, owner: owner})
 		}
 	}
-	return nil
+	return candidates
+}
+
+// requestHandoverCutoffs performs only the per-Recording source cutoff. It is
+// deliberately separated from inventories and migration so all known eligible
+// sources stop admitting work before any slower reconciliation begins.
+func (c *updateController) requestHandoverCutoffs(ctx context.Context, candidates []recordingHandoverCandidate) ([]recordingHandoverCandidate, []error) {
+	if ctx == nil || len(candidates) == 0 {
+		return nil, nil
+	}
+	type cutoffResult struct {
+		candidate recordingHandoverCandidate
+		err       error
+	}
+	const cutoffConcurrency = 8
+	cutoffWorkers := min(cutoffConcurrency, len(candidates))
+	cutoffJobs := make(chan recordingHandoverCandidate)
+	cutoffResults := make(chan cutoffResult, len(candidates))
+	var cutoffWG sync.WaitGroup
+	for worker := 0; worker < cutoffWorkers; worker++ {
+		cutoffWG.Add(1)
+		go func() {
+			defer cutoffWG.Done()
+			for candidate := range cutoffJobs {
+				manager, err := c.engineManagerClient(candidate.source)
+				if err == nil {
+					callCtx, cancel := context.WithTimeout(ctx, min(c.operationTimeout, 5*time.Second))
+					err = manager.RequestHandoverCutoff(callCtx, candidate.lease.RecordingID, candidate.owner)
+					cancel()
+					if err != nil {
+						cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						_ = manager.CancelHandoverCutoff(cleanupCtx, candidate.lease.RecordingID, candidate.owner)
+						cleanupCancel()
+					}
+				}
+				if err != nil {
+					c.noteHandoverRetryFailure(candidate.lease.RecordingID, time.Now())
+				}
+				cutoffResults <- cutoffResult{candidate: candidate, err: err}
+			}
+		}()
+	}
+	go func() {
+		defer close(cutoffJobs)
+		for _, candidate := range candidates {
+			select {
+			case cutoffJobs <- candidate:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() { cutoffWG.Wait(); close(cutoffResults) }()
+	cutoffReady := make([]recordingHandoverCandidate, 0, len(candidates))
+	var failures []error
+	for result := range cutoffResults {
+		if result.err != nil {
+			slog.Warn("recording handover cutoff could not be confirmed", "recording_id", result.candidate.lease.RecordingID, "source_generation", result.candidate.source.generationID, "code", "handover_cutoff_failed")
+			failures = append(failures, fmt.Errorf("recording %s handover cutoff failed: %w", result.candidate.lease.RecordingID, result.err))
+			continue
+		}
+		cutoffReady = append(cutoffReady, result.candidate)
+	}
+	if err := ctx.Err(); err != nil {
+		failures = append(failures, err)
+	}
+	return cutoffReady, failures
+}
+
+func (c *updateController) cancelHandoverCutoffs(candidates []recordingHandoverCandidate) {
+	if len(candidates) == 0 {
+		return
+	}
+	const concurrency = 8
+	workers := min(concurrency, len(candidates))
+	jobs := make(chan recordingHandoverCandidate)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for candidate := range jobs {
+				manager, err := c.engineManagerClient(candidate.source)
+				if err != nil {
+					continue
+				}
+				callCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = manager.CancelHandoverCutoff(callCtx, candidate.lease.RecordingID, candidate.owner)
+				cancel()
+			}
+		}()
+	}
+	for _, candidate := range candidates {
+		jobs <- candidate
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func (c *updateController) migrateHandoverCandidates(ctx context.Context, cutoffReady []recordingHandoverCandidate) error {
+	if len(cutoffReady) == 0 {
+		return nil
+	}
+	const migrationConcurrency = 4
+	err := runBoundedHandoverCandidates(ctx, cutoffReady, migrationConcurrency, func(candidate recordingHandoverCandidate) error {
+		err := c.handoverRecording(ctx, candidate.source, candidate.target, candidate.lease, candidate.owner)
+		if err != nil {
+			c.noteHandoverRetryFailure(candidate.lease.RecordingID, time.Now())
+			slog.Warn("recording handover failed; other recordings continue", "recording_id", candidate.lease.RecordingID, "source_generation", candidate.source.generationID, "target_generation", candidate.target.generationID, "code", "handover_failed")
+		} else {
+			c.clearHandoverRetry(candidate.lease.RecordingID)
+		}
+		return err
+	})
+	// This is also the cleanup path for work that a canceled producer could not
+	// dispatch. Successful transfers reject the stale source token.
+	c.cancelHandoverCutoffs(cutoffReady)
+	return err
+}
+
+// handoverRetryAllowed keeps a failed Recording from being cut off again on
+// every five-second reconciliation pass. Other recordings remain eligible;
+// retries for this one use a bounded exponential delay and recover on success.
+func (c *updateController) handoverRetryAllowed(recordingID string, now time.Time) bool {
+	if c == nil || recordingID == "" {
+		return false
+	}
+	c.mu.RLock()
+	state, ok := c.handoverRetries[recordingID]
+	c.mu.RUnlock()
+	return !ok || !now.Before(state.nextTry)
+}
+
+func (c *updateController) noteHandoverRetryFailure(recordingID string, now time.Time) {
+	if c == nil || recordingID == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.handoverRetries == nil {
+		c.handoverRetries = make(map[string]handoverRetryState)
+	}
+	state := c.handoverRetries[recordingID]
+	if state.failures < 8 {
+		state.failures++
+	}
+	delay := 10 * time.Second
+	for attempt := uint8(1); attempt < state.failures && delay < 2*time.Minute; attempt++ {
+		delay *= 2
+	}
+	if delay > 2*time.Minute {
+		delay = 2 * time.Minute
+	}
+	state.nextTry = now.Add(delay)
+	c.handoverRetries[recordingID] = state
+	c.mu.Unlock()
+}
+
+func (c *updateController) clearHandoverRetry(recordingID string) {
+	if c == nil || recordingID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.handoverRetries, recordingID)
+	c.mu.Unlock()
+}
+
+func runBoundedHandoverCandidates(ctx context.Context, candidates []recordingHandoverCandidate, concurrency int, run func(recordingHandoverCandidate) error) error {
+	if len(candidates) == 0 || run == nil {
+		return nil
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	workers := min(concurrency, len(candidates))
+	jobs := make(chan recordingHandoverCandidate)
+	results := make(chan error, len(candidates))
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for candidate := range jobs {
+				results <- run(candidate)
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, candidate := range candidates {
+			if ctx == nil {
+				jobs <- candidate
+				continue
+			}
+			select {
+			case jobs <- candidate:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() { wg.Wait(); close(results) }()
+	var failures []error
+	for err := range results {
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if ctx != nil && ctx.Err() != nil {
+		failures = append(failures, ctx.Err())
+	}
+	return errors.Join(failures...)
+}
+
+func (c *updateController) handoverDrainingRecordings(ctx context.Context, ready map[string]engineAttachment) error {
+	candidates := c.collectDrainingHandoverCandidates(ready)
+	cutoffReady, failures := c.requestHandoverCutoffs(ctx, candidates)
+	if err := c.migrateHandoverCandidates(ctx, cutoffReady); err != nil {
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
 }
 
 func (c *updateController) handoverRecording(ctx context.Context, source, target engineAttachment, lease generation.Lease, owner recordingowner.Owner) (returnErr error) {
@@ -931,14 +1204,44 @@ func (c *updateController) handoverRecording(ctx context.Context, source, target
 			slog.Warn("recording handover_failed", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch, "stage", stage, "code", "handover_failed", "reason_code", handoverDiagnosticReason(returnErr), "retryable", stage == "prepare_target" || stage == "prepare_drained_target", "recoverable", stage == "prepare_target" || stage == "prepare_drained_target", "duration_ms", time.Since(started).Milliseconds())
 		}
 	}()
-	sourceManager, err := c.engineManagerClient(source)
+	// The source drain may wait for an already-started media body and its
+	// canonical commit, so its IPC transport must honor the configured bounded
+	// operation deadline instead of the short default management-call timeout.
+	sourceManager, err := c.engineManagerClientWithTimeout(source, c.operationTimeout)
 	if err != nil {
 		return err
 	}
-	targetManager, err := c.engineManagerClient(target)
+	// Target preparation now fetches the post-drain continuation payload over
+	// Engine IPC; use the same bounded operation budget as source drain rather
+	// than the short inventory/control-call default.
+	targetManager, err := c.engineManagerClientWithTimeout(target, c.operationTimeout)
 	if err != nil {
 		return err
 	}
+	targetIdentity := acquire.HandoverTargetIdentity{EngineGeneration: target.generationID, WorkerInstance: target.instanceID}
+	paused := false
+	committed := false
+	var pausedSnapshot acquire.HandoverSnapshot
+	defer func() {
+		if committed {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = targetManager.DiscardPreparedHandover(cleanupCtx, lease.RecordingID, targetIdentity)
+		if paused {
+			current, currentErr := c.ownerAuthority.CurrentOwner(lease.RecordingID)
+			if currentErr == nil && current.EngineGeneration == source.generationID && current.WorkerInstance == source.instanceID {
+				if resumeErr := sourceManager.ResumeHandover(cleanupCtx, lease.RecordingID, current, pausedSnapshot); resumeErr != nil {
+					slog.Warn("recording handover source resume could not be confirmed", "recording_id", lease.RecordingID, "source_generation", source.generationID, "code", "source_resume_failed")
+				}
+			} else {
+				slog.Warn("recording handover source resume owner could not be confirmed", "recording_id", lease.RecordingID, "source_generation", source.generationID, "code", "source_resume_owner_unconfirmed")
+			}
+		} else {
+			_ = sourceManager.CancelHandoverCutoff(cleanupCtx, lease.RecordingID, owner)
+		}
+	}()
 	sourceInventory, err := sourceManager.Inventory(ctx)
 	if err != nil || sourceInventory.GenerationID != source.generationID || sourceInventory.InstanceID != source.instanceID || !inventoryHasOwner(sourceInventory, lease.RecordingID, owner) {
 		return errors.New("source Engine ownership inventory could not be confirmed")
@@ -948,32 +1251,8 @@ func (c *updateController) handoverRecording(ctx context.Context, source, target
 		return errors.New("target Engine readiness inventory could not be confirmed")
 	}
 
-	snapshot, err := sourceManager.HandoverSnapshot(ctx, lease.RecordingID, owner)
-	if err != nil || snapshot.Owner != owner || snapshot.RecordingID != lease.RecordingID {
-		return errors.New("source Engine continuation snapshot could not be confirmed")
-	}
-	targetIdentity := acquire.HandoverTargetIdentity{EngineGeneration: target.generationID, WorkerInstance: target.instanceID}
-	stage = "prepare_target"
+	stage = "source_drain"
 	slog.Info("recording handover_prepare_started", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch)
-	if err := runtimehook.Pause(runtimehook.BeforeTargetPrepare, lease.RecordingID); err != nil {
-		return errors.New("target preparation failpoint failed")
-	}
-	paused := false
-	committed := false
-	pausedSnapshot := snapshot
-	defer func() {
-		if !committed {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = targetManager.DiscardPreparedHandover(cleanupCtx, lease.RecordingID, targetIdentity)
-			if paused {
-				current, currentErr := c.ownerAuthority.CurrentOwner(lease.RecordingID)
-				if currentErr == nil && current.EngineGeneration == source.generationID && current.WorkerInstance == source.instanceID {
-					_ = sourceManager.ResumeHandover(cleanupCtx, lease.RecordingID, current, pausedSnapshot)
-				}
-			}
-		}
-	}()
 
 	drainSource := func() (acquire.HandoverSnapshot, error) {
 		drainStarted := time.Now()
@@ -992,43 +1271,16 @@ func (c *updateController) handoverRecording(ctx context.Context, source, target
 		}
 		return finalSnapshot, nil
 	}
-	preparedErr := targetManager.PrepareHandoverTarget(ctx, snapshot, targetIdentity)
-	var finalSnapshot acquire.HandoverSnapshot
-	if errors.Is(preparedErr, acquire.ErrHandoverSourceRefreshRequired) || errors.Is(preparedErr, acquire.ErrHandoverSourceBoundaryRequired) {
-		// Adapter Protocol v1 does not guarantee refresh idempotence, and a live
-		// manifest at the already-committed tail cannot prove continuation. Drain
-		// the source first, then repeat the complete target readiness proof.
-		stage = "source_drain"
-		finalSnapshot, err = drainSource()
-		if err != nil {
-			return err
-		}
-		stage = "prepare_drained_target"
-		if err := targetManager.DiscardPreparedHandover(ctx, lease.RecordingID, targetIdentity); err != nil {
-			return err
-		}
-		if err := targetManager.PrepareHandoverTargetAfterSourceDrain(ctx, finalSnapshot, targetIdentity); err != nil {
-			return err
-		}
-	} else {
-		if preparedErr != nil {
-			return preparedErr
-		}
-		// Keep the usual optimistic path: the target prepares while the source
-		// remains live. Then drain, discard the stale speculative payload and
-		// prove continuation again from the final canonical boundary.
-		stage = "source_drain"
-		finalSnapshot, err = drainSource()
-		if err != nil {
-			return err
-		}
-		stage = "prepare_drained_target"
-		if err := targetManager.DiscardPreparedHandover(ctx, lease.RecordingID, targetIdentity); err != nil {
-			return err
-		}
-		if err := targetManager.PrepareHandoverTargetAfterSourceDrain(ctx, finalSnapshot, targetIdentity); err != nil {
-			return err
-		}
+	finalSnapshot, err := drainSource()
+	if err != nil {
+		return err
+	}
+	if err := runtimehook.Pause(runtimehook.BeforeTargetPrepare, lease.RecordingID); err != nil {
+		return errors.New("target preparation failpoint failed")
+	}
+	stage = "prepare_drained_target"
+	if err := targetManager.PrepareHandoverTargetAfterSourceDrain(ctx, finalSnapshot, targetIdentity); err != nil {
+		return err
 	}
 	stage = "commit_owner"
 	slog.Info("recording handover_target_ready", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch, "duration_ms", time.Since(started).Milliseconds())
@@ -1148,11 +1400,18 @@ func (c *updateController) resolveHandoverDiagnostic(recordingID string) {
 }
 
 func (c *updateController) engineManagerClient(attachment engineAttachment) (*recorderengine.ManagerClient, error) {
+	return c.engineManagerClientWithTimeout(attachment, 3*time.Second)
+}
+
+func (c *updateController) engineManagerClientWithTimeout(attachment engineAttachment, timeout time.Duration) (*recorderengine.ManagerClient, error) {
 	secret, err := controlplane.LoadPrivateIPCSecret(attachment.tokenPath)
 	if err != nil {
 		return nil, errors.New("Recorder Engine credential is unavailable")
 	}
-	client, err := runtimeipc.NewClientForInstance(attachment.socketPath, attachment.generationID, attachment.instanceID, secret, 3*time.Second)
+	// The request context can shorten this transport bound for quick calls. The
+	// source Manager uses the longer bound only for its accepted-cohort drain;
+	// ordinary and target-readiness calls retain the short IPC timeout.
+	client, err := runtimeipc.NewClientForInstance(attachment.socketPath, attachment.generationID, attachment.instanceID, secret, timeout)
 	if err != nil {
 		return nil, errors.New("Recorder Engine IPC endpoint is unavailable")
 	}

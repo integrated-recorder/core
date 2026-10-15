@@ -616,17 +616,27 @@ func Run(ctx context.Context, config Config) error {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
+			activationWake := false
 			select {
 			case <-leaseCtx.Done():
 				return
+			case <-updates.handoverWake:
+				// Committed application activation signals the primary handover
+				// trigger immediately. The ticker below remains a reconciliation
+				// and retry fallback.
+				activationWake = true
 			case <-ticker.C:
-				// A lease pass may perform a bounded recording handover. Use the
-				// same operation budget as update activation so a slow but healthy
-				// source drain is not canceled and retried forever at 15 seconds.
-				callCtx, cancel := context.WithTimeout(leaseCtx, updateOperationTimeout)
-				_ = updates.ReconcileLeases(callCtx)
-				cancel()
 			}
+			// A lease pass may perform bounded concurrent recording handovers. Use
+			// the same operation budget as update activation so a slow but healthy
+			// source cohort is not canceled and retried forever at 15 seconds.
+			callCtx, cancel := context.WithTimeout(leaseCtx, updateOperationTimeout)
+			if activationWake {
+				_ = updates.ReconcileLeasesAfterActivation(callCtx)
+			} else {
+				_ = updates.ReconcileLeases(callCtx)
+			}
+			cancel()
 		}
 	}()
 	adapterReconcileDone := startPeriodicAdapterReconciliation(leaseCtx, installState, updates, 3*time.Second)

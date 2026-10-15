@@ -3,12 +3,14 @@
 ## Scope and safety policy
 
 Active Recording handover moves one Recording between Recorder Engine processes
-under the same Runtime Host and canonical storage root. The Host first prepares
-the target, then drains source admissions and accepted canonical work, durably
-transfers the owner epoch, activates the target, and finally retires the source
-entry. A failed pre-transfer attempt leaves the source owner in place. A
-post-transfer rollback, when possible, issues a strictly newer epoch; an old
-epoch is never restored.
+under the same Runtime Host and canonical storage root. Committing a compatible
+application generation immediately signals handover orchestration. The Host
+requests a source cutoff for every eligible Recording before bounded migration
+work, then drains only each source's accepted cohort, durably transfers the
+owner epoch, activates the target, and finally retires the source entry. A
+failed pre-transfer attempt leaves the source owner in place. A post-transfer
+rollback, when possible, issues a strictly newer epoch; an old epoch is never
+restored.
 
 Cold Host recovery is intentionally fail-stop. The Host does not reconnect an
 orphan Engine or resume a Recording after a Host crash. The startup Engine
@@ -39,27 +41,35 @@ source identity/ordinal/gap state; recording state; and terminal archive
 mutation. If the owner record or lock cannot be validated, the mutation fails
 closed.
 
-For a normal handover, the source scheduler stops new manifest admissions and
-waits for admitted segment HTTP bodies, metadata work, queued payloads, storage
-retries, and writer callbacks to finish. The owner transfer cannot begin until
-this segment boundary succeeds. A segment body already in progress is allowed
-to complete; Core does not cancel or splice a partial response across Engines.
-The handover does not wait for the broadcast to end. A timeout or drain error
-resumes the source under its current epoch. The target never writes the
-canonical archive before the Host has transferred ownership.
+At the cutoff, source manifest admission and queued worker dispatch stop under
+the scheduler lock that also claims queued tasks. A task whose worker claim won
+that lock first is in the source drain cohort; a queued task whose cutoff won
+the lock is parked for the target. Retry-wait and await-manifest tasks are also
+parked, without a synthetic GAP. The source finishes only already-started
+segment/init attempts, complete buffered payloads and their init dependencies,
+already-persisting payloads, and canonical metadata/snapshot work already
+admitted. An in-progress segment body is not canceled or spliced across
+Engines. This is a bounded cohort drain, not a drain of all observed tasks.
+The owner transfer cannot begin until that cohort reaches its canonical commit
+boundary. A timeout or drain error resumes the source under its current epoch.
+The target never writes the canonical archive before the Host has transferred
+ownership.
 
 ## Target continuation preflight
 
-The Host only considers a target whose immutable adapter-set identity exactly
-matches the source generation. Existing Recordings are never silently moved to
-a newer adapter. The authenticated bounded handover context contains the source
-owner tuple, adapter ID, resource reference, current media source, and
-Recording ID; secrets, signed URLs, and adapter state are not copied into the
-archive or public API. The target generation uses its own pinned immutable
-adapter-set directory, while shared configuration, secrets, and adapter-owned
-state are loaded through the existing adapter runtime.
+The Host only considers a target whose immutable adapter-set, storage-provider
+set, and storage-instance identities exactly match the source generation.
+Ordinary application-release updates carry those exact pinned identities
+forward. Set changes are not compatible handovers. Existing Recordings are
+never silently moved to a different adapter or storage configuration. The
+authenticated bounded handover context contains the source owner tuple, adapter
+ID, resource reference, current media source, and Recording ID; secrets, signed
+URLs, and adapter state are not copied into the archive or public API. The
+target generation uses its own pinned immutable adapter-set directory, while
+shared configuration, secrets, and adapter-owned state are loaded through the
+existing adapter runtime.
 
-The target:
+After source drain, the target:
 
 1. Loads the canonical Recording read-only and derives the next ordinal and
    source identity from its root and sidecars.
@@ -70,21 +80,23 @@ The target:
 3. Fetches and parses a fresh bounded HLS manifest, applies the normal epoch,
    sequence, URI, discontinuity, program-time, MAP, and byte-range identity
    rules, then identifies the next uncommitted media object.
-4. Fetches and validates that candidate, and any required init object, into
+4. For V2, resolves each advertised candidate through the canonical sharded
+   coordinate index. `LastObservedSequence` is only an observation high-water;
+   it does not prove media presence. Canonical PRESENT and effective terminal
+   coverage are skipped, and the first canonically absent candidate is used.
+5. Fetches and validates that candidate, and any required init object, into
    bounded shared ingest memory. It records the canonical-root fingerprint,
    expected ordinal, source identity, and payload hash in process-local
    prepared state. It does not write payloads, sidecars, root metadata, metadata
    revisions, or committed ordinals before ownership transfer.
-5. After the source has stopped admission and drained, repeats the full
-   preflight from the final canonical root. A stale speculative candidate is
-   discarded. The staged candidate is submitted through the ordinary fenced
-   canonical commit path after the Host owner CAS.
 
 Refresh, manifest, candidate fetch, identity, hash, root-fingerprint, or
-readiness failure before CAS leaves the source owner unchanged. The periodic
-handover retry can try again. Adapter Protocol v1 does not promise refresh
-idempotence, so an expired/refresh-required source is drained before target
-refresh. A target cannot allocate a new archive ordinal by itself.
+readiness failure before CAS leaves the source owner unchanged and releases its
+cutoff so the source can resume. The 5-second lease reconciliation is a
+recovery/retry fallback, not the primary handover trigger. Adapter Protocol v1
+does not promise refresh idempotence, so an expired/refresh-required source is
+drained before target refresh. A target cannot allocate a new archive ordinal
+by itself.
 
 ## Live handover state machine
 
@@ -92,22 +104,33 @@ The durable owner tuple is the authority; prepare state and payload staging are
 volatile and disposable. A Host-owned operation gate serializes handover with
 application release activation and adapter-set reconciliation.
 
-1. **Prepare:** confirm source and target Engine identities/inventories; require
-the same adapter set; take a source continuation snapshot; prepare a fresh
-manifest and candidate while the source keeps recording where safe.
-2. **Drain:** stop new source manifest admission, join metadata observation, and
-drain accepted media/storage work. Obtain a final source snapshot.
-3. **Revalidate:** discard stale speculative state and repeat target preflight
-against the final root. No canonical mutation is permitted at this stage.
+1. **Cutoff:** after application activation commits, enumerate compatible
+leases and request every known source cutoff promptly. Cutoff IPC fan-out and
+migration completion use bounded worker pools; one Recording failure does not
+starve others. A ready target Engine may be confirmed before cutoff, but it
+does not fetch a media payload.
+2. **Drain:** stop new source manifest admission, cancel an outstanding
+manifest request and source observers, park unstarted live tasks and stop
+   historical admission. Historical HTTP admission is checked after any global
+   concurrency wait: requests admitted before cutoff and their current bounded
+   fetch window may finish, while waiters and later recovery windows are
+   rejected before starting a source request. The source recovery gate joins
+   that bounded window and its canonical commits before owner transfer. Drain
+   only in-flight source attempts, already acquired payloads and their canonical
+   dependencies, plus already admitted metadata and snapshot callbacks. Obtain
+   a final source snapshot.
+3. **Target prepare:** after source drain, fetch a fresh target manifest,
+resolve continuation from canonical archive truth, and stage the next missing
+media payload in bounded memory. No canonical mutation is permitted at this
+stage.
 4. **Owner CAS:** under the same per-Recording lock as commits, replace
 `(source generation, source worker, epoch N)` with
 `(target generation, target worker, epoch N+1)`. This is the only point at
 which the source loses canonical write permission.
 5. **Activate:** target validates the current owner inside the canonical fence,
 checks the staged root fingerprint/ordinal/source identity, commits any
-prepared adapter state, adopts the already-fetched candidate, and starts the
-worker. The first target media commit uses the staged payload where still
-current.
+prepared adapter state, adopts the staged candidate, and starts the worker.
+The first target media commit uses the staged payload where still current.
 6. **Retire:** after target activation, detach the parked source. Its stale
 epoch cannot commit even if its process remains alive.
 7. **Abort:** before CAS, discard target staging and resume the source. After
@@ -117,10 +140,12 @@ source generation only with a newer epoch. If authority is ambiguous, no
 process is granted write permission.
 
 The application release may already be active when an individual Recording
-handover fails. The failed Recording remains on its current owner and does not
-roll back the release. New recordings use the active generation. Adapter-set
-changes are not eligible for existing-recording handover unless the immutable
-set is exactly the same.
+handover fails. The failed Recording resumes or remains on its current owner
+and does not roll back the release. New recordings use the active generation.
+An old source task parked at cutoff does not create a GAP; the target continues
+from the first canonically uncommitted coordinate. Adapter, storage-provider,
+or storage-instance set changes are not eligible for existing-recording
+handover.
 
 ## Cold Host startup reconciliation
 

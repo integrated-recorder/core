@@ -69,7 +69,8 @@ func TestProductionSignedUpdateAcceptanceE2E(t *testing.T) {
 }
 
 // TestProductionTargetAdapterRefreshPreflightE2E exercises the target's real
-// adapter refresh and staged-media readiness before the durable owner CAS.
+// adapter refresh and staged-media readiness after source drain and before
+// the durable owner CAS.
 // The Host, Control, Engine, and adapter are production executables; only the
 // source and signed release feed are deterministic local fixtures.
 func TestProductionTargetAdapterRefreshPreflightE2E(t *testing.T) {
@@ -81,7 +82,7 @@ func TestProductionTargetAdapterRefreshPreflightE2E(t *testing.T) {
 	}
 	fixture := newRuntimeUpdateFixture(t)
 	artifacts := buildRuntimeUpdateArtifacts(t, fixture.server.URL)
-	t.Run("target refresh and stages next media before transfer", func(t *testing.T) {
+	t.Run("target refresh and stages next media after source drain", func(t *testing.T) {
 		runTargetRefreshPreflightScenario(t, artifacts, fixture, targetPreflightFailureNone)
 	})
 	t.Run("target refresh failure preserves source owner", func(t *testing.T) {
@@ -1766,9 +1767,13 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	}
 	t.Cleanup(func() { makeRuntimeE2ETreeWritable(dataDir) })
 	streamR := fmt.Sprintf("r-%d", iteration)
+	streamR2 := fmt.Sprintf("r2-%d", iteration)
+	streamR3 := fmt.Sprintf("r3-%d", iteration)
 	streamW := fmt.Sprintf("w-%d", iteration)
 	streamS := fmt.Sprintf("s-%d", iteration)
 	fixture.reset(streamR, "Before update", "Before update", "session-r-"+strconv.Itoa(iteration))
+	fixture.reset(streamR2, "Second recording", "Before update", "session-r2-"+strconv.Itoa(iteration))
+	fixture.reset(streamR3, "Third recording", "Before update", "session-r3-"+strconv.Itoa(iteration))
 	fixture.reset(streamW, "Watch source", "Watch description", fmt.Sprintf("session-w-%d", iteration))
 	fixture.reset(streamS, "New source", "New description", "session-s-"+strconv.Itoa(iteration))
 	controlABinary := filepath.Join(artifacts.bundleA, "control-plane")
@@ -1792,7 +1797,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
 		// A known test-only hook name enables the supervisor's bounded child
 		// diagnostic capture. No arm marker is published, so no hook pauses.
-		"IR_RUNTIME_E2E_FAILPOINT=before_owner_cas",
+		"IR_RUNTIME_E2E_FAILPOINT=" + string(runtimehook.BeforeTargetPrepare),
 		"IR_RUNTIME_E2E_MARKER_DIR=" + diagnosticDir,
 	})
 	process := &runtimeHostProcess{command: command, done: make(chan struct{}), diagnosticDir: diagnosticDir}
@@ -1886,6 +1891,26 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if len(metadataBaseline.Items) != 1 || stringValue(metadataBaseline.Items[0].Title) != "Before update" || stringValue(metadataBaseline.Items[0].Description) != "Before update" {
 		t.Fatalf("unexpected source metadata baseline: %+v", metadataBaseline.Items)
 	}
+	var recordingR2 domain.Recording
+	var leaseR2 generation.Lease
+	var recordingR3 domain.Recording
+	var leaseR3 generation.Lease
+	if iteration == 1 {
+		recordingR2 = createRuntimeRecording(t, client, baseURL, "Recording R2", map[string]string{"source_url": artifacts.fixtureURL + "/source/" + streamR2})
+		leaseR2 = waitRecordingLease(t, dataDir, recordingR2.ID, 30*time.Second)
+		if leaseR2.EngineGeneration != status.DefaultEngine.ID {
+			t.Fatalf("R2 is pinned to generation %s, active A generation is %s", leaseR2.EngineGeneration, status.DefaultEngine.ID)
+		}
+		fixture.advance(streamR2, 3)
+		waitRecordingSequenceCount(t, client, baseURL, recordingR2.ID, 3, 30*time.Second)
+		recordingR3 = createRuntimeRecording(t, client, baseURL, "Recording R3", map[string]string{"source_url": artifacts.fixtureURL + "/source/" + streamR3})
+		leaseR3 = waitRecordingLease(t, dataDir, recordingR3.ID, 30*time.Second)
+		if leaseR3.EngineGeneration != status.DefaultEngine.ID {
+			t.Fatalf("R3 is pinned to generation %s, active A generation is %s", leaseR3.EngineGeneration, status.DefaultEngine.ID)
+		}
+		fixture.advance(streamR3, 3)
+		waitRecordingSequenceCount(t, client, baseURL, recordingR3.ID, 3, 30*time.Second)
+	}
 
 	inputW := map[string]string{"source_url": artifacts.fixtureURL + "/source/" + streamW}
 	watchID := createRuntimeWatch(t, client, baseURL, "Watch W", inputW)
@@ -1908,6 +1933,9 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	}
 	if err := verifyInstalledRuntimeRelease(installedDir, artifacts.manifestB); err != nil {
 		t.Fatalf("staged immutable B release failed independent size/hash/signature checks: %v", err)
+	}
+	if err := writeRuntimeHookArm(diagnosticDir, runtimehook.Arm{Point: runtimehook.BeforeTargetPrepare, RecordingID: recordingR.ID}); err != nil {
+		t.Fatalf("arm post-drain target preparation boundary for R: %v", err)
 	}
 	if engineProcess := processForBinary(engineABinary); engineProcess == 0 {
 		t.Fatal("Engine A exited during signed B staging")
@@ -1961,6 +1989,83 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		sort.Slice(generations, func(i, j int) bool { return generations[i].ID < generations[j].ID })
 		t.Fatalf("%v; activation returned code=%d status=%+v at=%s..%s; owner=%+v owner_err=%v generations=%+v leases=%+v; host output=%s", err, code, activateStatus, activateStarted, activateFinished, owner, ownerErr, generations, runtime.Leases, process.output.String())
 	}
+	if time.Since(activateFinished) >= 5*time.Second {
+		releaseRefresh()
+		t.Fatalf("handover did not start promptly after activation response: elapsed=%s", time.Since(activateFinished))
+	}
+	if iteration == 1 {
+		// R remains blocked in its already-started adapter refresh. R2 and R3
+		// must both receive their own cutoffs and progress in the same bounded
+		// orchestration cycle.
+		cutoffChecksStarted := time.Now()
+		if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR2.ID, 1, 5*time.Second); err != nil {
+			releaseRefresh()
+			t.Fatalf("R2 was starved behind R's blocked handover: %v; host=%s", err, process.output.String())
+		}
+		if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR3.ID, 1, 5*time.Second); err != nil {
+			releaseRefresh()
+			t.Fatalf("R3 was starved behind R/R2 handovers: %v; host=%s", err, process.output.String())
+		}
+		if time.Since(cutoffChecksStarted) >= 5*time.Second {
+			releaseRefresh()
+			t.Fatalf("all compatible Recording cutoffs did not begin promptly: elapsed=%s", time.Since(cutoffChecksStarted))
+		}
+		// R2/R3 have drained their canonical prefixes and are waiting for
+		// continuation; publish the next coordinate so the targets can finish
+		// while R remains blocked on the source Engine.
+		fixture.advance(streamR2, 1)
+		fixture.advance(streamR3, 1)
+		r2LeaseB := waitRecordingLeaseGeneration(t, dataDir, recordingR2.ID, activateStatus.DefaultEngine.ID, 30*time.Second, process.output.String, func() string {
+			return fixture.describe(streamR2)
+		})
+		if r2LeaseB.EngineGeneration == leaseR2.EngineGeneration {
+			releaseRefresh()
+			t.Fatalf("R2 did not migrate independently while R remained blocked: %+v", r2LeaseB)
+		}
+		if err := waitHostHandoverLogEvent(process, "recording handover_committed", recordingR2.ID, 1, 30*time.Second); err != nil {
+			releaseRefresh()
+			t.Fatalf("R2 lease moved without a completed handover: %v; host=%s", err, process.output.String())
+		}
+		r2 := waitCanonicalSegmentCount(t, dataDir, recordingR2.ID, 4, 20*time.Second)
+		if r2.State != domain.StateRecording || len(r2.Gaps) != 0 || !equalSequenceRange(recordingSequences(r2), 1, 4) {
+			releaseRefresh()
+			t.Fatalf("R2 did not continue without a gap while R was blocked: state=%s sequences=%v gaps=%+v", r2.State, recordingSequences(r2), r2.Gaps)
+		}
+		r3LeaseB := waitRecordingLeaseGeneration(t, dataDir, recordingR3.ID, activateStatus.DefaultEngine.ID, 30*time.Second, process.output.String, func() string {
+			return fixture.describe(streamR3)
+		})
+		if r3LeaseB.EngineGeneration == leaseR3.EngineGeneration {
+			releaseRefresh()
+			t.Fatalf("R3 did not migrate independently while R remained blocked: %+v", r3LeaseB)
+		}
+		if err := waitHostHandoverLogEvent(process, "recording handover_committed", recordingR3.ID, 1, 30*time.Second); err != nil {
+			releaseRefresh()
+			t.Fatalf("R3 lease moved without a completed handover: %v; host=%s", err, process.output.String())
+		}
+		r3 := waitCanonicalSegmentCount(t, dataDir, recordingR3.ID, 4, 20*time.Second)
+		if r3.State != domain.StateRecording || len(r3.Gaps) != 0 || !equalSequenceRange(recordingSequences(r3), 1, 4) {
+			releaseRefresh()
+			t.Fatalf("R3 did not continue without a gap while R was blocked: state=%s sequences=%v gaps=%+v", r3.State, recordingSequences(r3), r3.Gaps)
+		}
+	}
+	if err := waitHostHandoverLogEvent(process, "recording handover_source_drained", recordingR.ID, 1, 30*time.Second); err != nil {
+		releaseRefresh()
+		t.Fatalf("R did not drain its pre-cutoff cohort: %v; host=%s", err, process.output.String())
+	}
+	readyMarker := runtimehook.ReadyMarkerPath(diagnosticDir, runtimehook.BeforeTargetPrepare, recordingR.ID)
+	if err := waitRuntimeConditionError(10*time.Second, func() bool {
+		info, statErr := os.Lstat(readyMarker)
+		return statErr == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0600
+	}, "post-drain target preparation boundary"); err != nil {
+		releaseRefresh()
+		t.Fatalf("Host did not pause after source drain and before target media preparation: %v; host=%s", err, process.output.String())
+	}
+	requestsAtDrain := fixture.segmentRequestsFor(streamR)
+	time.Sleep(100 * time.Millisecond)
+	if requestsAfterDrain := fixture.segmentRequestsFor(streamR); !reflect.DeepEqual(requestsAtDrain, requestsAfterDrain) {
+		releaseRefresh()
+		t.Fatalf("segment requests changed after source drain but before target preparation: before=%+v after=%+v", requestsAtDrain, requestsAfterDrain)
+	}
 	if refreshAt.After(activateFinished) {
 		releaseRefresh()
 		t.Fatalf("fixture refresh began after activation returned; expected an in-flight Engine A refresh: refresh=%s activation=%s..%s", refreshAt, activateStarted, activateFinished)
@@ -1992,7 +2097,16 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	}
 	if processForBinary(engineABinary) == 0 {
 		releaseRefresh()
-		t.Fatal("Engine A exited while R still held its generation lease")
+		leaseSnapshot := readRuntimeLeases(t, dataDir)
+		runtimeSnapshot := readRuntimeGenerationSnapshot(t, dataDir)
+		ownerStore, ownerErr := recordingowner.Open(dataDir)
+		ownerR, ownerRErr := ownerStore.Current(recordingR.ID)
+		ownerR2, ownerR2Err := recordingowner.Owner{}, error(nil)
+		if recordingR2.ID != "" {
+			ownerR2, ownerR2Err = ownerStore.Current(recordingR2.ID)
+		}
+		currentR := getRecording(t, dataDir, client, baseURL, recordingR.ID)
+		t.Fatalf("Engine A exited while R was expected to retain its source lease: R=%s state=%s last_error=%q leaseR=%+v ownerR=%+v owner_err=%v/%v refreshes=%+v fixture=%s R2=%s leaseR2=%+v ownerR2=%+v ownerR2_err=%v generations=%+v host=%s", recordingR.ID, currentR.State, currentR.LastError, leaseSnapshot[recordingR.ID], ownerR, ownerErr, ownerRErr, fixture.refreshesFor(streamR), fixture.describe(streamR), recordingR2.ID, leaseSnapshot[recordingR2.ID], ownerR2, ownerR2Err, runtimeSnapshot.Generations, process.output.String())
 	}
 	status = waitRuntimeStatus(t, ctx, client, baseURL, func(s httpapi.Status) bool {
 		return s.ActiveControl != nil && s.ActiveControl.Version == e2eVersionB
@@ -2012,29 +2126,87 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		releaseRefresh()
 		t.Fatal(err)
 	}
-	// Freeze the actual B Engine process while R is still blocked in its A-side
-	// refresh. The Host has already requested a source drain based on the typed
-	// preflight result; after A drains, its target request must fail without an
-	// owner transfer, then the source resumes and remains the only writer.
-	if err := syscall.Kill(engineBPID, syscall.SIGSTOP); err != nil {
+	// Fail the target's post-drain source refresh once. This keeps the target
+	// Engine healthy and exercises the real prepare-failure/source-resume path
+	// without freezing a process or holding a stale IPC request open.
+	fixture.expireAndFailNextRefresh(streamR)
+	if err := writeRuntimeHookRelease(diagnosticDir, runtimehook.BeforeTargetPrepare, recordingR.ID); err != nil {
 		releaseRefresh()
-		t.Fatalf("could not suspend target Engine B for handover failure injection: %v", err)
+		t.Fatalf("release post-drain target preparation boundary: %v", err)
 	}
-	resumeTargetEngine := func() { _ = syscall.Kill(engineBPID, syscall.SIGCONT) }
-	t.Cleanup(resumeTargetEngine)
-	if refreshes := fixture.refreshesFor(streamR); len(refreshes) != 1 {
+	if err := os.Remove(runtimehook.ArmPath(diagnosticDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		releaseRefresh()
-		t.Fatalf("target preflight issued a concurrent adapter refresh while Engine A was refreshing: %+v", refreshes)
+		t.Fatalf("remove one-shot target preparation arm: %v", err)
+	}
+	if refreshes := fixture.refreshesFor(streamR); len(refreshes) != 1 || refreshes[0].Token != "token-0" || refreshes[0].At.After(activateFinished) {
+		releaseRefresh()
+		t.Fatalf("target issued refresh before the source-drained boundary: %+v", refreshes)
 	}
 	releaseRefresh()
 	if err := waitHostHandoverLogEvent(process, "recording handover_source_drained", recordingR.ID, 1, 30*time.Second); err != nil {
 		t.Fatalf("%v; host output=%s", err, process.output.String())
 	}
 	// Publish the exact next object after A has reached the durable drained
-	// boundary. The stopped target forces one pre-CAS failure; the source must
-	// resume and capture this object before a later target retry.
+	// boundary. The target refresh failure must leave ownership on A; A then
+	// resumes, refreshes the source, and commits this object before retry.
 	fixture.advance(streamR, 1)
-	recordingDuringTargetFailure := waitCanonicalSegmentCount(t, dataDir, recordingR.ID, 31, 30*time.Second)
+	storeDuringTargetFailure, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recordingDuringTargetFailure *domain.Recording
+	deadlineTargetFailure := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadlineTargetFailure) {
+		candidate, loadErr := storeDuringTargetFailure.LoadRecordingReadOnly(recordingR.ID)
+		if loadErr == nil && candidate != nil {
+			var count uint64
+			for _, track := range candidate.Tracks {
+				if track != nil {
+					count += track.MediaCount
+				}
+			}
+			if count >= 31 {
+				if err := materializeShardedRecordingForTest(storeDuringTargetFailure, candidate); err != nil {
+					t.Fatalf("materialize R after source resumed: %v", err)
+				}
+				recordingDuringTargetFailure = candidate
+				break
+			}
+			if candidate.State != domain.StateRecording {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if recordingDuringTargetFailure == nil {
+		latest, _ := storeDuringTargetFailure.LoadRecordingReadOnly(recordingR.ID)
+		header, headerErr := storeDuringTargetFailure.LoadRecordingHeader(context.Background(), recordingR.ID)
+		leaseNow := readRuntimeLeases(t, dataDir)[recordingR.ID]
+		ownerNow, ownerErr := ownerBeforeTargetFailure, error(nil)
+		if owners, openErr := recordingowner.Open(dataDir); openErr != nil {
+			ownerErr = openErr
+		} else {
+			ownerNow, ownerErr = owners.Current(recordingR.ID)
+		}
+		materializeErr := error(nil)
+		if latest != nil && latest.FormatVersion == storage.ShardedArchiveFormatVersion {
+			materializeErr = materializeShardedRecordingForTest(storeDuringTargetFailure, latest)
+		}
+		var canonicalSequences []uint64
+		trackSummary := "unavailable"
+		if headerErr == nil && header != nil && header.Tracks["main"] != nil {
+			track := header.Tracks["main"]
+			trackSummary = fmt.Sprintf("media=%d high_water=%d next_ordinal=%d pending=%+v", track.MediaCount, track.MediaHighWater, track.NextArchiveOrdinal, track.PendingSegments)
+		}
+		if latest != nil && latest.Tracks["main"] != nil {
+			for _, segment := range latest.Tracks["main"].Segments {
+				canonicalSequences = append(canonicalSequences, segment.Sequence)
+			}
+		}
+		flow, flowCode := getRuntimeJSON[map[string]any](t, client, baseURL, http.MethodGet, "/api/recordings/"+recordingR.ID+"/acquisition-flow", nil)
+		storageDiagnostic, _ := os.ReadFile(filepath.Join(dataDir, "management", "diagnostics", "recordings", recordingR.ID+".json"))
+		t.Fatalf("source did not resume after target preparation failure: recording=%+v canonical_sequences=%v materialize_err=%v header_track=%s header_err=%v flow_code=%d flow=%#v storage_diagnostic=%s lease=%+v owner=%+v owner_err=%v fixture=%s segment_requests=%+v refreshes=%+v host=%s child_diagnostics=%s", latest, canonicalSequences, materializeErr, trackSummary, headerErr, flowCode, flow, storageDiagnostic, leaseNow, ownerNow, ownerErr, fixture.describe(streamR), fixture.segmentRequestsFor(streamR), fixture.refreshesFor(streamR), process.output.String(), readRuntimeE2EChildDiagnostics(process.diagnosticDir))
+	}
 	if recordingDuringTargetFailure.State != domain.StateRecording || len(recordingDuringTargetFailure.Gaps) != 0 {
 		t.Fatalf("R did not continue on source Engine A while target Engine B was unavailable: state=%s gaps=%+v; fixture=%s", recordingDuringTargetFailure.State, recordingDuringTargetFailure.Gaps, fixture.describe(streamR))
 	}
@@ -2051,10 +2223,9 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		return diagnostic != nil && diagnostic.RecordingID == recordingR.ID && diagnostic.ReconcileState == "pending"
 	})
 	failureDiagnostic := failureStatus.HandoverDiagnostic
-	if failureDiagnostic.Phase != "prepare_drained_target" || failureDiagnostic.ReasonCode != "target_start_timeout" || !failureDiagnostic.Retryable || !failureDiagnostic.Recoverable || !failureDiagnostic.OwnershipRetained || failureDiagnostic.ReconcileAttempt < 1 {
+	if failureDiagnostic.Phase != "prepare_drained_target" || failureDiagnostic.ReasonCode != "unknown" || !failureDiagnostic.Retryable || !failureDiagnostic.Recoverable || !failureDiagnostic.OwnershipRetained || failureDiagnostic.ReconcileAttempt < 1 {
 		t.Fatalf("failed target preparation diagnostic=%+v; owner=%+v", failureDiagnostic, durableOwnerAfterTargetFailure)
 	}
-	resumeTargetEngine()
 	if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR.ID, 2, 30*time.Second); err != nil {
 		t.Fatalf("%v; host output=%s", err, process.output.String())
 	}
@@ -2095,8 +2266,8 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		t.Fatalf("old Engine A did not retire after R ownership moved to B: %v", err)
 	}
 	refreshes := fixture.refreshesFor(streamR)
-	if len(refreshes) != 1 || refreshes[0].Token != "token-0" || !refreshes[0].At.Before(activateFinished) {
-		t.Fatalf("expired source did not require exactly one pre-activation Engine A refresh: %+v, activation=%s", refreshes, activateFinished)
+	if len(refreshes) < 3 || refreshes[0].Token != "token-0" || !refreshes[0].At.Before(activateFinished) || refreshes[0].Succeeded || refreshes[1].Token != "token-0" || !refreshes[1].Failed || refreshes[1].At.Before(activateFinished) || refreshes[2].Token != "token-0" || !refreshes[2].Succeeded || refreshes[2].At.Before(refreshes[1].At) {
+		t.Fatalf("source/target refresh boundary was not preserved (pre-cutoff source attempt, failed target prep, source resume): %+v, activation=%s", refreshes, activateFinished)
 	}
 	if err := waitWatchPollingAfter(t, fixture, streamW, activateFinished, 20*time.Second); err != nil {
 		t.Fatalf("Watch W did not resume polling after Control B activation: %v", err)
@@ -2808,7 +2979,7 @@ func waitCanonicalSegmentCount(t *testing.T, dataDir, recordingID string, minimu
 	if err := materializeShardedRecordingForTest(store, recording); err != nil {
 		t.Fatalf("materialize canonical Recording after waiting for %d segments: %v", minimum, err)
 	}
-	t.Fatalf("canonical Recording %s stopped at %d segments, want at least %d", recordingID, recording.SegmentCount(), minimum)
+	t.Fatalf("canonical Recording %s reached terminal state=%s at %d segments, want at least %d; last_error=%q stopped_at=%v", recordingID, recording.State, recording.SegmentCount(), minimum, recording.LastError, recording.StoppedAt)
 	return nil
 }
 

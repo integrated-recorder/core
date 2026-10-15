@@ -27,8 +27,26 @@ const (
 
 type acquisitionPriorityKey struct{}
 
+type historicalSourceAdmissionKey struct{}
+
 func withHistoricalAcquisitionPriority(ctx context.Context) context.Context {
 	return context.WithValue(ctx, acquisitionPriorityKey{}, acquisitionPriorityHistorical)
+}
+
+// withHistoricalSourceAdmission attaches the per-Recording handover boundary
+// to historical HTTP requests. The RoundTripper checks it after any global
+// historical-concurrency wait and immediately before admitting the source
+// request. A request that already passed that check is part of the bounded
+// in-flight cohort and its response body is not canceled by handover.
+func withHistoricalSourceAdmission(ctx context.Context, e *entry) context.Context {
+	return context.WithValue(ctx, historicalSourceAdmissionKey{}, func() bool {
+		if e == nil {
+			return false
+		}
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return !e.deleted && e.handover == nil
+	})
 }
 
 func requestAcquisitionPriority(ctx context.Context) acquisitionPriority {
@@ -293,6 +311,10 @@ func (t historicalPriorityRoundTripper) RoundTrip(request *http.Request) (*http.
 	release, err := t.governor.acquire(request.Context())
 	if err != nil {
 		return nil, err
+	}
+	if admitted, ok := request.Context().Value(historicalSourceAdmissionKey{}).(func() bool); ok && !admitted() {
+		release()
+		return nil, errHistoricalHandoverAdmissionClosed
 	}
 	response, err := t.base.RoundTrip(request)
 	if err != nil {

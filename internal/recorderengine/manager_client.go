@@ -108,6 +108,33 @@ func (m *ManagerClient) HandoverSnapshot(ctx context.Context, recordingID string
 	return result.Snapshot, nil
 }
 
+// RequestHandoverCutoff freezes new source media admission without waiting for
+// the already-started cohort. Runtime Host uses this quick operation for all
+// eligible recordings before bounded migration workers begin.
+func (m *ManagerClient) RequestHandoverCutoff(ctx context.Context, recordingID string, expectedOwner recordingowner.Owner) error {
+	if !validClientOwner(recordingID, expectedOwner) {
+		return ErrHandoverIdentity
+	}
+	var result HandoverResult
+	if err := m.client.Call(ctx, OperationHandoverCutoff, HandoverOwnerRequest{RecordingID: recordingID, Owner: expectedOwner}, &result); err != nil {
+		return normalizeHandoverError(err)
+	}
+	return validateHandoverAck(result, recordingID, expectedOwner, true)
+}
+
+// CancelHandoverCutoff resumes a source that was cut off but failed
+// pre-transfer preparation. The source token must still be current.
+func (m *ManagerClient) CancelHandoverCutoff(ctx context.Context, recordingID string, expectedOwner recordingowner.Owner) error {
+	if !validClientOwner(recordingID, expectedOwner) {
+		return ErrHandoverIdentity
+	}
+	var result HandoverResult
+	if err := m.client.Call(ctx, OperationHandoverCancelCutoff, HandoverOwnerRequest{RecordingID: recordingID, Owner: expectedOwner}, &result); err != nil {
+		return normalizeHandoverError(err)
+	}
+	return validateHandoverAck(result, recordingID, expectedOwner, true)
+}
+
 // PauseForHandover asks the source Engine to reach a safe, drained commit
 // boundary while leaving its Recording and worker recoverable for resume.
 func (m *ManagerClient) PauseForHandover(ctx context.Context, recordingID string, expectedOwner recordingowner.Owner) (acquire.HandoverSnapshot, error) {

@@ -59,7 +59,17 @@ func (m *Manager) runTimedEventMonitor(ctx context.Context, e *entry) {
 					reconnect = true
 					continue
 				}
-				if _, err := m.commitTimedEventBatch(ctx, e, batch); err != nil {
+				if !e.beginObserverCanonicalCommit() {
+					// Do not acknowledge a batch that did not cross the source
+					// canonical-commit admission boundary. The target resumes from
+					// the last durable cursor and may safely replay this batch.
+					reconnect = true
+					continue
+				}
+				// Once admitted, the append must not inherit observer cancellation:
+				// handover joins this callback and transfers only after its durable
+				// resume cursor has advanced atomically with the event batch.
+				if _, err := m.commitTimedEventBatch(context.Background(), e, batch); err != nil {
 					if errors.Is(err, storage.ErrArchiveSealed) {
 						return
 					}

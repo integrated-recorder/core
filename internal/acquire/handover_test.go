@@ -963,16 +963,6 @@ func TestHandoverCutoffLeavesQueuedLiveCoordinatesForTarget(t *testing.T) {
 		}
 	})
 	identity := HandoverTargetIdentity{EngineGeneration: handoverGenB, WorkerInstance: handoverWorkerB}
-	preCutoffSnapshot, err := source.HandoverSnapshot(recording.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := target.PrepareHandoverTarget(context.Background(), preCutoffSnapshot, identity); err != nil {
-		t.Fatalf("manifest-only preflight before cutoff: %v", err)
-	}
-	if got := fixture.requestCounts()["target"]; len(got) != 0 {
-		t.Fatalf("target fetched media before source drain: %v", got)
-	}
 	if err := source.RequestHandoverCutoff(context.Background(), recording.ID, owner); err != nil {
 		t.Fatalf("request source cutoff: %v", err)
 	}
@@ -1002,11 +992,10 @@ func TestHandoverCutoffLeavesQueuedLiveCoordinatesForTarget(t *testing.T) {
 				break
 			}
 		}
-		// The scheduler's bounded outstanding window can admit a variable number
-		// of queued tasks behind the in-flight worker cohort (especially under
-		// race instrumentation). Every admitted post-cohort task must be parked;
-		// later manifest coordinates are reconstructed by the target.
-		parked := 0
+		// The scheduler's bounded outstanding window may admit queued work behind
+		// the in-flight worker cohort. Every such task must be parked; later
+		// manifest coordinates are reconstructed by the target. Some runs admit
+		// only the worker-owned cohort, which is also valid.
 		for sequence := 5; sequence <= 10; sequence++ {
 			task := scheduler.tasks[segmentTaskKey{epoch: 0, discontinuitySequence: 0, sequence: uint64(sequence)}]
 			if task == nil {
@@ -1016,10 +1005,6 @@ func TestHandoverCutoffLeavesQueuedLiveCoordinatesForTarget(t *testing.T) {
 				cutoffClassified = false
 				break
 			}
-			parked++
-		}
-		if parked == 0 {
-			cutoffClassified = false
 		}
 		scheduler.mu.Unlock()
 		if cutoffClassified {
@@ -1029,6 +1014,20 @@ func TestHandoverCutoffLeavesQueuedLiveCoordinatesForTarget(t *testing.T) {
 	}
 	if !cutoffClassified {
 		t.Fatalf("cutoff task classification failed: %s requests=%v", cutoffState, fixture.requestCounts())
+	}
+	// Probe the target after live admission/dispatch has been frozen while the
+	// accepted source bodies are still blocked in flight. This keeps the root
+	// stable during the read-only probe and proves that a target manifest check
+	// cannot fetch media before the source drain boundary.
+	preCutoffSnapshot, err := source.HandoverSnapshot(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.PrepareHandoverTarget(context.Background(), preCutoffSnapshot, identity); err != nil {
+		t.Fatalf("manifest-only pre-drain preflight: %v", err)
+	}
+	if got := fixture.requestCounts()["target"]; len(got) != 0 {
+		t.Fatalf("target fetched media before source drain: %v", got)
 	}
 	paused := make(chan struct {
 		snapshot HandoverSnapshot

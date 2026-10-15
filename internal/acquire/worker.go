@@ -387,12 +387,14 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			return fmt.Errorf("main track is missing")
 		}
 		minSeq, maxSeq := playlist.Segments[0].Sequence, playlist.Segments[0].Sequence
+		maxDiscontinuitySequence := playlist.Segments[0].DiscontinuitySequence
 		for _, seg := range playlist.Segments {
 			if seg.Sequence < minSeq {
 				minSeq = seg.Sequence
 			}
 			if seg.Sequence > maxSeq {
 				maxSeq = seg.Sequence
+				maxDiscontinuitySequence = seg.DiscontinuitySequence
 			}
 		}
 		sequenceReset := t.HasLastObservedSequence && maxSeq < t.LastObservedSequence
@@ -431,6 +433,7 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			}
 			t.SourceEpoch++
 			t.HasLastObservedSequence = false
+			t.GapResolutionCursor = nil
 		}
 		epoch := t.SourceEpoch
 		observedEpoch = epoch
@@ -446,25 +449,34 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 				})
 			}
 		}
-		if t.HasLastObservedSequence && t.LastObservedSequence < ^uint64(0) && minSeq > t.LastObservedSequence && minSeq-t.LastObservedSequence > 1 {
-			lastDS, known := lastObservedDiscontinuitySequence(t, epoch, t.LastObservedSequence)
-			if known && len(playlist.Segments) > 0 && playlist.Segments[0].DiscontinuitySequence == lastDS {
-				gapCandidates = append(gapCandidates, canonicalGapCandidate{
-					trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: lastDS,
-					fromSequence: t.LastObservedSequence + 1, toSequence: minSeq - 1,
-					reason: "sequence advanced past uncaptured media",
-				})
-			}
+		gapCursorSequence := t.LastObservedSequence
+		gapCursorDS, knownGapCursor := lastObservedDiscontinuitySequence(t, epoch, gapCursorSequence)
+		hasGapCursor := t.HasLastObservedSequence
+		if cursor := t.GapResolutionCursor; cursor != nil && cursor.SourceEpoch == epoch {
+			gapCursorSequence = cursor.Sequence
+			gapCursorDS = cursor.DiscontinuitySequence
+			knownGapCursor = true
+			hasGapCursor = true
+		}
+		if from, to, missing := sequenceAdvanceGapBounds(hasGapCursor, gapCursorSequence, minSeq); missing && knownGapCursor && len(playlist.Segments) > 0 && playlist.Segments[0].DiscontinuitySequence == gapCursorDS {
+			gapCandidates = append(gapCandidates, canonicalGapCandidate{
+				trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: gapCursorDS,
+				fromSequence: from, toSequence: to,
+				reason: "sequence advanced past uncaptured media",
+			})
 		}
 		for i := 1; i < len(playlist.Segments); i++ {
 			previous, next := playlist.Segments[i-1], playlist.Segments[i]
 			prevSeq := previous.Sequence
 			if previous.DiscontinuitySequence == next.DiscontinuitySequence && prevSeq < ^uint64(0) && next.Sequence > prevSeq && next.Sequence-prevSeq > 1 {
-				gapCandidates = append(gapCandidates, canonicalGapCandidate{
+				candidate := canonicalGapCandidate{
 					trackID: t.ID, sourceEpoch: epoch, discontinuitySequence: next.DiscontinuitySequence,
 					fromSequence: prevSeq + 1, toSequence: next.Sequence - 1,
 					reason: "sequence skipped in manifest",
-				})
+				}
+				if resumed, ok := resumeGapCandidateFromCursor(candidate, t.GapResolutionCursor); ok {
+					gapCandidates = append(gapCandidates, resumed)
+				}
 			}
 		}
 		present := map[segmentTaskKey]bool{}
@@ -581,6 +593,9 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 			t.LastObservedSequence = maxSeq
 		}
 		t.HasLastObservedSequence = true
+		t.GapResolutionCursor = &domain.GapResolutionCursor{
+			SourceEpoch: epoch, DiscontinuitySequence: maxDiscontinuitySequence, Sequence: maxSeq,
+		}
 		return nil
 	}(); err != nil {
 		return false, err
@@ -600,9 +615,11 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		// with media writes. The playlist observation alone never establishes
 		// that a V2 coordinate is absent from the archive.
 		if err := m.withCanonicalCommit(e, func() error {
-			if err := m.commitGapCandidates(r, gapCandidates); err != nil {
+			deferred, err := m.commitGapCandidates(r, gapCandidates)
+			if err != nil {
 				return err
 			}
+			deferGapResolutionCursor(r, deferred)
 			if !isShardedRecording(r) {
 				if err := applyLegacyGapRevisions(baseGapRevision, r); err != nil {
 					return err
@@ -638,9 +655,11 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	}
 	e.mu.Unlock()
 	if err := m.withCanonicalCommit(e, func() error {
-		if err := m.commitGapCandidates(r, gapCandidates); err != nil {
+		deferred, err := m.commitGapCandidates(r, gapCandidates)
+		if err != nil {
 			return err
 		}
+		deferGapResolutionCursor(r, deferred)
 		if !isShardedRecording(r) {
 			if err := applyLegacyGapRevisions(baseGapRevision, r); err != nil {
 				return err
@@ -2180,11 +2199,38 @@ func (m *Manager) finalizePending(r *domain.Recording, reason string) error {
 			candidates = append(candidates, m.finalizePendingEpochExcept(r, t, epoch, reason, nil)...)
 		}
 	}
-	return m.commitGapCandidates(r, candidates)
+	_, err := m.commitGapCandidates(r, candidates)
+	return err
 }
 
 func (m *Manager) finalizePendingEpoch(r *domain.Recording, t *domain.Track, epoch uint64, reason string) error {
-	return m.commitGapCandidates(r, m.finalizePendingEpochExcept(r, t, epoch, reason, nil))
+	_, err := m.commitGapCandidates(r, m.finalizePendingEpochExcept(r, t, epoch, reason, nil))
+	return err
+}
+
+// deferGapResolutionCursor moves only the inferred-gap progress marker to the
+// first unresolved coordinate. The actual source observation high-water is
+// intentionally unchanged; future playlist observations re-create the
+// remainder without confusing handover/acquisition code that consumes
+// LastObservedSequence.
+func deferGapResolutionCursor(recording *domain.Recording, deferred []canonicalGapCandidate) {
+	if recording == nil {
+		return
+	}
+	for _, candidate := range deferred {
+		track := recording.Tracks[candidate.trackID]
+		if track == nil || candidate.sourceEpoch != track.SourceEpoch || candidate.fromSequence == 0 {
+			continue
+		}
+		sequence := candidate.fromSequence - 1
+		cursor := track.GapResolutionCursor
+		if cursor == nil || cursor.SourceEpoch != candidate.sourceEpoch || sequence < cursor.Sequence {
+			track.GapResolutionCursor = &domain.GapResolutionCursor{
+				SourceEpoch: candidate.sourceEpoch, DiscontinuitySequence: candidate.discontinuitySequence,
+				Sequence: sequence,
+			}
+		}
+	}
 }
 
 func (m *Manager) finalizePendingEpochExcept(r *domain.Recording, t *domain.Track, epoch uint64, reason string, protected map[segmentTaskKey]bool) []canonicalGapCandidate {

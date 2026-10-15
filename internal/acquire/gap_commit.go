@@ -33,6 +33,41 @@ type gapCommitOutcome struct {
 	present  bool
 	missing  bool
 	appended int
+	deferred bool
+}
+
+// maxGapResolutionCoordinates bounds canonical coordinate lookups and the
+// derived coverage-state work performed for one candidate while the recording
+// commit fence is held. The V2 coverage index currently materializes fixed
+// sequence buckets, so resolving an arbitrarily large source interval in one
+// commit would still be unbounded even if the media lookup were range-aware.
+const maxGapResolutionCoordinates uint64 = 256
+
+func sequenceAdvanceGapBounds(hasPrevious bool, previous, next uint64) (from, to uint64, ok bool) {
+	if !hasPrevious || previous == ^uint64(0) || next <= previous || next-previous <= 1 {
+		return 0, 0, false
+	}
+	return previous + 1, next - 1, true
+}
+
+// resumeGapCandidateFromCursor skips the prefix that an earlier bounded pass
+// already resolved for the same source coordinate domain. It is only used for
+// inferred sequence ranges; explicit source gaps and terminal task failures
+// remain independent observations.
+func resumeGapCandidateFromCursor(candidate canonicalGapCandidate, cursor *domain.GapResolutionCursor) (canonicalGapCandidate, bool) {
+	if cursor == nil || cursor.SourceEpoch != candidate.sourceEpoch || cursor.DiscontinuitySequence != candidate.discontinuitySequence {
+		return candidate, candidate.toSequence >= candidate.fromSequence
+	}
+	if candidate.toSequence <= cursor.Sequence {
+		return canonicalGapCandidate{}, false
+	}
+	if candidate.fromSequence <= cursor.Sequence {
+		if cursor.Sequence == ^uint64(0) {
+			return canonicalGapCandidate{}, false
+		}
+		candidate.fromSequence = cursor.Sequence + 1
+	}
+	return candidate, candidate.toSequence >= candidate.fromSequence
 }
 
 // canonicalCoordinatePresent resolves current archive truth. V1 keeps its
@@ -86,6 +121,12 @@ func (m *Manager) commitGapIfStillMissing(recording *domain.Recording, candidate
 	track := recording.Tracks[candidate.trackID]
 	if track == nil {
 		return outcome, errors.New("track is missing for canonical gap commit")
+	}
+	// Compare the difference instead of computing (to-from)+1, which can
+	// overflow for the full uint64 range. This primitive never scans a range
+	// above the fixed budget; commitGapCandidates splits larger observations.
+	if candidate.toSequence-candidate.fromSequence >= maxGapResolutionCoordinates {
+		return gapCommitOutcome{deferred: true}, nil
 	}
 	flushMissing := func(from, to uint64) {
 		before := len(recording.Gaps)
@@ -155,13 +196,45 @@ func removePendingCoordinate(track *domain.Track, epoch, discontinuitySequence, 
 	}
 }
 
-// commitGapCandidates applies a bounded set of observed gap candidates. The
-// caller must already hold entry.persistMu and the canonical commit fence.
-func (m *Manager) commitGapCandidates(recording *domain.Recording, candidates []canonicalGapCandidate) error {
+// commitGapCandidates applies observed gap candidates while limiting every
+// candidate's synchronous coordinate work to maxGapResolutionCoordinates.
+// Remainders are returned to the caller so its durable gap-resolution cursor
+// can resume them on a later manifest. The caller must already hold
+// entry.persistMu and the canonical commit fence.
+func (m *Manager) commitGapCandidates(recording *domain.Recording, candidates []canonicalGapCandidate) ([]canonicalGapCandidate, error) {
+	var deferred []canonicalGapCandidate
 	for _, candidate := range candidates {
-		if _, err := m.commitGapIfStillMissing(recording, candidate); err != nil {
-			return err
+		if candidate.toSequence < candidate.fromSequence {
+			return nil, errors.New("invalid canonical gap candidate")
+		}
+		chunk, remainder, hasRemainder := splitCanonicalGapCandidate(candidate)
+		outcome, err := m.commitGapIfStillMissing(recording, chunk)
+		if err != nil {
+			return nil, err
+		}
+		if outcome.deferred {
+			return nil, errors.New("bounded canonical gap chunk was unexpectedly deferred")
+		}
+		if hasRemainder {
+			deferred = append(deferred, remainder)
 		}
 	}
-	return nil
+	return deferred, nil
+}
+
+// splitCanonicalGapCandidate bounds a candidate before any canonical lookup
+// or coverage publication. The difference comparison avoids length overflow;
+// when a remainder exists, the bounded end is strictly below the source end,
+// so both additions are safe at uint64 boundaries.
+func splitCanonicalGapCandidate(candidate canonicalGapCandidate) (chunk, remainder canonicalGapCandidate, hasRemainder bool) {
+	chunk = candidate
+	if candidate.toSequence < candidate.fromSequence || candidate.toSequence-candidate.fromSequence < maxGapResolutionCoordinates {
+		return chunk, canonicalGapCandidate{}, false
+	}
+	chunk.toSequence = candidate.fromSequence + maxGapResolutionCoordinates - 1
+	remainder = candidate
+	remainder.fromSequence = chunk.toSequence + 1
+	remainder.acquisition = nil
+	remainder.annotation = nil
+	return chunk, remainder, true
 }

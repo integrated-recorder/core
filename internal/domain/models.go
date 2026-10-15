@@ -106,12 +106,28 @@ type Track struct {
 	DurationSeconds         float64 `json:"duration_seconds,omitempty"`
 	HasLastObservedSequence bool    `json:"has_last_observed_sequence,omitempty"`
 	LastObservedSequence    uint64  `json:"last_observed_sequence,omitempty"`
+	// GapResolutionCursor is the last source coordinate through which inferred
+	// sequence gaps have been resolved. It can trail LastObservedSequence when
+	// a source reports a jump larger than Core's bounded synchronous resolution
+	// budget. Keeping this cursor separate preserves LastObservedSequence's
+	// source-observation and handover semantics while allowing later manifests
+	// to resume the deferred range.
+	GapResolutionCursor *GapResolutionCursor `json:"gap_resolution_cursor,omitempty"`
 	// PendingSequences is retained for legacy recordings where source epoch was
 	// implicitly zero. Newer recordings use PendingSegments.
 	PendingSequences []uint64          `json:"pending_sequences,omitempty"`
 	PendingSegments  []PendingSequence `json:"pending_segments,omitempty"`
 	InitSegments     []Segment         `json:"init_segments,omitempty"`
 	Segments         []Segment         `json:"segments"`
+}
+
+// GapResolutionCursor identifies the coordinate boundary for bounded source
+// sequence-gap reconciliation. It is an operational progress marker, not a
+// canonical gap observation.
+type GapResolutionCursor struct {
+	SourceEpoch           uint64 `json:"source_epoch"`
+	DiscontinuitySequence uint64 `json:"discontinuity_sequence"`
+	Sequence              uint64 `json:"sequence"`
 }
 
 // LivePresentationState is persisted with the recording root so an Engine

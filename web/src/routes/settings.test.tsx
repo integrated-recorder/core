@@ -133,6 +133,33 @@ describe('storage ingest settings UI', () => {
 })
 
 describe('runtime update settings UI', () => {
+  it('shows a cleaned previous release as rollback-ready without a draining label', async () => {
+    vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({
+      ...structuredClone(updateStatus),
+      active_generations: [structuredClone(updateStatus.default_engine!)],
+      draining_generations: [],
+      previous_release: { version: 'vPrev', commit: '123456789abcdef0123456789abcdef012345678', build_time: '2026-09-20T12:00:00Z', release_channel: 'stable' },
+    })
+    renderSettings('updates')
+
+    expect(await screen.findByText('vPrev')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '이전 버전으로 롤백' })).toBeEnabled()
+    fireEvent.click(screen.getByText('진단 정보', { selector: 'summary' }))
+    expect(screen.queryByText('정리 중')).not.toBeInTheDocument()
+  })
+
+  it('continues to show a real draining generation as cleaning up', async () => {
+    vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({
+      ...structuredClone(updateStatus),
+      draining_generations: [{ id: 'cccccccc-cccc-cccc-cccc-cccccccccccc', version: 'vDraining', commit: '123456789abcdef0123456789abcdef012345678', installed_at: '2026-09-20T12:00:00Z', state: 'draining', active_recordings: 0 }],
+    })
+    renderSettings('updates')
+
+    expect(await screen.findByText('vDraining')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('진단 정보', { selector: 'summary' }))
+    expect(screen.getAllByText('정리 중').length).toBeGreaterThan(0)
+  })
+
   it('renders only stable, sanitized handover diagnostics', async () => {
     const diagnostic = {
       recording_id: 'recording-123', phase: 'prepare_target', reason_code: 'target_start_timeout',

@@ -1317,7 +1317,11 @@ func activeControlCatalog(snapshot supervisor.Snapshot) (string, bool) {
 }
 
 func (c *updateController) processesStopped(id string) bool {
-	process, exists := supervisorGeneration(c.supervisor.Snapshot(), id)
+	return processesStoppedInSnapshot(c.supervisor.Snapshot(), id)
+}
+
+func processesStoppedInSnapshot(snapshot supervisor.Snapshot, id string) bool {
+	process, exists := supervisorGeneration(snapshot, id)
 	if !exists {
 		return true
 	}
@@ -2070,6 +2074,15 @@ func (c *updateController) status() httpapi.Status {
 		case generation.StateActive:
 			status.ActiveGenerations = append(status.ActiveGenerations, row)
 		case generation.StateDraining:
+			// A previous generation remains durably StateDraining so rollback can
+			// restart its signed release. Once it is dormant, lease-free, and no
+			// longer has a supervised process, cleanup is complete; expose it via
+			// previous_release rather than presenting it as an active drain.
+			// Keep inconsistent/live processes and leases visible as draining.
+			if item.ID == registryState.PreviousGenerationID && item.EngineDormant &&
+				leaseCount[item.ID] == 0 && processesStoppedInSnapshot(supState, item.ID) {
+				continue
+			}
 			status.DrainingGenerations = append(status.DrainingGenerations, row)
 		}
 	}

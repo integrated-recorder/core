@@ -918,8 +918,106 @@ func TestUpdateControllerReconciliationStopsIdlePreviousEngineButRetainsRollback
 	if process, exists := supervisorGeneration(fixture.sup.Snapshot(), fixture.initialID); !exists || process.Engine.State != supervisor.ProcessExited {
 		t.Fatalf("previous Engine process was not stopped: %+v", process)
 	}
+	status := fixture.controller.status()
+	if len(status.DrainingGenerations) != 0 {
+		t.Fatalf("cleaned previous rollback target remains operationally draining: %+v", status.DrainingGenerations)
+	}
+	if status.PreviousRelease == nil || status.PreviousRelease.Version != "1.0.0" {
+		t.Fatalf("cleaned previous generation is not exposed as rollback release: %+v", status.PreviousRelease)
+	}
 	if err := fixture.controller.ReconcileLeases(context.Background()); err != nil {
 		t.Fatalf("subsequent lease reconciliation required the dormant Engine inventory: %v", err)
+	}
+}
+
+func TestUpdateControllerStatusKeepsPreviousGenerationVisibleUntilCleanupCompletes(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	activateFixtureCandidate(t, fixture)
+
+	// No leases alone do not mean cleanup is complete while the Engine is live.
+	status := fixture.controller.status()
+	if len(status.DrainingGenerations) != 1 || status.DrainingGenerations[0].ID != fixture.initialID || status.DrainingGenerations[0].ActiveRecordings != 0 {
+		t.Fatalf("lease-free but live previous Engine was not shown as draining: %+v", status.DrainingGenerations)
+	}
+
+	// Even an inconsistent dormant marker must not hide a process still ready
+	// or stopping in the Host supervisor's authoritative process view.
+	if err := fixture.registry.MarkEngineDormant(fixture.initialID); err != nil {
+		t.Fatalf("MarkEngineDormant(): %v", err)
+	}
+	for _, processState := range []supervisor.ProcessState{supervisor.ProcessReady, supervisor.ProcessStopping} {
+		fixture.sup.mu.Lock()
+		process := fixture.sup.generations[fixture.initialID]
+		process.Engine.State = processState
+		fixture.sup.generations[fixture.initialID] = process
+		fixture.sup.mu.Unlock()
+
+		status = fixture.controller.status()
+		if len(status.DrainingGenerations) != 1 || status.DrainingGenerations[0].ID != fixture.initialID {
+			t.Fatalf("previous generation with Engine %s was hidden: %+v", processState, status.DrainingGenerations)
+		}
+	}
+}
+
+func TestUpdateControllerStatusRetainsPreviousGenerationWithRecordingLease(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	lease := generation.Lease{RecordingID: strings.Repeat("1", 32), EngineGeneration: fixture.initialID, WorkerInstance: strings.Repeat("2", 32), StartedAt: time.Now().UTC()}
+	if err := fixture.registry.PinRecording(lease); err != nil {
+		t.Fatal(err)
+	}
+	activateFixtureCandidate(t, fixture)
+
+	status := fixture.controller.status()
+	if len(status.DrainingGenerations) != 1 || status.DrainingGenerations[0].ID != fixture.initialID || status.DrainingGenerations[0].ActiveRecordings != 1 {
+		t.Fatalf("previous generation with a Recording lease was hidden or miscounted: %+v", status.DrainingGenerations)
+	}
+}
+
+func TestUpdateControllerStatusDoesNotHideDormantNonPreviousDrainingGeneration(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	activateFixtureCandidate(t, fixture)
+	activateSyntheticGeneration(t, fixture, strings.Repeat("3", 32), "1.2.4", strings.Repeat("4", 40))
+	if err := fixture.registry.MarkEngineDormant(fixture.initialID); err != nil {
+		t.Fatalf("MarkEngineDormant(non-previous): %v", err)
+	}
+
+	status := fixture.controller.status()
+	found := false
+	for _, item := range status.DrainingGenerations {
+		if item.ID == fixture.initialID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("dormant non-previous draining generation was hidden: %+v", status.DrainingGenerations)
+	}
+}
+
+func TestUpdateControllerStatusPersistsDormantRollbackProjectionAndRollbackAfterRestart(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	activateFixtureCandidate(t, fixture)
+	fixture.controller.inventorySource = emptyInventorySource(nil, "")
+	if err := fixture.controller.ReconcileLeases(context.Background()); err != nil {
+		t.Fatalf("ReconcileLeases(): %v", err)
+	}
+
+	path := filepath.Join(fixture.root, "runtime", "state", "generations.json")
+	reopened, err := generation.Open(path)
+	if err != nil {
+		t.Fatalf("reopen generation registry: %v", err)
+	}
+	fixture.controller.registry = reopened
+	status := fixture.controller.status()
+	if len(status.DrainingGenerations) != 0 || status.PreviousRelease == nil || status.PreviousRelease.Version != "1.0.0" {
+		t.Fatalf("restart regressed dormant rollback projection: %+v", status)
+	}
+
+	status, err = fixture.controller.Rollback(context.Background())
+	if err != nil {
+		t.Fatalf("Rollback() from dormant previous generation: %v", err)
+	}
+	if status.DefaultEngine == nil || status.DefaultEngine.ID != fixture.initialID || len(status.ActiveGenerations) != 1 || status.ActiveGenerations[0].ID != fixture.initialID {
+		t.Fatalf("rollback did not activate and project the dormant previous generation: %+v", status)
 	}
 }
 

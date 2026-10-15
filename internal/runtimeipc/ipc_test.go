@@ -250,7 +250,9 @@ func TestRequestDeadlineCancelsHandler(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 	err = client.Call(ctx, "wait", map[string]string{}, nil)
-	if !errors.Is(err, context.DeadlineExceeded) {
+	var remoteErr *RemoteError
+	remoteDeadline := errors.As(err, &remoteErr) && remoteErr.Code == "deadline_exceeded"
+	if !errors.Is(err, context.DeadlineExceeded) && !remoteDeadline {
 		t.Fatalf("Call error = %v, want deadline exceeded", err)
 	}
 }

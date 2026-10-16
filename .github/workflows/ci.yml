@@ -42,7 +42,7 @@ jobs:
         run: npm run build
 
   go:
-    name: Go checks
+    name: Fast Go checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -54,14 +54,14 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Test
-        run: go test -timeout=30m ./...
+        run: go test -short -timeout=30m ./...
       - name: Vet
         run: go vet ./...
       - name: Build
         run: go build ./...
 
   go-race:
-    name: Go race tests
+    name: Fast Go race
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -73,4 +73,31 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Race test
-        run: go test -race -count=1 -timeout=30m ./...
+        run: go test -race -short -count=1 -timeout=30m ./...
+
+  production-e2e:
+    name: Production process E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IR_RUN_SCALE_TESTS: "0"
+      IR_RUN_PRODUCTION_HISTORICAL_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Keep process-spawning acceptance coverage in a dedicated non-race tier.
+      # The product binaries are separately built as normal executables, so an
+      # outer race-instrumented test run does not race-instrument those children.
+      - name: Runtime Host process acceptance
+        run: >-
+          go test -timeout=30m
+          -run '^(TestBootstrapSupervisorRealProcessSmoke|TestRuntimeGenerationProcessBoundaryContinuity|TestProductionBundledHLSReferenceRecordingE2E|TestProductionAdapterLifecycleAcceptanceE2E|TestProductionSignedUpdateAcceptanceE2E|TestProductionTargetAdapterRefreshPreflightE2E|TestProductionHandoverHostCrashRecoveryE2E|TestProductionStorageProviderRegistryAcceptanceE2E|TestProductionHistoricalRepairAcceptanceE2E)$'
+          ./internal/runtimehost/bootstrap
+      - name: Storage provider process acceptance
+        run: >-
+          go test -timeout=30m
+          -run '^(TestConformanceRunnerUsesExternalExecutable|TestConformanceCommandJSONOutput|TestSubprocessAuthenticationAndBoundedFrames|TestProviderChildExitsWhenParentIsHardKilled)$'
+          ./internal/storageproto

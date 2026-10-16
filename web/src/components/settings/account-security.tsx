@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type FormEvent } from 'react'
 import { Link } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { KeyRound, RefreshCw, UserPlus } from 'lucide-react'
@@ -37,33 +37,39 @@ function ProfileValue({ label, value }: { label: string; value: string }) {
 function PasswordCard() {
   const { t } = useI18n()
   const { toast } = useToast()
-  const [currentPassword, setCurrentPassword] = useState('')
-  const [newPassword, setNewPassword] = useState('')
-  const [confirmPassword, setConfirmPassword] = useState('')
   const [formError, setFormError] = useState('')
-  const change = useMutation({
-    mutationFn: accountAPI.changePassword,
-    onSuccess: () => {
-      setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+  const [isChanging, setIsChanging] = useState(false)
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setFormError('')
+    const form = event.currentTarget
+    const data = new FormData(form)
+    const currentPassword = String(data.get('current_password') ?? '')
+    const newPassword = String(data.get('new_password') ?? '')
+    const confirmation = String(data.get('password_confirmation') ?? '')
+    if (newPassword !== confirmation) { setFormError(t('account.passwordsMismatch')); return }
+    if (isChanging) return
+    setIsChanging(true)
+    try {
+      await accountAPI.changePassword({ current_password: currentPassword, new_password: newPassword })
+      form.reset()
       invalidateCSRFToken()
       toast(t('account.passwordChanged'))
       window.dispatchEvent(new CustomEvent('ir:unauthorized'))
-    },
-    onError: error => setFormError(error instanceof APIError && error.errorCode === 'credentials_invalid' ? t('account.credentialsRejected') : errorMessage(error)),
-  })
-  const submit = (event: React.FormEvent) => {
-    event.preventDefault(); setFormError('')
-    if (newPassword !== confirmPassword) { setFormError(t('account.passwordsMismatch')); return }
-    change.mutate({ current_password: currentPassword, new_password: newPassword })
+    } catch (error) {
+      setFormError(error instanceof APIError && error.errorCode === 'credentials_invalid' ? t('account.credentialsRejected') : errorMessage(error))
+    } finally {
+      setIsChanging(false)
+    }
   }
   return <Card>
     <CardHeader><CardTitle className="flex items-center gap-2"><KeyRound className="h-4 w-4 text-primary" />{t('account.changePassword')}</CardTitle><p className="text-xs text-muted-foreground">{t('account.passwordPolicy')}</p></CardHeader>
     <CardContent><form className="max-w-xl space-y-3" onSubmit={submit}>
-      <label className="block space-y-1.5 text-sm">{t('account.currentPassword')}<Input type="password" autoComplete="current-password" minLength={12} maxLength={72} required value={currentPassword} onChange={event => setCurrentPassword(event.target.value)} /></label>
-      <label className="block space-y-1.5 text-sm">{t('account.newPassword')}<Input type="password" autoComplete="new-password" minLength={12} maxLength={72} required value={newPassword} onChange={event => setNewPassword(event.target.value)} /></label>
-      <label className="block space-y-1.5 text-sm">{t('account.confirmPassword')}<Input type="password" autoComplete="new-password" minLength={12} maxLength={72} required value={confirmPassword} onChange={event => setConfirmPassword(event.target.value)} /></label>
+      <label className="block space-y-1.5 text-sm">{t('account.currentPassword')}<Input type="password" name="current_password" autoComplete="current-password" minLength={12} maxLength={72} required /></label>
+      <label className="block space-y-1.5 text-sm">{t('account.newPassword')}<Input type="password" name="new_password" autoComplete="new-password" minLength={12} maxLength={72} required /></label>
+      <label className="block space-y-1.5 text-sm">{t('account.confirmPassword')}<Input type="password" name="password_confirmation" autoComplete="new-password" minLength={12} maxLength={72} required /></label>
       {formError && <p role="alert" className="text-sm text-destructive">{formError}</p>}
-      <Button type="submit" disabled={change.isPending}>{t('account.changePassword')}</Button>
+      <Button type="submit" disabled={isChanging}>{t('account.changePassword')}</Button>
     </form></CardContent>
   </Card>
 }

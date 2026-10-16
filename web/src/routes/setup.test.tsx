@@ -42,6 +42,12 @@ function setBrowserLocale(locale: string) {
   Object.defineProperty(navigator, 'language', { configurable: true, value: locale })
 }
 
+function setNativeInputValue(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+  if (!setter) throw new Error('native input value setter is unavailable')
+  setter.call(input, value)
+}
+
 beforeEach(() => {
   setBrowserLocale('ko-KR')
   vi.clearAllMocks()
@@ -85,15 +91,37 @@ describe('first-run setup flow', () => {
     expect(visibleLiterals).toEqual([])
   })
 
-  it('submits the one-time code, creates the administrator session, then begins setup', async () => {
+  it('exposes the owner credential and bootstraps from browser-populated native form values', async () => {
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
     expect(await screen.findByText(/로컬 콘솔과 container logs/)).toBeInTheDocument()
     expect(screen.getByText('docker compose logs archiver')).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('설치 코드'), { target: { value: 'test-only-code' } })
-    fireEvent.change(screen.getByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
-    fireEvent.change(screen.getByLabelText('비밀번호 확인'), { target: { value: 'a-strong-passphrase' } })
-    fireEvent.click(screen.getByRole('button', { name: '관리자 계정 만들기' }))
+    const username = screen.getByLabelText('계정') as HTMLInputElement
+    const setupCode = screen.getByLabelText('설치 코드') as HTMLInputElement
+    const password = screen.getByLabelText('관리자 비밀번호') as HTMLInputElement
+    const confirmation = screen.getByLabelText('비밀번호 확인') as HTMLInputElement
+    expect(username).toHaveAttribute('type', 'text')
+    expect(username).toHaveAttribute('name', 'username')
+    expect(username).toHaveAttribute('value', 'owner')
+    expect(username).toHaveAttribute('autocomplete', 'username')
+    expect(username).toHaveAttribute('readonly')
+    expect(username).not.toBeDisabled()
+    expect(username).not.toHaveAttribute('type', 'hidden')
+    expect(setupCode).toHaveAttribute('name', 'setup_code')
+    expect(setupCode).toHaveAttribute('autocomplete', 'one-time-code')
+    expect(password).toHaveAttribute('name', 'password')
+    expect(password).toHaveAttribute('autocomplete', 'new-password')
+    expect(confirmation).toHaveAttribute('name', 'password_confirmation')
+    expect(confirmation).toHaveAttribute('autocomplete', 'new-password')
+    expect(username.compareDocumentPosition(password) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    const form = username.closest('form')!
+    expect(password.closest('form')).toBe(form)
+    expect(form).toContainElement(screen.getByRole('button', { name: '관리자 계정 만들기' }))
+
+    setNativeInputValue(setupCode, 'test-only-code')
+    setNativeInputValue(password, 'a-strong-passphrase')
+    setNativeInputValue(confirmation, 'a-strong-passphrase')
+    fireEvent.submit(form)
     await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledWith('test-only-code', 'a-strong-passphrase'))
     await waitFor(() => expect(mocks.begin).toHaveBeenCalledTimes(1))
     expect(await screen.findByRole('heading', { name: '저장소 확인' })).toBeInTheDocument()
@@ -132,6 +160,26 @@ describe('first-run setup flow', () => {
     expect(await screen.findByRole('heading', { name: '저장소 확인' })).toBeInTheDocument()
     expect(screen.queryByLabelText('설치 코드')).not.toBeInTheDocument()
     expect(mocks.bootstrap).not.toHaveBeenCalled()
+  })
+
+  it('offers the owner username in setup resume and submits the native current password', async () => {
+    mocks.status.mockResolvedValue(status('setup_in_progress'))
+    mocks.session.mockResolvedValue(session(false))
+    renderSetup()
+    const username = await screen.findByLabelText('계정') as HTMLInputElement
+    const password = screen.getByLabelText('관리자 비밀번호') as HTMLInputElement
+    expect(username).toHaveAttribute('type', 'text')
+    expect(username).toHaveAttribute('name', 'username')
+    expect(username).toHaveAttribute('value', 'owner')
+    expect(username).toHaveAttribute('autocomplete', 'username')
+    expect(username).toHaveAttribute('readonly')
+    expect(username).not.toBeDisabled()
+    expect(password).toHaveAttribute('type', 'password')
+    expect(password).toHaveAttribute('name', 'password')
+    expect(password).toHaveAttribute('autocomplete', 'current-password')
+    setNativeInputValue(password, 'owner-current-password')
+    fireEvent.submit(username.closest('form')!)
+    await waitFor(() => expect(mocks.login).toHaveBeenCalledWith('owner-current-password'))
   })
 
   it('lets the user retry a failed storage test', async () => {

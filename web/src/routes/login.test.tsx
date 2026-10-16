@@ -16,6 +16,12 @@ function renderLogin() {
   return render(<QueryClientProvider client={client}><ToastProvider><LoginPage /></ToastProvider></QueryClientProvider>)
 }
 
+function setNativeInputValue(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+  if (!setter) throw new Error('native input value setter is unavailable')
+  setter.call(input, value)
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   mocks.session.mockResolvedValue({ auth_enabled: true, authenticated: false, needs_bootstrap: false })
@@ -23,17 +29,48 @@ beforeEach(() => {
 })
 
 describe('normal administrator login', () => {
-  it('submits only a password and navigates into the application', async () => {
+  it('renders a conventional credential form and submits browser-populated values', async () => {
     renderLogin()
     expect(screen.getByRole('heading', { name: '로그인' })).toBeInTheDocument()
     expect(screen.queryByText('Archive Live.')).not.toBeInTheDocument()
     expect(screen.queryByText(/HttpOnly|브라우저에 저장되지 않습니다/)).not.toBeInTheDocument()
-    expect(screen.getByLabelText('계정 이름')).toBeInTheDocument()
-    fireEvent.change(await screen.findByLabelText('비밀번호'), { target: { value: 'a-strong-passphrase' } })
-    fireEvent.click(screen.getByRole('button', { name: '로그인' }))
-    await waitFor(() => expect(mocks.login).toHaveBeenCalledWith('a-strong-passphrase'))
+    const username = screen.getByLabelText('계정 이름') as HTMLInputElement
+    const password = await screen.findByLabelText('비밀번호') as HTMLInputElement
+    expect(username).toHaveAttribute('type', 'text')
+    expect(username).toHaveAttribute('id', 'login')
+    expect(username).toHaveAttribute('name', 'username')
+    expect(username).toHaveAttribute('autocomplete', 'username')
+    expect(username).toHaveAttribute('autocapitalize', 'none')
+    expect(username).toHaveAttribute('spellcheck', 'false')
+    expect(password).toHaveAttribute('type', 'password')
+    expect(password).toHaveAttribute('name', 'password')
+    expect(password).toHaveAttribute('autocomplete', 'current-password')
+    expect(password).toBeRequired()
+    const form = username.closest('form')
+    expect(form).not.toBeNull()
+    expect(password.closest('form')).toBe(form)
+    expect(form).toContainElement(screen.getByRole('button', { name: '로그인' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '로그인' })).toBeEnabled())
+
+    // Set native DOM values without dispatching input/change, as AutoFill may do.
+    setNativeInputValue(username, 'alice')
+    setNativeInputValue(password, 'correct-password')
+    fireEvent.submit(form!)
+    await waitFor(() => expect(mocks.login).toHaveBeenCalledWith('correct-password', 'alice'))
     expect(mocks.navigate).toHaveBeenCalledWith({ to: '/' })
     expect(screen.queryByLabelText('초기화 토큰')).not.toBeInTheDocument()
     expect(screen.queryByText(/bootstrap-token/)).not.toBeInTheDocument()
+  })
+
+  it('preserves password-only owner compatibility when the username is blank', async () => {
+    renderLogin()
+    const username = screen.getByLabelText('계정 이름') as HTMLInputElement
+    const password = await screen.findByLabelText('비밀번호') as HTMLInputElement
+    await waitFor(() => expect(screen.getByRole('button', { name: '로그인' })).toBeEnabled())
+    setNativeInputValue(password, 'a-strong-passphrase')
+    fireEvent.submit(username.closest('form')!)
+    await waitFor(() => expect(mocks.login).toHaveBeenCalledWith('a-strong-passphrase'))
+    expect(mocks.login).toHaveBeenCalledTimes(1)
+    expect(mocks.navigate).toHaveBeenCalledWith({ to: '/' })
   })
 })

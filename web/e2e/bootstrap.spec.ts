@@ -77,6 +77,16 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
   await page.getByRole('button', { name: '시작하기' }).click()
   await expect(page.getByText('docker compose logs archiver', { exact: true })).toBeVisible()
   await expect(page.getByText(/runtime-host setup-code/)).toBeVisible()
+  const setupForm = page.locator('form').filter({ has: page.getByRole('button', { name: '관리자 계정 만들기' }) })
+  const setupUsername = setupForm.locator('input[name="username"]')
+  await expect(setupUsername).toHaveAttribute('type', 'text')
+  await expect(setupUsername).toHaveAttribute('value', 'owner')
+  await expect(setupUsername).toHaveAttribute('autocomplete', 'username')
+  await expect(setupUsername).toHaveAttribute('readonly', '')
+  await expect(setupUsername).not.toBeDisabled()
+  await expect(setupForm.locator('input[name="setup_code"]')).toHaveAttribute('autocomplete', 'one-time-code')
+  await expect(setupForm.locator('input[name="password"]')).toHaveAttribute('autocomplete', 'new-password')
+  await expect(setupForm.locator('input[name="password_confirmation"]')).toHaveAttribute('autocomplete', 'new-password')
   await page.getByLabel(/Setup code|설치 코드/).fill(testOnlySetupCode)
   await page.getByLabel('관리자 비밀번호').fill('a-strong-passphrase')
   await page.getByLabel('비밀번호 확인').fill('a-strong-passphrase')
@@ -147,6 +157,15 @@ test('administrator can log in, use the application, and log out', async ({ page
   })
 
   await page.goto('/login')
+  const username = page.getByLabel('계정 이름')
+  await expect(username).toHaveAttribute('type', 'text')
+  await expect(username).toHaveAttribute('name', 'username')
+  await expect(username).toHaveAttribute('autocomplete', 'username')
+  await expect(username).toHaveAttribute('autocapitalize', 'none')
+  await expect(username).toHaveAttribute('spellcheck', 'false')
+  await expect(page.getByLabel('비밀번호')).toHaveAttribute('name', 'password')
+  await expect(page.getByLabel('비밀번호')).toHaveAttribute('autocomplete', 'current-password')
+  await expect(page.locator('form')).toContainText('로그인')
   await page.getByLabel('비밀번호').fill('a-strong-passphrase')
   await page.getByRole('button', { name: '로그인' }).click()
   await expect(page).toHaveURL('/')
@@ -155,6 +174,62 @@ test('administrator can log in, use the application, and log out', async ({ page
   await page.getByRole('button', { name: '로그아웃' }).click()
   await expect(page).toHaveURL('/login')
   expect(logoutCSRF).toBe('session-csrf')
+})
+
+test('login submits an explicit native username and password pair', async ({ page }) => {
+  await page.route('**/api/**', async route => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    if (path === '/api/setup/status') {
+      await route.fulfill({ json: { state: 'ready', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false } })
+    } else if (path === '/api/auth/session') {
+      await route.fulfill({ json: { auth_enabled: true, authenticated: false, needs_bootstrap: false, csrf_token: '' } })
+    } else if (path === '/api/auth/login') {
+      expect(request.postDataJSON()).toEqual({ login: 'alice', password: 'correct-password' })
+      await route.fulfill({ status: 401, json: { error: 'login failed' } })
+    } else {
+      await route.fulfill({ status: 404, json: { error: 'unexpected test request' } })
+    }
+  })
+  await page.goto('/login')
+  const form = page.locator('form')
+  await form.locator('[name="username"]').fill('alice')
+  await form.locator('[name="password"]').fill('correct-password')
+  const loginRequest = page.waitForRequest(request => new URL(request.url()).pathname === '/api/auth/login')
+  await page.getByRole('button', { name: '로그인' }).click()
+  await loginRequest
+  await expect(page.getByRole('alert')).toBeVisible()
+})
+
+test('setup resume exposes the saved owner credential pair', async ({ page }) => {
+  let authenticated = false
+  await page.route('**/api/**', async route => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    if (path === '/api/setup/status') {
+      await route.fulfill({ json: { state: 'setup_in_progress', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
+    } else if (path === '/api/auth/session') {
+      await route.fulfill({ json: { auth_enabled: true, authenticated, needs_bootstrap: false, csrf_token: authenticated ? 'session-csrf' : 'initial-csrf' } })
+    } else if (path === '/api/auth/login') {
+      expect(request.postDataJSON()).toEqual({ password: 'owner-current-password' })
+      authenticated = true
+      await route.fulfill({ json: { auth_enabled: true, authenticated: true, needs_bootstrap: false, csrf_token: 'session-csrf' } })
+    } else {
+      await route.fulfill({ status: 404, json: { error: 'unexpected test request' } })
+    }
+  })
+  await page.goto('/setup')
+  const username = page.getByLabel('계정')
+  await expect(username).toHaveAttribute('type', 'text')
+  await expect(username).toHaveAttribute('name', 'username')
+  await expect(username).toHaveAttribute('value', 'owner')
+  await expect(username).toHaveAttribute('autocomplete', 'username')
+  await expect(username).toHaveAttribute('readonly', '')
+  await expect(page.getByLabel('관리자 비밀번호')).toHaveAttribute('name', 'password')
+  await expect(page.getByLabel('관리자 비밀번호')).toHaveAttribute('autocomplete', 'current-password')
+  await page.getByLabel('관리자 비밀번호').fill('owner-current-password')
+  await page.getByRole('button', { name: '로그인하고 이어하기' }).click()
+  await expect(page.getByRole('heading', { name: '저장소 확인' })).toBeVisible()
 })
 
 test('login stays compact at desktop and mobile widths in both locales', async ({ browser }, testInfo) => {

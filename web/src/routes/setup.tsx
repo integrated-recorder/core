@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Clipboard, HardDrive, LoaderCircle, RefreshCw, Server } from 'lucide-react'
@@ -82,39 +82,15 @@ export function SetupPage() {
   const authDisabled = status?.auth_disabled ?? false
   const authenticated = isAuthenticatedSession(session.data, authDisabled)
   const [step, setStep] = useState<SetupStep>(() => initialStep(status))
-  const [setupCode, setSetupCode] = useState('')
-  const [password, setPassword] = useState('')
-  const [confirmation, setConfirmation] = useState('')
+  const administratorForm = useRef<HTMLFormElement>(null)
+  const resumeForm = useRef<HTMLFormElement>(null)
   const [formError, setFormError] = useState<TranslationKey | undefined>()
+  const [isBootstrapping, setIsBootstrapping] = useState(false)
+  const [isLoggingIn, setIsLoggingIn] = useState(false)
   const [beginError, setBeginError] = useState<TranslationKey | undefined>()
   const [storageResult, setStorageResult] = useState<SetupStorageTest>()
   const [copied, setCopied] = useState(false)
 
-  const bootstrapping = useMutation({
-    mutationFn: () => authAPI.bootstrap(setupCode, password),
-    onSuccess: async result => {
-      client.setQueryData(qk.session, result)
-      setSetupCode('')
-      setPassword('')
-      setConfirmation('')
-      setFormError(undefined)
-      try {
-        const next = await setupAPI.begin()
-        client.setQueryData(qk.installation, next)
-        setBeginError(undefined)
-        setStep('storage')
-      } catch {
-        setBeginError('setup.error.beginFailed')
-        await client.invalidateQueries({ queryKey: qk.installation })
-      }
-    },
-    onError: () => setFormError('setup.error.bootstrapFailed'),
-  })
-  const loggingIn = useMutation({
-    mutationFn: () => authAPI.login(password),
-    onSuccess: result => { client.setQueryData(qk.session, result); setPassword(''); setFormError(undefined) },
-    onError: () => setFormError('setup.error.loginFailed'),
-  })
   const begin = useMutation({
     mutationFn: setupAPI.begin,
     onSuccess: result => { client.setQueryData(qk.installation, result); setBeginError(undefined); setStep('storage') },
@@ -145,20 +121,57 @@ export function SetupPage() {
     if (status?.state === 'ready' && step !== 'complete') void navigate({ to: '/' })
   }, [navigate, status?.state, step])
 
-  const submitAdministrator = (event: FormEvent<HTMLFormElement>) => {
+  const submitAdministrator = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setFormError(undefined)
+    const data = new FormData(event.currentTarget)
+    const setupCode = String(data.get('setup_code') ?? '')
+    const password = String(data.get('password') ?? '')
+    const confirmation = String(data.get('password_confirmation') ?? '')
     if (!setupCode.trim()) return setFormError('setup.error.setupCodeRequired')
     const passwordError = setupPasswordError(password, confirmation)
     if (passwordError) return setFormError(passwordError)
-    bootstrapping.mutate()
+    if (isBootstrapping) return
+    setIsBootstrapping(true)
+    try {
+      const result = await authAPI.bootstrap(setupCode, password)
+      client.setQueryData(qk.session, result)
+      administratorForm.current?.reset()
+      setFormError(undefined)
+      try {
+        const next = await setupAPI.begin()
+        client.setQueryData(qk.installation, next)
+        setBeginError(undefined)
+        setStep('storage')
+      } catch {
+        setBeginError('setup.error.beginFailed')
+        await client.invalidateQueries({ queryKey: qk.installation })
+      }
+    } catch {
+      setFormError('setup.error.bootstrapFailed')
+    } finally {
+      setIsBootstrapping(false)
+    }
   }
 
-  const submitResumeLogin = (event: FormEvent<HTMLFormElement>) => {
+  const submitResumeLogin = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setFormError(undefined)
+    const data = new FormData(event.currentTarget)
+    const password = String(data.get('password') ?? '')
     if (!password) return setFormError('setup.error.passwordRequired')
-    loggingIn.mutate()
+    if (isLoggingIn) return
+    setIsLoggingIn(true)
+    try {
+      const result = await authAPI.login(password)
+      client.setQueryData(qk.session, result)
+      resumeForm.current?.reset()
+      setFormError(undefined)
+    } catch {
+      setFormError('setup.error.loginFailed')
+    } finally {
+      setIsLoggingIn(false)
+    }
   }
 
   const copySetupCommand = async () => {
@@ -192,10 +205,11 @@ export function SetupPage() {
       <Badge tone="blue">{t('setup.resume.badge')}</Badge>
       <h1 className="mt-4 text-2xl font-semibold">{t('setup.resume.loginTitle')}</h1>
       <p className="mt-2 text-sm leading-6 text-muted-foreground">{t('setup.resume.loginDescription')}</p>
-      <form className="mt-6 space-y-4" onSubmit={submitResumeLogin}>
-        <div className="space-y-2"><Label htmlFor="resume-password">{t('setup.resume.passwordLabel')}</Label><Input id="resume-password" type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="current-password" required /></div>
+      <form ref={resumeForm} className="mt-6 space-y-4" onSubmit={submitResumeLogin}>
+        <div className="space-y-2"><Label htmlFor="resume-username">{t('setup.resume.usernameLabel')}</Label><Input id="resume-username" type="text" name="username" value="owner" autoComplete="username" autoCapitalize="none" spellCheck={false} readOnly /></div>
+        <div className="space-y-2"><Label htmlFor="resume-password">{t('setup.resume.passwordLabel')}</Label><Input id="resume-password" type="password" name="password" autoComplete="current-password" required /></div>
         {formError && <p className="text-sm text-destructive" role="alert">{t(formError)}</p>}
-        <Button type="submit" className="w-full" disabled={loggingIn.isPending}>{loggingIn.isPending ? t('setup.resume.loggingIn') : t('setup.resume.loginAction')}<ArrowRight className="h-4 w-4" /></Button>
+        <Button type="submit" className="w-full" disabled={isLoggingIn}>{isLoggingIn ? t('setup.resume.loggingIn') : t('setup.resume.loginAction')}<ArrowRight className="h-4 w-4" /></Button>
       </form>
     </section></SetupFrame>
     return <SetupFrame><section className="mx-auto w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-sm sm:p-8">
@@ -233,7 +247,7 @@ export function SetupPage() {
               <div className="flex justify-end"><Button onClick={() => status.claim_required && !status.auth_disabled ? setStep('administrator') : begin.mutate()} disabled={begin.isPending}>{begin.isPending ? t('setup.welcome.starting') : t('setup.welcome.start')}<ArrowRight className="h-4 w-4" /></Button></div>
             </div>}
 
-            {visibleStep === 'administrator' && <form className="max-w-xl space-y-5" onSubmit={submitAdministrator}>
+            {visibleStep === 'administrator' && <form ref={administratorForm} className="max-w-xl space-y-5" onSubmit={submitAdministrator}>
               <div>
                 <p className="text-sm leading-6 text-muted-foreground">{t('setup.claim.description')}</p>
                 <div className="mt-4 flex flex-col gap-2 rounded-lg border border-border bg-muted/30 p-3 sm:flex-row sm:items-center sm:justify-between">
@@ -242,16 +256,17 @@ export function SetupPage() {
                 </div>
                 <p className="mt-2 text-xs text-muted-foreground">{t('setup.claim.directRun')}</p>
               </div>
-              <div className="space-y-2"><Label htmlFor="setup-code">{t('setup.claim.codeLabel')}</Label><Input id="setup-code" type="password" value={setupCode} onChange={event => setSetupCode(event.target.value)} autoComplete="one-time-code" spellCheck={false} required /></div>
+              <div className="space-y-2"><Label htmlFor="setup-username">{t('setup.claim.usernameLabel')}</Label><Input id="setup-username" type="text" name="username" value="owner" autoComplete="username" autoCapitalize="none" spellCheck={false} readOnly /></div>
+              <div className="space-y-2"><Label htmlFor="setup-code">{t('setup.claim.codeLabel')}</Label><Input id="setup-code" type="password" name="setup_code" autoComplete="one-time-code" spellCheck={false} required /></div>
               <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2"><Label htmlFor="setup-password">{t('setup.claim.passwordLabel')}</Label><Input id="setup-password" type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="new-password" minLength={12} maxLength={72} required /></div>
-                <div className="space-y-2"><Label htmlFor="setup-password-confirm">{t('setup.claim.confirmLabel')}</Label><Input id="setup-password-confirm" type="password" value={confirmation} onChange={event => setConfirmation(event.target.value)} autoComplete="new-password" maxLength={72} required /></div>
+                <div className="space-y-2"><Label htmlFor="setup-password">{t('setup.claim.passwordLabel')}</Label><Input id="setup-password" type="password" name="password" autoComplete="new-password" minLength={12} maxLength={72} required /></div>
+                <div className="space-y-2"><Label htmlFor="setup-password-confirm">{t('setup.claim.confirmLabel')}</Label><Input id="setup-password-confirm" type="password" name="password_confirmation" autoComplete="new-password" maxLength={72} required /></div>
               </div>
               <p className="text-xs text-muted-foreground">{t('setup.claim.passwordHelp')}</p>
               {formError && <p role="alert" className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">{t(formError)}</p>}
               <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
                 <Button type="button" variant="outline" onClick={() => setStep('welcome')}><ArrowLeft className="h-4 w-4" />{t('setup.claim.previous')}</Button>
-                <Button type="submit" disabled={bootstrapping.isPending || session.isLoading}>{bootstrapping.isPending ? t('setup.claim.pending') : t('setup.claim.submit')}<ArrowRight className="h-4 w-4" /></Button>
+                <Button type="submit" disabled={isBootstrapping || session.isLoading}>{isBootstrapping ? t('setup.claim.pending') : t('setup.claim.submit')}<ArrowRight className="h-4 w-4" /></Button>
               </div>
             </form>}
 

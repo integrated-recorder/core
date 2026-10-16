@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Download, RotateCcw, Search, Sparkles } from 'lucide-react'
 import { runtimeUpdateAPI } from '@/api'
@@ -34,10 +35,14 @@ const failureKeys: Record<string, TranslationKey> = {
 export function RuntimeUpdates() {
   const { t } = useI18n()
   const client = useQueryClient()
+  const [checkUpToDate, setCheckUpToDate] = useState(false)
   const status = useQuery({ ...runtimeUpdateQuery, enabled: true })
   const action = useMutation({
     mutationFn: (operation: RuntimeUpdateAction) => runtimeUpdateAPI[operation](),
-    onSuccess: result => { client.setQueryData(qk.runtimeUpdate, result) },
+    onSuccess: (result, operation) => {
+      client.setQueryData(qk.runtimeUpdate, result)
+      setCheckUpToDate(operation === 'check' && !result.updates_available)
+    },
   })
   const value = status.data
   const unavailableReason = value?.update_unavailable_reason
@@ -45,7 +50,10 @@ export function RuntimeUpdates() {
   const developmentBuild = value?.application.version === 'dev'
   const canUpdate = Boolean(value && !unavailable && !developmentBuild)
   const pending = action.isPending
-  const perform = (operation: RuntimeUpdateAction) => action.mutate(operation)
+  const perform = (operation: RuntimeUpdateAction) => {
+    setCheckUpToDate(false)
+    action.mutate(operation)
+  }
 
   return <div role="tabpanel" id="settings-panel-updates" aria-labelledby="settings-tab-updates" tabIndex={0} className="space-y-4">
     <Card>
@@ -53,7 +61,7 @@ export function RuntimeUpdates() {
       <CardContent>
         {status.isLoading ? <LoadingState /> : status.error || !value ? <ErrorState message={status.error ? errorMessage(status.error) : t('runtime.statusUnavailable')} retry={() => void status.refetch()} /> : <div className="space-y-5">
           <div className="grid gap-4 lg:grid-cols-3">
-            <ReleaseCard title={t('runtime.availableVersion')} release={value.available_release} empty={t('runtime.noReleaseChecked')} />
+            <ReleaseCard title={t('runtime.availableVersion')} release={value.available_release} empty={value.verification_state === 'verified' ? t('runtime.noAvailableRelease') : t('runtime.noReleaseChecked')} />
             <ReleaseCard title={t('runtime.stagedVersion')} release={value.staged_release} empty={t('runtime.noCandidate')} />
             <ReleaseCard title={t('runtime.rollbackVersion')} release={value.previous_release} empty={t('runtime.noPrevious')} />
           </div>
@@ -67,6 +75,7 @@ export function RuntimeUpdates() {
           {unavailable && <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-5 text-amber-800 dark:text-amber-200">{unavailable}</p>}
           {!unavailable && developmentBuild && <p className="rounded-md border border-muted bg-muted/40 p-3 text-xs leading-5 text-muted-foreground">{t('runtime.unavailable.development_build')}</p>}
           {action.error && <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs leading-5 text-destructive">{errorMessage(action.error)}</p>}
+          {checkUpToDate && <p role="status" className="text-xs text-muted-foreground">{t('runtime.checkUpToDate')}</p>}
 
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" size="sm" onClick={() => perform('check')} disabled={!canUpdate || pending}><Search className="h-3.5 w-3.5" />{t('runtime.check')}</Button>

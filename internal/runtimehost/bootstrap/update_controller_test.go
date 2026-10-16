@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -207,12 +209,95 @@ func TestUpdateControllerDevelopmentBuildFailsClosed(t *testing.T) {
 	}
 }
 
+func TestUpdateControllerCheckAlreadyCurrentIsSuccessfulHTTP200(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	if status, err := fixture.controller.Check(context.Background()); err != nil || !status.UpdatesAvailable || status.AvailableRelease == nil {
+		t.Fatalf("initial newer-release check=(%+v, %v), want available candidate", status, err)
+	}
+	setFixtureReleaseToActiveIdentity(t, fixture)
+
+	handler, err := httpapi.New(nil, true, false, fixture.controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, httpapi.Endpoint+"/check", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST /check status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var status httpapi.Status
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode successful check status: %v", err)
+	}
+	if err := status.Validate(); err != nil {
+		t.Fatalf("successful check status is invalid: %v", err)
+	}
+	if status.UpdatesAvailable || status.AvailableRelease != nil || status.LastFailureCode != "" || status.VerificationState != "verified" {
+		t.Fatalf("already-current check status=%+v; want no candidate, no failure, verified", status)
+	}
+}
+
+func TestUpdateControllerCheckSourceFailureRemainsFailure(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	fixture.controller.sourceFactory = func() (install.Source, error) {
+		return nil, errors.New("test release source unavailable")
+	}
+
+	handler, err := httpapi.New(nil, true, false, fixture.controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, httpapi.Endpoint+"/check", nil))
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("POST /check source failure status=%d body=%s, want 502", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"code":"update_check_failed"`) {
+		t.Fatalf("source failure response=%s, want update_check_failed", response.Body.String())
+	}
+}
+
+func TestUpdateControllerStageWithoutAvailableCandidateRemainsOperationError(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	setFixtureReleaseToActiveIdentity(t, fixture)
+	if _, err := fixture.controller.Check(context.Background()); err != nil {
+		t.Fatalf("Check() for current release: %v", err)
+	}
+	handler, err := httpapi.New(nil, true, false, fixture.controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, httpapi.Endpoint+"/stage", nil))
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"code":"no_update_available"`) {
+		t.Fatalf("Stage() without a newer candidate status=%d body=%s, want 404 no_update_available", response.Code, response.Body.String())
+	}
+}
+
+func setFixtureReleaseToActiveIdentity(t *testing.T, fixture *controllerFixture) {
+	t.Helper()
+	manifest := fixture.manifest
+	manifest.ReleaseVersion = "1.0.0"
+	manifest.Commit = strings.Repeat("a", 40)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.source.manifest = data
+	fixture.source.signature = base64.StdEncoding.EncodeToString(ed25519.Sign(fixture.privateKey, data))
+}
+
 func TestApplicationUpdateStageInheritsActiveAdapterSet(t *testing.T) {
 	fixture := newControllerFixture(t, false)
 	setID := strings.Repeat("a", 64)
 	bindActiveAdapterSet(t, fixture, setID)
-	if _, err := fixture.controller.Check(context.Background()); err != nil {
+	checked, err := fixture.controller.Check(context.Background())
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !checked.UpdatesAvailable || checked.AvailableRelease == nil || checked.LastFailureCode != "" {
+		t.Fatalf("Check() status = %+v, want successful available candidate", checked)
 	}
 	if _, err := fixture.controller.Stage(context.Background()); err != nil {
 		t.Fatal(err)

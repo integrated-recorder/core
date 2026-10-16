@@ -5,6 +5,7 @@ import { createMemoryHistory, createRootRoute, createRoute, createRouter, Outlet
 import { accountAPI, authAPI, dashboardAPI, productAPI, runtimeUpdateAPI, userPreferencesAPI } from '@/api'
 import { ToastProvider } from '@/components/ui/toast'
 import { APIError } from '@/api/client'
+import { configureFormatPreferences } from '@/lib/formatting'
 import type { RuntimeUpdateStatus, StorageSettings, SystemSettings } from '@/types/api'
 import type { UserPreferences } from '@/types/api'
 import { SettingsPage, type SettingsSection } from './settings'
@@ -75,7 +76,7 @@ beforeEach(() => {
   vi.spyOn(runtimeUpdateAPI, 'rollback').mockResolvedValue({ ...structuredClone(updateStatus), application: runtimeIdentity, staged_release: undefined })
   vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })))
 })
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); document.documentElement.lang = 'ko-KR'; configureFormatPreferences('ko-KR', 'system') })
 
 describe('storage ingest settings UI', () => {
   it('loads MiB/seconds values, shows effective values separately, and sends bytes/milliseconds to the API', async () => {
@@ -189,6 +190,8 @@ describe('runtime update settings UI', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '업데이트 확인' }))
     await waitFor(() => expect(runtimeUpdateAPI.check).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText('현재 최신 버전입니다.')).not.toBeInTheDocument()
+    expect(screen.getByText('1.1.0')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '다운로드 및 검증' }))
     expect(await screen.findByText('검증 상태 · 검증 완료')).toBeInTheDocument()
     await waitFor(() => expect(runtimeUpdateAPI.stage).toHaveBeenCalledTimes(1))
@@ -201,6 +204,76 @@ describe('runtime update settings UI', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '이전 버전으로 롤백' }))
     await waitFor(() => expect(runtimeUpdateAPI.rollback).toHaveBeenCalledTimes(1))
+  })
+
+  it('shows an informational status when a successful check finds no newer release', async () => {
+    vi.mocked(runtimeUpdateAPI.check).mockResolvedValue({
+      ...structuredClone(updateStatus), available_release: undefined, updates_available: false,
+      last_failure_code: undefined, verification_state: 'verified',
+    })
+    renderSettings('updates')
+    await screen.findByText('1.1.0')
+
+    fireEvent.click(screen.getByRole('button', { name: '업데이트 확인' }))
+
+    expect(await screen.findByText('현재 최신 버전입니다.')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('현재 최신 버전입니다.')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByText('요청한 항목을 찾을 수 없습니다.')).not.toBeInTheDocument()
+    expect(screen.queryByText('새 버전을 확인하지 않았습니다.')).not.toBeInTheDocument()
+    expect(screen.getByText('새 버전 없음')).toBeInTheDocument()
+  })
+
+  it('shows a release candidate returned by a successful check', async () => {
+    vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({
+      ...structuredClone(updateStatus), available_release: undefined, updates_available: false,
+      verification_state: 'not_checked',
+    })
+    vi.mocked(runtimeUpdateAPI.check).mockResolvedValue(structuredClone(updateStatus))
+    renderSettings('updates')
+    expect(await screen.findByText('새 버전을 확인하지 않았습니다.')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '업데이트 확인' }))
+
+    expect(await screen.findByText('1.1.0')).toBeInTheDocument()
+    expect(screen.queryByText('현재 최신 버전입니다.')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('clears the up-to-date result when a later check discovers an update', async () => {
+    const current = {
+      ...structuredClone(updateStatus), available_release: undefined, updates_available: false,
+      last_failure_code: undefined, verification_state: 'verified' as const,
+    }
+    vi.mocked(runtimeUpdateAPI.check)
+      .mockResolvedValueOnce(current)
+      .mockResolvedValueOnce(structuredClone(updateStatus))
+    renderSettings('updates')
+    await screen.findByText('1.1.0')
+    const check = screen.getByRole('button', { name: '업데이트 확인' })
+
+    fireEvent.click(check)
+    expect(await screen.findByText('현재 최신 버전입니다.')).toBeInTheDocument()
+    fireEvent.click(check)
+
+    await waitFor(() => expect(runtimeUpdateAPI.check).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByText('현재 최신 버전입니다.')).not.toBeInTheDocument())
+    expect(screen.getByText('1.1.0')).toBeInTheDocument()
+  })
+
+  it('shows the up-to-date result in English when en-US is selected', async () => {
+    vi.spyOn(authAPI, 'session').mockResolvedValue({ auth_enabled: true, authenticated: true, needs_bootstrap: false })
+    vi.mocked(userPreferencesAPI.get).mockResolvedValue({ locale: 'en-US', theme: 'system', timezone: 'system' })
+    vi.mocked(runtimeUpdateAPI.check).mockResolvedValue({
+      ...structuredClone(updateStatus), available_release: undefined, updates_available: false,
+      last_failure_code: undefined, verification_state: 'verified',
+    })
+    renderLocalizedSettings('updates')
+    const check = await screen.findByRole('button', { name: 'Check for updates' })
+    fireEvent.click(check)
+
+    expect(await screen.findByText('You’re up to date.')).toBeInTheDocument()
+    expect(screen.getByText('No newer release.')).toBeInTheDocument()
   })
 
   it('shows update action errors', async () => {

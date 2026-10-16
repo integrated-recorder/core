@@ -302,9 +302,9 @@ func (c *updateController) Check(ctx context.Context) (httpapi.Status, error) {
 	if c.activeMatches(manifest) {
 		c.mu.Lock()
 		c.available, c.availableSource, c.availableNotes = nil, nil, ""
-		c.verification, c.lastFailureCode = "verified", "no_update_available"
+		c.verification, c.lastFailureCode = "verified", ""
 		c.mu.Unlock()
-		return c.status(), httpapi.NewControllerError("no_update_available")
+		return c.status(), nil
 	}
 	c.mu.Lock()
 	copyManifest := manifest

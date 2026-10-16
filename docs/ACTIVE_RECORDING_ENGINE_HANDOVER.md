@@ -5,10 +5,12 @@
 Active Recording handover moves one Recording between Recorder Engine processes
 under the same Runtime Host and canonical storage root. Committing a compatible
 application generation immediately signals handover orchestration. The Host
-requests a source cutoff for every eligible Recording before bounded migration
-work, then drains only each source's accepted cohort, durably transfers the
-owner epoch, activates the target, and finally retires the source entry. A
-failed pre-transfer attempt leaves the source owner in place. A post-transfer
+fans out compatible source cutoffs with at most eight workers. Each confirmed
+cutoff immediately enters a bounded migration pool of at most four workers;
+migration does not wait for unrelated cutoff requests. The Host then drains
+only each source's accepted cohort, durably transfers the owner epoch,
+activates the target, and finally retires the source entry. A failed
+pre-transfer attempt leaves the source owner in place. A post-transfer
 rollback, when possible, issues a strictly newer epoch; an old epoch is never
 restored.
 
@@ -105,10 +107,12 @@ volatile and disposable. A Host-owned operation gate serializes handover with
 application release activation and adapter-set reconciliation.
 
 1. **Cutoff:** after application activation commits, enumerate compatible
-leases and request every known source cutoff promptly. Cutoff IPC fan-out and
-migration completion use bounded worker pools; one Recording failure does not
-starve others. A ready target Engine may be confirmed before cutoff, but it
-does not fetch a media payload.
+leases and stream source cutoff requests through at most eight workers. Each
+successful cutoff is sent directly to a small bounded migration queue
+served by at most four workers; no global all-cutoffs-complete barrier exists.
+A slow/failed cutoff cannot prolong the frozen interval for an unrelated
+Recording, and one Recording failure does not starve others. A ready target
+Engine may be confirmed before cutoff, but it does not fetch a media payload.
 2. **Drain:** stop new source manifest admission, cancel an outstanding
 manifest request and source observers, park unstarted live tasks and stop
    historical admission. Historical HTTP admission is checked after any global

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"os"
@@ -906,25 +907,27 @@ func TestBoundedHandoverMigrationContinuesAfterFirstRecordingFails(t *testing.T)
 	seen := make(map[string]int)
 	active, maxActive := 0, 0
 	firstFailure := errors.New("target preparation failed")
-	err := runBoundedHandoverCandidates(context.Background(), candidates, 2, func(candidate recordingHandoverCandidate) error {
-		id := candidate.lease.RecordingID
-		mu.Lock()
-		seen[id]++
-		active++
-		if active > maxActive {
-			maxActive = active
-		}
-		mu.Unlock()
-		defer func() {
+	err := runBoundedHandoverPipeline(context.Background(), candidates, handoverCutoffConcurrency, 2,
+		func(context.Context, recordingHandoverCandidate) error { return nil },
+		func(_ context.Context, candidate recordingHandoverCandidate) error {
+			id := candidate.lease.RecordingID
 			mu.Lock()
-			active--
+			seen[id]++
+			active++
+			if active > maxActive {
+				maxActive = active
+			}
 			mu.Unlock()
-		}()
-		if id == "recording-1" {
-			return firstFailure
-		}
-		return nil
-	})
+			defer func() {
+				mu.Lock()
+				active--
+				mu.Unlock()
+			}()
+			if id == "recording-1" {
+				return firstFailure
+			}
+			return nil
+		}, func(recordingHandoverCandidate) error { return nil }, nil)
 	if !errors.Is(err, firstFailure) {
 		t.Fatalf("migration errors=%v, want first Recording failure retained", err)
 	}
@@ -935,6 +938,329 @@ func TestBoundedHandoverMigrationContinuesAfterFirstRecordingFails(t *testing.T)
 	}
 	if maxActive > 2 {
 		t.Fatalf("handover concurrency=%d, want configured bound 2", maxActive)
+	}
+}
+
+func handoverPipelineCandidates(ids ...string) []recordingHandoverCandidate {
+	candidates := make([]recordingHandoverCandidate, 0, len(ids))
+	for _, id := range ids {
+		candidates = append(candidates, recordingHandoverCandidate{lease: generation.Lease{RecordingID: id}})
+	}
+	return candidates
+}
+
+func TestHandoverPipelineStreamsMigrationAheadOfSlowCutoff(t *testing.T) {
+	candidates := handoverPipelineCandidates("recording-1", "recording-2", "recording-3")
+	r1Cutoff := make(chan struct{})
+	r2Started := make(chan struct{})
+	releaseR2 := make(chan struct{})
+	r2Complete := make(chan struct{})
+	r1Migration := make(chan struct{})
+	events := make([]string, 0, 5)
+	var eventsMu sync.Mutex
+	appendEvent := func(event string) {
+		eventsMu.Lock()
+		events = append(events, event)
+		eventsMu.Unlock()
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runBoundedHandoverPipeline(context.Background(), candidates, 3, 1,
+			func(_ context.Context, candidate recordingHandoverCandidate) error {
+				switch candidate.lease.RecordingID {
+				case "recording-1":
+					appendEvent("r1_cutoff_success")
+					close(r1Cutoff)
+				case "recording-2":
+					<-r1Cutoff
+					close(r2Started)
+					<-releaseR2
+					appendEvent("r2_cutoff_complete")
+					close(r2Complete)
+				}
+				return nil
+			},
+			func(_ context.Context, candidate recordingHandoverCandidate) error {
+				if candidate.lease.RecordingID == "recording-1" {
+					appendEvent("r1_migration_start")
+					close(r1Migration)
+				}
+				return nil
+			}, func(recordingHandoverCandidate) error { return nil }, nil)
+	}()
+	select {
+	case <-r2Started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("slow Recording cutoff did not enter its deterministic barrier")
+	}
+	select {
+	case <-r1Migration:
+	case <-time.After(3 * time.Second):
+		t.Fatal("fast Recording migration waited for the unrelated slow cutoff")
+	}
+	select {
+	case <-r2Complete:
+		t.Fatal("slow cutoff unexpectedly completed before its release barrier")
+	default:
+	}
+	close(releaseR2)
+	if err := <-done; err != nil {
+		t.Fatalf("pipeline failed: %v", err)
+	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	r1MigrationIndex, r2CompleteIndex := -1, -1
+	for index, event := range events {
+		if event == "r1_migration_start" {
+			r1MigrationIndex = index
+		}
+		if event == "r2_cutoff_complete" {
+			r2CompleteIndex = index
+		}
+	}
+	if r1MigrationIndex < 0 || r2CompleteIndex < 0 || r1MigrationIndex >= r2CompleteIndex {
+		t.Fatalf("migration did not overlap cutoff fan-out: events=%v", events)
+	}
+}
+
+func TestHandoverPipelineCutoffAndMigrationFailuresAreIsolated(t *testing.T) {
+	t.Run("cutoff failure", func(t *testing.T) {
+		controller := &updateController{handoverRetries: make(map[string]handoverRetryState)}
+		candidates := handoverPipelineCandidates("recording-1", "recording-2", "recording-3")
+		migrated := make(map[string]bool)
+		cleaned := make(map[string]bool)
+		var mu sync.Mutex
+		cutoffErr := errors.New("cutoff failed")
+		err := runBoundedHandoverPipeline(context.Background(), candidates, 3, 2,
+			func(_ context.Context, candidate recordingHandoverCandidate) error {
+				if candidate.lease.RecordingID == "recording-1" {
+					return cutoffErr
+				}
+				return nil
+			},
+			func(_ context.Context, candidate recordingHandoverCandidate) error {
+				mu.Lock()
+				migrated[candidate.lease.RecordingID] = true
+				mu.Unlock()
+				return nil
+			},
+			func(candidate recordingHandoverCandidate) error {
+				mu.Lock()
+				cleaned[candidate.lease.RecordingID] = true
+				mu.Unlock()
+				return nil
+			},
+			func(candidate recordingHandoverCandidate, _ error) {
+				controller.noteHandoverRetryFailure(candidate.lease.RecordingID, time.Now())
+			})
+		if !errors.Is(err, cutoffErr) || !strings.Contains(err.Error(), "recording-1") {
+			t.Fatalf("pipeline error=%v, want isolated recording-1 cutoff failure", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if !migrated["recording-2"] || !migrated["recording-3"] || migrated["recording-1"] {
+			t.Fatalf("cutoff failure blocked healthy peers: migrated=%v", migrated)
+		}
+		if !cleaned["recording-1"] {
+			t.Fatalf("failed/ambiguous cutoff was not cleaned up: cleaned=%v", cleaned)
+		}
+		state := controller.handoverRetries["recording-1"]
+		if state.failures != 1 || controller.handoverRetries["recording-2"].failures != 0 {
+			t.Fatalf("retry failure accounting changed unexpectedly: %+v", controller.handoverRetries)
+		}
+	})
+
+	t.Run("migration failure", func(t *testing.T) {
+		candidates := handoverPipelineCandidates("recording-1", "recording-2", "recording-3")
+		migrated := make(map[string]bool)
+		cleaned := make(map[string]bool)
+		var mu sync.Mutex
+		migrationErr := errors.New("pre-CAS target preparation failed")
+		err := runBoundedHandoverPipeline(context.Background(), candidates, 3, 2,
+			func(context.Context, recordingHandoverCandidate) error { return nil },
+			func(_ context.Context, candidate recordingHandoverCandidate) error {
+				if candidate.lease.RecordingID == "recording-1" {
+					return migrationErr
+				}
+				mu.Lock()
+				migrated[candidate.lease.RecordingID] = true
+				mu.Unlock()
+				return nil
+			},
+			func(candidate recordingHandoverCandidate) error {
+				mu.Lock()
+				cleaned[candidate.lease.RecordingID] = true
+				mu.Unlock()
+				return nil
+			}, nil)
+		if !errors.Is(err, migrationErr) || !strings.Contains(err.Error(), "recording-1") {
+			t.Fatalf("pipeline error=%v, want isolated recording-1 migration failure", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if !migrated["recording-2"] || !migrated["recording-3"] || migrated["recording-1"] || !cleaned["recording-1"] {
+			t.Fatalf("migration failure blocked peers or skipped cutoff cleanup: migrated=%v cleaned=%v", migrated, cleaned)
+		}
+	})
+}
+
+func TestHandoverPipelineCancellationCleansSuccessfulAndPendingCutoffs(t *testing.T) {
+	t.Run("already canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		calls := 0
+		err := runBoundedHandoverPipeline(ctx, handoverPipelineCandidates("recording-1"), 1, 1,
+			func(context.Context, recordingHandoverCandidate) error { calls++; return nil },
+			func(context.Context, recordingHandoverCandidate) error { calls++; return nil },
+			func(recordingHandoverCandidate) error { calls++; return nil }, nil)
+		if !errors.Is(err, context.Canceled) || calls != 0 {
+			t.Fatalf("pre-canceled pipeline err=%v calls=%d, want no operations", err, calls)
+		}
+	})
+
+	t.Run("successful cutoff waiting behind migration", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		candidates := handoverPipelineCandidates("recording-1", "recording-2", "recording-3", "recording-4")
+		firstMigration := make(chan struct{})
+		r3CutoffStarted := make(chan struct{})
+		r2CutoffSucceeded := make(chan struct{})
+		r4CutoffFailed := make(chan struct{})
+		cleaned := make(chan string, 4)
+		done := make(chan error, 1)
+		go func() {
+			done <- runBoundedHandoverPipeline(ctx, candidates, 3, 1,
+				func(ctx context.Context, candidate recordingHandoverCandidate) error {
+					switch candidate.lease.RecordingID {
+					case "recording-2":
+						<-firstMigration
+						close(r2CutoffSucceeded)
+					case "recording-3":
+						close(r3CutoffStarted)
+						<-ctx.Done()
+						return ctx.Err()
+					case "recording-4":
+						close(r4CutoffFailed)
+						return errors.New("injected cutoff failure")
+					}
+					return nil
+				},
+				func(ctx context.Context, candidate recordingHandoverCandidate) error {
+					if candidate.lease.RecordingID == "recording-1" {
+						close(firstMigration)
+						<-ctx.Done()
+						return ctx.Err()
+					}
+					return nil
+				},
+				func(candidate recordingHandoverCandidate) error {
+					cleaned <- candidate.lease.RecordingID
+					return nil
+				}, nil)
+		}()
+		select {
+		case <-firstMigration:
+		case <-time.After(3 * time.Second):
+			t.Fatal("first migration did not start")
+		}
+		select {
+		case <-r3CutoffStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatal("blocked cutoff did not start")
+		}
+		select {
+		case <-r2CutoffSucceeded:
+		case <-time.After(3 * time.Second):
+			t.Fatal("second successful cutoff did not reach the migration queue")
+		}
+		select {
+		case <-r4CutoffFailed:
+		case <-time.After(3 * time.Second):
+			t.Fatal("injected cutoff failure did not finish")
+		}
+		// recording-2's successful cutoff is queued behind the occupied
+		// migration worker. Cancel while another cutoff is blocked and
+		// a peer has failed to prove every established cutoff is cleaned.
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled pipeline err=%v, want context.Canceled", err)
+		}
+		seen := map[string]bool{}
+		for len(cleaned) > 0 {
+			seen[<-cleaned] = true
+		}
+		if !seen["recording-1"] || !seen["recording-2"] || !seen["recording-3"] || !seen["recording-4"] {
+			t.Fatalf("successful/pending/failed cutoffs were not explicitly cleaned up: %v", seen)
+		}
+	})
+}
+
+func TestHandoverPipelineConcurrencyBounds(t *testing.T) {
+	candidates := make([]recordingHandoverCandidate, 32)
+	for i := range candidates {
+		candidates[i].lease.RecordingID = fmt.Sprintf("recording-%02d", i)
+	}
+	cutoffRelease, migrationRelease := make(chan struct{}), make(chan struct{})
+	cutoffEight, migrationFour := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	activeCutoffs, maxCutoffs := 0, 0
+	activeMigrations, maxMigrations := 0, 0
+	var cutoffEightOnce, migrationFourOnce sync.Once
+	done := make(chan error, 1)
+	go func() {
+		done <- runBoundedHandoverPipeline(context.Background(), candidates, handoverCutoffConcurrency, handoverMigrationConcurrency,
+			func(context.Context, recordingHandoverCandidate) error {
+				mu.Lock()
+				activeCutoffs++
+				if activeCutoffs > maxCutoffs {
+					maxCutoffs = activeCutoffs
+				}
+				if activeCutoffs == handoverCutoffConcurrency {
+					cutoffEightOnce.Do(func() { close(cutoffEight) })
+				}
+				mu.Unlock()
+				<-cutoffRelease
+				mu.Lock()
+				activeCutoffs--
+				mu.Unlock()
+				return nil
+			},
+			func(context.Context, recordingHandoverCandidate) error {
+				mu.Lock()
+				activeMigrations++
+				if activeMigrations > maxMigrations {
+					maxMigrations = activeMigrations
+				}
+				if activeMigrations == handoverMigrationConcurrency {
+					migrationFourOnce.Do(func() { close(migrationFour) })
+				}
+				mu.Unlock()
+				<-migrationRelease
+				mu.Lock()
+				activeMigrations--
+				mu.Unlock()
+				return nil
+			}, func(recordingHandoverCandidate) error { return nil }, nil)
+	}()
+	select {
+	case <-cutoffEight:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pipeline did not reach configured cutoff concurrency")
+	}
+	close(cutoffRelease)
+	select {
+	case <-migrationFour:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pipeline did not reach configured migration concurrency")
+	}
+	close(migrationRelease)
+	if err := <-done; err != nil {
+		t.Fatalf("pipeline failed: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if maxCutoffs != handoverCutoffConcurrency || maxMigrations != handoverMigrationConcurrency {
+		t.Fatalf("observed concurrency cutoff=%d migration=%d, want %d/%d", maxCutoffs, maxMigrations, handoverCutoffConcurrency, handoverMigrationConcurrency)
 	}
 }
 

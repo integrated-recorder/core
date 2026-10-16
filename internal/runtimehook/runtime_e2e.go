@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -28,7 +29,7 @@ var (
 )
 
 var knownPoints = map[Point]struct{}{
-	BeforeTargetPrepare: {}, DuringTargetPrepare: {}, AfterTargetReady: {},
+	BeforeTargetPrepare: {}, BeforeHandoverCutoff: {}, DuringTargetPrepare: {}, AfterTargetReady: {},
 	AfterSourceAdmissionStop: {}, DuringSourceDrain: {}, AfterSourceDrain: {},
 	BeforeOwnerCAS: {}, AfterOwnerCAS: {}, BeforeTargetActivation: {},
 	BeforeTargetFirstCommit: {}, AfterTargetFirstCommit: {},
@@ -40,17 +41,28 @@ var knownObservations = map[Observation]struct{}{
 }
 
 type config struct {
-	point Point
-	dir   string
+	points map[Point]struct{}
+	dir    string
 }
 
 func readConfig() (config, bool) {
-	p, dir := Point(os.Getenv(pointEnv)), os.Getenv(markerDirEnv)
-	if _, ok := knownPoints[p]; !ok || !validPoint.MatchString(string(p)) ||
-		dir == "" || !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+	rawPoints, dir := os.Getenv(pointEnv), os.Getenv(markerDirEnv)
+	parts := strings.Split(rawPoints, ",")
+	if len(parts) == 0 || len(parts) > 16 || dir == "" || !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
 		return config{}, false
 	}
-	return config{point: p, dir: dir}, true
+	points := make(map[Point]struct{}, len(parts))
+	for _, part := range parts {
+		point := Point(part)
+		if _, ok := knownPoints[point]; !ok || !validPoint.MatchString(part) {
+			return config{}, false
+		}
+		if _, duplicate := points[point]; duplicate {
+			return config{}, false
+		}
+		points[point] = struct{}{}
+	}
+	return config{points: points, dir: dir}, true
 }
 
 // Pause atomically publishes a ready marker and waits for its matching release
@@ -59,7 +71,7 @@ func readConfig() (config, bool) {
 // runtime_e2e build tag.
 func Pause(point Point, recordingID string) error {
 	cfg, enabled := readConfig()
-	if !enabled || cfg.point != point || !validID.MatchString(recordingID) {
+	if _, configured := cfg.points[point]; !enabled || !configured || !validID.MatchString(recordingID) {
 		return nil
 	}
 	if err := validatePrivateDirectory(cfg.dir); err != nil {
@@ -69,7 +81,7 @@ func Pause(point Point, recordingID string) error {
 	if err != nil {
 		return err
 	}
-	if !exists || arm.Point != point || arm.RecordingID != recordingID {
+	if !exists || !arm.matches(point, recordingID) {
 		return nil
 	}
 	ready := ReadyMarkerPath(cfg.dir, point, recordingID)
@@ -167,6 +179,18 @@ func validObservation(observation Observation) bool {
 	return ok
 }
 
+func (arm Arm) matches(point Point, recordingID string) bool {
+	if arm.Point == point && arm.RecordingID == recordingID {
+		return true
+	}
+	for _, target := range arm.Additional {
+		if target.Point == point && target.RecordingID == recordingID {
+			return true
+		}
+	}
+	return false
+}
+
 // ChildEnvironment returns only the fixed point selector and private marker
 // directory. No ambient environment or Control/Engine credentials are copied.
 func ChildEnvironment() []string {
@@ -174,7 +198,7 @@ func ChildEnvironment() []string {
 	if !enabled || validatePrivateDirectory(cfg.dir) != nil {
 		return nil
 	}
-	return []string{pointEnv + "=" + string(cfg.point), markerDirEnv + "=" + cfg.dir}
+	return []string{pointEnv + "=" + os.Getenv(pointEnv), markerDirEnv + "=" + cfg.dir}
 }
 
 func validatePrivateDirectory(path string) error {
@@ -221,8 +245,25 @@ func readArm(directory string) (Arm, bool, error) {
 }
 
 func validArm(arm Arm) bool {
-	_, known := knownPoints[arm.Point]
-	return known && validPoint.MatchString(string(arm.Point)) && validID.MatchString(arm.RecordingID)
+	if !validArmTarget(ArmTarget{Point: arm.Point, RecordingID: arm.RecordingID}) || len(arm.Additional) > 8 {
+		return false
+	}
+	seen := map[ArmTarget]struct{}{{Point: arm.Point, RecordingID: arm.RecordingID}: {}}
+	for _, target := range arm.Additional {
+		if !validArmTarget(target) {
+			return false
+		}
+		if _, exists := seen[target]; exists {
+			return false
+		}
+		seen[target] = struct{}{}
+	}
+	return true
+}
+
+func validArmTarget(target ArmTarget) bool {
+	_, pointOK := knownPoints[target.Point]
+	return pointOK && validPoint.MatchString(string(target.Point)) && validID.MatchString(target.RecordingID)
 }
 
 func safeMarkerExists(path string) (bool, error) {

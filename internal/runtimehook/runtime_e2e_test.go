@@ -158,6 +158,48 @@ func TestChildEnvironmentIsAnExplicitAllowlist(t *testing.T) {
 	}
 }
 
+func TestPauseSupportsMultipleAllowlistedPointsAndExactArmTargets(t *testing.T) {
+	directory := privateTestDirectory(t)
+	secondRecording := "fedcba9876543210fedcba9876543210"
+	configureTestHook(t, directory, BeforeTargetPrepare)
+	t.Setenv(pointEnv, string(BeforeTargetPrepare)+","+string(BeforeHandoverCutoff))
+	writeTestArm(t, directory, Arm{
+		Point: BeforeTargetPrepare, RecordingID: testRecordingID,
+		Additional: []ArmTarget{{Point: BeforeHandoverCutoff, RecordingID: secondRecording}},
+	}, 0600)
+	if got := ChildEnvironment(); !reflect.DeepEqual(got, []string{pointEnv + "=" + string(BeforeTargetPrepare) + "," + string(BeforeHandoverCutoff), markerDirEnv + "=" + directory}) {
+		t.Fatalf("multiple point allowlist was not forwarded exactly: %q", got)
+	}
+	if err := Pause(BeforeHandoverCutoff, testRecordingID); err != nil {
+		t.Fatalf("nonmatching additional target should be inert: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- Pause(BeforeHandoverCutoff, secondRecording) }()
+	ready := ReadyMarkerPath(directory, BeforeHandoverCutoff, secondRecording)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Lstat(ready); err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := os.Lstat(ready); err != nil {
+		t.Fatalf("matching additional arm did not publish ready marker: %v", err)
+	}
+	release := ReleaseMarkerPath(directory, BeforeHandoverCutoff, secondRecording)
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("matching additional arm target failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("additional exact arm target did not unblock")
+	}
+}
+
 func TestPauseRejectsInvalidPrivateDirectory(t *testing.T) {
 	root := privateTestDirectory(t)
 	directory := filepath.Join(root, "public")

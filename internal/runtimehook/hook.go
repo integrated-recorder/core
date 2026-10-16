@@ -14,6 +14,7 @@ type Observation string
 
 const (
 	BeforeTargetPrepare            Point = "before_target_prepare"
+	BeforeHandoverCutoff           Point = "before_handover_cutoff"
 	DuringTargetPrepare            Point = "during_target_prepare"
 	AfterTargetReady               Point = "after_target_ready"
 	AfterSourceAdmissionStop       Point = "after_source_admission_stop"
@@ -33,6 +34,15 @@ const StaleOwnerCommitRejected Observation = "stale_owner_commit_rejected"
 // Arm is a private, test-only selector atomically published after the product
 // API has returned the recording ID. The normal product build never reads it.
 type Arm struct {
+	Point       Point       `json:"point"`
+	RecordingID string      `json:"recording_id"`
+	Additional  []ArmTarget `json:"additional,omitempty"`
+}
+
+// ArmTarget adds another exact boundary/Recording pair to one private test
+// arm. This lets process E2E tests coordinate separate cutoff and migration
+// boundaries without weakening the exact-ID match.
+type ArmTarget struct {
 	Point       Point  `json:"point"`
 	RecordingID string `json:"recording_id"`
 }

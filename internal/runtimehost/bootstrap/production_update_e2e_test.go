@@ -1785,6 +1785,10 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	var localStorageArtifact string
 
 	listenAddr := reserveRuntimeAddress(t)
+	runtimeE2EFailpoints := string(runtimehook.BeforeTargetPrepare)
+	if iteration == 1 {
+		runtimeE2EFailpoints += "," + string(runtimehook.BeforeHandoverCutoff)
+	}
 	command := exec.Command(artifacts.hostA)
 	command.Env = minimalRuntimeE2EEnv([]string{
 		"DATA_DIR=" + dataDir,
@@ -1797,7 +1801,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
 		// A known test-only hook name enables the supervisor's bounded child
 		// diagnostic capture. No arm marker is published, so no hook pauses.
-		"IR_RUNTIME_E2E_FAILPOINT=" + string(runtimehook.BeforeTargetPrepare),
+		"IR_RUNTIME_E2E_FAILPOINT=" + runtimeE2EFailpoints,
 		"IR_RUNTIME_E2E_MARKER_DIR=" + diagnosticDir,
 	})
 	process := &runtimeHostProcess{command: command, done: make(chan struct{}), diagnosticDir: diagnosticDir}
@@ -1934,7 +1938,13 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if err := verifyInstalledRuntimeRelease(installedDir, artifacts.manifestB); err != nil {
 		t.Fatalf("staged immutable B release failed independent size/hash/signature checks: %v", err)
 	}
-	if err := writeRuntimeHookArm(diagnosticDir, runtimehook.Arm{Point: runtimehook.BeforeTargetPrepare, RecordingID: recordingR.ID}); err != nil {
+	handoverArm := runtimehook.Arm{Point: runtimehook.BeforeTargetPrepare, RecordingID: recordingR.ID}
+	if iteration == 1 {
+		// R3's Host-side cutoff IPC is intentionally held before it reaches the
+		// Engine. R's target-preparation boundary remains independently armed.
+		handoverArm.Additional = []runtimehook.ArmTarget{{Point: runtimehook.BeforeHandoverCutoff, RecordingID: recordingR3.ID}}
+	}
+	if err := writeRuntimeHookArm(diagnosticDir, handoverArm); err != nil {
 		t.Fatalf("arm post-drain target preparation boundary for R: %v", err)
 	}
 	if engineProcess := processForBinary(engineABinary); engineProcess == 0 {
@@ -1994,27 +2004,29 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		t.Fatalf("handover did not start promptly after activation response: elapsed=%s", time.Since(activateFinished))
 	}
 	if iteration == 1 {
-		// R remains blocked in its already-started adapter refresh. R2 and R3
-		// must both receive their own cutoffs and progress in the same bounded
-		// orchestration cycle.
+		// R remains blocked in its already-started adapter refresh. R3's cutoff
+		// is held at the Host boundary while R2 must migrate through the streaming
+		// pipeline before that unrelated cutoff can finish.
+		r3CutoffReady := runtimehook.ReadyMarkerPath(diagnosticDir, runtimehook.BeforeHandoverCutoff, recordingR3.ID)
+		if err := waitRuntimeConditionError(10*time.Second, func() bool {
+			info, statErr := os.Lstat(r3CutoffReady)
+			return statErr == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0600
+		}, "R3's deliberately delayed cutoff"); err != nil {
+			releaseRefresh()
+			t.Fatalf("R3 cutoff was not held at its deterministic boundary: %v; host=%s", err, process.output.String())
+		}
 		cutoffChecksStarted := time.Now()
 		if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR2.ID, 1, 5*time.Second); err != nil {
 			releaseRefresh()
 			t.Fatalf("R2 was starved behind R's blocked handover: %v; host=%s", err, process.output.String())
 		}
-		if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR3.ID, 1, 5*time.Second); err != nil {
-			releaseRefresh()
-			t.Fatalf("R3 was starved behind R/R2 handovers: %v; host=%s", err, process.output.String())
-		}
 		if time.Since(cutoffChecksStarted) >= 5*time.Second {
 			releaseRefresh()
-			t.Fatalf("all compatible Recording cutoffs did not begin promptly: elapsed=%s", time.Since(cutoffChecksStarted))
+			t.Fatalf("healthy Recording cutoff did not begin promptly: elapsed=%s", time.Since(cutoffChecksStarted))
 		}
-		// R2/R3 have drained their canonical prefixes and are waiting for
-		// continuation; publish the next coordinate so the targets can finish
-		// while R remains blocked on the source Engine.
+		// R2 has drained its canonical prefix and is waiting for continuation.
+		// R3 remains frozen only at the test's pre-cutoff boundary.
 		fixture.advance(streamR2, 1)
-		fixture.advance(streamR3, 1)
 		r2LeaseB := waitRecordingLeaseGeneration(t, dataDir, recordingR2.ID, activateStatus.DefaultEngine.ID, 30*time.Second, process.output.String, func() string {
 			return fixture.describe(streamR2)
 		})
@@ -2031,6 +2043,23 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 			releaseRefresh()
 			t.Fatalf("R2 did not continue without a gap while R was blocked: state=%s sequences=%v gaps=%+v", r2.State, recordingSequences(r2), r2.Gaps)
 		}
+		if lease := readRuntimeLeases(t, dataDir)[recordingR3.ID]; lease.EngineGeneration != leaseR3.EngineGeneration {
+			releaseRefresh()
+			t.Fatalf("R3 ownership changed before its delayed cutoff completed: lease=%+v", lease)
+		}
+		if err := writeRuntimeHookRelease(diagnosticDir, runtimehook.BeforeHandoverCutoff, recordingR3.ID); err != nil {
+			releaseRefresh()
+			t.Fatalf("release R3 cutoff boundary: %v", err)
+		}
+		if err := writeRuntimeHookArm(diagnosticDir, runtimehook.Arm{Point: runtimehook.BeforeTargetPrepare, RecordingID: recordingR.ID}); err != nil {
+			releaseRefresh()
+			t.Fatalf("remove one-shot R3 cutoff arm while retaining R target boundary: %v", err)
+		}
+		if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR3.ID, 1, 10*time.Second); err != nil {
+			releaseRefresh()
+			t.Fatalf("R3 cutoff did not proceed after its barrier release: %v; host=%s", err, process.output.String())
+		}
+		fixture.advance(streamR3, 1)
 		r3LeaseB := waitRecordingLeaseGeneration(t, dataDir, recordingR3.ID, activateStatus.DefaultEngine.ID, 30*time.Second, process.output.String, func() string {
 			return fixture.describe(streamR3)
 		})
@@ -2046,6 +2075,15 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		if r3.State != domain.StateRecording || len(r3.Gaps) != 0 || !equalSequenceRange(recordingSequences(r3), 1, 4) {
 			releaseRefresh()
 			t.Fatalf("R3 did not continue without a gap while R was blocked: state=%s sequences=%v gaps=%+v", r3.State, recordingSequences(r3), r3.Gaps)
+		}
+		for _, stream := range []string{streamR2, streamR3} {
+			requests := fixture.segmentRequestsFor(stream)
+			for sequence := uint64(1); sequence <= 4; sequence++ {
+				if len(requests[sequence]) != 1 || !requests[sequence][0].Succeeded {
+					releaseRefresh()
+					t.Fatalf("%s sequence %d source fetches=%+v; want exactly one successful request across handover", stream, sequence, requests[sequence])
+				}
+			}
 		}
 	}
 	if err := waitHostHandoverLogEvent(process, "recording handover_source_drained", recordingR.ID, 1, 30*time.Second); err != nil {

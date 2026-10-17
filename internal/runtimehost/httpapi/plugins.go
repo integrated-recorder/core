@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -25,9 +26,21 @@ var pluginIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 // and locally desired plugin versions. It never contains URLs, digests, or
 // filesystem information.
 type PluginStatus struct {
-	State       string             `json:"state"`
-	FailureCode string             `json:"failure_code,omitempty"`
-	Plugins     []PluginStatusItem `json:"plugins"`
+	State           string                       `json:"state"`
+	FailureCode     string                       `json:"failure_code,omitempty"`
+	AutomaticUpdate *PluginAutomaticUpdateStatus `json:"automatic_update,omitempty"`
+	Plugins         []PluginStatusItem           `json:"plugins"`
+}
+
+// PluginAutomaticUpdateStatus is a bounded, secret-free projection of the
+// Runtime Host's Registry reconciliation worker. It is intentionally separate
+// from Registry availability: installed plugins remain usable during outages.
+type PluginAutomaticUpdateStatus struct {
+	Enabled         bool       `json:"enabled"`
+	State           string     `json:"state"`
+	LastCheckedAt   *time.Time `json:"last_checked_at,omitempty"`
+	LastSuccessAt   *time.Time `json:"last_success_at,omitempty"`
+	LastFailureCode string     `json:"last_failure_code,omitempty"`
 }
 
 type PluginStatusItem struct {
@@ -38,6 +51,7 @@ type PluginStatusItem struct {
 	InstalledVersion string                  `json:"installed_version,omitempty"`
 	Installed        bool                    `json:"installed"`
 	UpdateAvailable  bool                    `json:"update_available"`
+	StorageState     string                  `json:"storage_state,omitempty"`
 	Trust            plugintrust.Attestation `json:"trust"`
 }
 
@@ -51,9 +65,15 @@ func (s PluginStatus) Validate() error {
 	if (s.State == "ready" && s.FailureCode != "") || (s.State == "unavailable" && s.FailureCode != "plugin_registry_unavailable") || (s.State == "not_configured" && s.FailureCode != "") || len(s.Plugins) > 256 {
 		return errInvalidPluginStatus
 	}
+	if s.AutomaticUpdate != nil && s.AutomaticUpdate.Validate() != nil {
+		return errInvalidPluginStatus
+	}
 	seen := make(map[string]struct{}, len(s.Plugins))
 	for _, item := range s.Plugins {
 		if !pluginIDPattern.MatchString(item.ID) || (item.Type != "" && item.Type != "source" && item.Type != "storage") || !safePluginText(item.Name, 128) || item.AvailableVersion != "" && !safePluginText(item.AvailableVersion, 128) || item.InstalledVersion != "" && !safePluginText(item.InstalledVersion, 128) || item.Trust.Validate() != nil {
+			return errInvalidPluginStatus
+		}
+		if item.StorageState != "" && (item.Type != "storage" || !item.Installed || item.StorageState != "artifact_installed" && item.StorageState != "configured" && item.StorageState != "active") {
 			return errInvalidPluginStatus
 		}
 		if _, exists := seen[item.ID]; exists {
@@ -66,6 +86,24 @@ func (s PluginStatus) Validate() error {
 		if !item.Installed && (item.InstalledVersion != "" || item.UpdateAvailable) {
 			return errInvalidPluginStatus
 		}
+	}
+	return nil
+}
+
+func (s PluginAutomaticUpdateStatus) Validate() error {
+	if s.State != "idle" && s.State != "checking" && s.State != "updating" && s.State != "deferred" && s.State != "failed" {
+		return errInvalidPluginStatus
+	}
+	switch s.LastFailureCode {
+	case "", "plugin_registry_unavailable", "plugin_download_failed", "plugin_verification_failed", "plugin_identity_mismatch", "plugin_install_failed":
+	default:
+		return errInvalidPluginStatus
+	}
+	if (s.State == "failed") != (s.LastFailureCode != "") || !s.Enabled && (s.State != "idle" || s.LastFailureCode != "") {
+		return errInvalidPluginStatus
+	}
+	if s.LastCheckedAt != nil && s.LastCheckedAt.IsZero() || s.LastSuccessAt != nil && s.LastSuccessAt.IsZero() {
+		return errInvalidPluginStatus
 	}
 	return nil
 }

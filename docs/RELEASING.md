@@ -88,7 +88,10 @@ clients support operator-configured curated HTTPS catalogs and manual artifact
 install/update through the same immutable import path; v3 adds publisher
 affiliation while preserving v1/v2 parsing. The registry pins
 artifact size and SHA-256; publisher PKI/signatures, a community registry
-service, and automatic remote adapter updates remain follow-on work. See
+service, and plugin dependency resolution remain follow-on work. Registry
+installed source and storage plugins automatically reconcile to the configured
+exact `stable` selection; this does not update Runtime Host itself or perform
+cross-plugin-set Recording handover. See
 [`PLUGIN_REGISTRY_V1.md`](PLUGIN_REGISTRY_V1.md) and
 [`PLUGIN_TRUST_MODEL.md`](PLUGIN_TRUST_MODEL.md) for the Registry schemas,
 trust provenance, and runtime contract.

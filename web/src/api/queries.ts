@@ -31,7 +31,7 @@ export const installationQuery = queryOptions({
 })
 export const runtimeUpdateQuery = queryOptions({ queryKey: qk.runtimeUpdate, queryFn: () => runtimeUpdateAPI.status(), staleTime: 5_000, refetchInterval: 15_000, refetchIntervalInBackground: false })
 export const adaptersQuery = queryOptions({ queryKey: qk.adapters, queryFn: adaptersAPI.list, staleTime: 15_000, refetchInterval: 20_000, refetchIntervalInBackground: false })
-export const pluginsQuery = queryOptions({ queryKey: qk.plugins, queryFn: pluginsAPI.status, staleTime: 15_000 })
+export const pluginsQuery = queryOptions({ queryKey: qk.plugins, queryFn: pluginsAPI.status, staleTime: 15_000, refetchInterval: 30_000, refetchIntervalInBackground: false })
 export const dashboardQuery = queryOptions({ queryKey: qk.dashboard, queryFn: dashboardAPI.get, staleTime: 10_000, refetchInterval: 15_000, refetchIntervalInBackground: false })
 export const storagePoolsQuery = queryOptions({ queryKey: qk.storagePools, queryFn: storageAPI.pools, staleTime: 2_000, refetchInterval: 5_000, refetchIntervalInBackground: false })
 export const storageMetricsQuery = (poolId: string, window: StorageMetricWindow, enabled = true) => queryOptions({

@@ -260,6 +260,17 @@ This release provides the Storage Provider Protocol, the bundled `storage.local`
 reference/production plugin, executable lifecycle, Registry v2 type support,
 and a conformance runner. It does not include a production S3, Backblaze B2,
 WebDAV, or SFTP provider. It also does not provide
-publisher PKI or plugin signatures, sandboxing, automatic plugin updates,
-archive migration, multi-pool placement, tiering, replication/mirroring,
-provider dependency resolution, or cross-storage-set Recording handover.
+publisher PKI or plugin signatures, sandboxing, archive migration, multi-pool
+placement, tiering, replication/mirroring, provider dependency resolution, or
+cross-storage-set Recording handover.
+
+Registry-managed storage artifacts follow the Registry's explicit `stable`
+selection automatically on the Runtime Host's approximately 15-minute
+reconciliation cadence. A verified artifact update does not change the
+physical primary backend. Existing provider-level configuration is carried to
+the new immutable set only when the new schema accepts it; otherwise the
+previous desired/active set remains selected and the new artifact is shown as
+requiring configuration. Storage status separately reports artifact,
+configuration, and active-generation state. Operators still configure, probe,
+and explicitly activate storage through the Storage surface. Active recordings
+remain pinned to their original immutable provider set.

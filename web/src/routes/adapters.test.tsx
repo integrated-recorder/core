@@ -116,6 +116,50 @@ describe('adapter discovery controls', () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/activate'))).toBe(false)
   })
 
+  it('shows automatic update health and distinguishes storage artifact, configuration, and active state', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      const body = url === '/api/runtime/plugins' ? {
+        state: 'ready',
+        automatic_update: { enabled: true, state: 'idle', last_checked_at: '2026-10-17T01:02:03Z' },
+        plugins: [
+          { id: 'storage-artifact', type: 'storage', name: 'Artifact only', installed_version: '2.0.0', installed: true, update_available: false, storage_state: 'artifact_installed' },
+          { id: 'storage-configured', type: 'storage', name: 'Configured', installed_version: '2.0.0', installed: true, update_available: false, storage_state: 'configured' },
+          { id: 'storage-active', type: 'storage', name: 'Active', installed_version: '2.0.0', installed: true, update_available: false, storage_state: 'active' },
+        ],
+      } : []
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await renderPlugins()
+
+    expect(await screen.findByText('설치된 플러그인은 Registry의 stable 버전에 맞춰 자동 확인·업데이트됩니다.')).toBeInTheDocument()
+    expect(screen.getByText(/마지막 자동 확인:/)).toBeInTheDocument()
+    expect(screen.getByText('새 실행 파일만 설치됨 · 저장소 설정이 필요합니다. 기존 저장소는 유지됩니다.')).toBeInTheDocument()
+    expect(screen.getByText('설정됨 · 새 저장소 버전은 명시적으로 활성화하기 전까지 사용되지 않습니다.')).toBeInTheDocument()
+    expect(screen.getByText('현재 활성 저장소 버전입니다.')).toBeInTheDocument()
+  })
+
+  it('shows a bounded automatic-update failure without hiding installed plugins', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      const body = url === '/api/runtime/plugins' ? {
+        state: 'unavailable', failure_code: 'plugin_registry_unavailable',
+        automatic_update: { enabled: true, state: 'failed', last_failure_code: 'plugin_registry_unavailable' },
+        plugins: [{ id: 'demo', type: 'source', name: 'Installed Demo', installed_version: '1.0.0', installed: true, update_available: false }],
+      } : []
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await renderPlugins()
+
+    expect(await screen.findByText('자동 업데이트를 완료하지 못했습니다. 설치된 플러그인은 계속 사용할 수 있습니다.')).toBeInTheDocument()
+    expect(screen.getByText('Installed Demo')).toBeInTheDocument()
+    expect(screen.queryByText(/fixture storage registry unavailable/)).not.toBeInTheDocument()
+  })
+
   it('keeps installed plugins visible while the registry is unavailable', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)

@@ -93,6 +93,10 @@ type Config struct {
 	// PluginRegistryHTTPClient is a deterministic test seam. Production hosts
 	// leave it nil and use the bounded public HTTPS client.
 	PluginRegistryHTTPClient *http.Client
+	// PluginAutoUpdateInterval is an internal scheduling seam. Normal
+	// installations use the bounded production default; runtime process tests
+	// may inject a short interval without changing production policy.
+	PluginAutoUpdateInterval time.Duration
 	// ReleaseBundleDir optionally selects a local signed package as the update
 	// source. This supports offline administration and deterministic host tests;
 	// it is still verified against TrustedReleaseKeys before installation.
@@ -106,6 +110,7 @@ func DefaultConfig() Config {
 		DataDir: defaultDataDir, BundleDir: defaultBundleDir, StorageLocalBinary: defaultStorageLocalBinary, BundledHLSBinary: defaultBundledHLSBinary,
 		ListenAddr: defaultListenAddr, AdapterDirs: defaultAdapterDirs, PluginRegistryURL: defaultPluginRegistryURL,
 		ControlReadyWait: defaultControlWait, ShutdownTimeout: defaultCloseWait,
+		PluginAutoUpdateInterval: defaultPluginAutoUpdateInterval,
 	}
 }
 
@@ -195,6 +200,9 @@ func (c Config) Validate() error {
 	}
 	if c.ControlReadyWait <= 0 || c.ControlReadyWait > 2*time.Minute || c.ShutdownTimeout <= 0 || c.ShutdownTimeout > 2*time.Minute {
 		return errors.New("runtime startup and shutdown timeouts are invalid")
+	}
+	if c.PluginAutoUpdateInterval < 100*time.Millisecond || c.PluginAutoUpdateInterval > 24*time.Hour {
+		return errors.New("automatic plugin update interval is invalid")
 	}
 	return nil
 }
@@ -640,10 +648,12 @@ func Run(ctx context.Context, config Config) error {
 		}
 	}()
 	adapterReconcileDone := startPeriodicAdapterReconciliation(leaseCtx, installState, updates, 3*time.Second)
+	pluginUpdateDone := startPeriodicPluginAutoUpdateReconciliation(leaseCtx, installState, updates, config.PluginAutoUpdateInterval, jitterPluginAutoUpdateInterval)
 	serveErr := sup.ServeWithHostHandler(ctx, listener, "/api", setupHandler)
 	stopLeaseReconciliation()
 	<-leaseDone
 	<-adapterReconcileDone
+	<-pluginUpdateDone
 	supervisorClosed = true
 	return serveErr
 }

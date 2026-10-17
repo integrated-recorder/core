@@ -17,6 +17,7 @@ import (
 )
 
 const runtimeE2ERegistryCAEnv = "IR_RUNTIME_E2E_PLUGIN_REGISTRY_CA_FILE"
+const runtimeE2EPluginAutoUpdateIntervalEnv = "IR_RUNTIME_E2E_PLUGIN_AUTO_UPDATE_INTERVAL"
 
 // configureRuntimeE2EPluginRegistryTrust permits a process E2E to trust only
 // its private local HTTPS fixture. Registry and artifact validation remain in
@@ -29,6 +30,13 @@ func configureRuntimeE2EPluginRegistryTrust(config *bootstrap.Config) error {
 	caPath := strings.TrimSpace(os.Getenv(runtimeE2ERegistryCAEnv))
 	if caPath == "" {
 		return nil
+	}
+	if raw := strings.TrimSpace(os.Getenv(runtimeE2EPluginAutoUpdateIntervalEnv)); raw != "" {
+		interval, parseErr := time.ParseDuration(raw)
+		if parseErr != nil || interval < 100*time.Millisecond || interval > time.Hour {
+			return errors.New("test automatic update interval is invalid")
+		}
+		config.PluginAutoUpdateInterval = interval
 	}
 	u, err := url.Parse(config.PluginRegistryURL)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {

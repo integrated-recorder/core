@@ -297,6 +297,29 @@ func TestPluginStatusAcceptsMaximumRegistryVersionLength(t *testing.T) {
 	}
 }
 
+func TestPluginStatusProjectsAutomaticUpdatesAndStorageLifecycle(t *testing.T) {
+	now := time.Date(2026, 10, 17, 1, 2, 3, 0, time.UTC)
+	controller := &fakeController{pluginStatus: PluginStatus{
+		State:           "ready",
+		AutomaticUpdate: &PluginAutomaticUpdateStatus{Enabled: true, State: "idle", LastCheckedAt: &now, LastSuccessAt: &now},
+		Plugins:         []PluginStatusItem{{ID: "storage-demo", Type: "storage", Name: "Storage Demo", InstalledVersion: "2.0.0", Installed: true, StorageState: "configured", Trust: plugintrust.NewCustomRegistry()}},
+	}}
+	api, err := New(nil, true, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, PluginsEndpoint, nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"automatic_update":{"enabled":true,"state":"idle","last_checked_at":"2026-10-17T01:02:03Z","last_success_at":"2026-10-17T01:02:03Z"}`) || !strings.Contains(response.Body.String(), `"storage_state":"configured"`) {
+		t.Fatalf("plugin status did not project bounded updater/provider lifecycle: %d %s", response.Code, response.Body.String())
+	}
+	invalid := controller.pluginStatus
+	invalid.Plugins[0].Type = "source"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("storage lifecycle state was accepted on a source plugin")
+	}
+}
+
 func TestPluginStatusRejectsInvalidTrustTuple(t *testing.T) {
 	status := PluginStatus{State: "ready", Plugins: []PluginStatusItem{{
 		ID: "demo", Name: "Demo", Trust: plugintrust.Attestation{Provenance: plugintrust.Registry, Authority: plugintrust.Custom, Publisher: plugintrust.FirstParty, Reviewed: true},

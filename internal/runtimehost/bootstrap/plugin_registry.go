@@ -3,8 +3,10 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/plugintrust"
@@ -149,6 +151,14 @@ func (c *updateController) installStoragePlugin(ctx context.Context, id string, 
 	}
 	defer cancel()
 	defer c.releaseOperation()
+	return c.installStoragePluginLocked(operationCtx, id, update)
+}
+
+// installStoragePluginLocked runs the existing manual storage-provider update
+// lifecycle while the caller owns the common Host operation gate. It imports
+// only a verified immutable artifact and uses the existing config carry-forward
+// rule; it never changes the active physical backend by itself.
+func (c *updateController) installStoragePluginLocked(operationCtx context.Context, id string, update bool) (httpapi.PluginStatus, error) {
 	if c.pluginRegistry == nil || c.storageCatalog == nil {
 		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_registry_unavailable")
 	}
@@ -290,6 +300,12 @@ func (c *updateController) changePlugin(ctx context.Context, id string, update b
 	}
 	defer cancel()
 	defer c.releaseOperation()
+	return c.changePluginLocked(operationCtx, id, update)
+}
+
+// changePluginLocked executes a source-plugin transaction while the caller
+// owns the shared application/plugin operation gate.
+func (c *updateController) changePluginLocked(operationCtx context.Context, id string, update bool) (httpapi.PluginStatus, error) {
 	if c.pluginRegistry == nil {
 		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_registry_unavailable")
 	}
@@ -386,6 +402,7 @@ func (c *updateController) pluginStatus() httpapi.PluginStatus {
 					item.Installed = true
 					item.InstalledVersion = artifact.Version
 					item.UpdateAvailable = c.pluginRegistry != nil && c.pluginRegistry.UpdateAvailable(artifact.ID, artifact.Version)
+					item.StorageState = c.storagePluginLifecycleState(artifact.ID, artifact.Digest)
 					item.Trust = attestation
 					continue
 				}
@@ -395,13 +412,308 @@ func (c *updateController) pluginStatus() httpapi.PluginStatus {
 				}
 				status.Plugins = append(status.Plugins, httpapi.PluginStatusItem{
 					ID: artifact.ID, Type: pluginregistry.TypeStorage, Name: name,
-					InstalledVersion: artifact.Version, Installed: true, Trust: attestation,
+					InstalledVersion: artifact.Version, Installed: true, StorageState: c.storagePluginLifecycleState(artifact.ID, artifact.Digest), Trust: attestation,
 				})
 			}
 		}
 	}
 	sort.Slice(status.Plugins, func(i, j int) bool { return status.Plugins[i].ID < status.Plugins[j].ID })
+	automatic := c.pluginAutoUpdateStatusSnapshot()
+	status.AutomaticUpdate = &automatic
 	return status
+}
+
+// storagePluginLifecycleState separates an imported executable from a provider
+// configuration and from the provider currently pinned by an active Engine.
+// It reads only immutable catalog and generation metadata; it never infers an
+// activation from a Registry selection or a successful artifact download.
+func (c *updateController) storagePluginLifecycleState(id, digest string) string {
+	if c == nil || c.storageCatalog == nil || id == "" || digest == "" {
+		return "artifact_installed"
+	}
+	if c.registry != nil {
+		snapshot := c.registry.Snapshot()
+		for _, item := range snapshot.Generations {
+			if item.State != generation.StateActive || item.StorageProviderSetID == "" {
+				continue
+			}
+			set, err := c.storageCatalog.LoadSet(item.StorageProviderSetID)
+			if err == nil && set.Artifact.ID == id && set.Artifact.Digest == digest {
+				return "active"
+			}
+		}
+	}
+	if desired, err := c.storageCatalog.DesiredSet(id); err == nil && desired.Artifact.Digest == digest {
+		return "configured"
+	}
+	instances, err := c.storageCatalog.ListStorageInstances()
+	if err == nil {
+		for _, instance := range instances {
+			if instance.ProviderID != id || instance.DesiredSetID == "" {
+				continue
+			}
+			set, setErr := c.storageCatalog.LoadSet(instance.DesiredSetID)
+			if setErr == nil && set.Artifact.Digest == digest {
+				return "configured"
+			}
+		}
+	}
+	return "artifact_installed"
+}
+
+func (c *updateController) pluginAutoUpdateStatusSnapshot() httpapi.PluginAutomaticUpdateStatus {
+	if c == nil {
+		return httpapi.PluginAutomaticUpdateStatus{State: "idle"}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	status := c.pluginAutoUpdateStatus
+	status.LastCheckedAt = cloneTime(status.LastCheckedAt)
+	status.LastSuccessAt = cloneTime(status.LastSuccessAt)
+	return status
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func (c *updateController) setPluginAutoUpdateState(state, failureCode string, checkedAt, successAt *time.Time) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	current := c.pluginAutoUpdateStatus
+	current.Enabled = c.pluginRegistry != nil && c.pluginRegistry.Configured()
+	current.State = state
+	current.LastFailureCode = failureCode
+	if checkedAt != nil {
+		current.LastCheckedAt = cloneTime(checkedAt)
+	}
+	if successAt != nil {
+		current.LastSuccessAt = cloneTime(successAt)
+	}
+	c.pluginAutoUpdateStatus = current
+}
+
+// reconcileRegistryPluginsAutomatically runs one bounded, low-priority pass.
+// Refresh and each individual plugin transaction use a non-blocking acquisition
+// of the shared Host operation gate, so explicit operations take precedence.
+// Source and storage updates deliberately dispatch through their existing
+// transaction helpers rather than creating a second installation path.
+func (c *updateController) reconcileRegistryPluginsAutomatically(ctx context.Context) (retrySoon bool) {
+	if c == nil || ctx == nil || c.pluginRegistry == nil || !c.pluginRegistry.Configured() {
+		if c != nil {
+			c.setPluginAutoUpdateState("idle", "", nil, nil)
+		}
+		return false
+	}
+	if ctx.Err() != nil {
+		c.setPluginAutoUpdateState("deferred", "", nil, nil)
+		return true
+	}
+	if c.installation == nil || c.installation.Snapshot().State != installation.StateReady {
+		c.setPluginAutoUpdateState("deferred", "", nil, nil)
+		return true
+	}
+	if c.registry == nil || c.registry.Snapshot().StagedGenerationID != "" {
+		c.setPluginAutoUpdateState("deferred", "", nil, nil)
+		slog.Info("plugin_auto_refresh_deferred", "reason_code", "staged_generation")
+		return true
+	}
+	if err := c.lockOperation(ctx, false); err != nil {
+		c.setPluginAutoUpdateState("deferred", "", nil, nil)
+		slog.Info("plugin_auto_refresh_deferred", "reason_code", "operation_busy")
+		return true
+	}
+	c.setPluginAutoUpdateState("checking", "", nil, nil)
+	slog.Info("plugin_auto_refresh_started")
+	refreshErr := c.pluginRegistry.Refresh(ctx)
+	c.releaseOperation()
+	checkedAt := time.Now().UTC()
+	if ctx.Err() != nil {
+		c.setPluginAutoUpdateState("deferred", "", nil, nil)
+		return true
+	}
+	if refreshErr != nil {
+		slog.Warn("plugin_auto_refresh_failed", "failure_code", "plugin_registry_unavailable")
+		c.setPluginAutoUpdateState("failed", "plugin_registry_unavailable", &checkedAt, nil)
+		return false
+	}
+
+	status := c.pluginStatus()
+	candidates := make([]httpapi.PluginStatusItem, 0, len(status.Plugins))
+	for _, item := range status.Plugins {
+		if item.Installed && item.UpdateAvailable && (item.Type == pluginregistry.TypeSource || item.Type == pluginregistry.TypeStorage) {
+			candidates = append(candidates, item)
+		}
+	}
+	for _, candidate := range candidates {
+		slog.Info("plugin_auto_update_available", "plugin_id", candidate.ID, "plugin_type", candidate.Type, "from_version", candidate.InstalledVersion, "to_version", candidate.AvailableVersion)
+	}
+	if len(candidates) > pluginAutoUpdateMaxCandidates {
+		candidates = candidates[:pluginAutoUpdateMaxCandidates]
+		retrySoon = true
+	}
+	failureCode := ""
+	for _, candidate := range candidates {
+		if ctx.Err() != nil {
+			c.setPluginAutoUpdateState("deferred", "", &checkedAt, nil)
+			return true
+		}
+		if c.registry.Snapshot().StagedGenerationID != "" {
+			c.setPluginAutoUpdateState("deferred", "", &checkedAt, nil)
+			slog.Info("plugin_auto_update_deferred", "plugin_id", candidate.ID, "plugin_type", candidate.Type, "reason_code", "staged_generation")
+			return true
+		}
+		// A manual update may have completed after the Registry refresh and
+		// before this candidate reached its transaction boundary.
+		current := c.pluginStatus()
+		if !pluginStatusNeedsUpdate(current, candidate.ID) {
+			continue
+		}
+		if err := c.lockOperation(ctx, false); err != nil {
+			c.setPluginAutoUpdateState("deferred", "", &checkedAt, nil)
+			slog.Info("plugin_auto_update_deferred", "plugin_id", candidate.ID, "plugin_type", candidate.Type, "reason_code", "operation_busy")
+			return true
+		}
+		c.setPluginAutoUpdateState("updating", "", &checkedAt, nil)
+		slog.Info("plugin_auto_update_started", "plugin_id", candidate.ID, "plugin_type", candidate.Type, "from_version", candidate.InstalledVersion, "to_version", candidate.AvailableVersion)
+		operationCtx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+		var updateErr error
+		if candidate.Type == pluginregistry.TypeStorage {
+			_, updateErr = c.installStoragePluginLocked(operationCtx, candidate.ID, true)
+		} else {
+			_, updateErr = c.changePluginLocked(operationCtx, candidate.ID, true)
+		}
+		cancel()
+		c.releaseOperation()
+		if ctx.Err() != nil {
+			c.setPluginAutoUpdateState("deferred", "", &checkedAt, nil)
+			return true
+		}
+		if updateErr != nil {
+			code := pluginAutoUpdateFailureCode(updateErr)
+			failureCode = code
+			slog.Warn("plugin_auto_update_failed", "plugin_id", candidate.ID, "plugin_type", candidate.Type, "from_version", candidate.InstalledVersion, "to_version", candidate.AvailableVersion, "failure_code", code)
+			continue
+		}
+		if candidate.Type == pluginregistry.TypeStorage {
+			artifact, artifactErr := c.installedStorageArtifact(candidate.ID)
+			storageState := "artifact_installed"
+			if artifactErr == nil {
+				storageState = c.storagePluginLifecycleState(candidate.ID, artifact.Digest)
+			}
+			slog.Info("plugin_auto_update_succeeded", "plugin_id", candidate.ID, "plugin_type", candidate.Type, "from_version", candidate.InstalledVersion, "to_version", candidate.AvailableVersion, "storage_state", storageState, "physical_backend_changed", false)
+		} else {
+			slog.Info("plugin_auto_update_succeeded", "plugin_id", candidate.ID, "plugin_type", candidate.Type, "from_version", candidate.InstalledVersion, "to_version", candidate.AvailableVersion)
+		}
+	}
+	if failureCode != "" {
+		c.setPluginAutoUpdateState("failed", failureCode, &checkedAt, nil)
+		return retrySoon
+	}
+	completedAt := time.Now().UTC()
+	c.setPluginAutoUpdateState("idle", "", &checkedAt, &completedAt)
+	return retrySoon
+}
+
+func pluginStatusNeedsUpdate(status httpapi.PluginStatus, id string) bool {
+	for _, item := range status.Plugins {
+		if item.ID == id {
+			return item.Installed && item.UpdateAvailable
+		}
+	}
+	return false
+}
+
+func pluginAutoUpdateFailureCode(err error) string {
+	var controllerErr *httpapi.ControllerError
+	if errors.As(err, &controllerErr) {
+		switch controllerErr.Code {
+		case "plugin_registry_unavailable", "plugin_download_failed", "plugin_verification_failed", "plugin_identity_mismatch":
+			return controllerErr.Code
+		}
+	}
+	return "plugin_install_failed"
+}
+
+func jitterPluginAutoUpdateInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultPluginAutoUpdateInterval
+	}
+	// ±10% avoids synchronizing many Hosts against the same public Registry.
+	spread := interval / 10
+	if spread <= 0 {
+		return interval
+	}
+	return interval - spread + time.Duration(time.Now().UnixNano()%int64(2*spread+1))
+}
+
+func startPeriodicPluginAutoUpdateReconciliation(ctx context.Context, store *installation.Store, controller *updateController, interval time.Duration, jitter func(time.Duration) time.Duration) <-chan struct{} {
+	if controller == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return startPeriodicPluginAutoUpdateWorker(ctx, store, controller.pluginAutoUpdateWake, interval, jitter, func(callCtx context.Context) bool {
+		callCtx, cancel := context.WithTimeout(callCtx, controller.operationTimeout)
+		defer cancel()
+		return controller.reconcileRegistryPluginsAutomatically(callCtx)
+	})
+}
+
+func startPeriodicPluginAutoUpdateWorker(ctx context.Context, store *installation.Store, wake <-chan struct{}, interval time.Duration, jitter func(time.Duration) time.Duration, reconcile func(context.Context) bool) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if interval <= 0 {
+			interval = defaultPluginAutoUpdateInterval
+		}
+		if jitter == nil {
+			jitter = jitterPluginAutoUpdateInterval
+		}
+		for {
+			if store == nil || reconcile == nil {
+				return
+			}
+			if store.Snapshot().State != installation.StateReady {
+				if !waitPluginAutoUpdate(ctx, wake, time.Second) {
+					return
+				}
+				continue
+			}
+			retrySoon := reconcile(ctx)
+			delay := jitter(interval)
+			if retrySoon && delay > pluginAutoUpdateRetryDelay {
+				delay = pluginAutoUpdateRetryDelay
+			}
+			if !waitPluginAutoUpdate(ctx, wake, delay) {
+				return
+			}
+		}
+	}()
+	return done
+}
+
+func waitPluginAutoUpdate(ctx context.Context, wake <-chan struct{}, delay time.Duration) bool {
+	if ctx == nil {
+		return false
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-wake:
+		return true
+	case <-timer.C:
+		return true
+	}
 }
 
 func (c *updateController) storageAttestation(id, digest string) (plugintrust.Attestation, error) {

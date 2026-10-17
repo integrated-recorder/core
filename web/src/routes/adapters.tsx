@@ -14,6 +14,7 @@ import { AdapterMark } from '@/components/adapter/adapter-mark'
 import { PluginTrustBadges } from '@/components/plugin-trust'
 import { useToast } from '@/components/ui/use-toast'
 import { useI18n } from '@/i18n/provider'
+import { formatDate } from '@/lib/utils'
 
 export function AdaptersPage() {
   const { t } = useI18n()
@@ -92,6 +93,14 @@ function PluginRegistrySection() {
     {query.isPending ? <div className="p-4"><LoadingState /></div> : query.error ? <div className="p-4"><ErrorState message={errorMessage(query.error)} retry={() => void query.refetch()} /></div> : <>
       {notConfigured && <div role="status" className="flex items-start gap-2 border-b border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground"><CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />{t('plugins.registry.notConfigured')}</div>}
       {status?.state === 'unavailable' && <div role="status" className="flex items-start gap-2 border-b border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground"><CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />{t('plugins.registry.unavailable')}</div>}
+      {status?.automatic_update?.enabled && <div role="status" className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border bg-muted/20 px-4 py-2.5 text-xs text-muted-foreground">
+        <span>{t('plugins.autoUpdate.enabled')}</span>
+        {status.automatic_update.last_checked_at && <span>{t('plugins.autoUpdate.lastChecked', { date: formatDate(status.automatic_update.last_checked_at) })}</span>}
+        {status.automatic_update.state === 'checking' && <span>{t('plugins.autoUpdate.checking')}</span>}
+        {status.automatic_update.state === 'updating' && <span>{t('plugins.autoUpdate.updating')}</span>}
+        {status.automatic_update.state === 'deferred' && <span>{t('plugins.autoUpdate.deferred')}</span>}
+        {status.automatic_update.state === 'failed' && <span>{t('plugins.autoUpdate.failed')}</span>}
+      </div>}
       <PluginGroup title={t('plugins.group.sources')} plugins={sourcePlugins} busy={busy} onInstall={plugin => install.mutate(plugin)} onUpdate={plugin => update.mutate(plugin)} onUninstall={plugin => uninstall.mutate(plugin)} registryState={status?.state} />
       <div className="border-t border-border">
         <PluginGroup title={t('plugins.group.storage')} description={t('plugins.group.storageHelp')} plugins={storagePlugins} busy={busy} onInstall={plugin => install.mutate(plugin)} onUpdate={plugin => update.mutate(plugin)} onUninstall={plugin => uninstall.mutate(plugin)} registryState={status?.state} storage />
@@ -111,7 +120,7 @@ function PluginGroup({ title, description, plugins, busy, onInstall, onUpdate, o
   return <section aria-label={title}>
     <div className="px-4 pb-2 pt-4"><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3>{description && <p className="mt-1 text-xs text-muted-foreground">{description}</p>}</div>
     {plugins.length ? <div className="divide-y divide-border">{plugins.map(plugin => <div key={plugin.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-      <div className="min-w-0"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{plugin.name}</span>{plugin.installed && <Badge tone="green">{t('plugins.installed')}</Badge>}</div><p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{plugin.id} · {plugin.installed ? `${t('plugins.installed')} ${plugin.installed_version ?? t('plugins.unknownVersion')}` : t('plugins.notInstalled')}{plugin.available_version ? ` · ${t('plugins.availableVersion', { version: plugin.available_version })}` : ''}</p><div className="mt-1.5"><PluginTrustBadges trust={plugin.trust} compact /></div></div>
+      <div className="min-w-0"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{plugin.name}</span>{plugin.installed && <Badge tone="green">{t('plugins.installed')}</Badge>}</div><p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{plugin.id} · {plugin.installed ? `${t('plugins.installed')} ${plugin.installed_version ?? t('plugins.unknownVersion')}` : t('plugins.notInstalled')}{plugin.available_version ? ` · ${t('plugins.availableVersion', { version: plugin.available_version })}` : ''}</p>{plugin.type === 'storage' && plugin.storage_state === 'artifact_installed' && <p className="mt-1 text-xs text-muted-foreground">{t('plugins.autoUpdate.storageArtifactOnly')}</p>}{plugin.type === 'storage' && plugin.storage_state === 'configured' && <p className="mt-1 text-xs text-muted-foreground">{t('plugins.autoUpdate.storageConfigured')}</p>}{plugin.type === 'storage' && plugin.storage_state === 'active' && <p className="mt-1 text-xs text-muted-foreground">{t('plugins.autoUpdate.storageActive')}</p>}<div className="mt-1.5"><PluginTrustBadges trust={plugin.trust} compact /></div></div>
       <div className="flex flex-wrap gap-2">{!plugin.installed && plugin.available_version && <Button size="sm" disabled={busy || registryState !== 'ready'} onClick={() => onInstall(plugin)}><Download className="h-3.5 w-3.5" />{t('plugins.install')}</Button>}{plugin.installed && plugin.update_available && <Button size="sm" variant="outline" disabled={busy || registryState !== 'ready'} onClick={() => onUpdate(plugin)}><Upload className="h-3.5 w-3.5" />{t('plugins.update')}</Button>}{plugin.installed && <Button size="sm" variant="ghost" disabled={busy} onClick={() => onUninstall(plugin)}><Trash2 className="h-3.5 w-3.5" />{t('plugins.uninstall')}</Button>}</div>
     </div>)}</div> : registryState === 'ready' ? <p className="px-4 pb-4 text-sm text-muted-foreground">{t('plugins.noCandidates', { kind: storage ? t('plugins.group.storage') : t('plugins.group.sources') })}</p> : null}
   </section>

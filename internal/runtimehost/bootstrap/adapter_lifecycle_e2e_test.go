@@ -2,15 +2,20 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,11 +42,16 @@ func TestProductionAdapterLifecycleAcceptanceE2E(t *testing.T) {
 	originalAdapter := buildFixtureAdapter(t, artifacts.root, runtimeE2EAdapterID, "0.1.0")
 	addedAdapter := buildFixtureAdapter(t, artifacts.root, addedFixtureAdapterID, "1.0.0")
 	upgradedAdapter := buildFixtureAdapter(t, artifacts.root, runtimeE2EAdapterID, "0.2.0")
+	autoV1 := buildFixtureAdapter(t, artifacts.root, "registry_fixture", "1.0.0")
+	autoV2 := buildFixtureAdapter(t, artifacts.root, "registry_fixture", "2.0.0")
 	for iteration := 1; iteration <= 2; iteration++ {
 		t.Run(fmt.Sprintf("iteration_%d", iteration), func(t *testing.T) {
 			runProductionAdapterLifecycleScenario(t, artifacts, fixture, originalAdapter, addedAdapter, upgradedAdapter, iteration)
 		})
 	}
+	t.Run("automatic_registry_update_keeps_recording_pinned", func(t *testing.T) {
+		runProductionAutomaticPluginUpdateScenario(t, artifacts, fixture, autoV1, autoV2)
+	})
 }
 
 type runtimeAdapterLifecycleArtifacts struct {
@@ -122,6 +132,184 @@ func buildFixtureAdapter(t *testing.T, root, adapterID, version string) string {
 	runBuildCommand(t, findRuntimeE2EModuleRoot(t), 4*time.Minute,
 		"build", "-o", output, "-ldflags", flags, "./web/e2e/runtime_update_adapter")
 	return output
+}
+
+func runProductionAutomaticPluginUpdateScenario(t *testing.T, artifacts runtimeAdapterLifecycleArtifacts, fixture *runtimeUpdateFixture, v1Path, v2Path string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	v1, err := os.ReadFile(v1Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := os.ReadFile(v2Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releases := map[string][]byte{"1.0.0": v1, "2.0.0": v2}
+	var registryMu sync.Mutex
+	stableVersion := "1.0.0"
+	registryRequests := 0
+	registryServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		registryMu.Lock()
+		version := stableVersion
+		registryRequests++
+		artifact := append([]byte(nil), releases[version]...)
+		registryMu.Unlock()
+		switch r.URL.Path {
+		case "/registry.json":
+			writeRuntimeAutoPluginRegistry(t, w, r, version, artifact)
+		case "/artifact":
+			if r.URL.Query().Get("version") != version {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprint(len(artifact)))
+			_, _ = w.Write(artifact)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer registryServer.Close()
+	caPath := writeRuntimeE2ERegistryCA(t, registryServer)
+	dataRoot := newRuntimeE2ETempDir(t)
+	dataDir := filepath.Join(dataRoot, "data")
+	if err := os.Mkdir(dataDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	streamR, streamS := "auto-plugin-r", "auto-plugin-s"
+	fixture.reset(streamR, "Recording R", "Pinned source v1", "auto-plugin-r-session")
+	fixture.reset(streamS, "Recording S", "New source v2", "auto-plugin-s-session")
+	listenAddr := reserveRuntimeAddress(t)
+	baseURL := "http://" + listenAddr
+	command := exec.Command(artifacts.hostA)
+	command.Env = minimalRuntimeE2EEnv([]string{
+		"DATA_DIR=" + dataDir,
+		"ADDR=" + listenAddr,
+		"IR_STORAGE_LOCAL_PLUGIN=" + artifacts.storageLocalBinary,
+		"AUTH_DISABLED=1",
+		"ADAPTER_DIR=" + artifacts.adapterDir,
+		"IR_ALLOW_OPERATOR_PLUGINS=1",
+		"IR_PLUGIN_REGISTRY_URL=" + registryServer.URL + "/registry.json",
+		"IR_RUNTIME_E2E_PLUGIN_REGISTRY_CA_FILE=" + caPath,
+		"IR_RUNTIME_E2E_PLUGIN_AUTO_UPDATE_INTERVAL=100ms",
+	})
+	process := &runtimeHostProcess{command: command, done: make(chan struct{})}
+	command.Stdout, command.Stderr = &process.output, &process.output
+	if err := command.Start(); err != nil {
+		t.Fatalf("start production Runtime Host for automatic plugin update: %v", err)
+	}
+	go func() { process.err = command.Wait(); close(process.done) }()
+	t.Cleanup(func() { stopRuntimeHostProcess(process) })
+	client := &http.Client{Timeout: 90 * time.Second}
+	status := waitRuntimeHostStatus(t, ctx, client, baseURL, process)
+	if status.DefaultEngine == nil {
+		t.Fatalf("Host did not expose initial Engine status: %+v", status)
+	}
+	initialGeneration := status.DefaultEngine.ID
+	plugins, code := getRuntimeJSON[httpapi.PluginStatus](t, client, baseURL, http.MethodPost, httpapi.PluginsEndpoint+"/refresh", map[string]any{})
+	if code != http.StatusOK || plugins.State != "ready" {
+		t.Fatalf("initial registry refresh status=%d plugins=%+v", code, plugins)
+	}
+	plugins, code = getRuntimeJSON[httpapi.PluginStatus](t, client, baseURL, http.MethodPost, httpapi.PluginsEndpoint+"/registry_fixture/install", map[string]any{})
+	if code != http.StatusOK || !pluginStatusHasVersion(plugins, "registry_fixture", "1.0.0") {
+		t.Fatalf("install initial Registry source plugin status=%d plugins=%+v", code, plugins)
+	}
+	status = waitRuntimeHostStatus(t, ctx, client, baseURL, process)
+	initialGeneration = status.DefaultEngine.ID
+	initialRegistry := readRuntimeGenerationSnapshot(t, dataDir)
+	initialSetID := initialRegistry.Generations[initialGeneration].AdapterSetID
+	if initialSetID == "" {
+		t.Fatalf("initial source generation has no adapter set: %+v", initialRegistry.Generations[initialGeneration])
+	}
+	recordingR := createRuntimeRecordingWithAdapter(t, client, baseURL, "registry_fixture", "Pinned to Registry source v1", map[string]string{"source_url": fixture.server.URL + "/source/" + streamR})
+	leaseR := waitRecordingLease(t, dataDir, recordingR.ID, 20*time.Second)
+	if leaseR.EngineGeneration != initialGeneration {
+		t.Fatalf("R did not pin v1 generation: lease=%+v initial=%s", leaseR, initialGeneration)
+	}
+	fixture.advance(streamR, 3)
+	waitRecordingSequenceCount(t, client, baseURL, recordingR.ID, 3, 30*time.Second)
+	registryMu.Lock()
+	requestsBeforeUpdate := registryRequests
+	stableVersion = "2.0.0"
+	registryMu.Unlock()
+	if err := waitRuntimeConditionError(90*time.Second, func() bool {
+		pluginStatus, pluginCode := getRuntimeJSON[httpapi.PluginStatus](t, client, baseURL, http.MethodGet, httpapi.PluginsEndpoint, nil)
+		if pluginCode != http.StatusOK || !pluginStatusHasVersion(pluginStatus, "registry_fixture", "2.0.0") {
+			return false
+		}
+		current, statusCode := getRuntimeJSON[httpapi.Status](t, client, baseURL, http.MethodGet, httpapi.Endpoint, nil)
+		return statusCode == http.StatusOK && current.DefaultEngine != nil && current.DefaultEngine.ID != initialGeneration
+	}, "automatic Registry stable selection activation"); err != nil {
+		t.Fatalf("automatic update did not install and activate v2 without its update endpoint: %v; host=%s", err, process.output.String())
+	}
+	registryMu.Lock()
+	requestsAfterUpdate := registryRequests
+	registryMu.Unlock()
+	if requestsAfterUpdate <= requestsBeforeUpdate {
+		t.Fatalf("automatic pass did not fetch the Registry after stable changed: before=%d after=%d", requestsBeforeUpdate, requestsAfterUpdate)
+	}
+	plugins, _ = getRuntimeJSON[httpapi.PluginStatus](t, client, baseURL, http.MethodGet, httpapi.PluginsEndpoint, nil)
+	if item, ok := pluginStatusItem(plugins, "registry_fixture"); !ok || item.InstalledVersion != "2.0.0" || item.UpdateAvailable {
+		t.Fatalf("automatic plugin status did not converge to v2: %+v found=%t", item, ok)
+	}
+	registryState := readRuntimeGenerationSnapshot(t, dataDir)
+	newGeneration := registryState.Generations[registryState.ActiveGenerationID]
+	if registryState.ActiveGenerationID == initialGeneration || newGeneration.AdapterSetID == initialSetID {
+		t.Fatalf("automatic source update did not activate a new immutable adapter set: %+v", newGeneration)
+	}
+	leaseR = readRuntimeLeases(t, dataDir)[recordingR.ID]
+	if leaseR.EngineGeneration != initialGeneration {
+		t.Fatalf("automatic adapter-set change migrated existing Recording R: %+v", leaseR)
+	}
+	oldSetBinary := filepath.Join(dataDir, "runtime", "adapters", "sets", initialSetID, "bin", "integrated-recorder-adapter-registry_fixture")
+	if info, err := os.Stat(oldSetBinary); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("v1 immutable adapter disappeared while R retained its lease: info=%v err=%v", info, err)
+	}
+	fixture.advance(streamR, 3)
+	waitRecordingSequenceCount(t, client, baseURL, recordingR.ID, 6, 30*time.Second)
+	requests := fixture.segmentRequestsFor(streamR)
+	for sequence := uint64(1); sequence <= 6; sequence++ {
+		if got := requests[sequence]; len(got) != 1 || !got[0].Succeeded {
+			t.Fatalf("v1 pinned Recording R source request seq=%d is not exact-once success: %+v all=%+v", sequence, got, requests)
+		}
+	}
+	if recording := getRecording(t, dataDir, client, baseURL, recordingR.ID); recording.State != domain.StateRecording || len(recording.Gaps) != 0 {
+		t.Fatalf("R was interrupted by automatic plugin update: %+v", recording)
+	}
+	recordingS := createRuntimeRecordingWithAdapter(t, client, baseURL, "registry_fixture", "Uses Registry source v2", map[string]string{"source_url": fixture.server.URL + "/source/" + streamS})
+	leaseS := waitRecordingLease(t, dataDir, recordingS.ID, 20*time.Second)
+	if leaseS.EngineGeneration != newGeneration.ID || leaseS.EngineGeneration == leaseR.EngineGeneration {
+		t.Fatalf("new Recording S did not use v2 generation while R remained pinned: R=%+v S=%+v new=%s", leaseR, leaseS, newGeneration.ID)
+	}
+	fixture.advance(streamS, 2)
+	waitRecordingSequenceCount(t, client, baseURL, recordingS.ID, 2, 30*time.Second)
+	stopRecording(t, client, baseURL, recordingS.ID)
+	stopRecording(t, client, baseURL, recordingR.ID)
+	waitRuntimeRecordingState(t, client, baseURL, recordingR.ID, domain.StateStopped, 20*time.Second)
+}
+
+func writeRuntimeAutoPluginRegistry(t *testing.T, w http.ResponseWriter, r *http.Request, version string, binary []byte) {
+	t.Helper()
+	digest := sha256.Sum256(binary)
+	document := map[string]any{
+		"schema_version": 1,
+		"plugins": []any{map[string]any{
+			"id": "registry_fixture", "name": "Automatic Registry Fixture", "repository": "https://github.com/example/automatic-fixture",
+			"channels": map[string]string{"stable": version},
+			"releases": []any{map[string]any{
+				"version": version, "protocol_version": 1, "source_commit": strings.Repeat("b", 40),
+				"artifacts": []any{map[string]any{
+					"os": runtime.GOOS, "arch": runtime.GOARCH, "url": "https://" + r.Host + "/artifact?version=" + version,
+					"filename": "integrated-recorder-adapter-registry_fixture", "size": len(binary), "sha256": hex.EncodeToString(digest[:]),
+				}},
+			}},
+		}},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(document); err != nil {
+		t.Errorf("encode automatic plugin Registry fixture: %v", err)
+	}
 }
 
 type lifecycleAdapterView struct {

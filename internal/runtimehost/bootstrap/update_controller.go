@@ -35,11 +35,14 @@ import (
 )
 
 const (
-	updateOperationTimeout         = 2 * time.Minute
-	updateMaxTrustKeys             = 16
-	handoverCutoffConcurrency      = 8
-	handoverMigrationConcurrency   = 4
-	handoverMigrationQueueCapacity = 8
+	updateOperationTimeout          = 2 * time.Minute
+	defaultPluginAutoUpdateInterval = 15 * time.Minute
+	pluginAutoUpdateRetryDelay      = time.Minute
+	pluginAutoUpdateMaxCandidates   = 8
+	updateMaxTrustKeys              = 16
+	handoverCutoffConcurrency       = 8
+	handoverMigrationConcurrency    = 4
+	handoverMigrationQueueCapacity  = 8
 )
 
 type updateSupervisor interface {
@@ -155,21 +158,23 @@ type updateController struct {
 	gate chan struct{}
 	mu   sync.RWMutex
 
-	handoverWake chan struct{}
+	handoverWake         chan struct{}
+	pluginAutoUpdateWake chan struct{}
 
-	engines            map[string]engineAttachment
-	manifests          map[string]release.Manifest
-	releaseNotes       map[string]string
-	buildIdentities    map[string]buildinfo.Info
-	bundleBuild        buildinfo.Info
-	inventorySource    leases.InventorySource
-	available          *release.Manifest
-	availableSource    install.Source
-	availableNotes     string
-	verification       string
-	lastFailureCode    string
-	handoverDiagnostic *httpapi.HandoverDiagnostic
-	handoverRetries    map[string]handoverRetryState
+	engines                map[string]engineAttachment
+	manifests              map[string]release.Manifest
+	releaseNotes           map[string]string
+	buildIdentities        map[string]buildinfo.Info
+	bundleBuild            buildinfo.Info
+	inventorySource        leases.InventorySource
+	available              *release.Manifest
+	availableSource        install.Source
+	availableNotes         string
+	verification           string
+	lastFailureCode        string
+	handoverDiagnostic     *httpapi.HandoverDiagnostic
+	handoverRetries        map[string]handoverRetryState
+	pluginAutoUpdateStatus httpapi.PluginAutomaticUpdateStatus
 }
 
 type handoverRetryState struct {
@@ -240,11 +245,14 @@ func newUpdateController(options updateControllerOptions) (*updateController, er
 		catalogWriter:     options.CatalogWriter,
 		resourceTokenPath: options.ResourceTokenPath, operationTimeout: options.OperationTimeout,
 		controlTarget:     options.ControlTarget,
-		unavailableReason: options.UnavailableReason, gate: make(chan struct{}, 1), handoverWake: make(chan struct{}, 1),
+		unavailableReason: options.UnavailableReason, gate: make(chan struct{}, 1), handoverWake: make(chan struct{}, 1), pluginAutoUpdateWake: make(chan struct{}, 1),
 		engines: make(map[string]engineAttachment), manifests: make(map[string]release.Manifest), buildIdentities: make(map[string]buildinfo.Info),
 		handoverRetries: make(map[string]handoverRetryState),
 		bundleBuild:     options.ApplicationBuild,
 		verification:    "not_checked",
+	}
+	c.pluginAutoUpdateStatus = httpapi.PluginAutomaticUpdateStatus{
+		Enabled: options.PluginRegistry != nil && options.PluginRegistry.Configured(), State: "idle",
 	}
 	for _, attachment := range options.Engines {
 		if !generationPattern.MatchString(attachment.generationID) || !filepath.IsAbs(attachment.releaseDir) || !filepath.IsAbs(attachment.socketPath) || !filepath.IsAbs(attachment.tokenPath) || attachment.instanceID == "" {

@@ -236,7 +236,9 @@ Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 �
 
 중지/완료/interrupted recording의 저장 segment를 참조하는 finite HLS VOD manifest를 생성합니다. Segment endpoint는 저장된 원본 byte를 직접 반환하며 파일을 이어 붙이거나 remux하지 않습니다. 재생 가능한 codec인지 여부는 browser 지원에 달려 있습니다.
 
-미구현: 실제 platform chat/event transport와 authentication, 추가 bundled platform-specific source adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, 전체 canonical archive TAR packaging, LTO, export transcoding/추가 format, recording-level authorization과 role-management UI, adapter sandbox, publisher PKI/signing, community registry hosting, automatic plugin update, plugin dependency resolution. Watch 감지는 polling 기반이며 webhook/push 알림은 구현하지 않았습니다.
+미구현: 실제 platform chat/event transport와 authentication, 추가 bundled platform-specific source adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, 전체 canonical archive TAR packaging, LTO, export transcoding/추가 format, recording-level authorization과 role-management UI, adapter sandbox, publisher PKI/signing, community registry hosting, plugin dependency resolution, plugin-set 간 live handover. Watch 감지는 polling 기반이며 webhook/push 알림은 구현하지 않았습니다.
+
+Runtime Host는 설치된 Registry source/storage plugin을 설정된 정확한 `stable` 선택에 맞춰 setup 완료 직후와 약 15분 간격(소폭 jitter)으로 자동 조정합니다. Registry artifact 검증과 plugin별 기존 transaction을 application/plugin 공통 operation gate 아래에서 재사용하며, 명시적 작업이 우선하고 staged generation이 있으면 미룹니다. Source 변경은 새 adapter-set generation을 활성화하지만 기존 녹화는 기존 generation에 고정됩니다. Storage 변경은 immutable artifact를 설치하고 호환되는 provider-level 설정만 이어받으며 물리 저장소를 자동 전환하지 않습니다. Storage 상태는 artifact 설치, 설정, 활성 여부를 구분합니다. Registry 실패는 설치된 artifact, desired state, active generation을 바꾸지 않습니다. 이 동작은 Runtime Host 자체를 업데이트하거나 plugin-set 간 live handover를 허용하지 않습니다.
 
 ## Web application
 

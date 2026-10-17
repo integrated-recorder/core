@@ -902,7 +902,8 @@ func (s *Store) PublishShardedMedia(ctx context.Context, header *domain.Recordin
 			if err := s.saveV2JSON(ctx, header.ID, v2LivePromotionIntentPath, intent, archiveRootMaxBytes); err != nil {
 				return fmt.Errorf("persist live presentation promotion intent: %w", err)
 			}
-			if err := s.applyV2LivePromotion(ctx, header.ID, existing, record, merged.Tracks[coord.TrackID]); err != nil {
+			indexTrack := livePromotionIndexTrack(merged.Tracks[coord.TrackID], track)
+			if err := s.applyV2LivePromotion(ctx, header.ID, existing, record, indexTrack); err != nil {
 				return fmt.Errorf("publish live presentation promotion: %w", err)
 			}
 			if err := s.saveHeaderLocked(ctx, merged, current); err != nil {
@@ -964,6 +965,20 @@ func sameV2PromotionBase(existing, promoted V2MediaRecord) bool {
 	a, errA := json.Marshal(left)
 	b, errB := json.Marshal(right)
 	return errA == nil && errB == nil && bytes.Equal(a, b)
+}
+
+// livePromotionIndexTrack keeps the target projection's cursor while using
+// the root's previously committed live high-water to prove which lower slots
+// may be filled as reservations. The promotion intent/header already contains
+// the target high-water, but that value is not authoritative until the live
+// index pages have been published.
+func livePromotionIndexTrack(target, committed *domain.Track) *domain.Track {
+	if target == nil || committed == nil {
+		return nil
+	}
+	projection := *target
+	projection.LiveSlotHighWater = committed.LiveSlotHighWater
+	return &projection
 }
 
 func (s *Store) applyV2LivePromotion(ctx context.Context, id string, existing, promoted V2MediaRecord, track *domain.Track) error {
@@ -1049,7 +1064,8 @@ func (s *Store) reconcileLivePromotionIntentLocked(ctx context.Context, id strin
 	if err := reconcileV2LivePresentation(desired.Tracks[intent.Record.Segment.TrackID], intent.Record.Segment); err != nil {
 		return err
 	}
-	if err := s.applyV2LivePromotion(ctx, id, existing, intent.Record, desired.Tracks[intent.Record.Segment.TrackID]); err != nil {
+	indexTrack := livePromotionIndexTrack(desired.Tracks[intent.Record.Segment.TrackID], track)
+	if err := s.applyV2LivePromotion(ctx, id, existing, intent.Record, indexTrack); err != nil {
 		return err
 	}
 	if err := s.saveHeaderLocked(ctx, desired, current); err != nil {

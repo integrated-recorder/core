@@ -1878,6 +1878,109 @@ func TestShardedLivePromotionIntentReconcilesPartialPublication(t *testing.T) {
 	}
 }
 
+func newShardedLivePromotionHighWaterFixture(t *testing.T, id string) (*Store, *domain.Recording, V2MediaRecord) {
+	t.Helper()
+	ctx := context.Background()
+	store, header := newShardedArchiveTestStore(t, id)
+	header.Tracks["main"].LivePresentation = &domain.LivePresentationState{NextOrdinal: 21}
+	if err := store.SaveRecordingHeader(ctx, header); err != nil {
+		t.Fatal(err)
+	}
+	var promoted V2MediaRecord
+	for ordinal := uint64(1); ordinal <= 18; ordinal++ {
+		payload := []byte(fmt.Sprintf("live-promotion-%d", ordinal))
+		payloadPath := fmt.Sprintf("tracks/main/objects/promotion-%02d.ts", ordinal)
+		stored, err := store.StorageBackend.SavePayloadExact(header.ID, payloadPath, bytes.NewReader(payload), 1024, int64(len(payload)))
+		if err != nil {
+			t.Fatalf("save payload %d: %v", ordinal, err)
+		}
+		coordinate := archiveindex.Coordinate{
+			SessionID: header.SourceSessionID, TrackID: "main", Sequence: 1000 + ordinal,
+			Kind: archiveindex.ObjectMedia,
+		}
+		record := v2ScaleMediaRecord(coordinate, ordinal, payloadPath, stored.Size, stored.SHA256)
+		if ordinal <= 15 {
+			record.Segment.LivePresentationOrdinal = ordinal
+		}
+		if err := store.AppendShardedMedia(ctx, header.ID, record); err != nil {
+			t.Fatalf("append media %d: %v", ordinal, err)
+		}
+		if ordinal == 18 {
+			promoted = record
+		}
+	}
+	root, err := store.LoadRecordingHeader(ctx, header.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	track := root.Tracks["main"]
+	if track.MediaHighWater != 18 || track.LiveSlotHighWater != 15 || track.LivePresentation == nil || track.LivePresentation.NextOrdinal != 21 {
+		t.Fatalf("fixture high-waters = media %d, live %d, cursor %#v", track.MediaHighWater, track.LiveSlotHighWater, track.LivePresentation)
+	}
+	promoted.Segment.LivePresentationOrdinal = 18
+	return store, root, promoted
+}
+
+func assertShardedLivePromotionReservations(t *testing.T, store *Store, header *domain.Recording, promoted V2MediaRecord) {
+	t.Helper()
+	root, err := store.LoadRecordingHeader(context.Background(), header.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := root.Tracks["main"].LiveSlotHighWater; got != 18 {
+		t.Fatalf("live high-water = %d, want 18", got)
+	}
+	var page v2LivePage
+	pageNo, _ := pageSlot(18)
+	if err := store.loadV2JSON(context.Background(), header.ID, v2LivePagePath("main", pageNo), archiveShardMaxBytes, &page); err != nil {
+		t.Fatalf("load live page: %v", err)
+	}
+	if len(page.Entries) != 18 || !page.Entries[15].Reserved || !page.Entries[16].Reserved || page.Entries[17].Reserved || page.Entries[17].PresentationOrdinal != 18 || page.Entries[17].ArchiveOrdinal != 18 {
+		t.Fatalf("live page did not preserve assigned reservations and promoted coordinate: entries=%#v", page.Entries)
+	}
+	visible, err := store.LookupShardedMediaByCoordinate(context.Background(), header.ID, promoted.Coordinate)
+	if err != nil || visible.Segment.LivePresentationOrdinal != 18 {
+		t.Fatalf("promoted canonical media = %#v err=%v", visible.Segment, err)
+	}
+}
+
+func TestShardedLivePromotionDirectUsesCommittedLiveHighWater(t *testing.T) {
+	ctx := context.Background()
+	store, header, promoted := newShardedLivePromotionHighWaterFixture(t, "d9e2f247ab144c6a850fd5c07fb1e6a9")
+	if err := store.PublishShardedMedia(ctx, header, promoted); err != nil {
+		t.Fatalf("promote live ordinal 18 after durable slot 15: %v", err)
+	}
+	assertShardedLivePromotionReservations(t, store, header, promoted)
+}
+
+func TestShardedLivePromotionRecoveryUsesCommittedLiveHighWater(t *testing.T) {
+	ctx := context.Background()
+	store, header, promoted := newShardedLivePromotionHighWaterFixture(t, "e9e2f247ab144c6a850fd5c07fb1e6a9")
+	backend := store.StorageBackend
+	failure := errors.New("injected crash after promoted media page publication")
+	store.StorageBackend = &failAfterV2SidecarWrite{
+		StorageBackend: backend,
+		relative:       v2MediaPagePath("main", false, 0),
+		failure:        failure,
+	}
+	if err := store.PublishShardedMedia(ctx, header, promoted); !errors.Is(err, failure) {
+		t.Fatalf("promotion error = %v, want injected crash", err)
+	}
+	store.StorageBackend = backend
+	partial, err := store.LoadRecordingHeader(ctx, header.ID)
+	if err != nil || partial.Tracks["main"].LiveSlotHighWater != 15 {
+		t.Fatalf("partial promotion became root-visible: live high-water=%d err=%v", partial.Tracks["main"].LiveSlotHighWater, err)
+	}
+	if err := store.ReconcileShardedArchive(ctx, header.ID); err != nil {
+		t.Fatalf("reconcile assigned reservation slots 16..17 before promotion 18: %v", err)
+	}
+	assertShardedLivePromotionReservations(t, store, header, promoted)
+	var intent v2LivePromotionIntent
+	if err := store.loadV2JSON(ctx, header.ID, v2LivePromotionIntentPath, archiveRootMaxBytes, &intent); err != nil || intent.Pending {
+		t.Fatalf("promotion intent remains pending=%t err=%v", intent.Pending, err)
+	}
+}
+
 func TestShardedTimelineRejectsDivergentCoordinateProjection(t *testing.T) {
 	ctx := context.Background()
 	store, header := newShardedArchiveTestStore(t, "d8e2f247ab144c6a850fd5c07fb1e6a5")

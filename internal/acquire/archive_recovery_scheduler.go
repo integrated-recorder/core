@@ -48,6 +48,10 @@ type automaticRecoveryScheduler struct {
 	cursor           string
 	rescanGeneration uint64
 	lastCompletedID  string
+	// testPassCompleted is an optional deterministic observation seam. It is
+	// nil in production and lets async recovery tests wait for a pass without
+	// polling scheduler state with sleeps.
+	testPassCompleted chan string
 }
 
 type automaticRecoveryOutcome struct {
@@ -229,6 +233,20 @@ func (s *automaticRecoveryScheduler) run() {
 		}
 		outcome := s.process(id, item)
 		s.complete(id, item, outcome)
+		s.signalTestPassCompleted(id)
+	}
+}
+
+func (s *automaticRecoveryScheduler) signalTestPassCompleted(id string) {
+	s.mu.Lock()
+	completed := s.testPassCompleted
+	s.mu.Unlock()
+	if completed == nil {
+		return
+	}
+	select {
+	case completed <- id:
+	default:
 	}
 }
 

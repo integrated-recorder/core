@@ -14,10 +14,13 @@ import (
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/hls"
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
 func TestManifestHistoricalAvailabilityAutomaticSchedulerRepairsSlidingWindow(t *testing.T) {
+	// Keep the high-volume sliding-window case on V2, where archive work is
+	// bounded by sharded indexes. Separate repair tests continue covering V1.
 	store, err := storage.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -41,17 +44,7 @@ func TestManifestHistoricalAvailabilityAutomaticSchedulerRepairsSlidingWindow(t 
 		fixture.objects[fmt.Sprintf("/archive/segment-%d.ts", sequence)] = historicalRecoveryPayload(sequence)
 	}
 
-	root := newRepairTestRoot(t, store, domain.StateRecording, media)
-	root.Gaps = nil
-	track := root.Tracks["main"]
-	track.Segments = nil
-	track.InitSegments = nil
-	track.SourceEpoch = 0
-	track.SourcePlaylistURL = media.ManifestURL
-	track.NextArchiveOrdinal = 1
-	if err := store.SaveRecording(root); err != nil {
-		t.Fatal(err)
-	}
+	root := newRecoveryShardedTestRoot(t, store, "84e2f247ab144c6a850fd5c07fb1e6a1", domain.StateRecording, media)
 
 	fence := &repairOwnerFence{}
 	manager, e, closeManager := newRepairTestManager(t, store, fixture, root, fence, nil)
@@ -75,16 +68,19 @@ func TestManifestHistoricalAvailabilityAutomaticSchedulerRepairsSlidingWindow(t 
 	}); err != nil {
 		t.Fatal(err)
 	}
+	manager.autoRecovery.mu.Lock()
+	manager.autoRecovery.testPassCompleted = make(chan string, 8)
+	manager.autoRecovery.mu.Unlock()
 	// This normal live-origin commit creates the final persisted tail coordinate
 	// and triggers the real Core-owned scheduler.
 	commitManifestRecoveryLiveOrigin(t, manager, e, owner, 200)
 
-	waitForManifestRecoveryCondition(t, manager, fixture, root.ID, "automatic manifest backfill through sequence 200", func() bool {
-		return manifestRecoveryTimelineMatches(manager, root.ID, 101, 100, 1, 200, 101, 202)
-	})
 	waitForManifestRecoveryRecheck(t, manager, root.ID)
 	firstRequests := fixture.requestedURLs()
 	firstRoot := requireManifestRecoveryWindow(t, manager, store, root.ID, 100, 200)
+	if !manifestRecoveryTimelineMatchesRecording(firstRoot, 101, 100, 1, 200, 101, 202) {
+		t.Fatal("automatic manifest backfill did not reconcile the first sharded window")
+	}
 	assertManifestRecoveryMediaRequests(t, firstRequests, 100, 189)
 	firstRevision := firstRoot.TimelineRevision
 	firstPrefix := snapshotManifestRecoverySegments(t, firstRoot, store, root.ID, 100, 149)
@@ -92,15 +88,21 @@ func TestManifestHistoricalAvailabilityAutomaticSchedulerRepairsSlidingWindow(t 
 	fixture.setManifest(manifestWindowForAutomaticRecovery(150, 250))
 	// A later live-origin claim wakes the delayed manifest recheck. Sequence 251
 	// is beyond the DVR snapshot, leaving 201..250 for historical acquisition.
+	if _, err := manager.observePlaylistAtGeneration(e, hls.MediaPlaylist{
+		TargetDuration: 2, MediaSequence: 251, DiscontinuitySequence: 0,
+		Segments: []hls.MediaSegment{{Sequence: 251, DiscontinuitySequence: 0, URI: "https://media.example/live/segment-251.ts", Duration: 2}},
+	}, e.mediaGeneration); err != nil {
+		t.Fatalf("observe live sequence 251 after sliding window: %v", err)
+	}
 	commitManifestRecoveryLiveOrigin(t, manager, e, owner, 251)
 
-	waitForManifestRecoveryCondition(t, manager, fixture, root.ID, "automatic sliding-window backfill through sequence 250", func() bool {
-		return manifestRecoveryTimelineMatches(manager, root.ID, 152, 100, 1, 251, 152, 304)
-	})
 	waitForManifestRecoveryRecheck(t, manager, root.ID)
 	allRequests := fixture.requestedURLs()
 	secondRequests := allRequests[len(firstRequests):]
 	updatedRoot := requireManifestRecoveryWindow(t, manager, store, root.ID, 100, 251)
+	if !manifestRecoveryTimelineMatchesRecording(updatedRoot, 152, 100, 1, 251, 152, 304) {
+		t.Fatal("automatic sliding-window recovery did not reconcile the full sharded timeline")
+	}
 	if updatedRoot.TimelineRevision <= firstRevision {
 		t.Fatalf("timeline revision=%d, first revision=%d", updatedRoot.TimelineRevision, firstRevision)
 	}
@@ -146,63 +148,45 @@ func commitManifestRecoveryLiveOrigin(t *testing.T, manager *Manager, e *entry, 
 
 func waitForManifestRecoveryRecheck(t *testing.T, manager *Manager, recordingID string) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		manager.mu.RLock()
-		scheduler := manager.autoRecovery
-		manager.mu.RUnlock()
-		if scheduler != nil {
-			scheduler.mu.Lock()
-			item, queued := scheduler.queued[recordingID]
-			finished := scheduler.inFlight != recordingID && queued && !item.due.IsZero()
-			scheduler.mu.Unlock()
-			if finished {
-				return
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for automatic recovery scheduler to finish pass")
-}
-
-func waitForManifestRecoveryCondition(t *testing.T, manager *Manager, fixture *repairFixtureTransport, recordingID, description string, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Minute)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	current, getErr := manager.Get(recordingID)
-	if getErr != nil {
-		t.Fatalf("timed out waiting for %s: load recording: %v; requests=%v", description, getErr, fixture.requestedURLs())
-	}
 	manager.mu.RLock()
 	scheduler := manager.autoRecovery
 	manager.mu.RUnlock()
-	queueState := "unavailable"
-	if scheduler != nil {
-		scheduler.mu.Lock()
-		queueState = fmt.Sprintf("inFlight=%q queued=%+v", scheduler.inFlight, scheduler.queued[recordingID])
-		scheduler.mu.Unlock()
+	if scheduler == nil {
+		t.Fatal("automatic recovery scheduler is unavailable")
 	}
-	t.Fatalf("timed out waiting for %s: segments=%d timelineRevision=%d scheduler=%s requests=%v", description,
-		len(current.Tracks["main"].Segments), current.TimelineRevision, queueState, fixture.requestedURLs())
+	scheduler.mu.Lock()
+	completed := scheduler.testPassCompleted
+	scheduler.mu.Unlock()
+	if completed == nil {
+		t.Fatal("automatic recovery completion signal is unavailable")
+	}
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	for {
+		scheduler.mu.Lock()
+		item, queued := scheduler.queued[recordingID]
+		finished := scheduler.inFlight != recordingID && queued && !item.due.IsZero()
+		scheduler.mu.Unlock()
+		if finished {
+			return
+		}
+		select {
+		case completedID := <-completed:
+			if completedID == recordingID {
+				continue
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for automatic recovery scheduler to finish pass")
+		}
+	}
 }
 
-func manifestRecoveryTimelineMatches(manager *Manager, recordingID string, count int, firstSequence, firstOrdinal, lastSequence, lastOrdinal uint64, duration float64) bool {
-	e, exists := manager.entry(recordingID)
-	if !exists {
+func manifestRecoveryTimelineMatchesRecording(recording *domain.Recording, count int, firstSequence, firstOrdinal, lastSequence, lastOrdinal uint64, duration float64) bool {
+	if recording == nil || recording.Tracks["main"] == nil || len(recording.Tracks["main"].Segments) != count || recording.Duration() != duration {
 		return false
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.recording == nil || e.recording.Tracks["main"] == nil || len(e.recording.Tracks["main"].Segments) != count || e.recording.Duration() != duration {
-		return false
-	}
-	first, firstExists := findSegmentBySequence(e.recording.Tracks["main"].Segments, firstSequence)
-	last, lastExists := findSegmentBySequence(e.recording.Tracks["main"].Segments, lastSequence)
+	first, firstExists := findSegmentBySequence(recording.Tracks["main"].Segments, firstSequence)
+	last, lastExists := findSegmentBySequence(recording.Tracks["main"].Segments, lastSequence)
 	return firstExists && lastExists && first.TimelineOrdinal == firstOrdinal && last.TimelineOrdinal == lastOrdinal
 }
 

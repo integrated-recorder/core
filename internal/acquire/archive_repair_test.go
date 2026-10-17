@@ -306,6 +306,42 @@ func newRecoveryFairnessRoot(t *testing.T, store *storage.Store, id string, medi
 	return root
 }
 
+func newRecoveryShardedTestRoot(t *testing.T, store *storage.Store, id string, state domain.RecordingState, media adapterproto.MediaSource) *domain.Recording {
+	t.Helper()
+	contextBytes, err := mediaContext(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := archiveindex.NewSessionIdentity(id, "fixture", nil, media.SessionRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	root := &domain.Recording{
+		FormatVersion: storage.ShardedArchiveFormatVersion, ShardedArchive: &domain.ShardedArchiveSummary{},
+		ID: id, SourceSessionID: identity.ID, Title: "sharded recovery fixture", AdapterID: "fixture",
+		SourceURIClassification: "public", State: state, CreatedAt: now, StartedAt: now, TimelineRevision: 1,
+		Tracks: map[string]*domain.Track{"main": {
+			ID: "main", SourcePlaylistURL: media.ManifestURL, NextArchiveOrdinal: 1,
+			LivePresentation: &domain.LivePresentationState{NextOrdinal: 1},
+		}},
+	}
+	if state != domain.StateRecording {
+		root.StoppedAt = &now
+	}
+	if err := store.CreateShardedRecording(root); err != nil {
+		t.Fatal(err)
+	}
+	contextDoc, err := newAcquisitionContextSidecar(contextBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSidecar(root.ID, acquisitionContextPath, contextDoc); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 type repairMultiOwnerFence struct {
 	mu      sync.Mutex
 	current map[string]OwnershipToken
@@ -514,11 +550,7 @@ func TestHistoricalGapOnlyPassUsesBoundedRecoveryWorkAndContinues(t *testing.T) 
 		Mode: adapterproto.HistoricalModeManifest, HistoricalManifestURL: media.ManifestURL,
 	}
 	fixture := &repairFixtureTransport{manifest: []byte(manifest.String()), objects: map[string][]byte{}}
-	root := newRepairTestRoot(t, store, domain.StateCompleted, media)
-	root.Gaps = nil
-	if err := store.SaveRecording(root); err != nil {
-		t.Fatal(err)
-	}
+	root := newRecoveryShardedTestRoot(t, store, "84e2f247ab144c6a850fd5c07fb1e6a1", domain.StateCompleted, media)
 	fence := &repairOwnerFence{}
 	manager, e, closeManager := newRepairTestManager(t, store, fixture, root, fence, nil)
 	e.mu.Lock()
@@ -604,8 +636,8 @@ func TestAutomaticRecoveryGapOnlyPassYieldsToNextRecording(t *testing.T) {
 		},
 		objects: map[string][]byte{"/b/b.m4v": []byte("recording-b-media")},
 	}
-	aRoot := newRecoveryFairnessRoot(t, store, aID, mediaA)
-	bRoot := newRecoveryFairnessRoot(t, store, bID, mediaB)
+	aRoot := newRecoveryShardedTestRoot(t, store, aID, domain.StateCompleted, mediaA)
+	bRoot := newRecoveryShardedTestRoot(t, store, bID, domain.StateCompleted, mediaB)
 	fence := newRepairMultiOwnerFence()
 	manager, err := NewManagerWithMode(store, &http.Client{Transport: fixture}, nil, func(_ context.Context, raw string) error {
 		parsed, parseErr := url.Parse(raw)

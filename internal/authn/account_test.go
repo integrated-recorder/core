@@ -13,6 +13,149 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+func TestBootstrapSupportsArbitraryOwnerLoginAndRenamePreservesIdentity(t *testing.T) {
+	root := t.TempDir()
+	service, token := openForTest(t, root)
+	if err := service.Bootstrap("sangwook", token, testPassword); err != nil {
+		t.Fatalf("bootstrap selected login: %v", err)
+	}
+	owner, err := service.FindByLogin("sangwook")
+	if err != nil || owner.ID == "" || !hasRole(owner.Roles, RoleOwner) {
+		t.Fatalf("bootstrap identity=%+v err=%v", owner, err)
+	}
+	if _, err := service.LoginAs("owner", testPassword); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("literal owner login unexpectedly worked: %v", err)
+	}
+	session, err := service.LoginAs("sangwook", testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RenameLogin(owner.ID, "wrong-current-password", "new-login"); !errors.Is(err, ErrCurrentPassword) {
+		t.Fatalf("wrong current password rename error=%v", err)
+	}
+	if _, err := service.RenameLogin(owner.ID, testPassword, "invalid login"); !errors.Is(err, ErrInvalidLogin) {
+		t.Fatalf("invalid login rename error=%v", err)
+	}
+	if _, err := service.CreateUser("NEW-LOGIN", "another-valid-password", RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RenameLogin(owner.ID, testPassword, "new-login"); !errors.Is(err, ErrDuplicateLogin) {
+		t.Fatalf("case-insensitive duplicate rename error=%v", err)
+	}
+	renamed, err := service.RenameLogin(owner.ID, testPassword, "SangWook")
+	if err != nil {
+		t.Fatalf("case-only rename: %v", err)
+	}
+	if renamed.ID != owner.ID || renamed.Login != "SangWook" || !hasRole(renamed.Roles, RoleOwner) {
+		t.Fatalf("renamed identity=%+v, stable identity/Owner role not preserved", renamed)
+	}
+	if _, err := service.Authenticate(session.Token); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("old session survived login rename: %v", err)
+	}
+	if _, err := service.LoginAs("sangwook", testPassword); err != nil {
+		t.Fatalf("case-insensitive login after case-only rename: %v", err)
+	}
+	if _, err := service.LoginAs("owner", testPassword); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("owner fallback appeared after rename: %v", err)
+	}
+}
+
+func TestCustomRoleChangesAreResolvedForExistingSessions(t *testing.T) {
+	root := t.TempDir()
+	service, token := openForTest(t, root)
+	bootstrapForTest(t, service, token)
+	service.bcryptCost = bcrypt.MinCost
+	owner, err := service.FindByLogin("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := service.CreateCustomRole("Archive reader", []Permission{PermissionRecordingRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := service.CreateUserWithRolesAs(owner.ID, "custom-user", "custom-role-password", []string{role.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.LoginAs(user.Login, "custom-role-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := service.Authenticate(session.Token)
+	if err != nil || HasPermission(Principal{UserID: before.UserID, Permissions: before.Permissions}, PermissionSystemDiagnostics) {
+		t.Fatalf("initial custom role authority=%+v err=%v", before.Permissions, err)
+	}
+	if _, err := service.UpdateCustomRole(role.ID, role.Name, []Permission{PermissionRecordingRead, PermissionSystemDiagnostics}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := service.Authenticate(session.Token)
+	if err != nil || !HasPermission(Principal{UserID: after.UserID, Permissions: after.Permissions}, PermissionSystemDiagnostics) {
+		t.Fatalf("existing session did not pick up edited role: permissions=%+v err=%v", after.Permissions, err)
+	}
+	if err := service.DeleteCustomRole(role.ID); !errors.Is(err, ErrRoleInUse) {
+		t.Fatalf("assigned custom role deletion error=%v", err)
+	}
+}
+
+func TestConcurrentFinalOwnerDemotionsCannotRemoveRootAuthority(t *testing.T) {
+	root := t.TempDir()
+	first, token := openForTest(t, root)
+	bootstrapForTest(t, first, token)
+	first.bcryptCost = bcrypt.MinCost
+	ownerA, err := first.FindByLogin("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerB, err := first.CreateUserWithRolesAs(ownerA.ID, "second-owner", "second-owner-password", []string{RoleOwner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenWithoutBootstrap(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make([]error, 2)
+	var wg sync.WaitGroup
+	for i, pair := range [][2]string{{ownerA.ID, ownerA.ID}, {ownerB.ID, ownerB.ID}} {
+		wg.Add(1)
+		go func(i int, pair [2]string, service *Service) {
+			defer wg.Done()
+			<-start
+			_, results[i] = service.SetUserRoles(pair[0], pair[1], []string{RoleOperator})
+		}(i, pair, []*Service{first, second}[i])
+	}
+	close(start)
+	wg.Wait()
+	successes := 0
+	protected := 0
+	for _, err := range results {
+		if err == nil {
+			successes++
+		} else if errors.Is(err, ErrLastOwner) {
+			protected++
+		} else {
+			t.Fatalf("unexpected owner demotion error: %v", err)
+		}
+	}
+	if successes != 1 || protected != 1 {
+		t.Fatalf("owner demotions: successes=%d protected=%d errors=%v", successes, protected, results)
+	}
+	users, err := first.ListUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	remainingOwners := 0
+	for _, user := range users {
+		if user.Status == UserStatusActive && hasRole(user.Roles, RoleOwner) {
+			remainingOwners++
+		}
+	}
+	if remainingOwners != 1 {
+		t.Fatalf("active Owner count after concurrent demotion=%d", remainingOwners)
+	}
+}
+
 func TestChangePasswordAdvancesEpochAndInvalidatesAllSessionsAcrossRestart(t *testing.T) {
 	root := t.TempDir()
 	service, token := openForTest(t, root)
@@ -417,6 +560,12 @@ func TestUserDisableEnableOwnerProtectionAndSessionManagement(t *testing.T) {
 	}
 	if _, err := service.SetUserEnabled(owner.ID, false); !errors.Is(err, ErrLastOwner) {
 		t.Fatalf("last owner disable error = %v", err)
+	}
+	if _, err := service.SetUserEnabledAs(owner.ID, owner.ID, false); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("last owner administrative disable error = %v", err)
+	}
+	if _, err := service.DeleteUser(owner.ID, owner.ID); !errors.Is(err, ErrLastOwner) {
+		t.Fatalf("last owner delete error = %v", err)
 	}
 	member, err := service.CreateUser("member-one", "member-password-one", RoleMember)
 	if err != nil {

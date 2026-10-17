@@ -103,7 +103,7 @@ func TestValidLegacyAdministratorMigratesReadyWithoutChangingProductData(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := auth.Bootstrap(setupCode, "legacy-install-migration-password"); err != nil {
+	if err := auth.Bootstrap("owner", setupCode, "legacy-install-migration-password"); err != nil {
 		t.Fatal(err)
 	}
 	installationPath := filepath.Join(root, "runtime", Filename)

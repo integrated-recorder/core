@@ -219,7 +219,7 @@ func openPreferencesTestService(t *testing.T, root string) *Service {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(token, "preferences-test-bootstrap-password"); err != nil {
+	if err := service.Bootstrap("owner", token, "preferences-test-bootstrap-password"); err != nil {
 		t.Fatal(err)
 	}
 	return service

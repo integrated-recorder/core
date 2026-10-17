@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { workflowsAPI } from '@/api'
-import { accountQuery, adaptersQuery, qk } from '@/api/queries'
+import { accountAuthorizationQuery, adaptersQuery, qk } from '@/api/queries'
 import { SchemaForm } from '@/components/schema-form'
 import { PageHeading } from '@/components/page-heading'
 import { StatusBadge } from '@/components/status-badge'
@@ -26,7 +26,7 @@ export function WorkflowDetailPage() {
   const navigate = useNavigate()
   const { toast } = useToast()
   const workflow = useQuery({ queryKey: qk.workflow(workflowId), queryFn: () => workflowsAPI.get(workflowId), retry: false })
-  const account = useQuery(accountQuery)
+  const authorization = useQuery(accountAuthorizationQuery)
   const adapters = useQuery(adaptersQuery)
   const [errorText, setErrorText] = useState('')
   const cancel = useMutation({ mutationFn: () => workflowsAPI.cancel(workflowId), onSuccess: async () => { toast(t('workflow.detail.cancelled')); await client.invalidateQueries({ queryKey: qk.workflows }); await client.invalidateQueries({ queryKey: qk.workflowHistory }); await navigate({ to: '/workflows' }) }, onError: error => toast(t('workflow.detail.cancelFailed'), errorMessage(error), 'error') })
@@ -41,7 +41,7 @@ export function WorkflowDetailPage() {
   const prompt = item.challenge?.prompt
   const submit = (result: { values: Record<string, unknown>; secrets: Record<string, string>; persistFields: string[] }) => proceed.mutate({ values: result.values, secrets: result.secrets, persist_fields: result.persistFields })
   const terminalPrompt = prompt?.type === 'complete' || prompt?.type === 'error'
-  const canPersist = account.data?.role === 'owner'
+  const canPersist = authorization.data?.permissions?.includes('plugin.configure') ?? false
   const requiresPersistence = challengeSchema.fields.some(field => field.persistence?.mode === 'required')
   const adapter = adapters.data?.find(candidate => candidate.status.id === item.adapter_id)
   return <div className="page-enter">

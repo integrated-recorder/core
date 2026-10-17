@@ -48,7 +48,7 @@ func TestRuntimeHostSetupCodeSubprocess(t *testing.T) {
 	if err != nil || string(stdout) != expected+"\n" || len(stderr) != 0 {
 		t.Fatalf("setup-code subprocess stdout=%q stderr=%q err=%v", stdout, stderr, err)
 	}
-	if err := authService.Bootstrap(expected, "runtime-host-cli-test-password"); err != nil {
+	if err := authService.Bootstrap("owner", expected, "runtime-host-cli-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	stdout, stderr, err = run(root)
@@ -74,7 +74,7 @@ func TestRuntimeHostPasswordRecoveryUsesStdinInvalidatesSessionsAndAudits(t *tes
 	}
 	const oldPassword = "runtime-host-old-password"
 	const newPassword = "runtime-host-new-password"
-	if err := service.Bootstrap(token, oldPassword); err != nil {
+	if err := service.Bootstrap("owner", token, oldPassword); err != nil {
 		t.Fatal(err)
 	}
 	oldSession, err := service.Login(oldPassword)
@@ -141,7 +141,7 @@ func TestRuntimeHostPasswordRecoveryRejectsMismatchedStdin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(token, "runtime-host-old-password"); err != nil {
+	if err := service.Bootstrap("owner", token, "runtime-host-old-password"); err != nil {
 		t.Fatal(err)
 	}
 	input, writer, err := os.Pipe()

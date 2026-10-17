@@ -39,7 +39,7 @@ func openForTest(t *testing.T, root string) (*Service, string) {
 
 func bootstrapForTest(t *testing.T, service *Service, token string) {
 	t.Helper()
-	if err := service.Bootstrap(token, testPassword); err != nil {
+	if err := service.Bootstrap("owner", token, testPassword); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 }
@@ -96,10 +96,10 @@ func TestBootstrapRejectsWrongTokenConsumesTokenAndRejectsReplay(t *testing.T) {
 	service, token := openForTest(t, root)
 	tokenPath := filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath()))
 	wrong := "wrong bootstrap token"
-	if err := service.Bootstrap(wrong, testPassword); !errors.Is(err, ErrInvalidBootstrapToken) {
+	if err := service.Bootstrap("owner", wrong, testPassword); !errors.Is(err, ErrInvalidBootstrapToken) {
 		t.Fatalf("wrong token error = %v", err)
 	}
-	if err := service.Bootstrap(token, testPassword); err != nil {
+	if err := service.Bootstrap("owner", token, testPassword); err != nil {
 		t.Fatalf("valid bootstrap: %v", err)
 	}
 	if service.NeedsBootstrap() {
@@ -108,7 +108,7 @@ func TestBootstrapRejectsWrongTokenConsumesTokenAndRejectsReplay(t *testing.T) {
 	if _, err := os.Stat(tokenPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("bootstrap token still exists: %v", err)
 	}
-	if err := service.Bootstrap(token, testPassword); !errors.Is(err, ErrBootstrapUnavailable) {
+	if err := service.Bootstrap("owner", token, testPassword); !errors.Is(err, ErrBootstrapUnavailable) {
 		t.Fatalf("bootstrap replay error = %v", err)
 	}
 	if strings.Contains(ErrInvalidBootstrapToken.Error(), token) || strings.Contains(ErrInvalidBootstrapToken.Error(), testPassword) {
@@ -134,7 +134,7 @@ func TestConcurrentBootstrapCreatesOneOwner(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := service.Bootstrap(token, testPassword)
+			err := service.Bootstrap("owner", token, testPassword)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -164,7 +164,7 @@ func TestReadSetupCodeIsReadOnlyAndRefusesAfterClaim(t *testing.T) {
 	if err != nil || got != token {
 		t.Fatalf("ReadSetupCode = %q, %v; want existing token", got, err)
 	}
-	if err := service.Bootstrap(token, testPassword); err != nil {
+	if err := service.Bootstrap("owner", token, testPassword); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := ReadSetupCode(root); got != "" || !errors.Is(err, ErrBootstrapUnavailable) {
@@ -180,7 +180,7 @@ func TestAuthenticationInstancesRefreshAdministratorAfterCrossProcessBootstrap(t
 		t.Fatal(err)
 	}
 	control.bcryptCost = bcrypt.MinCost
-	if err := control.Bootstrap(token, testPassword); err != nil {
+	if err := control.Bootstrap("owner", token, testPassword); err != nil {
 		t.Fatal(err)
 	}
 	configured, err := host.AdministratorConfigured()
@@ -193,7 +193,7 @@ func TestAuthenticationInstancesRefreshAdministratorAfterCrossProcessBootstrap(t
 	if _, err := host.Login(testPassword); err != nil {
 		t.Fatalf("Host auth instance could not log in after Control bootstrap: %v", err)
 	}
-	if err := host.Bootstrap(token, "another-valid-password"); !errors.Is(err, ErrBootstrapUnavailable) {
+	if err := host.Bootstrap("owner", token, "another-valid-password"); !errors.Is(err, ErrBootstrapUnavailable) {
 		t.Fatalf("stale Host instance bootstrap replay error=%v", err)
 	}
 }
@@ -207,7 +207,7 @@ func TestOpenWithoutBootstrapNeverCreatesReplacementToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap("no-token", testPassword); !errors.Is(err, ErrBootstrapUnavailable) {
+	if err := service.Bootstrap("owner", "no-token", testPassword); !errors.Is(err, ErrBootstrapUnavailable) {
 		t.Fatalf("recovery-only auth bootstrap error=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, securityDirectory, bootstrapTokenFilename)); !errors.Is(err, os.ErrNotExist) {
@@ -240,7 +240,7 @@ func TestPasswordPolicyAndBcryptPersistence(t *testing.T) {
 	root := t.TempDir()
 	service, token := openForTest(t, root)
 	for _, password := range []string{"short-pass", strings.Repeat("x", 73)} {
-		if err := service.Bootstrap(token, password); !errors.Is(err, ErrInvalidPassword) {
+		if err := service.Bootstrap("owner", token, password); !errors.Is(err, ErrInvalidPassword) {
 			t.Errorf("Bootstrap(%d bytes) error = %v", len(password), err)
 		}
 	}
@@ -360,8 +360,8 @@ func TestTwoUsersHaveIndependentSessionsCSRFLogoutAndRestartIdentity(t *testing.
 	if service.ValidCSRF(ownerSession.Token, secondSession.CSRFToken) || service.ValidCSRF(secondSession.Token, ownerSession.CSRFToken) {
 		t.Fatal("CSRF token crossed user session")
 	}
-	ownerPrincipal := Principal{UserID: ownerSession.UserID, Login: ownerSession.Login, Role: ownerSession.Role}
-	secondPrincipal := Principal{UserID: secondSession.UserID, Login: secondSession.Login, Role: secondSession.Role}
+	ownerPrincipal := Principal{UserID: ownerSession.UserID, Login: ownerSession.Login, Roles: ownerSession.Roles, Permissions: ownerSession.Permissions, Role: ownerSession.Role}
+	secondPrincipal := Principal{UserID: secondSession.UserID, Login: secondSession.Login, Roles: secondSession.Roles, Permissions: secondSession.Permissions, Role: secondSession.Role}
 	ownerFromContext, ok := PrincipalFromContext(WithPrincipal(context.Background(), ownerPrincipal))
 	if !ok || ownerFromContext.UserID != ownerPrincipal.UserID {
 		t.Fatal("owner principal context was not preserved")
@@ -370,7 +370,7 @@ func TestTwoUsersHaveIndependentSessionsCSRFLogoutAndRestartIdentity(t *testing.
 	if !ok || secondFromContext.UserID != secondPrincipal.UserID {
 		t.Fatal("second user principal context was not preserved")
 	}
-	if !HasPermission(ownerPrincipal, PermissionAuditRead) || !HasPermission(secondPrincipal, PermissionRecordingControl) || HasPermission(secondPrincipal, Permission("unknown.permission")) {
+	if !HasPermission(ownerPrincipal, PermissionAuditRead) || !HasPermission(secondPrincipal, PermissionRecordingCreate) || HasPermission(secondPrincipal, Permission("unknown.permission")) {
 		t.Fatal("owner permission policy is not explicit")
 	}
 	service.Logout(ownerSession.Token)
@@ -405,7 +405,7 @@ func TestRequirePermissionUsesContextPrincipalNotClientHeader(t *testing.T) {
 		t.Fatalf("client header supplied principal: status=%d called=%v", response.Code, called)
 	}
 
-	principal := Principal{UserID: "usr-00000000000000000000000000000000", Login: "owner", Role: RoleOwner}
+	principal := Principal{UserID: "usr-00000000000000000000000000000000", Login: "owner", Roles: []string{RoleOwner}, Permissions: BuiltInRoles()[0].Permissions, Role: RoleOwner}
 	request = request.WithContext(WithPrincipal(request.Context(), principal))
 	response = httptest.NewRecorder()
 	protected.ServeHTTP(response, request)

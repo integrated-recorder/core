@@ -4,6 +4,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AdaptersPage, PluginsPage } from './adapters'
 import { ToastProvider } from '@/components/ui/toast'
+import { qk } from '@/api/queries'
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
@@ -11,7 +12,8 @@ async function renderAdapterSurface(Component: React.ComponentType, installedAda
   vi.spyOn(window, 'scrollTo').mockImplementation(() => undefined)
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   client.setQueryData(['adapters'], installedAdapters)
-  client.setQueryData(['user', 'account'], { user_id: 'usr-00000000000000000000000000000001', login: 'owner', role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+  client.setQueryData(['user', 'account'], { user_id: 'usr-00000000000000000000000000000001', login: 'owner', roles: ['owner'], role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+  client.setQueryData(qk.accountAuthorization, { user_id: 'usr-00000000000000000000000000000001', login: 'owner', roles: ['owner'], permissions: ['plugin.read', 'plugin.manage', 'plugin.configure'] })
   const root = createRootRoute()
   const surfaceRoute = createRoute({ getParentRoute: () => root, path: '/', component: () => <Component /> })
   const storageRoute = createRoute({ getParentRoute: () => root, path: '/storage/locations', component: () => null })

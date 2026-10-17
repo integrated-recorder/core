@@ -60,7 +60,7 @@ func TestPreviewAPIRoutesRequireAuthAndServePrivateJPEG(t *testing.T) {
 		t.Fatal(err)
 	}
 	const password = "correct horse battery staple"
-	if err := auth.Bootstrap(strings.TrimSpace(string(bootstrap)), password); err != nil {
+	if err := auth.Bootstrap("owner", strings.TrimSpace(string(bootstrap)), password); err != nil {
 		t.Fatal(err)
 	}
 	api := NewWithOptions(manager, nil, nil, Options{Previews: previews, Auth: auth})

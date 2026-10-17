@@ -170,7 +170,11 @@ func routePluginOperation(method, path string) (pluginOperation, string, bool) {
 func (h *handler) servePluginOperation(w http.ResponseWriter, r *http.Request, operation pluginOperation, id string) {
 	setResponseHeaders(w)
 	mutation := operation != pluginStatus
-	r, authorized := h.authorize(w, r, authn.PermissionPluginManage, mutation)
+	permission := authn.PermissionPluginRead
+	if mutation {
+		permission = authn.PermissionPluginManage
+	}
+	r, authorized := h.authorize(w, r, permission, mutation)
 	if !authorized {
 		return
 	}

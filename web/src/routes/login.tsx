@@ -24,10 +24,11 @@ export function LoginPage() {
     const data = new FormData(event.currentTarget)
     const login = String(data.get('username') ?? '').trim()
     const password = String(data.get('password') ?? '')
+    if (!login) return setFormError(t('login.usernameRequired'))
     if (!password) return setFormError(t('login.passwordRequired'))
     setIsSubmitting(true)
     try {
-      const result = login ? await authAPI.login(password, login) : await authAPI.login(password)
+      const result = await authAPI.login(login, password)
       client.setQueryData(qk.session, result)
       await client.invalidateQueries({ queryKey: qk.session })
       await navigate({ to: '/' })
@@ -39,5 +40,5 @@ export function LoginPage() {
     }
   }
 
-  return <main className="grid min-h-screen place-items-center bg-background px-4 py-8"><section className="w-full max-w-sm rounded-xl border border-border bg-card p-6 sm:p-8"><AppBrand variant="login" className="mb-7" /><h1 className="mb-5 text-xl font-semibold tracking-tight">{t('login.title')}</h1>{error && <p role="alert" className="mb-4 rounded-md bg-destructive/10 p-3 text-sm text-destructive">{t('login.unavailable')}</p>}<form className="space-y-4" onSubmit={submit}><div className="space-y-2"><Label htmlFor="login">{t('login.account')}</Label><Input id="login" type="text" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} defaultValue="" /></div><div className="space-y-2"><Label htmlFor="password">{t('login.password')}</Label><Input id="password" type="password" name="password" autoComplete="current-password" required /></div>{formError && <p role="alert" className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">{formError}</p>}<Button type="submit" className="w-full" disabled={isSubmitting || isLoading}>{isSubmitting ? t('login.pending') : t('login.submit')}</Button></form></section></main>
+  return <main className="grid min-h-screen place-items-center bg-background px-4 py-8"><section className="w-full max-w-sm rounded-xl border border-border bg-card p-6 sm:p-8"><AppBrand variant="login" className="mb-7" /><h1 className="mb-5 text-xl font-semibold tracking-tight">{t('login.title')}</h1>{error && <p role="alert" className="mb-4 rounded-md bg-destructive/10 p-3 text-sm text-destructive">{t('login.unavailable')}</p>}<form className="space-y-4" onSubmit={submit}><div className="space-y-2"><Label htmlFor="login">{t('login.account')}</Label><Input id="login" type="text" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} autoCorrect="off" required /></div><div className="space-y-2"><Label htmlFor="password">{t('login.password')}</Label><Input id="password" type="password" name="password" autoComplete="current-password" required /></div>{formError && <p role="alert" className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">{formError}</p>}<Button type="submit" className="w-full" disabled={isSubmitting || isLoading}>{isSubmitting ? t('login.pending') : t('login.submit')}</Button></form></section></main>
 }

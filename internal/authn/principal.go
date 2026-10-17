@@ -2,29 +2,19 @@ package authn
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 )
 
-type Permission string
-
-const (
-	PermissionRecordingRead    Permission = "recording.read"
-	PermissionRecordingControl Permission = "recording.control"
-	PermissionRecordingDelete  Permission = "recording.delete"
-	PermissionStorageManage    Permission = "storage.manage"
-	PermissionPluginManage     Permission = "plugin.manage"
-	PermissionSettingsManage   Permission = "settings.manage"
-	PermissionAuditRead        Permission = "audit.read"
-	PermissionUpdateManage     Permission = "update.manage"
-	PermissionUserPreferences  Permission = "user.preferences.self"
-)
-
-// Principal binds request identity to server-validated session state.
-// No request header can create or replace this value.
+// Principal is reconstructed from the latest durable account and role state
+// for every authenticated request. Role is a deprecated display aid only;
+// authorization uses the explicit permission union.
 type Principal struct {
-	UserID string
-	Login  string
-	Role   string
+	UserID      string
+	Login       string
+	Roles       []string
+	Permissions []Permission
+	Role        string
 }
 
 type principalContextKey struct{}
@@ -35,37 +25,34 @@ func WithPrincipal(ctx context.Context, principal Principal) context.Context {
 
 func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 	principal, ok := ctx.Value(principalContextKey{}).(Principal)
-	if !ok || !validUserID(principal.UserID) || principal.Login == "" || principal.Role == "" {
+	if !ok || !validUserID(principal.UserID) || principal.Login == "" || len(principal.Permissions) == 0 {
 		return Principal{}, false
 	}
 	return principal, true
 }
 
 func HasPermission(principal Principal, permission Permission) bool {
-	if !validUserID(principal.UserID) || principal.Role == "" {
+	if !validUserID(principal.UserID) || len(principal.Permissions) == 0 {
 		return false
 	}
-	// A user may manage only their own preferences; this is identity-scoped and
-	// does not require owner-level control-plane permissions.
-	if permission == PermissionUserPreferences {
+	switch permission {
+	case PermissionAccountProfileSelf, PermissionAccountPasswordSelf, PermissionAccountSessionsSelf, PermissionUserPreferences:
 		return true
 	}
-	switch principal.Role {
-	case RoleOwner:
-		switch permission {
-		case PermissionRecordingRead, PermissionRecordingControl, PermissionRecordingDelete,
-			PermissionStorageManage, PermissionPluginManage, PermissionSettingsManage,
-			PermissionAuditRead, PermissionUpdateManage:
+	for _, candidate := range principal.Permissions {
+		if candidate == permission {
 			return true
 		}
-	case RoleMember:
-		return permission == PermissionRecordingRead || permission == PermissionRecordingControl
 	}
 	return false
 }
 
-// RequirePermission is the shared authorization middleware seam. Current
-// owner role grants every declared control-plane permission.
+func HasRole(principal Principal, roleID string) bool {
+	return validUserID(principal.UserID) && hasRole(principal.Roles, roleID)
+}
+
+// RequirePermission is shared by product and Runtime Host APIs. Unknown
+// permission identifiers always fail closed.
 func RequirePermission(permission Permission, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := PrincipalFromContext(r.Context())
@@ -74,7 +61,12 @@ func RequirePermission(permission Permission, next http.Handler) http.Handler {
 			return
 		}
 		if !HasPermission(principal, permission) {
-			http.Error(w, "permission denied", http.StatusForbidden)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(struct {
+				ErrorCode string `json:"error_code"`
+				Message   string `json:"message"`
+			}{ErrorCode: "permission_denied", Message: "Permission denied."})
 			return
 		}
 		next.ServeHTTP(w, r)

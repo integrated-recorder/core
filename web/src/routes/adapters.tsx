@@ -2,7 +2,7 @@ import { Link } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRight, CircleAlert, Download, PackageOpen, RefreshCw, Trash2, Upload } from 'lucide-react'
 import { adaptersAPI, pluginsAPI } from '@/api'
-import { accountQuery, adaptersQuery, pluginsQuery, qk } from '@/api/queries'
+import { accountAuthorizationQuery, adaptersQuery, pluginsQuery, qk } from '@/api/queries'
 import { PageHeading } from '@/components/page-heading'
 import { errorMessage } from '@/lib/errors'
 import { StatusBadge } from '@/components/status-badge'
@@ -19,8 +19,8 @@ import { formatDate } from '@/lib/utils'
 export function AdaptersPage() {
   const { t } = useI18n()
   const query = useQuery(adaptersQuery)
-  const account = useQuery(accountQuery)
-  const owner = account.data?.role === 'owner'
+  const authorization = useQuery(accountAuthorizationQuery)
+  const canManagePlugins = authorization.data?.permissions?.includes('plugin.manage') ?? false
   const client = useQueryClient()
   const { toast } = useToast()
   const reconcile = useMutation({
@@ -34,7 +34,7 @@ export function AdaptersPage() {
     },
     onError: error => toast(t('plugins.scanFailed'), errorMessage(error), 'error'),
   })
-  const actions = <div className="flex flex-wrap gap-2">{owner && <Button variant="outline" disabled={reconcile.isPending} onClick={() => reconcile.mutate()}><RefreshCw className={`h-4 w-4 ${reconcile.isPending ? 'animate-spin' : ''}`} />{t('plugins.rescan')}</Button>}<Button variant="ghost" onClick={() => void query.refetch()}><RefreshCw className="h-4 w-4" />{t('plugins.refresh')}</Button></div>
+  const actions = <div className="flex flex-wrap gap-2">{canManagePlugins && <Button variant="outline" disabled={reconcile.isPending} onClick={() => reconcile.mutate()}><RefreshCw className={`h-4 w-4 ${reconcile.isPending ? 'animate-spin' : ''}`} />{t('plugins.rescan')}</Button>}<Button variant="ghost" onClick={() => void query.refetch()}><RefreshCw className="h-4 w-4" />{t('plugins.refresh')}</Button></div>
   const unreviewedInstalled = query.data?.some(adapter => isUnreviewed(adapter.trust)) ?? false
   return <div className="page-enter space-y-4">
     <PageHeading title={t('nav.sources')} actions={actions} />

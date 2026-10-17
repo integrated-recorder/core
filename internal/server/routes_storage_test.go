@@ -122,7 +122,7 @@ func TestStoragePoolAPIRequiresSessionWhenAuthIsEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := auth.Bootstrap(strings.TrimSpace(string(bootstrap)), "storage-api-test-strong-password"); err != nil {
+	if err := auth.Bootstrap("owner", strings.TrimSpace(string(bootstrap)), "storage-api-test-strong-password"); err != nil {
 		t.Fatal(err)
 	}
 	handler := NewWithOptions(manager, nil, nil, Options{Auth: auth})

@@ -51,7 +51,7 @@ func TestStorageFailureDiagnosticRequiresAdministratorAndReturnsSafeRecord(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := auth.Bootstrap(strings.TrimSpace(string(bootstrap)), "storage-diagnostic-test-password"); err != nil {
+	if err := auth.Bootstrap("owner", strings.TrimSpace(string(bootstrap)), "storage-diagnostic-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := auth.Login("storage-diagnostic-test-password")

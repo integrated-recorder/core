@@ -56,21 +56,21 @@ describe('normal administrator login', () => {
     setNativeInputValue(username, 'alice')
     setNativeInputValue(password, 'correct-password')
     fireEvent.submit(form!)
-    await waitFor(() => expect(mocks.login).toHaveBeenCalledWith('correct-password', 'alice'))
+    await waitFor(() => expect(mocks.login).toHaveBeenCalledWith('alice', 'correct-password'))
     expect(mocks.navigate).toHaveBeenCalledWith({ to: '/' })
     expect(screen.queryByLabelText('초기화 토큰')).not.toBeInTheDocument()
     expect(screen.queryByText(/bootstrap-token/)).not.toBeInTheDocument()
   })
 
-  it('preserves password-only owner compatibility when the username is blank', async () => {
+  it('rejects a blank username rather than assuming an Owner login', async () => {
     renderLogin()
     const username = screen.getByLabelText('계정 이름') as HTMLInputElement
     const password = await screen.findByLabelText('비밀번호') as HTMLInputElement
     await waitFor(() => expect(screen.getByRole('button', { name: '로그인' })).toBeEnabled())
     setNativeInputValue(password, 'a-strong-passphrase')
     fireEvent.submit(username.closest('form')!)
-    await waitFor(() => expect(mocks.login).toHaveBeenCalledWith('a-strong-passphrase'))
-    expect(mocks.login).toHaveBeenCalledTimes(1)
-    expect(mocks.navigate).toHaveBeenCalledWith({ to: '/' })
+    expect(await screen.findByRole('alert')).toHaveTextContent('로그인 이름을 입력하세요.')
+    expect(mocks.login).not.toHaveBeenCalled()
+    expect(mocks.navigate).not.toHaveBeenCalled()
   })
 })

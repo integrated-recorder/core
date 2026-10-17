@@ -17,11 +17,13 @@ export const qk = {
   watchRecordings: (id: string) => ['watch', id, 'recordings'] as const, watchEvents: (id: string) => ['watch', id, 'events'] as const,
   notifications: ['notifications'] as const, audit: ['audit'] as const, logs: (query: unknown) => ['logs', query] as const,
   userPreferences: ['user', 'preferences'] as const,
-  account: ['user', 'account'] as const, accountSessions: ['user', 'sessions'] as const, users: ['users'] as const,
+  account: ['user', 'account'] as const, accountAuthorization: ['user', 'authorization'] as const, accountSessions: ['user', 'sessions'] as const, users: ['users'] as const, roles: ['roles'] as const,
 }
 export const accountQuery = queryOptions({ queryKey: qk.account, queryFn: () => accountAPI.self(), staleTime: 30_000, retry: false })
+export const accountAuthorizationQuery = queryOptions({ queryKey: qk.accountAuthorization, queryFn: () => accountAPI.authorization(), staleTime: 0, refetchOnWindowFocus: true, retry: false })
 export const accountSessionsQuery = queryOptions({ queryKey: qk.accountSessions, queryFn: () => accountAPI.sessions(), staleTime: 5_000, retry: false })
 export const usersQuery = queryOptions({ queryKey: qk.users, queryFn: () => accountAPI.users(), staleTime: 10_000, retry: false })
+export const rolesQuery = queryOptions({ queryKey: qk.roles, queryFn: () => accountAPI.roles(), staleTime: 10_000, retry: false })
 export const sessionQuery = queryOptions({ queryKey: qk.session, queryFn: authAPI.session, retry: false, staleTime: 10_000 })
 export const userPreferencesQuery = queryOptions({ queryKey: qk.userPreferences, queryFn: () => userPreferencesAPI.get(), staleTime: 60_000, retry: false })
 export const installationQuery = queryOptions({

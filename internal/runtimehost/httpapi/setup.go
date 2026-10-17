@@ -203,8 +203,8 @@ func (h *setupHandler) authorize(w http.ResponseWriter, r *http.Request) (*http.
 		writeSetupError(w, http.StatusUnauthorized, "authentication_required", "인증이 필요합니다.")
 		return r, false
 	}
-	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Role: session.Role}
-	if !authn.HasPermission(principal, authn.PermissionSettingsManage) {
+	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Roles: session.Roles, Permissions: session.Permissions, Role: session.Role}
+	if !authn.HasPermission(principal, authn.PermissionSystemSettings) {
 		writeSetupError(w, http.StatusForbidden, "permission_denied", "권한이 없습니다.")
 		return r, false
 	}

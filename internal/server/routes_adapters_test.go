@@ -146,7 +146,7 @@ func TestAdapterBrandingAPIUsesAuthenticatedIconProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	const password = "correct horse battery staple"
-	if err := auth.Bootstrap(strings.TrimSpace(string(bootstrap)), password); err != nil {
+	if err := auth.Bootstrap("owner", strings.TrimSpace(string(bootstrap)), password); err != nil {
 		t.Fatal(err)
 	}
 	authenticatedHandler := NewWithOptions(nil, host, nil, Options{Auth: auth})

@@ -19,6 +19,7 @@ function dashboardResponse() {
 
 test('first-run setup claims the installation, runs diagnostics, and completes without exposing a token path', async ({ page }) => {
   const testOnlySetupCode = 'in-memory-one-time-test-code'
+  const selectedOwnerLogin = 'sangwook-e2e'
   let installationState: 'uninitialized' | 'setup_in_progress' | 'ready' = 'uninitialized'
   let administratorConfigured = false
   let authenticated = false
@@ -33,9 +34,11 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
       await route.fulfill({ json: { state: installationState, administrator_configured: administratorConfigured, claim_required: !administratorConfigured, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     } else if (path === '/api/auth/session') {
       await route.fulfill({ json: { auth_enabled: true, authenticated, needs_bootstrap: !administratorConfigured, csrf_token: authenticated ? 'csrf-after-bootstrap' : 'csrf-before-bootstrap' } })
+    } else if (path === '/api/user/authorization') {
+      await route.fulfill({ json: { user_id: 'usr-e2e-owner', login: selectedOwnerLogin, roles: ['owner'], permissions: ['recording.read', 'recording.create', 'recording.workflow.manage', 'storage.read', 'system.diagnostics.read'] } })
     } else if (path === '/api/auth/bootstrap') {
       bootstrapCSRF = request.headers()['x-csrf-token'] ?? ''
-      expect(request.postDataJSON()).toEqual({ token: testOnlySetupCode, password: 'a-strong-passphrase' })
+      expect(request.postDataJSON()).toEqual({ login: selectedOwnerLogin, token: testOnlySetupCode, password: 'a-strong-passphrase' })
       administratorConfigured = true
       authenticated = true
       await route.fulfill({ json: { auth_enabled: true, authenticated: true, needs_bootstrap: false, csrf_token: 'csrf-after-bootstrap' } })
@@ -80,13 +83,14 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
   const setupForm = page.locator('form').filter({ has: page.getByRole('button', { name: '관리자 계정 만들기' }) })
   const setupUsername = setupForm.locator('input[name="username"]')
   await expect(setupUsername).toHaveAttribute('type', 'text')
-  await expect(setupUsername).toHaveAttribute('value', 'owner')
+  await expect(setupUsername).toHaveValue('')
   await expect(setupUsername).toHaveAttribute('autocomplete', 'username')
-  await expect(setupUsername).toHaveAttribute('readonly', '')
+  await expect(setupUsername).not.toHaveAttribute('readonly')
   await expect(setupUsername).not.toBeDisabled()
   await expect(setupForm.locator('input[name="setup_code"]')).toHaveAttribute('autocomplete', 'one-time-code')
   await expect(setupForm.locator('input[name="password"]')).toHaveAttribute('autocomplete', 'new-password')
   await expect(setupForm.locator('input[name="password_confirmation"]')).toHaveAttribute('autocomplete', 'new-password')
+  await setupUsername.fill(selectedOwnerLogin)
   await page.getByLabel(/Setup code|설치 코드/).fill(testOnlySetupCode)
   await page.getByLabel('관리자 비밀번호').fill('a-strong-passphrase')
   await page.getByLabel('비밀번호 확인').fill('a-strong-passphrase')
@@ -131,8 +135,10 @@ test('administrator can log in, use the application, and log out', async ({ page
       await route.fulfill({ json: { state: 'ready', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     } else if (path === '/api/auth/session') {
       await route.fulfill({ json: { auth_enabled: true, authenticated, needs_bootstrap: false, csrf_token: authenticated ? 'session-csrf' : '' } })
+    } else if (path === '/api/user/authorization') {
+      await route.fulfill({ json: { user_id: 'usr-e2e-owner', login: 'alice', roles: ['owner'], permissions: ['recording.read', 'recording.create', 'recording.workflow.manage', 'storage.read', 'system.diagnostics.read'] } })
     } else if (path === '/api/auth/login') {
-      expect(request.postDataJSON()).toEqual({ password: 'a-strong-passphrase' })
+      expect(request.postDataJSON()).toEqual({ login: 'alice', password: 'a-strong-passphrase' })
       authenticated = true
       await route.fulfill({ json: { auth_enabled: true, authenticated: true, needs_bootstrap: false, csrf_token: 'session-csrf' } })
     } else if (path === '/api/auth/logout') {
@@ -166,6 +172,7 @@ test('administrator can log in, use the application, and log out', async ({ page
   await expect(page.getByLabel('비밀번호')).toHaveAttribute('name', 'password')
   await expect(page.getByLabel('비밀번호')).toHaveAttribute('autocomplete', 'current-password')
   await expect(page.locator('form')).toContainText('로그인')
+  await page.getByLabel('계정 이름').fill('alice')
   await page.getByLabel('비밀번호').fill('a-strong-passphrase')
   await page.getByRole('button', { name: '로그인' }).click()
   await expect(page).toHaveURL('/')
@@ -201,7 +208,7 @@ test('login submits an explicit native username and password pair', async ({ pag
   await expect(page.getByRole('alert')).toBeVisible()
 })
 
-test('setup resume exposes the saved owner credential pair', async ({ page }) => {
+test('setup resume exposes an editable account credential pair', async ({ page }) => {
   let authenticated = false
   await page.route('**/api/**', async route => {
     const request = route.request()
@@ -211,7 +218,7 @@ test('setup resume exposes the saved owner credential pair', async ({ page }) =>
     } else if (path === '/api/auth/session') {
       await route.fulfill({ json: { auth_enabled: true, authenticated, needs_bootstrap: false, csrf_token: authenticated ? 'session-csrf' : 'initial-csrf' } })
     } else if (path === '/api/auth/login') {
-      expect(request.postDataJSON()).toEqual({ password: 'owner-current-password' })
+      expect(request.postDataJSON()).toEqual({ login: 'sangwook', password: 'owner-current-password' })
       authenticated = true
       await route.fulfill({ json: { auth_enabled: true, authenticated: true, needs_bootstrap: false, csrf_token: 'session-csrf' } })
     } else {
@@ -222,11 +229,12 @@ test('setup resume exposes the saved owner credential pair', async ({ page }) =>
   const username = page.getByLabel('계정')
   await expect(username).toHaveAttribute('type', 'text')
   await expect(username).toHaveAttribute('name', 'username')
-  await expect(username).toHaveAttribute('value', 'owner')
+  await expect(username).toHaveValue('')
   await expect(username).toHaveAttribute('autocomplete', 'username')
-  await expect(username).toHaveAttribute('readonly', '')
+  await expect(username).not.toHaveAttribute('readonly')
   await expect(page.getByLabel('관리자 비밀번호')).toHaveAttribute('name', 'password')
   await expect(page.getByLabel('관리자 비밀번호')).toHaveAttribute('autocomplete', 'current-password')
+  await username.fill('sangwook')
   await page.getByLabel('관리자 비밀번호').fill('owner-current-password')
   await page.getByRole('button', { name: '로그인하고 이어하기' }).click()
   await expect(page.getByRole('heading', { name: '저장소 확인' })).toBeVisible()

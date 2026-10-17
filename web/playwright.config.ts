@@ -6,7 +6,9 @@ export default defineConfig({
   testDir: './e2e',
   // First-run setup is a distinct production Host/Control/Engine process test
   // with its own private data directory and credential handoff.
-  testIgnore: ['**/setup-first-run.spec.ts'],
+  // Setup and legacy-migration scenarios are run by their owning native Host
+  // runners with private isolated data directories.
+  testIgnore: ['**/setup-first-run.spec.ts', '**/auth-migration.spec.ts'],
   fullyParallel: false,
   workers: 1,
   reporter: 'list',

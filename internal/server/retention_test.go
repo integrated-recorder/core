@@ -136,7 +136,7 @@ func TestRetentionDisabledRunDoesNotDeleteAndEnabledRunClearsProjections(t *test
 		t.Fatal(err)
 	}
 	enabled := httptest.NewRecorder()
-	principal := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	principal := serverTestPrincipal(authn.RoleOwner)
 	runRequest := httptest.NewRequest(http.MethodPost, "/api/retention/run", strings.NewReader(`{}`))
 	runRequest = runRequest.WithContext(authn.WithPrincipal(runRequest.Context(), principal))
 	s.ServeHTTP(enabled, runRequest)
@@ -249,7 +249,7 @@ func TestRetentionAuditsCanonicalDeleteBeforeProjectionCleanupFailure(t *testing
 		t.Fatal(err)
 	}
 	api := NewWithOptions(manager, nil, nil, Options{Management: products, Settings: settings})
-	principal := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	principal := serverTestPrincipal(authn.RoleOwner)
 	request := httptest.NewRequest(http.MethodPost, "/api/retention/run", strings.NewReader(`{}`))
 	request = request.WithContext(authn.WithPrincipal(request.Context(), principal))
 	response := httptest.NewRecorder()

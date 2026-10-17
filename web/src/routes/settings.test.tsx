@@ -54,14 +54,16 @@ function renderLocalizedSettings(section: SettingsSection = 'preferences') {
 
 beforeEach(() => {
   vi.stubGlobal('scrollTo', vi.fn())
-  vi.spyOn(accountAPI, 'self').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000001', login: 'owner', role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+  vi.spyOn(accountAPI, 'self').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000001', login: 'owner', roles: ['owner'], role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+  vi.spyOn(accountAPI, 'authorization').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000001', login: 'owner', roles: ['owner'], permissions: ['user.read', 'user.create', 'user.manage', 'role.read', 'role.manage', 'system.read', 'system.settings.manage'] })
+  vi.spyOn(accountAPI, 'roles').mockResolvedValue({ roles: [{ id: 'owner', name: 'Owner', built_in: true, permissions: [] }, { id: 'operator', name: 'Operator', built_in: true, permissions: [] }, { id: 'viewer', name: 'Viewer', built_in: true, permissions: [] }], permissions: [] })
   vi.spyOn(accountAPI, 'sessions').mockResolvedValue({ items: [{ id: 'opaque-session-id', expires_at: '2026-10-12T00:00:00Z', current: true }] })
-  vi.spyOn(accountAPI, 'users').mockResolvedValue({ items: [{ user_id: 'usr-00000000000000000000000000000001', login: 'owner', role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' }] })
+  vi.spyOn(accountAPI, 'users').mockResolvedValue({ items: [{ user_id: 'usr-00000000000000000000000000000001', login: 'owner', roles: ['owner'], role: 'owner', status: 'active', created_at: '2026-10-01T00:00:00Z' }] })
   vi.spyOn(accountAPI, 'changePassword').mockResolvedValue(undefined)
   vi.spyOn(accountAPI, 'revokeSession').mockResolvedValue(undefined)
   vi.spyOn(accountAPI, 'revokeOthers').mockResolvedValue({ revoked_count: 0 })
-  vi.spyOn(accountAPI, 'createUser').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', role: 'member', status: 'active', created_at: '2026-10-01T00:00:00Z' })
-  vi.spyOn(accountAPI, 'setUserEnabled').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', role: 'member', status: 'disabled', created_at: '2026-10-01T00:00:00Z' })
+  vi.spyOn(accountAPI, 'createUser').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', roles: ['operator'], role: 'operator', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+  vi.spyOn(accountAPI, 'setUserEnabled').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', roles: ['operator'], role: 'operator', status: 'disabled', created_at: '2026-10-01T00:00:00Z' })
   vi.spyOn(productAPI, 'settings').mockResolvedValue(structuredClone(settingsDefaults))
   vi.spyOn(productAPI, 'saveSettings').mockResolvedValue(structuredClone(settingsDefaults))
   vi.spyOn(userPreferencesAPI, 'get').mockResolvedValue({ locale: 'system', theme: 'system', timezone: 'system' })
@@ -366,7 +368,7 @@ describe('account and security settings', () => {
     const unauthorized = vi.fn()
     window.addEventListener('ir:unauthorized', unauthorized)
     renderSettings('security')
-    const currentPassword = await screen.findByLabelText('현재 비밀번호')
+    const currentPassword = (await screen.findAllByLabelText('현재 비밀번호')).at(-1)!
     const newPassword = screen.getByLabelText('새 비밀번호')
     const confirmation = screen.getAllByLabelText('새 비밀번호 확인')[0]!
     expect(currentPassword).toHaveAttribute('name', 'current_password')
@@ -396,7 +398,8 @@ describe('account and security settings', () => {
   })
 
   it('hides owner user management from a member account', async () => {
-    vi.mocked(accountAPI.self).mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', role: 'member', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+    vi.mocked(accountAPI.self).mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', roles: ['operator'], role: 'operator', status: 'active', created_at: '2026-10-01T00:00:00Z' })
+    vi.mocked(accountAPI.authorization).mockResolvedValue({ user_id: 'usr-00000000000000000000000000000002', login: 'member', roles: ['operator'], permissions: ['recording.read', 'recording.create'] })
     renderSettings('security')
     expect(await screen.findByRole('heading', { name: '계정 정보' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: '사용자 관리' })).not.toBeInTheDocument()

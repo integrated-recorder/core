@@ -102,15 +102,15 @@ function build() {
   return output('runtime-host', './cmd/runtime-host', hostExtra)
 }
 
-const productEnv = () => ({
+const productEnv = (dataRoot = dataDir) => ({
   ...process.env,
-  DATA_DIR: dataDir,
+  DATA_DIR: dataRoot,
   ADDR: hostAddress,
   ADAPTER_DIR: adapterDir,
 })
 
-function startHost(binary) {
-  const child = spawn(binary, [], { cwd: repositoryRoot, env: productEnv(), detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
+function startHost(binary, dataRoot = dataDir) {
+  const child = spawn(binary, [], { cwd: repositoryRoot, env: productEnv(dataRoot), detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
   const collect = chunk => {
     const text = chunk.toString()
     if (setupCodeForLogCheck && `${hostLogBoundary}${text}`.includes(setupCodeForLogCheck)) hostLogContainsSetupCode = true
@@ -121,6 +121,14 @@ function startHost(binary) {
   child.stderr.on('data', collect)
   child.once('error', () => { restartFailure = 'Runtime Host process failed to start.' })
   return child
+}
+
+function safeHostLogTail() {
+  return hostLogs.split(/\r?\n/).filter(Boolean).slice(-12).map(line => line
+    .replaceAll(root, '<acceptance-temp>')
+    .replace(/((?:password|token|secret|cookie|authorization|private[_-]?key)\s*["=:]\s*)("[^"]*"|\S+)/ig, '$1<redacted>')
+    .replace(/([?&][^=\s]+)=([^&#\s]+)/g, '$1=<redacted>')
+    .replaceAll(setupCodeForLogCheck, '<redacted-setup-code>')).join('\n')
 }
 
 function hostExited(child) {
@@ -188,7 +196,7 @@ async function waitForHealth(child, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (restartFailure) throw new Error(restartFailure)
-    if (hostExited(child)) throw new Error('Runtime Host exited before becoming healthy.')
+    if (hostExited(child)) throw new Error(`Runtime Host exited before becoming healthy.${hostLogs ? `\n${safeHostLogTail()}` : ''}`)
     try {
       const response = await fetch(`${baseURL}/healthz`, { signal: AbortSignal.timeout(1_000) })
       if (response.ok) return
@@ -274,6 +282,34 @@ async function main() {
     process.exitCode = 1
   } else {
     process.exitCode = result
+  }
+
+  if (result === 0 && process.exitCode === 0) {
+    const orphaned = await stopHost(host)
+    host = null
+    if (orphaned || hostChildLeakDetected) throw new Error('Runtime Host left product child processes running before the migration fixture.')
+
+    const securityDir = join(dataDir, 'security')
+    writeFileSync(join(securityDir, 'users.json'), JSON.stringify({
+      version: 1,
+      users: [
+        { user_id: 'usr-0123456789abcdef0123456789abcdef', login: 'legacy-owner', role: 'owner', status: 'active', created_at: '2025-01-02T03:04:05Z', password_hash: '$2a$04$vsPhwLYUKLGceXLMce3b4u6NzXaeZLPteH4NawlbAZo4O48EQBRjO' },
+        { user_id: 'usr-1123456789abcdef0123456789abcdef', login: 'legacy-member', role: 'member', status: 'active', created_at: '2025-01-02T03:04:05Z', password_hash: '$2a$04$7l/aOZSOTo1VQrMyFmyzAOvAZhCAzzvbPEBq7Wcbk8H7JfmadfMaO' },
+      ],
+    }) + '\n', { mode: 0o600 })
+
+    host = startHost(hostBinary)
+    await waitForHealth(host)
+    playwright = spawn(process.execPath, [playwrightCLI, 'test', '--config', 'playwright.migration.config.ts'], {
+      cwd: webDir,
+      env: { ...process.env, IR_SETUP_E2E_DATA_DIR: dataDir },
+      stdio: 'inherit',
+    })
+    const migrationResult = await new Promise((resolveExit, reject) => {
+      playwright.once('error', reject)
+      playwright.once('exit', (code, signal) => resolveExit(code ?? (signal ? 1 : 0)))
+    })
+    if (migrationResult !== 0) process.exitCode = migrationResult
   }
 }
 

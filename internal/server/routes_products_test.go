@@ -636,7 +636,7 @@ func TestRecordingDeleteAuditsBeforeManagementCleanupFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := NewWithOptions(manager, nil, nil, Options{Management: products})
-	principal := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	principal := serverTestPrincipal(authn.RoleOwner)
 	request := httptest.NewRequest(http.MethodDelete, "/api/recordings/"+recording.ID, nil)
 	request = request.WithContext(authn.WithPrincipal(request.Context(), principal))
 	response := httptest.NewRecorder()
@@ -678,7 +678,7 @@ func TestAuthMiddlewareProtectsProductMutationsAndRequiresCSRF(t *testing.T) {
 		t.Fatal(err)
 	}
 	bootstrapToken := strings.TrimSpace(string(bootstrapBytes))
-	if err := auth.Bootstrap(bootstrapToken, "correct horse battery staple"); err != nil {
+	if err := auth.Bootstrap("owner", bootstrapToken, "correct horse battery staple"); err != nil {
 		t.Fatal(err)
 	}
 	manager, err := acquire.NewManager(store, nil, nil, nil)
@@ -700,7 +700,7 @@ func TestAuthMiddlewareProtectsProductMutationsAndRequiresCSRF(t *testing.T) {
 		t.Fatalf("unauthenticated dashboard=%d %s", unauthorized.Code, unauthorized.Body.String())
 	}
 	login := httptest.NewRecorder()
-	loginRequest := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"correct horse battery staple"}`))
+	loginRequest := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"login":"owner","password":"correct horse battery staple"}`))
 	handler.ServeHTTP(login, loginRequest)
 	if login.Code != http.StatusOK || login.Result().Cookies() == nil {
 		t.Fatalf("login=%d %s", login.Code, login.Body.String())

@@ -162,7 +162,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setResponseHeaders(w)
-	permission := authn.PermissionUpdateManage
+	permission := authn.PermissionSystemUpdate
 	if operation == operationAdapterReconcile {
 		permission = authn.PermissionPluginManage
 	}
@@ -311,7 +311,7 @@ func (h *handler) authorize(w http.ResponseWriter, r *http.Request, permission a
 		writeAPIError(w, http.StatusUnauthorized, "authentication_required", "인증이 필요합니다.")
 		return r, false
 	}
-	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Role: session.Role}
+	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Roles: session.Roles, Permissions: session.Permissions, Role: session.Role}
 	if !authn.HasPermission(principal, permission) {
 		writeAPIError(w, http.StatusForbidden, "permission_denied", "권한이 없습니다.")
 		return r, false

@@ -3,9 +3,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ToastProvider } from '@/components/ui/toast'
+import { qk } from '@/api/queries'
+import { accountAPI } from '@/api'
 import { StorageLocationsPage, StoragePage } from './storage'
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
 const provider = {
   id: 'fixture-storage', name: 'Fixture Storage', version: '1.0.0', configured: true, active: false, health: 'unknown',
@@ -31,7 +33,9 @@ function status(probeReady = false, active = false) {
 async function renderStorage(fetchMock: ReturnType<typeof vi.fn>, Component: React.ComponentType = StorageLocationsPage) {
   vi.stubGlobal('fetch', fetchMock)
   vi.stubGlobal('scrollTo', vi.fn())
+  vi.spyOn(accountAPI, 'authorization').mockResolvedValue({ user_id: 'usr-00000000000000000000000000000001', login: 'admin-test', roles: ['administrator'], permissions: ['storage.read', 'storage.manage', 'plugin.read'] })
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  client.setQueryData(qk.session, { auth_enabled: true, authenticated: true, needs_bootstrap: false, csrf_token: 'test-csrf' })
   const root = createRootRoute()
   const pageRoute = createRoute({ getParentRoute: () => root, path: '/', component: () => <Component /> })
   const pluginsRoute = createRoute({ getParentRoute: () => root, path: '/plugins', component: () => null })

@@ -131,7 +131,7 @@ func testAuth(t *testing.T) authFixture {
 			fixtureErr = err
 			return
 		}
-		if err := service.Bootstrap(strings.TrimSpace(string(token)), "runtime-httpapi-test-password"); err != nil {
+		if err := service.Bootstrap("owner", strings.TrimSpace(string(token)), "runtime-httpapi-test-password"); err != nil {
 			fixtureErr = err
 			return
 		}

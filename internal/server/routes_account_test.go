@@ -22,7 +22,7 @@ func newAccountTestHandler(t *testing.T) (*authn.Service, *management.Store, htt
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := auth.Bootstrap(setupCode, "account-owner-password"); err != nil {
+	if err := auth.Bootstrap("owner", setupCode, "account-owner-password"); err != nil {
 		t.Fatal(err)
 	}
 	ownerSession, err := auth.Login("account-owner-password")

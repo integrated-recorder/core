@@ -18,6 +18,7 @@ test('actual adapter child streams, reconnects, archives, and replays generic ti
   test.setTimeout(120_000)
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
   await page.goto('/login')
+  await page.getByLabel(/Account name|계정 이름/).fill('owner')
   await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')

@@ -41,6 +41,7 @@ var (
 	ErrBootstrapUnavailable  = errors.New("authentication bootstrap is unavailable")
 	ErrInvalidBootstrapToken = errors.New("invalid bootstrap token")
 	ErrInvalidPassword       = errors.New("password must be between 12 and 72 bytes")
+	ErrInvalidLogin          = errors.New("login must use 1-64 ASCII letters, digits, dot, underscore, or hyphen")
 	ErrInvalidCredentials    = errors.New("invalid credentials")
 	ErrUnauthenticated       = errors.New("unauthenticated")
 	ErrSessionCapacity       = errors.New("session capacity reached")
@@ -58,32 +59,28 @@ var (
 // token is omitted from JSON so callers can place it in an HttpOnly cookie;
 // the CSRF token remains available for request-header validation.
 type Session struct {
-	ID        string    `json:"-"`
-	Token     string    `json:"-"`
-	CSRFToken string    `json:"csrf_token,omitempty"`
-	ExpiresAt time.Time `json:"expires_at"`
-	UserID    string    `json:"-"`
-	Login     string    `json:"-"`
-	Role      string    `json:"-"`
+	ID          string       `json:"-"`
+	Token       string       `json:"-"`
+	CSRFToken   string       `json:"csrf_token,omitempty"`
+	ExpiresAt   time.Time    `json:"expires_at"`
+	UserID      string       `json:"-"`
+	Login       string       `json:"-"`
+	Roles       []string     `json:"-"`
+	Permissions []Permission `json:"-"`
+	Role        string       `json:"-"` // deprecated display compatibility; never used for authorization
 }
 
 type adminRecord struct {
 	PasswordHash string `json:"password_hash"`
 }
 
-const (
-	RoleOwner          = "owner"
-	RoleMember         = "member"
-	UserStatusActive   = "active"
-	UserStatusDisabled = "disabled"
-)
-
 // User is safe identity metadata. Password hashes never leave the private
 // persisted user record.
 type User struct {
 	ID        string    `json:"user_id"`
 	Login     string    `json:"login"`
-	Role      string    `json:"role"`
+	Roles     []string  `json:"roles"`
+	Role      string    `json:"role,omitempty"` // compatibility projection, always derived from Roles
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -95,11 +92,28 @@ type userRecord struct {
 }
 
 type persistedUserStore struct {
-	Version int          `json:"version"`
-	Users   []userRecord `json:"users"`
+	Version        int          `json:"version"`
+	Users          []userRecord `json:"users"`
+	CustomRoles    []Role       `json:"custom_roles,omitempty"`
+	migratedFromV1 bool         `json:"-"`
 }
 
-const userStoreVersion = 1
+type legacyUserRecord struct {
+	ID              string    `json:"user_id"`
+	Login           string    `json:"login"`
+	Role            string    `json:"role"`
+	Status          string    `json:"status"`
+	CreatedAt       time.Time `json:"created_at"`
+	PasswordHash    string    `json:"password_hash"`
+	CredentialEpoch uint64    `json:"credential_epoch,omitempty"`
+}
+
+type legacyPersistedUserStore struct {
+	Version int                `json:"version"`
+	Users   []legacyUserRecord `json:"users"`
+}
+
+const userStoreVersion = 2
 
 type sessionRecord struct {
 	id              string
@@ -330,7 +344,10 @@ func (s *Service) NeedsBootstrap() bool {
 
 // Bootstrap creates first owner if token matches the
 // persisted first-run token. A successful call consumes the bootstrap token.
-func (s *Service) Bootstrap(token, password string) error {
+func (s *Service) Bootstrap(login, token, password string) error {
+	if !loginRE.MatchString(login) {
+		return ErrInvalidLogin
+	}
 	if !validPasswordLength(password) {
 		return ErrInvalidPassword
 	}
@@ -366,11 +383,11 @@ func (s *Service) Bootstrap(token, password string) error {
 		if err != nil {
 			return fmt.Errorf("%w: hash administrator password", ErrStorage)
 		}
-		owner, err := newUserRecord("owner", RoleOwner, string(hash), s.now())
+		owner, err := newUserRecord(login, []string{RoleOwner}, string(hash), s.now())
 		if err != nil {
 			return err
 		}
-		data, err := encodeUserStore([]userRecord{owner})
+		data, err := encodeUserStore(persistedUserStore{Version: userStoreVersion, Users: []userRecord{owner}})
 		if err != nil {
 			return err
 		}
@@ -398,9 +415,31 @@ func (s *Service) BootstrapTokenRelativePath() string {
 	return filepath.ToSlash(filepath.Join(securityDirectory, bootstrapTokenFilename))
 }
 
-// Login preserves password-only owner login for existing browser clients.
+// Login is an internal legacy helper only. Browser and HTTP callers must use
+// LoginAs with an explicit mutable login identity. For old local callers it
+// resolves the active Owner by role rather than assuming login == "owner".
 func (s *Service) Login(password string) (Session, error) {
-	return s.LoginAs("owner", password)
+	var login string
+	err := s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		for _, user := range store.Users {
+			if user.Status == UserStatusActive && hasRole(user.Roles, RoleOwner) {
+				login = user.Login
+				break
+			}
+		}
+		if login == "" {
+			return ErrInvalidCredentials
+		}
+		return nil
+	})
+	if err != nil {
+		return Session{}, ErrInvalidCredentials
+	}
+	return s.LoginAs(login, password)
 }
 
 // LoginAs verifies a login identity and creates a durable, user-bound session.
@@ -428,7 +467,14 @@ func (s *Service) LoginAs(login, password string) (Session, error) {
 		if verifyErr != nil {
 			return verifyErr
 		}
-		session.UserID, session.Login, session.Role = user.ID, user.Login, user.Role
+		store, storeErr := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if storeErr != nil {
+			return storeErr
+		}
+		session.UserID, session.Login = user.ID, user.Login
+		session.Roles = append([]string(nil), user.Roles...)
+		session.Permissions = permissionsForRoles(user.Roles, store.CustomRoles)
+		session.Role = primaryRole(user.Roles)
 		active, countErr := s.countAndCleanSessions(now)
 		if countErr != nil {
 			return countErr
@@ -472,7 +518,12 @@ func (s *Service) Authenticate(token string) (Session, error) {
 			_ = s.removeSession(token)
 			return ErrUnauthenticated
 		}
-		session = Session{ID: record.id, ExpiresAt: record.expiresAt, UserID: user.ID, Login: user.Login, Role: user.Role}
+		store, storeErr := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if storeErr != nil {
+			return storeErr
+		}
+		session = Session{ID: record.id, ExpiresAt: record.expiresAt, UserID: user.ID, Login: user.Login,
+			Roles: append([]string(nil), user.Roles...), Permissions: permissionsForRoles(user.Roles, store.CustomRoles), Role: primaryRole(user.Roles)}
 		return nil
 	})
 	if err != nil {

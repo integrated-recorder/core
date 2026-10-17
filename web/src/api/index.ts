@@ -1,10 +1,10 @@
 import { api, queryString } from './client'
-import type { AccountSession, AccountUser, Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, TimedEventPage, UserPreferences, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { AccountAuthorization, AccountRole, AccountSession, AccountUser, Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PermissionID, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, TimedEventPage, UserPreferences, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
-  bootstrap: (token: string, password: string) => api<ApiSession>('/api/auth/bootstrap', { method: 'POST', body: { token, password } }),
-  login: (password: string, login?: string) => api<ApiSession>('/api/auth/login', { method: 'POST', body: login ? { login, password } : { password } }),
+  bootstrap: (login: string, token: string, password: string) => api<ApiSession>('/api/auth/bootstrap', { method: 'POST', body: { login, token, password } }),
+  login: (login: string, password: string) => api<ApiSession>('/api/auth/login', { method: 'POST', body: { login, password } }),
   logout: () => api<void>('/api/auth/logout', { method: 'POST' }),
 }
 export const setupAPI = {
@@ -127,13 +127,21 @@ export const userPreferencesAPI = {
 }
 export const accountAPI = {
   self: () => api<AccountUser>('/api/user'),
+  authorization: () => api<AccountAuthorization>('/api/user/authorization'),
+  renameLogin: (body: { login: string; current_password: string }) => api<void>('/api/user', { method: 'PATCH', body }),
   changePassword: (body: { current_password: string; new_password: string }) => api<void>('/api/user/password', { method: 'POST', body }),
   sessions: () => api<{ items: AccountSession[] }>('/api/user/sessions'),
   revokeSession: (id: string) => api<void>(`/api/user/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   revokeOthers: () => api<{ revoked_count: number }>('/api/user/sessions/revoke-others', { method: 'POST', body: {} }),
   users: () => api<{ items: AccountUser[] }>('/api/users'),
-  createUser: (body: { login: string; password: string }) => api<AccountUser>('/api/users', { method: 'POST', body }),
+  createUser: (body: { login: string; password: string; roles: string[] }) => api<AccountUser>('/api/users', { method: 'POST', body }),
   setUserEnabled: (id: string, enabled: boolean) => api<AccountUser>(`/api/users/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST', body: {} }),
+  setUserRoles: (id: string, roles: string[]) => api<AccountUser>(`/api/users/${encodeURIComponent(id)}/roles`, { method: 'PATCH', body: { roles } }),
+  deleteUser: (id: string) => api<void>(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  roles: () => api<{ roles: AccountRole[]; permissions: PermissionID[] }>('/api/roles'),
+  createRole: (body: { name: string; permissions: PermissionID[] }) => api<AccountRole>('/api/roles', { method: 'POST', body }),
+  updateRole: (id: string, body: { name: string; permissions: PermissionID[] }) => api<AccountRole>(`/api/roles/${encodeURIComponent(id)}`, { method: 'PUT', body }),
+  deleteRole: (id: string) => api<void>(`/api/roles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 }
 export const runtimeUpdateAPI = {
   status: () => api<RuntimeUpdateStatus>('/api/runtime/update'),

@@ -313,7 +313,7 @@ func TestPrintSetupCodeOnlyReadsExistingOneTimeToken(t *testing.T) {
 	if output.String() != expected+"\n" {
 		t.Fatalf("setup-code output=%q, want exact credential plus newline", output.String())
 	}
-	if err := authService.Bootstrap(expected, "runtime-host-setup-code-password"); err != nil {
+	if err := authService.Bootstrap("owner", expected, "runtime-host-setup-code-password"); err != nil {
 		t.Fatal(err)
 	}
 	output.Reset()
@@ -336,7 +336,7 @@ func TestFirstRunSetupConsoleMessageIncludesOnlyUnclaimedLocalCode(t *testing.T)
 	if !strings.Contains(message, code) || !strings.Contains(message, "local Runtime Host console/container logs") {
 		t.Fatalf("first-run setup message lacks local code guidance: %q", message)
 	}
-	if err := authService.Bootstrap(code, "runtime-host-console-setup-password"); err != nil {
+	if err := authService.Bootstrap("owner", code, "runtime-host-console-setup-password"); err != nil {
 		t.Fatal(err)
 	}
 	message = firstRunSetupConsoleMessage(root)
@@ -411,7 +411,7 @@ func createClaimedAdminWithStaleToken(t *testing.T, root string, setupInProgress
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(code, "runtime-host-setup-code-password"); err != nil {
+	if err := service.Bootstrap("owner", code, "runtime-host-setup-code-password"); err != nil {
 		t.Fatal(err)
 	}
 	if setupInProgress {

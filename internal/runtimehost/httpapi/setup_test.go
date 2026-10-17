@@ -58,7 +58,7 @@ func setupFixture(t *testing.T) (http.Handler, *installation.Store, authFixture,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(strings.TrimSpace(string(token)), "runtime-setup-api-password"); err != nil {
+	if err := service.Bootstrap("owner", strings.TrimSpace(string(token)), "runtime-setup-api-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := service.Login("runtime-setup-api-password")

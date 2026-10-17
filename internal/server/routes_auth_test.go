@@ -17,6 +17,19 @@ import (
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
+func serverTestPrincipal(roleID string) authn.Principal {
+	for _, role := range authn.BuiltInRoles() {
+		if role.ID == roleID {
+			id := "usr-0123456789abcdef0123456789abcdef"
+			if roleID == authn.RoleOperator || roleID == authn.RoleViewer {
+				id = "usr-1123456789abcdef0123456789abcdef"
+			}
+			return authn.Principal{UserID: id, Login: roleID, Roles: []string{role.ID}, Permissions: role.Permissions, Role: role.ID}
+		}
+	}
+	panic("unknown server test role: " + roleID)
+}
+
 func TestLoginAcceptsOptionalIdentityAndPersistsBoundSession(t *testing.T) {
 	root := t.TempDir()
 	service, err := authn.Open(root)
@@ -28,7 +41,7 @@ func TestLoginAcceptsOptionalIdentityAndPersistsBoundSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(strings.TrimSpace(string(tokenBytes)), "owner-login-test-password"); err != nil {
+	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "owner-login-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	fixtureUser, err := service.CreateUser("fixture-user", "fixture-login-test-password", authn.RoleOwner)
@@ -94,7 +107,7 @@ func TestAuthenticatedUserPreferencesAreSessionScopedAndDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(strings.TrimSpace(string(tokenBytes)), "prefs-owner-password"); err != nil {
+	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "prefs-owner-password"); err != nil {
 		t.Fatal(err)
 	}
 	owner, err := service.FindByLogin("owner")
@@ -206,7 +219,7 @@ func TestLogoutRevokesSessionAndClearsCookies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(strings.TrimSpace(string(tokenBytes)), "logout-test-password"); err != nil {
+	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "logout-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := service.Login("logout-test-password")
@@ -237,18 +250,19 @@ func TestLogoutRevokesSessionAndClearsCookies(t *testing.T) {
 }
 
 func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
-	owner := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
-	member := authn.Principal{UserID: "usr-1123456789abcdef0123456789abcdef", Login: "member", Role: "member"}
+	roles := authn.BuiltInRoles()
+	owner := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Roles: []string{authn.RoleOwner}, Permissions: roles[0].Permissions, Role: authn.RoleOwner}
+	member := authn.Principal{UserID: "usr-1123456789abcdef0123456789abcdef", Login: "member", Roles: []string{authn.RoleOperator}, Permissions: roles[2].Permissions, Role: authn.RoleOperator}
 	for _, tc := range []struct {
 		method string
 		path   string
 		want   authn.Permission
 	}{
-		{http.MethodPost, "/api/watches", authn.PermissionSettingsManage},
-		{http.MethodPut, "/api/watches/watch-1", authn.PermissionSettingsManage},
-		{http.MethodPost, "/api/watches/watch-1/check", authn.PermissionRecordingControl},
+		{http.MethodPost, "/api/watches", authn.PermissionWatchManage},
+		{http.MethodPut, "/api/watches/watch-1", authn.PermissionWatchManage},
+		{http.MethodPost, "/api/watches/watch-1/check", authn.PermissionWatchCheck},
 		{http.MethodPost, "/api/retention/run", authn.PermissionRecordingDelete},
-		{http.MethodPost, "/api/recordings", authn.PermissionRecordingControl},
+		{http.MethodPost, "/api/recordings", authn.PermissionRecordingCreate},
 		{http.MethodDelete, "/api/recordings/0123456789abcdef0123456789abcdef", authn.PermissionRecordingDelete},
 		{http.MethodGet, "/api/user/preferences", authn.PermissionUserPreferences},
 		{http.MethodPut, "/api/user/preferences", authn.PermissionUserPreferences},
@@ -266,7 +280,7 @@ func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
 	if authn.HasPermission(owner, unknownKnownNamespace) {
 		t.Fatalf("unclassified namespace mutation was granted: %q", unknownKnownNamespace)
 	}
-	if got := permissionForRequest(httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)); got != authn.PermissionUserPreferences || !authn.HasPermission(member, got) {
+	if got := permissionForRequest(httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)); got != authn.PermissionAccountSessionsSelf || !authn.HasPermission(member, got) {
 		t.Fatalf("logout permission=%q; every user must be able to revoke their own session", got)
 	}
 	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodOptions} {
@@ -292,32 +306,32 @@ func TestPermissionForRequestExplicitlyProtectsMutations(t *testing.T) {
 	if got := permissionForRequest(httptest.NewRequest(http.MethodHead, "/api/audit", nil)); got != authn.PermissionAuditRead {
 		t.Fatalf("HEAD audit permission=%q, want audit.read", got)
 	}
-	if !authn.HasPermission(member, authn.PermissionUserPreferences) || authn.HasPermission(member, authn.PermissionSettingsManage) {
+	if !authn.HasPermission(member, authn.PermissionUserPreferences) || authn.HasPermission(member, authn.PermissionSystemSettings) {
 		t.Fatal("self preference permission should be available to an authenticated non-owner without granting system settings")
 	}
-	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters", nil)); got != authn.PermissionRecordingControl || !authn.HasPermission(member, got) {
+	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters", nil)); got != authn.PermissionRecordingCreate || !authn.HasPermission(member, got) {
 		t.Fatalf("source adapter catalog permission=%q; recording members need the read-only catalog to start captures", got)
 	}
 	for _, path := range []string{"/api/adapters/hls/schema", "/api/adapters/hls/resources", "/api/adapters/hls/resources/search"} {
-		if got := permissionForRequest(httptest.NewRequest(http.MethodGet, path, nil)); got != authn.PermissionRecordingControl || !authn.HasPermission(member, got) {
+		if got := permissionForRequest(httptest.NewRequest(http.MethodGet, path, nil)); got != authn.PermissionRecordingCreate || !authn.HasPermission(member, got) {
 			t.Errorf("recording source read %s permission=%q; recording members need source inputs to start captures", path, got)
 		}
 	}
-	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls", nil)); got != authn.PermissionRecordingControl || !authn.HasPermission(member, got) {
+	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls", nil)); got != authn.PermissionRecordingCreate || !authn.HasPermission(member, got) {
 		t.Fatalf("source detail read permission=%q; recording members need read-only source metadata", got)
 	}
-	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls/config", nil)); got != authn.PermissionPluginManage || authn.HasPermission(member, got) {
+	if got := permissionForRequest(httptest.NewRequest(http.MethodGet, "/api/adapters/hls/config", nil)); got != authn.PermissionPluginConfigure || authn.HasPermission(member, got) {
 		t.Fatalf("adapter configuration permission=%q; members must not read plugin configuration", got)
 	}
-	if got := permissionForRequest(httptest.NewRequest(http.MethodPut, "/api/adapters/hls/config", nil)); got != authn.PermissionPluginManage || authn.HasPermission(member, got) {
+	if got := permissionForRequest(httptest.NewRequest(http.MethodPut, "/api/adapters/hls/config", nil)); got != authn.PermissionPluginConfigure || authn.HasPermission(member, got) {
 		t.Fatalf("adapter configuration mutation permission=%q; members must not manage plugin configuration", got)
 	}
 }
 
 func TestWorkflowContinuationSeparatesInputFromPersistentConfiguration(t *testing.T) {
 	server := &Server{}
-	member := authn.Principal{UserID: "usr-1123456789abcdef0123456789abcdef", Login: "member", Role: authn.RoleMember}
-	owner := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	member := serverTestPrincipal(authn.RoleOperator)
+	owner := serverTestPrincipal(authn.RoleOwner)
 	for _, tc := range []struct {
 		name      string
 		principal authn.Principal
@@ -352,7 +366,7 @@ func TestAuthenticatedUnknownReadRoutesAreDenied(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(strings.TrimSpace(string(tokenBytes)), "unknown-route-test-password"); err != nil {
+	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "unknown-route-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := service.Login("unknown-route-test-password")
@@ -367,6 +381,13 @@ func TestAuthenticatedUnknownReadRoutesAreDenied(t *testing.T) {
 		handler.ServeHTTP(response, request)
 		if response.Code != http.StatusForbidden {
 			t.Errorf("authenticated unknown %s route status=%d body=%s", method, response.Code, response.Body.String())
+			continue
+		}
+		var payload struct {
+			ErrorCode string `json:"error_code"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || payload.ErrorCode != "permission_denied" {
+			t.Errorf("authenticated unknown %s route error=%q body=%s", method, payload.ErrorCode, response.Body.String())
 		}
 	}
 }
@@ -394,7 +415,7 @@ func TestHTTPAuditBindsIndependentUserSessionsAndLogoutIsPerSession(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(strings.TrimSpace(string(tokenBytes)), "owner-a-password-123"); err != nil {
+	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "owner-a-password-123"); err != nil {
 		t.Fatal(err)
 	}
 	userB, err := service.CreateUser("fixture-user-b", "user-b-password-123", authn.RoleOwner)
@@ -459,7 +480,7 @@ func TestHTTPLogoutDoesNotClaimSuccessWhenRevocationFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap(strings.TrimSpace(string(tokenBytes)), "logout-failure-test-password"); err != nil {
+	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "logout-failure-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := service.Login("logout-failure-test-password")

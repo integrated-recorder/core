@@ -328,7 +328,7 @@ func TestWorkflowAPIResourceChallengePersistenceAndEphemeralAnswers(t *testing.T
 	}
 	secret := "private-secret-value"
 	continueBody := `{"values":{"setting":"saved"},"secrets":{"credential":"` + secret + `"},"persist":true}`
-	member := authn.Principal{UserID: "usr-1123456789abcdef0123456789abcdef", Login: "member", Role: authn.RoleMember}
+	member := serverTestPrincipal(authn.RoleOperator)
 	memberRequest := httptest.NewRequest(http.MethodPost, "/api/resolve-workflows/"+workflowID+"/continue", strings.NewReader(continueBody))
 	memberRequest = memberRequest.WithContext(authn.WithPrincipal(memberRequest.Context(), member))
 	memberContinuation := httptest.NewRecorder()
@@ -336,7 +336,7 @@ func TestWorkflowAPIResourceChallengePersistenceAndEphemeralAnswers(t *testing.T
 	if memberContinuation.Code != http.StatusForbidden || !strings.Contains(memberContinuation.Body.String(), "workflow_persistence_requires_plugin_manage") {
 		t.Fatalf("member persistent continuation=%d %s", memberContinuation.Code, memberContinuation.Body.String())
 	}
-	owner := authn.Principal{UserID: "usr-0123456789abcdef0123456789abcdef", Login: "owner", Role: authn.RoleOwner}
+	owner := serverTestPrincipal(authn.RoleOwner)
 	continued := httptest.NewRecorder()
 	ownerRequest := httptest.NewRequest(http.MethodPost, "/api/resolve-workflows/"+workflowID+"/continue", strings.NewReader(continueBody))
 	ownerRequest = ownerRequest.WithContext(authn.WithPrincipal(ownerRequest.Context(), owner))

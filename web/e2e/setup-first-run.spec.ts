@@ -4,6 +4,8 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const setupCode = process.env.IR_SETUP_E2E_CODE
+const selectedOwnerLogin = 'rc8-owner-test'
+const initialPassword = 'first-run-product-e2e-password-2026'
 const dataDir = process.env.IR_SETUP_E2E_DATA_DIR
 const restartFile = process.env.IR_SETUP_E2E_RESTART_FILE
 
@@ -67,6 +69,7 @@ test('fresh installation completes through product APIs and remains ready after 
   let requestURLLeak = false
   let disallowedRequestBodyLeak = false
   let bootstrapBodyContainsCode = false
+  let bootstrapLogin = ''
   let responseBodyLeak = false
   const responseChecks: Promise<void>[] = []
   page.on('request', request => {
@@ -75,6 +78,7 @@ test('fresh installation completes through product APIs and remains ready after 
     const body = request.postData() ?? ''
     if (request.method() === 'POST' && new URL(url).pathname === '/api/auth/bootstrap') {
       bootstrapBodyContainsCode ||= body.includes(setupCode!)
+      bootstrapLogin = String(request.postDataJSON()?.login ?? '')
     } else if (body.includes(setupCode!)) {
       disallowedRequestBodyLeak = true
     }
@@ -104,10 +108,15 @@ test('fresh installation completes through product APIs and remains ready after 
   await expect(page.getByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeVisible()
 
   await page.getByRole('button', { name: '시작하기' }).click()
+  const setupUsername = page.getByLabel('계정')
+  await expect(setupUsername).toHaveAttribute('name', 'username')
+  await expect(setupUsername).toHaveAttribute('autocomplete', 'username')
+  await expect(setupUsername).not.toHaveAttribute('readonly')
+  await setupUsername.fill(selectedOwnerLogin)
   await page.getByLabel('설치 코드').fill(setupCode)
   expect((await page.locator('body').innerText()).includes(setupCode!)).toBe(false)
-  await page.getByLabel('관리자 비밀번호').fill('first-run-product-e2e-password-2026')
-  await page.getByLabel('비밀번호 확인').fill('first-run-product-e2e-password-2026')
+  await page.getByLabel('관리자 비밀번호').fill(initialPassword)
+  await page.getByLabel('비밀번호 확인').fill(initialPassword)
   await page.getByRole('button', { name: '관리자 계정 만들기' }).click()
 
   await expect(page.getByRole('heading', { name: '저장소 확인' })).toBeVisible()
@@ -151,6 +160,10 @@ test('fresh installation completes through product APIs and remains ready after 
   await page.getByRole('button', { name: 'Recorder 열기' }).click()
   await expect(page).toHaveURL('http://127.0.0.1:4173/')
   await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
+  const initialOwner = await page.request.get('/api/user').then(response => response.json()) as { user_id: string; login: string; roles: string[] }
+  expect(initialOwner.login).toBe(selectedOwnerLogin)
+  expect(initialOwner.roles).toContain('owner')
+  expect(bootstrapLogin).toBe(selectedOwnerLogin)
 
   const dashboardResponse = await page.request.get('/api/dashboard')
   expect(dashboardResponse.ok()).toBeTruthy()
@@ -182,11 +195,121 @@ test('fresh installation completes through product APIs and remains ready after 
   const postRestartDashboard = await page.request.get('/api/dashboard')
   expect(postRestartDashboard.ok()).toBeTruthy()
 
+  // The setup-selected identity is the browser credential pair after the
+  // installation is complete; login must not rely on the old literal owner.
+  const initialSession = await page.request.get('/api/auth/session').then(response => response.json()) as { csrf_token: string }
+  const logout = await page.request.post('/api/auth/logout', { headers: { 'X-CSRF-Token': initialSession.csrf_token }, data: {} })
+  expect(logout.status()).toBe(204)
+  await page.goto('/login')
+  await page.getByLabel('계정 이름').fill(selectedOwnerLogin)
+  await page.getByLabel('비밀번호').fill(initialPassword)
+  await page.getByRole('button', { name: '로그인' }).click()
+  await expect(page).toHaveURL('/')
+  expect((await page.request.get('/api/user').then(response => response.json())).login).toBe(selectedOwnerLogin)
+  const blankLogin = await page.request.post('/api/auth/login', { data: { login: '', password: initialPassword } })
+  expect(blankLogin.status()).toBe(401)
+
+  // Exercise self-service login rename and its session invalidation through
+  // the native account form. The old login is rejected after the redirect.
+  await page.goto('/account/security')
+  await page.getByLabel('새 로그인 이름').fill('rc8-owner-renamed')
+  await page.getByLabel('현재 비밀번호').first().fill(initialPassword)
+  await page.getByRole('button', { name: '로그인 이름 변경' }).click()
+  await expect(page).toHaveURL('/login')
+  expect((await page.request.post('/api/auth/login', { data: { login: selectedOwnerLogin, password: initialPassword } })).status()).toBe(401)
+  await page.getByLabel('계정 이름').fill('rc8-owner-renamed')
+  await page.getByLabel('비밀번호').fill(initialPassword)
+  await page.getByRole('button', { name: '로그인' }).click()
+  await expect(page).toHaveURL('/')
+  const renamedOwner = await page.request.get('/api/user').then(response => response.json()) as { user_id: string; login: string }
+  expect(renamedOwner).toMatchObject({ user_id: initialOwner.user_id, login: 'rc8-owner-renamed' })
+
+  // A second account is created through the real account-management form.
+  await page.goto('/system/users')
+  await page.getByLabel('로그인 이름').fill('rc8-operator-test')
+  await page.getByLabel('초기 비밀번호').fill('rc8-operator-password-2026')
+  await page.getByLabel('비밀번호 확인').last().fill('rc8-operator-password-2026')
+  await page.getByRole('button', { name: '사용자 생성' }).click()
+  await expect(page.getByText(/rc8-operator-test/)).toBeVisible()
+  const operator = await page.request.get('/api/users').then(response => response.json()) as { items: { user_id: string; login: string; roles: string[] }[] }
+  const operatorUser = operator.items.find(user => user.login === 'rc8-operator-test')!
+  expect(operatorUser.roles).toContain('operator')
+  const ownerSession = await page.request.get('/api/auth/session').then(response => response.json()) as { csrf_token: string }
+  const ownerUserID = renamedOwner.user_id
+  const ownerCannotDemoteSelf = await page.request.patch(`/api/users/${ownerUserID}/roles`, {
+    headers: { 'X-CSRF-Token': ownerSession.csrf_token }, data: { roles: ['operator'] },
+  })
+  expect(ownerCannotDemoteSelf.status()).toBe(409)
+
+  const operatorContext = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale: 'ko-KR' })
+  const operatorPage = await operatorContext.newPage()
+  await operatorPage.goto('/login')
+  await operatorPage.getByLabel('계정 이름').fill('rc8-operator-test')
+  await operatorPage.getByLabel('비밀번호').fill('rc8-operator-password-2026')
+  await operatorPage.getByRole('button', { name: '로그인' }).click()
+  await expect(operatorPage).toHaveURL('/')
+  expect((await operatorPage.request.get('/api/dashboard')).status()).toBe(200)
+  expect((await operatorPage.request.get('/api/users')).status()).toBe(403)
+  const operatorSession = await operatorPage.request.get('/api/auth/session').then(response => response.json()) as { csrf_token: string }
+  const recordingAdmission = await operatorPage.request.post('/api/recordings', { headers: { 'X-CSRF-Token': operatorSession.csrf_token }, data: {} })
+  expect(recordingAdmission.status()).toBe(400)
+
+  // Custom permissions are resolved from durable role state on each request.
+  const createdRoleResponse = await page.request.post('/api/roles', {
+    headers: { 'X-CSRF-Token': ownerSession.csrf_token },
+    data: { name: 'Diagnostics reader', permissions: ['system.diagnostics.read'] },
+  })
+  expect(createdRoleResponse.status()).toBe(201)
+  const customRole = await createdRoleResponse.json() as { id: string }
+  const roleAssignResponse = await page.request.patch(`/api/users/${operatorUser.user_id}/roles`, {
+    headers: { 'X-CSRF-Token': ownerSession.csrf_token },
+    data: { roles: ['viewer', customRole.id] },
+  })
+  expect(roleAssignResponse.ok()).toBeTruthy()
+  await operatorContext.close()
+  const assignedOperatorContext = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale: 'ko-KR' })
+  const assignedOperatorPage = await assignedOperatorContext.newPage()
+  await assignedOperatorPage.goto('/login')
+  await assignedOperatorPage.getByLabel('계정 이름').fill('rc8-operator-test')
+  await assignedOperatorPage.getByLabel('비밀번호').fill('rc8-operator-password-2026')
+  await assignedOperatorPage.getByRole('button', { name: '로그인' }).click()
+  await expect(assignedOperatorPage).toHaveURL('/')
+  const beforeRoleEdit = await assignedOperatorPage.request.get('/api/user/authorization').then(response => response.json()) as { roles: string[]; permissions: string[] }
+  expect(beforeRoleEdit.roles).toEqual(expect.arrayContaining(['viewer', customRole.id]))
+  expect(beforeRoleEdit.permissions).toContain('system.diagnostics.read')
+  expect((await assignedOperatorPage.request.get('/api/logs?limit=1')).status()).toBe(200)
+  const updateRoleResponse = await page.request.put(`/api/roles/${customRole.id}`, {
+    headers: { 'X-CSRF-Token': ownerSession.csrf_token },
+    data: { name: 'Diagnostics reader', permissions: ['storage.read'] },
+  })
+  expect(updateRoleResponse.ok()).toBeTruthy()
+  const afterRoleEdit = await assignedOperatorPage.request.get('/api/user/authorization').then(response => response.json()) as { roles: string[]; permissions: string[] }
+  expect(afterRoleEdit.roles).toEqual(expect.arrayContaining(['viewer', customRole.id]))
+  expect(afterRoleEdit.permissions).not.toContain('system.diagnostics.read')
+  expect(afterRoleEdit.permissions).toContain('storage.read')
+  expect((await assignedOperatorPage.request.get('/api/logs?limit=1')).status()).toBe(403)
+  expect((await assignedOperatorPage.request.get('/api/system/storage')).status()).toBe(200)
+  await assignedOperatorContext.close()
+
+  const changedPassword = 'first-run-product-e2e-password-changed-2026'
+  await page.goto('/account/security')
+  await page.getByLabel('현재 비밀번호').last().fill(initialPassword)
+  await page.getByLabel('새 비밀번호', { exact: true }).fill(changedPassword)
+  await page.getByLabel('새 비밀번호 확인').fill(changedPassword)
+  await page.getByRole('button', { name: '비밀번호 변경' }).last().click()
+  await expect(page).toHaveURL('/login')
+  expect((await page.request.post('/api/auth/login', { data: { login: 'rc8-owner-renamed', password: initialPassword } })).status()).toBe(401)
+  await page.getByLabel('계정 이름').fill('rc8-owner-renamed')
+  await page.getByLabel('비밀번호').fill(changedPassword)
+  await page.getByRole('button', { name: '로그인' }).click()
+  await expect(page).toHaveURL('/')
+
   expect((await page.locator('body').innerText()).includes(setupCode!)).toBe(false)
   await Promise.all(responseChecks)
   expect(requestURLLeak).toBe(false)
   expect(disallowedRequestBodyLeak).toBe(false)
   expect(bootstrapBodyContainsCode).toBe(true)
+  expect(bootstrapLogin).toBe(selectedOwnerLogin)
   expect(responseBodyLeak).toBe(false)
   await context.close()
 })

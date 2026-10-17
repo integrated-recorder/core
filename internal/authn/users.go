@@ -21,7 +21,19 @@ var loginRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 func (s *Service) loadOrMigrateUsers(allowToken bool) error {
 	path := filepath.Join(s.securityDir, usersFilename)
-	if _, err := readUserStore(path); err == nil {
+	if store, err := readUserStore(path); err == nil {
+		if store.migratedFromV1 {
+			return s.withAuthLock(func() error {
+				current, readErr := readUserStore(path)
+				if readErr != nil {
+					return readErr
+				}
+				if current.migratedFromV1 {
+					return s.persistAuthState(current)
+				}
+				return nil
+			})
+		}
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -49,11 +61,11 @@ func (s *Service) migrateLegacyAdmin() error {
 	if err != nil {
 		return err
 	}
-	owner, err := newUserRecord("owner", RoleOwner, string(hash), s.now())
+	owner, err := newUserRecord("owner", []string{RoleOwner}, string(hash), s.now())
 	if err != nil {
 		return err
 	}
-	data, err := encodeUserStore([]userRecord{owner})
+	data, err := encodeUserStore(persistedUserStore{Version: userStoreVersion, Users: []userRecord{owner}})
 	if err != nil {
 		return err
 	}
@@ -162,7 +174,11 @@ func (s *Service) ListUsers() ([]User, error) {
 
 // CreateUser creates one account with the requested existing role.
 func (s *Service) CreateUser(login, password, role string) (User, error) {
-	if !loginRE.MatchString(login) || !validPasswordLength(password) || (role != RoleOwner && role != RoleMember) {
+	return s.CreateUserWithRoles(login, password, []string{role})
+}
+
+func (s *Service) CreateUserWithRoles(login, password string, roles []string) (User, error) {
+	if !loginRE.MatchString(login) || !validPasswordLength(password) {
 		return User{}, ErrInvalidCredentials
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), s.bcryptCost)
@@ -181,14 +197,390 @@ func (s *Service) CreateUser(login, password, role string) (User, error) {
 				return ErrDuplicateLogin
 			}
 		}
-		created, err = newUserRecord(login, role, string(hash), s.now())
+		if err := validateRoleAssignments(roles, store.CustomRoles); err != nil {
+			return err
+		}
+		created, err = newUserRecord(login, roles, string(hash), s.now())
 		if err != nil {
 			return err
 		}
 		store.Users = append(store.Users, created)
-		return s.persistUserStore(store.Users)
+		return s.persistAuthState(store)
 	})
 	return created.User, err
+}
+
+func (s *Service) CreateUserWithRolesAs(actorID, login, password string, roles []string) (User, error) {
+	var created User
+	err := s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		actor, err := userByID(store.Users, actorID)
+		if err != nil || actor.Status != UserStatusActive {
+			return ErrUnauthenticated
+		}
+		if err := validateRoleAssignments(roles, store.CustomRoles); err != nil {
+			return err
+		}
+		if hasRole(roles, RoleOwner) && !hasRole(actor.Roles, RoleOwner) {
+			return ErrOwnerAssignment
+		}
+		for _, existing := range store.Users {
+			if strings.EqualFold(existing.Login, login) {
+				return ErrDuplicateLogin
+			}
+		}
+		if !loginRE.MatchString(login) || !validPasswordLength(password) {
+			return ErrInvalidCredentials
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(password), s.bcryptCost)
+		if err != nil {
+			return fmt.Errorf("%w: hash user password", ErrStorage)
+		}
+		record, err := newUserRecord(login, roles, string(hash), s.now())
+		if err != nil {
+			return err
+		}
+		store.Users = append(store.Users, record)
+		if err := s.persistAuthState(store); err != nil {
+			return err
+		}
+		created = record.User
+		return nil
+	})
+	return created, err
+}
+
+// RenameLogin validates the current password, preserves the stable user ID,
+// writes the new login atomically, and advances the credential epoch.
+func (s *Service) RenameLogin(userID, currentPassword, login string) (User, error) {
+	if !loginRE.MatchString(login) {
+		return User{}, ErrInvalidLogin
+	}
+	var result User
+	err := s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		index := userIndexByID(store.Users, userID)
+		if index < 0 || store.Users[index].Status != UserStatusActive || !validPasswordLength(currentPassword) || bcrypt.CompareHashAndPassword([]byte(store.Users[index].PasswordHash), []byte(currentPassword)) != nil {
+			return ErrCurrentPassword
+		}
+		for i, existing := range store.Users {
+			if i != index && strings.EqualFold(existing.Login, login) {
+				return ErrDuplicateLogin
+			}
+		}
+		if store.Users[index].Login == login {
+			result = store.Users[index].User
+			return nil
+		}
+		if store.Users[index].CredentialEpoch == ^uint64(0) {
+			return ErrStorage
+		}
+		store.Users[index].Login = login
+		store.Users[index].CredentialEpoch++
+		if err := s.persistAuthState(store); err != nil {
+			return err
+		}
+		_ = s.revokeUserSessionsLocked(userID)
+		result = store.Users[index].User
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) AuthorizationFor(userID string) (Authorization, error) {
+	var result Authorization
+	err := s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		user, err := userByID(store.Users, userID)
+		if err != nil || user.Status != UserStatusActive {
+			return ErrUserNotFound
+		}
+		result = Authorization{UserID: user.ID, Login: user.Login, Roles: append([]string(nil), user.Roles...), Permissions: permissionsForRoles(user.Roles, store.CustomRoles)}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) ListRoles() ([]Role, []Permission, error) {
+	var roles []Role
+	err := s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		roles = BuiltInRoles()
+		roles = append(roles, store.CustomRoles...)
+		sort.Slice(roles, func(i, j int) bool { return roles[i].ID < roles[j].ID })
+		return nil
+	})
+	return roles, PermissionCatalog(), err
+}
+
+func (s *Service) CreateCustomRole(name string, permissions []Permission) (Role, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 64 {
+		return Role{}, ErrInvalidRole
+	}
+	permissions, err := validateRolePermissions(permissions)
+	if err != nil {
+		return Role{}, err
+	}
+	var result Role
+	err = s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		for _, existing := range store.CustomRoles {
+			if strings.EqualFold(existing.Name, name) {
+				return ErrInvalidRole
+			}
+		}
+		id, err := randomRoleID()
+		if err != nil {
+			return err
+		}
+		created := s.now().UTC()
+		result = Role{ID: id, Name: name, Permissions: permissions, CreatedAt: &created}
+		store.CustomRoles = append(store.CustomRoles, result)
+		return s.persistAuthState(store)
+	})
+	return result, err
+}
+
+func (s *Service) UpdateCustomRole(id, name string, permissions []Permission) (Role, error) {
+	name = strings.TrimSpace(name)
+	if !validRoleID(id) || name == "" || len(name) > 64 {
+		return Role{}, ErrInvalidRole
+	}
+	if _, builtin := builtinRole(id); builtin {
+		return Role{}, ErrBuiltinRole
+	}
+	permissions, err := validateRolePermissions(permissions)
+	if err != nil {
+		return Role{}, err
+	}
+	var result Role
+	err = s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		for index := range store.CustomRoles {
+			if strings.EqualFold(store.CustomRoles[index].Name, name) && store.CustomRoles[index].ID != id {
+				return ErrInvalidRole
+			}
+			if store.CustomRoles[index].ID == id {
+				createdAt := store.CustomRoles[index].CreatedAt
+				result = Role{ID: id, Name: name, Permissions: permissions, CreatedAt: createdAt}
+				store.CustomRoles[index] = result
+				if err := s.persistAuthState(store); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
+		return ErrRoleNotFound
+	})
+	return result, err
+}
+
+func (s *Service) DeleteCustomRole(id string) error {
+	if _, builtin := builtinRole(id); builtin {
+		return ErrBuiltinRole
+	}
+	return s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		roleIndex := -1
+		for i, role := range store.CustomRoles {
+			if role.ID == id {
+				roleIndex = i
+				break
+			}
+		}
+		if roleIndex < 0 {
+			return ErrRoleNotFound
+		}
+		for _, user := range store.Users {
+			if hasRole(user.Roles, id) {
+				return ErrRoleInUse
+			}
+		}
+		store.CustomRoles = append(store.CustomRoles[:roleIndex], store.CustomRoles[roleIndex+1:]...)
+		return s.persistAuthState(store)
+	})
+}
+
+// SetUserRoles uses the same cross-process auth-store lock as owner-count
+// checks and persistence so two concurrent mutations cannot remove the final
+// active Owner.
+func (s *Service) SetUserRoles(actorID, targetID string, roles []string) (User, error) {
+	var result User
+	err := s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		actor, err := userByID(store.Users, actorID)
+		if err != nil || actor.Status != UserStatusActive {
+			return ErrUnauthenticated
+		}
+		index := userIndexByID(store.Users, targetID)
+		if index < 0 {
+			return ErrUserNotFound
+		}
+		if err := validateRoleAssignments(roles, store.CustomRoles); err != nil {
+			return err
+		}
+		current := &store.Users[index]
+		rootChange := hasRole(current.Roles, RoleOwner) || hasRole(roles, RoleOwner)
+		if rootChange && !hasRole(actor.Roles, RoleOwner) {
+			return ErrOwnerAssignment
+		}
+		if sameStrings(current.Roles, roles) {
+			result = current.User
+			return nil
+		}
+		if hasRole(current.Roles, RoleOwner) && !hasRole(roles, RoleOwner) && current.Status == UserStatusActive && activeOwnerCount(store.Users) <= 1 {
+			return ErrLastOwner
+		}
+		if current.CredentialEpoch == ^uint64(0) {
+			return ErrStorage
+		}
+		current.Roles = append([]string(nil), roles...)
+		current.Role = primaryRole(roles)
+		current.CredentialEpoch++
+		if err := s.persistAuthState(store); err != nil {
+			return err
+		}
+		_ = s.revokeUserSessionsLocked(targetID)
+		result = current.User
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) SetUserEnabledAs(actorID, targetID string, enabled bool) (User, error) {
+	var result User
+	err := s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		actor, err := userByID(store.Users, actorID)
+		if err != nil || actor.Status != UserStatusActive {
+			return ErrUnauthenticated
+		}
+		index := userIndexByID(store.Users, targetID)
+		if index < 0 {
+			return ErrUserNotFound
+		}
+		target := &store.Users[index]
+		if hasRole(target.Roles, RoleOwner) && !hasRole(actor.Roles, RoleOwner) {
+			return ErrOwnerAssignment
+		}
+		if !enabled && target.Status == UserStatusActive && hasRole(target.Roles, RoleOwner) && activeOwnerCount(store.Users) <= 1 {
+			return ErrLastOwner
+		}
+		want := UserStatusDisabled
+		if enabled {
+			want = UserStatusActive
+		}
+		if target.Status == want {
+			result = target.User
+			return nil
+		}
+		if target.CredentialEpoch == ^uint64(0) {
+			return ErrStorage
+		}
+		target.Status = want
+		target.CredentialEpoch++
+		if err := s.persistAuthState(store); err != nil {
+			return err
+		}
+		_ = s.revokeUserSessionsLocked(targetID)
+		result = target.User
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) DeleteUser(actorID, targetID string) (User, error) {
+	var deleted User
+	err := s.withAuthLock(func() error {
+		store, err := readUserStore(filepath.Join(s.securityDir, usersFilename))
+		if err != nil {
+			return err
+		}
+		actor, err := userByID(store.Users, actorID)
+		if err != nil || actor.Status != UserStatusActive {
+			return ErrUnauthenticated
+		}
+		index := userIndexByID(store.Users, targetID)
+		if index < 0 {
+			return ErrUserNotFound
+		}
+		target := store.Users[index]
+		if hasRole(target.Roles, RoleOwner) && !hasRole(actor.Roles, RoleOwner) {
+			return ErrOwnerAssignment
+		}
+		if target.Status == UserStatusActive && hasRole(target.Roles, RoleOwner) && activeOwnerCount(store.Users) <= 1 {
+			return ErrLastOwner
+		}
+		deleted = target.User
+		store.Users = append(store.Users[:index], store.Users[index+1:]...)
+		if len(store.Users) == 0 {
+			return ErrLastOwner
+		}
+		if err := s.persistAuthState(store); err != nil {
+			return err
+		}
+		_ = s.revokeUserSessionsLocked(targetID)
+		return nil
+	})
+	return deleted, err
+}
+
+func userByID(users []userRecord, id string) (userRecord, error) {
+	index := userIndexByID(users, id)
+	if index < 0 {
+		return userRecord{}, ErrUserNotFound
+	}
+	return users[index], nil
+}
+
+func activeOwnerCount(users []userRecord) int {
+	count := 0
+	for _, user := range users {
+		if user.Status == UserStatusActive && hasRole(user.Roles, RoleOwner) {
+			count++
+		}
+	}
+	return count
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) VerifyCredentials(login, password string) (User, error) {
@@ -288,7 +680,7 @@ func (s *Service) updatePasswordLocked(store persistedUserStore, index int, pass
 	}
 	store.Users[index].PasswordHash = string(hash)
 	store.Users[index].CredentialEpoch++
-	if err := s.persistUserStore(store.Users); err != nil {
+	if err := s.persistAuthState(store); err != nil {
 		return err
 	}
 	// Epoch mismatch is the security boundary. Removing persisted records is a
@@ -320,10 +712,10 @@ func (s *Service) SetUserEnabled(userID string, enabled bool) (User, error) {
 			result = current.User
 			return nil
 		}
-		if !enabled && current.Role == RoleOwner {
+		if !enabled && hasRole(current.Roles, RoleOwner) {
 			activeOwners := 0
 			for _, candidate := range store.Users {
-				if candidate.Role == RoleOwner && candidate.Status == UserStatusActive {
+				if hasRole(candidate.Roles, RoleOwner) && candidate.Status == UserStatusActive {
 					activeOwners++
 				}
 			}
@@ -336,7 +728,7 @@ func (s *Service) SetUserEnabled(userID string, enabled bool) (User, error) {
 		}
 		current.Status = want
 		current.CredentialEpoch++
-		if err := s.persistUserStore(store.Users); err != nil {
+		if err := s.persistAuthState(store); err != nil {
 			return err
 		}
 		_ = s.revokeUserSessionsLocked(current.ID)
@@ -552,8 +944,10 @@ func findUserRecordByID(path, id string) (userRecord, error) {
 	return store.Users[index], nil
 }
 
-func (s *Service) persistUserStore(users []userRecord) error {
-	data, err := encodeUserStore(users)
+func (s *Service) persistAuthState(store persistedUserStore) error {
+	store.Version = userStoreVersion
+	store.migratedFromV1 = false
+	data, err := encodeUserStore(store)
 	if err != nil {
 		return err
 	}
@@ -570,7 +964,7 @@ func (s *Service) persistUserStore(users []userRecord) error {
 	return nil
 }
 
-func newUserRecord(login, role, passwordHash string, createdAt time.Time) (userRecord, error) {
+func newUserRecord(login string, roles []string, passwordHash string, createdAt time.Time) (userRecord, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return userRecord{}, fmt.Errorf("%w: generate user identity", ErrStorage)
@@ -578,14 +972,26 @@ func newUserRecord(login, role, passwordHash string, createdAt time.Time) (userR
 	return userRecord{User: User{
 		ID:        "usr-" + hex.EncodeToString(raw[:]),
 		Login:     login,
-		Role:      role,
+		Roles:     append([]string(nil), roles...),
+		Role:      primaryRole(roles),
 		Status:    UserStatusActive,
 		CreatedAt: createdAt.UTC(),
 	}, PasswordHash: passwordHash, CredentialEpoch: 1}, nil
 }
 
-func encodeUserStore(users []userRecord) ([]byte, error) {
-	data, err := json.Marshal(persistedUserStore{Version: userStoreVersion, Users: users})
+func encodeUserStore(input any) ([]byte, error) {
+	var store persistedUserStore
+	switch value := input.(type) {
+	case persistedUserStore:
+		store = value
+	case []userRecord: // legacy in-package test fixtures
+		store = persistedUserStore{Version: userStoreVersion, Users: value}
+	default:
+		return nil, fmt.Errorf("%w: encode user store", ErrStorage)
+	}
+	store.Version = userStoreVersion
+	store.migratedFromV1 = false
+	data, err := json.Marshal(store)
 	if err != nil || len(data) > maxUserStoreBytes {
 		return nil, fmt.Errorf("%w: encode user store", ErrStorage)
 	}
@@ -619,20 +1025,50 @@ func readUserStore(path string) (persistedUserStore, error) {
 	if err != nil || len(data) == 0 || len(data) > maxUserStoreBytes {
 		return persistedUserStore{}, ErrCorruptStore
 	}
-	decoder := json.NewDecoder(strings.NewReader(string(data)))
-	decoder.DisallowUnknownFields()
-	var store persistedUserStore
-	if decoder.Decode(&store) != nil || store.Version != userStoreVersion || len(store.Users) == 0 {
+	var version struct {
+		Version int `json:"version"`
+	}
+	if json.Unmarshal(data, &version) != nil {
 		return persistedUserStore{}, ErrCorruptStore
 	}
-	var extra any
-	if !errors.Is(decoder.Decode(&extra), io.EOF) {
+	var store persistedUserStore
+	if version.Version == 1 {
+		var legacy legacyPersistedUserStore
+		legacyDecoder := json.NewDecoder(strings.NewReader(string(data)))
+		legacyDecoder.DisallowUnknownFields()
+		if legacyDecoder.Decode(&legacy) != nil || legacy.Version != 1 || len(legacy.Users) == 0 {
+			return persistedUserStore{}, ErrCorruptStore
+		}
+		store = persistedUserStore{Version: userStoreVersion, migratedFromV1: true}
+		for _, old := range legacy.Users {
+			role := RoleOperator
+			if old.Role == RoleOwner {
+				role = RoleOwner
+			} else if old.Role != "member" {
+				return persistedUserStore{}, ErrCorruptStore
+			}
+			store.Users = append(store.Users, userRecord{User: User{ID: old.ID, Login: old.Login, Roles: []string{role}, Role: role, Status: old.Status, CreatedAt: old.CreatedAt}, PasswordHash: old.PasswordHash, CredentialEpoch: old.CredentialEpoch})
+		}
+	} else if version.Version == userStoreVersion {
+		decoder := json.NewDecoder(strings.NewReader(string(data)))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&store) != nil || store.Version != userStoreVersion || len(store.Users) == 0 {
+			return persistedUserStore{}, ErrCorruptStore
+		}
+		var extra any
+		if !errors.Is(decoder.Decode(&extra), io.EOF) {
+			return persistedUserStore{}, ErrCorruptStore
+		}
+	} else {
 		return persistedUserStore{}, ErrCorruptStore
+	}
+	for i := range store.Users {
+		store.Users[i].Role = primaryRole(store.Users[i].Roles)
 	}
 	ids := make(map[string]struct{}, len(store.Users))
 	logins := make(map[string]struct{}, len(store.Users))
 	for _, record := range store.Users {
-		if !validUserID(record.ID) || !loginRE.MatchString(record.Login) || (record.Role != RoleOwner && record.Role != RoleMember) || (record.Status != UserStatusActive && record.Status != UserStatusDisabled) || record.CreatedAt.IsZero() {
+		if !validUserID(record.ID) || !loginRE.MatchString(record.Login) || !allRoleIDsKnown(record.Roles, store.CustomRoles) || (record.Status != UserStatusActive && record.Status != UserStatusDisabled) || record.CreatedAt.IsZero() {
 			return persistedUserStore{}, ErrCorruptStore
 		}
 		if _, err := bcrypt.Cost([]byte(record.PasswordHash)); err != nil {
@@ -647,7 +1083,43 @@ func readUserStore(path string) (persistedUserStore, error) {
 		}
 		ids[idKey], logins[loginKey] = struct{}{}, struct{}{}
 	}
+	if activeOwnerCount(store.Users) == 0 {
+		return persistedUserStore{}, ErrCorruptStore
+	}
+	customIDs := make(map[string]struct{}, len(store.CustomRoles))
+	customNames := make(map[string]struct{}, len(store.CustomRoles))
+	for _, role := range store.CustomRoles {
+		if !validRoleID(role.ID) || role.BuiltIn || strings.TrimSpace(role.Name) == "" || len(role.Name) > 64 {
+			return persistedUserStore{}, ErrCorruptStore
+		}
+		if _, builtin := builtinRole(role.ID); builtin {
+			return persistedUserStore{}, ErrCorruptStore
+		}
+		if _, err := validateRolePermissions(role.Permissions); err != nil {
+			return persistedUserStore{}, ErrCorruptStore
+		}
+		nameKey := strings.ToLower(strings.TrimSpace(role.Name))
+		if _, duplicate := customIDs[role.ID]; duplicate {
+			return persistedUserStore{}, ErrCorruptStore
+		}
+		if _, duplicate := customNames[nameKey]; duplicate {
+			return persistedUserStore{}, ErrCorruptStore
+		}
+		customIDs[role.ID], customNames[nameKey] = struct{}{}, struct{}{}
+	}
 	return store, nil
+}
+
+func primaryRole(roles []string) string {
+	if len(roles) == 0 {
+		return ""
+	}
+	for _, role := range roles {
+		if role == RoleOwner {
+			return RoleOwner
+		}
+	}
+	return roles[0]
 }
 
 func validUserID(id string) bool {

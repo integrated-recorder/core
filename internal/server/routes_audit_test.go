@@ -141,7 +141,7 @@ func TestAuditMutationUsesAuthenticatedPrincipalAndDegradesOnAppendFailure(t *te
 	}
 	logs := applog.NewStore()
 	s := &Server{products: products, logs: logs}
-	principal := authn.Principal{UserID: "usr-00000000000000000000000000000001", Login: "owner", Role: authn.RoleOwner}
+	principal := serverTestPrincipal(authn.RoleOwner)
 	r := httptest.NewRequest(http.MethodPost, "/api/watches", nil).WithContext(authn.WithPrincipal(context.Background(), principal))
 	if err := s.appendAuditForRequest(r, "watch_created", "watch-stage4-a"); err != nil {
 		t.Fatal(err)

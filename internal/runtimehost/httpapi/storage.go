@@ -286,7 +286,11 @@ func routeStorageInstanceOperation(method, path string) (storageInstanceOperatio
 func (h *handler) serveStorageInstanceOperation(w http.ResponseWriter, r *http.Request, operation storageInstanceOperation, id string) {
 	setResponseHeaders(w)
 	mutation := operation != storageInstanceList && operation != storageInstanceConfigRead
-	r, authorized := h.authorize(w, r, authn.PermissionStorageManage, mutation)
+	permission := authn.PermissionStorageRead
+	if mutation {
+		permission = authn.PermissionStorageManage
+	}
+	r, authorized := h.authorize(w, r, permission, mutation)
 	if !authorized {
 		return
 	}
@@ -384,7 +388,11 @@ func (h *handler) serveStorageInstanceOperation(w http.ResponseWriter, r *http.R
 func (h *handler) serveStorageOperation(w http.ResponseWriter, r *http.Request, operation storageOperation, id string) {
 	setResponseHeaders(w)
 	mutation := operation == storageConfigWrite || operation == storageProbe || operation == storageActivate
-	r, authorized := h.authorize(w, r, authn.PermissionStorageManage, mutation)
+	permission := authn.PermissionStorageRead
+	if mutation {
+		permission = authn.PermissionStorageManage
+	}
+	r, authorized := h.authorize(w, r, permission, mutation)
 	if !authorized {
 		return
 	}

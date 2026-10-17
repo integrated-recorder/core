@@ -34,7 +34,7 @@ export function TimedEventTimeline({ items, loading, errorMessage, retry, live, 
   loadingMore: boolean
   loadMore: () => void
   onSeek: (seconds: number) => void
-  exportHref: string
+  exportHref?: string
 }) {
   const { t } = useI18n()
   if (loading && !items?.length) return <p className="py-4 text-sm text-muted-foreground" role="status">{t('common.loading')}</p>
@@ -44,7 +44,7 @@ export function TimedEventTimeline({ items, loading, errorMessage, retry, live, 
   return <section aria-label={t('timedEvents.title')}>
     <div className="mb-2 flex items-center justify-between gap-3">
       <h3 className="text-sm font-semibold">{t('timedEvents.title')}</h3>
-      <a href={exportHref} download><Button size="sm" variant="ghost"><Download className="h-3.5 w-3.5" />{t('timedEvents.export')}</Button></a>
+      {exportHref && <a href={exportHref} download><Button size="sm" variant="ghost"><Download className="h-3.5 w-3.5" />{t('timedEvents.export')}</Button></a>}
     </div>
     <ol className="max-h-[28rem] divide-y divide-border overflow-y-auto rounded-md border border-border" aria-label={t('timedEvents.title')}>
       {items.map(event => {

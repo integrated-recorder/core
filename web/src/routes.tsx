@@ -2,7 +2,7 @@ import { lazy } from 'react'
 import { createRootRouteWithContext, createRoute, createRouter, redirect } from '@tanstack/react-router'
 import type { QueryClient } from '@tanstack/react-query'
 import { RootComponent, RootError } from '@/components/route-shell'
-import { accountQuery, installationQuery, sessionQuery } from '@/api/queries'
+import { accountAuthorizationQuery, installationQuery, sessionQuery } from '@/api/queries'
 import { installationRouteRedirect } from '@/lib/installation-routing'
 const DashboardPage = lazy(() => import('@/routes/dashboard').then(module => ({ default: module.DashboardPage })))
 const RecordingsPage = lazy(() => import('@/routes/recordings').then(module => ({ default: module.RecordingsPage })))
@@ -42,10 +42,27 @@ const rootRoute = createRootRouteWithContext<RouterContext>()({
     const session = await context.queryClient.ensureQueryData(sessionQuery)
     const destination = installationRouteRedirect(path, installation, installation.auth_disabled || session.authenticated)
     if (destination) throw redirect({ to: destination })
-    const ownerOnly = ['/storage', '/system', '/plugins', '/watches'].some(prefix => path === prefix || path.startsWith(`${prefix}/`))
-    if (ownerOnly && session.auth_enabled && session.authenticated) {
-      const account = await context.queryClient.ensureQueryData(accountQuery)
-      if (account.role !== 'owner') throw redirect({ to: '/' })
+    if (session.auth_enabled && session.authenticated) {
+      const required = path === '/' || path === '/recordings' || path.startsWith('/recordings/') ? [['recording.read']]
+        : path === '/new' ? [['recording.create']]
+        : path === '/sources' || path.startsWith('/sources/') ? [['recording.create']]
+          : path === '/plugins' || path.startsWith('/plugins/') ? [['plugin.read', 'plugin.manage']]
+            : path === '/watches' || path.startsWith('/watches/') ? [['watch.read']]
+              : path === '/storage/locations' ? [['storage.manage']]
+                  : path === '/storage/advanced' ? [['system.settings.manage']]
+                : path === '/storage/retention' ? [['recording.delete', 'system.settings.manage']]
+                  : path === '/storage' || path.startsWith('/storage/') ? [['storage.read', 'storage.manage']]
+                : path === '/system/users' ? [['user.read', 'user.create', 'user.manage', 'role.read', 'role.manage']]
+                  : path === '/system/updates' ? [['system.update.manage']]
+                    : path === '/system/diagnostics' ? [['system.diagnostics.read']]
+                      : path === '/system/audit' ? [['audit.read']]
+                        : path === '/system' ? [['system.read', 'system.settings.manage', 'system.diagnostics.read']]
+                          : path.startsWith('/workflows') ? [['recording.workflow.manage']]
+                              : []
+      if (required.length) {
+        const authorization = await context.queryClient.ensureQueryData(accountAuthorizationQuery)
+        if (!required.every(group => group.some(permission => authorization.permissions.includes(permission)))) throw redirect({ to: '/account/security' })
+      }
     }
   },
   component: RootComponent,

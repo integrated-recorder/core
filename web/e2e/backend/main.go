@@ -202,7 +202,7 @@ func run() error {
 		adapters.Close()
 		return fmt.Errorf("read isolated E2E setup credential: %w", err)
 	}
-	if err := auth.Bootstrap(setupCode, "browser-e2e-strong-password"); err != nil {
+	if err := auth.Bootstrap("owner", setupCode, "browser-e2e-strong-password"); err != nil {
 		_ = watchService.Close(context.Background())
 		_ = previewService.Close(context.Background())
 		_ = exportService.Close(context.Background())
@@ -334,7 +334,7 @@ func serveFixtureRuntimeRead(w http.ResponseWriter, r *http.Request, auth *authn
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return
 	}
-	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Role: session.Role}
+	principal := authn.Principal{UserID: session.UserID, Login: session.Login, Roles: session.Roles, Permissions: session.Permissions, Role: session.Role}
 	if !authn.HasPermission(principal, permission) {
 		http.Error(w, "permission denied", http.StatusForbidden)
 		return

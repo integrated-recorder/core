@@ -14,6 +14,7 @@ import { Label } from '@/components/ui/label'
 import { useI18n } from '@/i18n/provider'
 import type { TranslationKey } from '@/i18n/catalog'
 import { formatBytes } from '@/lib/utils'
+import { passwordLengthStatus } from '@/lib/credentials'
 import type { Adapter, InstallationStatus, SetupStorageTest } from '@/types/api'
 
 type SetupStep = 'welcome' | 'administrator' | 'storage' | 'adapters' | 'review' | 'complete'
@@ -51,9 +52,9 @@ function isAuthenticatedSession(session: { auth_enabled: boolean; authenticated:
 }
 
 function setupPasswordError(password: string, confirmation: string): TranslationKey | undefined {
-  const bytes = new TextEncoder().encode(password).length
-  if (bytes < 12) return 'setup.error.passwordTooShort'
-  if (bytes > 72) return 'setup.error.passwordTooLong'
+  const length = passwordLengthStatus(password)
+  if (length === 'too_short') return 'setup.error.passwordTooShort'
+  if (length === 'too_long') return 'setup.error.passwordTooLong'
   if (password !== confirmation) return 'setup.error.passwordMismatch'
   return undefined
 }
@@ -125,18 +126,19 @@ export function SetupPage() {
     event.preventDefault()
     setFormError(undefined)
     const data = new FormData(event.currentTarget)
+    const login = String(data.get('username') ?? '').trim()
     const setupCode = String(data.get('setup_code') ?? '')
     const password = String(data.get('password') ?? '')
     const confirmation = String(data.get('password_confirmation') ?? '')
+    if (!login) return setFormError('login.usernameRequired')
     if (!setupCode.trim()) return setFormError('setup.error.setupCodeRequired')
     const passwordError = setupPasswordError(password, confirmation)
     if (passwordError) return setFormError(passwordError)
     if (isBootstrapping) return
     setIsBootstrapping(true)
     try {
-      const result = await authAPI.bootstrap(setupCode, password)
+      const result = await authAPI.bootstrap(login, setupCode, password)
       client.setQueryData(qk.session, result)
-      administratorForm.current?.reset()
       setFormError(undefined)
       try {
         const next = await setupAPI.begin()
@@ -158,14 +160,15 @@ export function SetupPage() {
     event.preventDefault()
     setFormError(undefined)
     const data = new FormData(event.currentTarget)
+    const login = String(data.get('username') ?? '').trim()
     const password = String(data.get('password') ?? '')
+    if (!login) return setFormError('login.usernameRequired')
     if (!password) return setFormError('setup.error.passwordRequired')
     if (isLoggingIn) return
     setIsLoggingIn(true)
     try {
-      const result = await authAPI.login(password)
+      const result = await authAPI.login(login, password)
       client.setQueryData(qk.session, result)
-      resumeForm.current?.reset()
       setFormError(undefined)
     } catch {
       setFormError('setup.error.loginFailed')
@@ -206,7 +209,7 @@ export function SetupPage() {
       <h1 className="mt-4 text-2xl font-semibold">{t('setup.resume.loginTitle')}</h1>
       <p className="mt-2 text-sm leading-6 text-muted-foreground">{t('setup.resume.loginDescription')}</p>
       <form ref={resumeForm} className="mt-6 space-y-4" onSubmit={submitResumeLogin}>
-        <div className="space-y-2"><Label htmlFor="resume-username">{t('setup.resume.usernameLabel')}</Label><Input id="resume-username" type="text" name="username" value="owner" autoComplete="username" autoCapitalize="none" spellCheck={false} readOnly /></div>
+        <div className="space-y-2"><Label htmlFor="resume-username">{t('setup.resume.usernameLabel')}</Label><Input id="resume-username" type="text" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} autoCorrect="off" required /></div>
         <div className="space-y-2"><Label htmlFor="resume-password">{t('setup.resume.passwordLabel')}</Label><Input id="resume-password" type="password" name="password" autoComplete="current-password" required /></div>
         {formError && <p className="text-sm text-destructive" role="alert">{t(formError)}</p>}
         <Button type="submit" className="w-full" disabled={isLoggingIn}>{isLoggingIn ? t('setup.resume.loggingIn') : t('setup.resume.loginAction')}<ArrowRight className="h-4 w-4" /></Button>
@@ -256,11 +259,11 @@ export function SetupPage() {
                 </div>
                 <p className="mt-2 text-xs text-muted-foreground">{t('setup.claim.directRun')}</p>
               </div>
-              <div className="space-y-2"><Label htmlFor="setup-username">{t('setup.claim.usernameLabel')}</Label><Input id="setup-username" type="text" name="username" value="owner" autoComplete="username" autoCapitalize="none" spellCheck={false} readOnly /></div>
+              <div className="space-y-2"><Label htmlFor="setup-username">{t('setup.claim.usernameLabel')}</Label><Input id="setup-username" type="text" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} autoCorrect="off" required /></div>
               <div className="space-y-2"><Label htmlFor="setup-code">{t('setup.claim.codeLabel')}</Label><Input id="setup-code" type="password" name="setup_code" autoComplete="one-time-code" spellCheck={false} required /></div>
               <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2"><Label htmlFor="setup-password">{t('setup.claim.passwordLabel')}</Label><Input id="setup-password" type="password" name="password" autoComplete="new-password" minLength={12} maxLength={72} required /></div>
-                <div className="space-y-2"><Label htmlFor="setup-password-confirm">{t('setup.claim.confirmLabel')}</Label><Input id="setup-password-confirm" type="password" name="password_confirmation" autoComplete="new-password" maxLength={72} required /></div>
+                <div className="space-y-2"><Label htmlFor="setup-password">{t('setup.claim.passwordLabel')}</Label><Input id="setup-password" type="password" name="password" autoComplete="new-password" required /></div>
+                <div className="space-y-2"><Label htmlFor="setup-password-confirm">{t('setup.claim.confirmLabel')}</Label><Input id="setup-password-confirm" type="password" name="password_confirmation" autoComplete="new-password" required /></div>
               </div>
               <p className="text-xs text-muted-foreground">{t('setup.claim.passwordHelp')}</p>
               {formError && <p role="alert" className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">{t(formError)}</p>}

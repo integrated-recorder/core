@@ -11,6 +11,8 @@ import (
 
 func (s *Server) registerAccountRoutes() {
 	s.mux.HandleFunc("GET /api/user", s.accountSelf)
+	s.mux.HandleFunc("GET /api/user/authorization", s.accountAuthorization)
+	s.mux.HandleFunc("PATCH /api/user", s.accountRenameLogin)
 	s.mux.HandleFunc("POST /api/user/password", s.accountChangePassword)
 	s.mux.HandleFunc("GET /api/user/sessions", s.accountSessions)
 	s.mux.HandleFunc("DELETE /api/user/sessions/{sessionID}", s.accountRevokeSession)
@@ -19,6 +21,9 @@ func (s *Server) registerAccountRoutes() {
 	s.mux.HandleFunc("POST /api/users", s.usersCreate)
 	s.mux.HandleFunc("POST /api/users/{userID}/disable", s.userDisable)
 	s.mux.HandleFunc("POST /api/users/{userID}/enable", s.userEnable)
+	s.mux.HandleFunc("PATCH /api/users/{userID}/roles", s.userRolesUpdate)
+	s.mux.HandleFunc("DELETE /api/users/{userID}", s.userDelete)
+	s.registerRoleRoutes()
 }
 
 func (s *Server) accountSelf(w http.ResponseWriter, r *http.Request) {
@@ -33,6 +38,51 @@ func (s *Server) accountSelf(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, user)
+}
+
+func (s *Server) accountAuthorization(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authn.PrincipalFromContext(r.Context())
+	if !ok || s.auth == nil {
+		writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
+		return
+	}
+	authorization, err := s.auth.AuthorizationFor(principal.UserID)
+	if err != nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "account_unavailable", "Account permissions could not be loaded.")
+		return
+	}
+	writeJSON(w, http.StatusOK, authorization)
+}
+
+func (s *Server) accountRenameLogin(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authn.PrincipalFromContext(r.Context())
+	if !ok || s.auth == nil {
+		writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
+		return
+	}
+	var request struct {
+		Login           string `json:"login"`
+		CurrentPassword string `json:"current_password"`
+	}
+	if err := decodeJSONBody(w, r, 8<<10, &request); err != nil {
+		writeCodedError(w, http.StatusBadRequest, "login_invalid", "The login name could not be changed.")
+		return
+	}
+	user, err := s.auth.RenameLogin(principal.UserID, request.CurrentPassword, strings.TrimSpace(request.Login))
+	switch {
+	case errors.Is(err, authn.ErrInvalidLogin):
+		writeCodedError(w, http.StatusBadRequest, "login_invalid", "Choose a valid login name.")
+	case errors.Is(err, authn.ErrDuplicateLogin):
+		writeCodedError(w, http.StatusConflict, "login_exists", "That login name is already in use.")
+	case errors.Is(err, authn.ErrCurrentPassword):
+		writeCodedError(w, http.StatusUnauthorized, "current_credentials_invalid", "Current credentials could not be verified.")
+	case err != nil:
+		writeCodedError(w, http.StatusServiceUnavailable, "account_unavailable", "The login name could not be changed.")
+	default:
+		s.auditMutation(w, r, "login_renamed", user.ID)
+		clearAccountCookies(w, r, s.forceSecureCookie)
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func (s *Server) accountChangePassword(w http.ResponseWriter, r *http.Request) {
@@ -153,21 +203,33 @@ func (s *Server) usersCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		Login    string `json:"login"`
-		Password string `json:"password"`
+		Login    string   `json:"login"`
+		Password string   `json:"password"`
+		Roles    []string `json:"roles,omitempty"`
 	}
 	if err := decodeJSONBody(w, r, 16<<10, &request); err != nil {
 		writeCodedError(w, http.StatusBadRequest, "user_invalid", "The user could not be created.")
 		return
 	}
-	user, err := s.auth.CreateUser(request.Login, request.Password, authn.RoleMember)
+	roles := request.Roles
+	if len(roles) == 0 {
+		roles = []string{authn.RoleOperator}
+	}
+	principal, _ := authn.PrincipalFromContext(r.Context())
+	user, err := s.auth.CreateUserWithRolesAs(principal.UserID, request.Login, request.Password, roles)
 	if errors.Is(err, authn.ErrDuplicateLogin) {
-		writeCodedError(w, http.StatusConflict, "user_exists", "The user could not be created.")
+		writeCodedError(w, http.StatusConflict, "login_exists", "The user could not be created.")
+		return
+	}
+	if errors.Is(err, authn.ErrOwnerAssignment) {
+		writeCodedError(w, http.StatusForbidden, "owner_assignment_requires_owner", "Only an Owner can assign the Owner role.")
 		return
 	}
 	if err != nil {
 		if errors.Is(err, authn.ErrInvalidCredentials) {
 			writeCodedError(w, http.StatusBadRequest, "user_invalid", "Check the login name and password policy.")
+		} else if errors.Is(err, authn.ErrInvalidRole) {
+			writeCodedError(w, http.StatusBadRequest, "role_invalid", "The selected role is invalid.")
 		} else {
 			writeCodedError(w, http.StatusServiceUnavailable, "users_unavailable", "The user could not be created.")
 		}
@@ -196,7 +258,11 @@ func (s *Server) setUserEnabled(w http.ResponseWriter, r *http.Request, enabled 
 		writeCodedError(w, http.StatusConflict, "self_disable_rejected", "The current account cannot be disabled.")
 		return
 	}
-	user, err := s.auth.SetUserEnabled(userID, enabled)
+	user, err := s.auth.SetUserEnabledAs(principal.UserID, userID, enabled)
+	if errors.Is(err, authn.ErrOwnerAssignment) {
+		writeCodedError(w, http.StatusForbidden, "owner_assignment_requires_owner", "Only an Owner can change an Owner account.")
+		return
+	}
 	if errors.Is(err, authn.ErrLastOwner) {
 		writeCodedError(w, http.StatusConflict, "last_owner_protected", "The last active owner cannot be disabled.")
 		return
@@ -215,6 +281,65 @@ func (s *Server) setUserEnabled(w http.ResponseWriter, r *http.Request, enabled 
 	}
 	s.auditMutation(w, r, action, user.ID)
 	writeJSON(w, http.StatusOK, user)
+}
+
+func (s *Server) userRolesUpdate(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authn.PrincipalFromContext(r.Context())
+	if !ok || s.auth == nil {
+		writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
+		return
+	}
+	var request struct {
+		Roles []string `json:"roles"`
+	}
+	if err := decodeJSONBody(w, r, 16<<10, &request); err != nil {
+		writeCodedError(w, http.StatusBadRequest, "role_invalid", "The role assignment is invalid.")
+		return
+	}
+	userID := strings.TrimSpace(r.PathValue("userID"))
+	user, err := s.auth.SetUserRoles(principal.UserID, userID, request.Roles)
+	switch {
+	case errors.Is(err, authn.ErrOwnerAssignment):
+		writeCodedError(w, http.StatusForbidden, "owner_assignment_requires_owner", "Only an Owner can change Owner assignments.")
+	case errors.Is(err, authn.ErrLastOwner):
+		writeCodedError(w, http.StatusConflict, "last_owner_protected", "At least one active Owner must remain.")
+	case errors.Is(err, authn.ErrUserNotFound):
+		writeCodedError(w, http.StatusNotFound, "user_not_found", "The user could not be found.")
+	case errors.Is(err, authn.ErrInvalidRole):
+		writeCodedError(w, http.StatusBadRequest, "role_invalid", "The role assignment is invalid.")
+	case err != nil:
+		writeCodedError(w, http.StatusServiceUnavailable, "users_unavailable", "The role assignment could not be changed.")
+	default:
+		s.auditMutation(w, r, "user_roles_changed", user.ID)
+		writeJSON(w, http.StatusOK, user)
+	}
+}
+
+func (s *Server) userDelete(w http.ResponseWriter, r *http.Request) {
+	principal, ok := authn.PrincipalFromContext(r.Context())
+	if !ok || s.auth == nil {
+		writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
+		return
+	}
+	userID := strings.TrimSpace(r.PathValue("userID"))
+	if userID == principal.UserID {
+		writeCodedError(w, http.StatusConflict, "self_delete_rejected", "Use another Owner account to remove this account.")
+		return
+	}
+	user, err := s.auth.DeleteUser(principal.UserID, userID)
+	switch {
+	case errors.Is(err, authn.ErrOwnerAssignment):
+		writeCodedError(w, http.StatusForbidden, "owner_assignment_requires_owner", "Only an Owner can remove an Owner account.")
+	case errors.Is(err, authn.ErrLastOwner):
+		writeCodedError(w, http.StatusConflict, "last_owner_protected", "At least one active Owner must remain.")
+	case errors.Is(err, authn.ErrUserNotFound):
+		writeCodedError(w, http.StatusNotFound, "user_not_found", "The user could not be found.")
+	case err != nil:
+		writeCodedError(w, http.StatusServiceUnavailable, "users_unavailable", "The user could not be removed.")
+	default:
+		s.auditMutation(w, r, "user_deleted", user.ID)
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func clearAccountCookies(w http.ResponseWriter, r *http.Request, forceSecure bool) {

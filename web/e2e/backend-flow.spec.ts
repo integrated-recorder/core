@@ -85,6 +85,7 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
   expect(await page.locator('script:not([src])').count()).toBe(0)
   await assertResponsive(page)
   await page.setViewportSize({ width: 1440, height: 900 })
+  await page.getByLabel(/Account name|계정 이름/).fill('owner')
   await expect(page.getByLabel(/Password|비밀번호/)).toBeVisible()
   await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
@@ -393,7 +394,7 @@ test('actual Go backend: direct HLS capture, VOD, management, and delete', async
     const expectedStatus = path === '/static/unknown' ? 404 : 403
     expect(response.status(), `${path} must fail closed before SPA fallback`).toBe(expectedStatus)
     expect(response.headers()['content-type'] ?? '').not.toContain('text/html')
-    if (expectedStatus === 403) expect(await response.text()).toContain('permission denied')
+    if (expectedStatus === 403) expect(await response.json()).toMatchObject({ error_code: 'permission_denied' })
   }
   await assertNoCSPViolations(cspViolations)
   expect(consoleErrors).toEqual([])
@@ -841,9 +842,10 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
   await expect(page.getByText(/Workflow Fixture · 취소됨/)).toBeVisible()
 })
 
-test('actual Go backend: account password, sessions, and owner user management', async ({ page, browser }, testInfo) => {
+test('actual Go backend: account password, sessions, and Owner user management', async ({ page, browser }, testInfo) => {
   test.setTimeout(120_000)
   await page.goto('/login')
+  await page.getByLabel(/Account name|계정 이름/).fill('owner')
   await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')
@@ -858,14 +860,16 @@ test('actual Go backend: account password, sessions, and owner user management',
 
   const currentPassword = 'browser-e2e-strong-password'
   const changedPassword = 'browser-e2e-updated-password'
-  await page.getByLabel(/Current password|현재 비밀번호/).fill(currentPassword)
-  await page.getByLabel(/New password|새 비밀번호$/).fill(changedPassword)
-  await page.getByLabel(/Confirm new password|새 비밀번호 확인/).first().fill(changedPassword)
-  await page.getByRole('button', { name: /Change password|비밀번호 변경/ }).click()
+  const passwordForm = page.locator('form').filter({ has: page.getByRole('button', { name: /Change password|비밀번호 변경/ }) })
+  await passwordForm.getByLabel(/Current password|현재 비밀번호/).fill(currentPassword)
+  await passwordForm.getByLabel(/New password|새 비밀번호$/).fill(changedPassword)
+  await passwordForm.getByLabel(/Confirm new password|새 비밀번호 확인/).fill(changedPassword)
+  await passwordForm.getByRole('button', { name: /Change password|비밀번호 변경/ }).click()
   await expect(page).toHaveURL('/login')
   await expect(page.getByRole('heading', { name: /Sign in|로그인/ })).toBeVisible()
 
   const loginPassword = page.getByLabel(/^(Password|비밀번호)$/)
+  await page.getByLabel(/Account name|계정 이름/).fill('owner')
   await loginPassword.fill(currentPassword)
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page.getByRole('alert')).toBeVisible()
@@ -893,7 +897,8 @@ test('actual Go backend: account password, sessions, and owner user management',
   await page.getByLabel(/Initial password|초기 비밀번호/).fill('stage7-member-password')
   await page.getByLabel(/Confirm new password|새 비밀번호 확인/).last().fill('stage7-member-password')
   await page.getByRole('button', { name: /Create user|사용자 생성/ }).click()
-  await expect(page.getByText(/stage7-member\s+·\s+Member/)).toBeVisible()
+  const stage7MemberRow = page.getByRole('listitem').filter({ hasText: 'stage7-member' })
+  await expect(stage7MemberRow).toContainText(/Operator|운영자/)
 
   const memberContext = await browser.newContext({ locale: 'ko-KR' })
   const memberPage = await memberContext.newPage()
@@ -923,10 +928,11 @@ test('actual Go backend: account password, sessions, and owner user management',
   await page.getByRole('button', { name: /Disable|비활성화/ }).last().click()
   await page.getByRole('alertdialog').getByRole('button', { name: /Disable|비활성화/ }).click()
   await page.goto('/account/security')
-  await page.getByLabel(/Current password|현재 비밀번호/).fill(changedPassword)
-  await page.getByLabel(/New password|새 비밀번호$/).fill(currentPassword)
-  await page.getByLabel(/Confirm new password|새 비밀번호 확인/).first().fill(currentPassword)
-  await page.getByRole('button', { name: /Change password|비밀번호 변경/ }).click()
+  const finalPasswordForm = page.locator('form').filter({ has: page.getByRole('button', { name: /Change password|비밀번호 변경/ }) })
+  await finalPasswordForm.getByLabel(/Current password|현재 비밀번호/).fill(changedPassword)
+  await finalPasswordForm.getByLabel(/New password|새 비밀번호$/).fill(currentPassword)
+  await finalPasswordForm.getByLabel(/Confirm new password|새 비밀번호 확인/).fill(currentPassword)
+  await finalPasswordForm.getByRole('button', { name: /Change password|비밀번호 변경/ }).click()
   await expect(page).toHaveURL('/login')
 })
 
@@ -935,7 +941,8 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   const memberLogin = 'browser-multi-member'
   const memberPassword = 'browser-multi-member-password'
 
-  // The legacy password-only owner flow remains the first-run-compatible path.
+  // The general UI fixture retains a legacy-style Owner login; browser auth
+  // still submits the explicit username/password pair.
   await login(page)
   const initialOwner = await getJSON<{ user_id: string; login: string; role: string }>(page, '/api/user')
   expect(initialOwner).toMatchObject({ login: 'owner', role: 'owner' })
@@ -947,14 +954,14 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   await page.getByLabel(/Confirm new password|새 비밀번호 확인/).last().fill(memberPassword)
   await page.getByRole('button', { name: /Create user|사용자 생성/ }).click()
   const memberRow = page.getByRole('listitem').filter({ hasText: memberLogin })
-  await expect(memberRow).toContainText(/Member|멤버/)
+  await expect(memberRow).toContainText(/Operator|운영자/)
   await logoutFromApplication(page)
 
   const memberContext = await browser.newContext({ locale: 'ko-KR' })
   const memberPage = await memberContext.newPage()
   await loginAs(memberPage, memberLogin, memberPassword)
   const member = await getJSON<{ user_id: string; login: string; role: string; status: string }>(memberPage, '/api/user')
-  expect(member).toMatchObject({ login: memberLogin, role: 'member', status: 'active' })
+  expect(member).toMatchObject({ login: memberLogin, role: 'operator', status: 'active' })
   const memberManagementNav = memberPage.getByRole('navigation', { name: /Operations|운영/ })
   await expect(memberManagementNav.getByRole('link', { name: /Sources|소스/ })).toBeVisible()
   await expect(memberManagementNav.getByRole('link', { name: /Auto recording|자동 녹화/ })).toHaveCount(0)
@@ -963,7 +970,7 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   await memberPage.goto('/account/security')
   await expect(memberPage.getByRole('heading', { name: /Account information|계정 정보/ })).toBeVisible()
   await expect(memberPage.locator('#main-content').getByText(memberLogin, { exact: true })).toBeVisible()
-  await expect(memberPage.locator('#main-content').getByText('Member', { exact: true })).toBeVisible()
+  await expect(memberPage.locator('#main-content').getByText('Operator', { exact: true })).toBeVisible()
   await expect(memberPage.getByRole('heading', { name: /User management|사용자 관리/ })).toHaveCount(0)
   expect((await memberPage.request.get('/api/user')).status()).toBe(200)
   expect((await memberPage.request.get('/api/user/preferences')).status()).toBe(200)
@@ -1071,7 +1078,7 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
 
   for (const route of ['/storage', '/storage/locations', '/storage/retention', '/storage/advanced', '/system', '/system/users', '/system/updates', '/system/diagnostics', '/system/audit', '/plugins', '/watches']) {
     await memberPage.goto(route)
-    await expect(memberPage).toHaveURL('/', { timeout: 10_000 })
+    await expect(memberPage).toHaveURL('/account/security', { timeout: 10_000 })
   }
 
   // Keep owner and member sessions live together and prove identity, session,
@@ -1153,7 +1160,7 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
   await memberRowAfterLogin.getByRole('button', { name: /Enable|활성화/ }).click()
   await expect(memberRowAfterLogin).toContainText(/Active|활성/)
   await loginAs(memberPage, memberLogin, memberPassword)
-  expect(await getJSON<{ user_id: string; login: string; role: string }>(memberPage, '/api/user')).toMatchObject({ user_id: member.user_id, login: memberLogin, role: 'member' })
+  expect(await getJSON<{ user_id: string; login: string; role: string }>(memberPage, '/api/user')).toMatchObject({ user_id: member.user_id, login: memberLogin, role: 'operator' })
   expect((await getJSON<{ authenticated: boolean }>(page, '/api/auth/session')).authenticated).toBe(true)
   expect(await getJSON<UserPreferencesWire>(memberPage, '/api/user/preferences')).toEqual(memberPreferences)
 
@@ -1164,6 +1171,7 @@ test('actual Go backend: member login, recording permissions, and owner isolatio
 
 async function login(page: Page) {
   await page.goto('/login')
+  await page.getByLabel(/Account name|계정 이름/).fill('owner')
   await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: /Sign in|로그인/ }).click()
   await expect(page).toHaveURL('/')

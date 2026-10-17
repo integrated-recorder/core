@@ -343,6 +343,16 @@ func TestHandoverPauseDefersHistoricalWorkUntilSourceResumes(t *testing.T) {
 			HistoricalManifestURL: "https://fixture.invalid/history.m3u8",
 		},
 	}
+	liveWriteStarted, releaseLiveWrite := make(chan struct{}), make(chan struct{})
+	var liveWriteStartedOnce, releaseLiveWriteOnce sync.Once
+	manager.storageWriteHook = func() {
+		liveWriteStartedOnce.Do(func() {
+			close(liveWriteStarted)
+			<-releaseLiveWrite
+		})
+	}
+	releaseInitialLiveWrite := func() { releaseLiveWriteOnce.Do(func() { close(releaseLiveWrite) }) }
+	t.Cleanup(releaseInitialLiveWrite)
 	recording, err := manager.StartResolvedWithIDOwned(context.Background(), owner, handoverRecordingID, "fixture", media, nil, "handover recovery fixture", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -352,6 +362,12 @@ func TestHandoverPauseDefersHistoricalWorkUntilSourceResumes(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("automatic historical recovery did not start")
 	}
+	select {
+	case <-liveWriteStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("live media did not reach its canonical write boundary")
+	}
+	drainWaiting := observeHandoverDrainWait(t, manager, recording.ID)
 
 	type pauseResult struct {
 		snapshot HandoverSnapshot
@@ -364,11 +380,19 @@ func TestHandoverPauseDefersHistoricalWorkUntilSourceResumes(t *testing.T) {
 		snapshot, pauseErr := manager.PauseForHandover(ctx, recording.ID, owner)
 		paused <- pauseResult{snapshot: snapshot, err: pauseErr}
 	}()
+	e, _ := manager.entry(recording.ID)
+	waitHandoverState(t, e, handoverDraining)
+	select {
+	case <-drainWaiting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handover did not wait for accepted live persistence and historical request")
+	}
 	select {
 	case result := <-paused:
-		t.Fatalf("handover returned before historical request drained: err=%v", result.err)
-	case <-time.After(50 * time.Millisecond):
+		t.Fatalf("handover returned before accepted work drained: err=%v", result.err)
+	default:
 	}
+	releaseInitialLiveWrite()
 	close(transport.resume)
 	var result pauseResult
 	select {
@@ -379,6 +403,9 @@ func TestHandoverPauseDefersHistoricalWorkUntilSourceResumes(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("PauseForHandover: %v", result.err)
 	}
+	if got := fixture.segmentRequests.Load(); got != 1 {
+		t.Fatalf("source fetched %d media objects at cutoff, want only the pre-cutoff live segment", got)
+	}
 	current, err := manager.Get(recording.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -387,7 +414,6 @@ func TestHandoverPauseDefersHistoricalWorkUntilSourceResumes(t *testing.T) {
 		t.Fatalf("historical media not yet admitted at cutoff was committed on source: %#v", current.Tracks["main"].Segments)
 	}
 	rootAtPause := recordingRootBytes(t, store, recording.ID)
-	time.Sleep(80 * time.Millisecond)
 	if afterPause := recordingRootBytes(t, store, recording.ID); !bytes.Equal(rootAtPause, afterPause) {
 		t.Fatal("canonical archive changed after handover snapshot")
 	}

@@ -661,8 +661,7 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return fmt.Errorf("initialize Runtime Host HTTPS API: %w", err)
 	}
-	publicHandler := httpsManager.WrapHTTP(httpsHandler)
-	if err := httpsManager.SetHandler(publicHandler); err != nil {
+	if err := httpsManager.SetHandler(httpsHandler); err != nil {
 		// HTTPS is an optional operator setting. A conflicting TLS port must not
 		// take down the authenticated HTTP management plane; redirects remain
 		// disabled until the TLS listener is actually ready.
@@ -708,7 +707,7 @@ func Run(ctx context.Context, config Config) error {
 	}()
 	adapterReconcileDone := startPeriodicAdapterReconciliation(leaseCtx, installState, updates, 3*time.Second)
 	pluginUpdateDone := startPeriodicPluginAutoUpdateReconciliation(leaseCtx, installState, updates, config.PluginAutoUpdateInterval, jitterPluginAutoUpdateInterval)
-	serveErr := sup.ServeWithHostHandler(ctx, listener, "/api", publicHandler)
+	serveErr := sup.ServeWithHostHandlerAndMiddleware(ctx, listener, "/api", httpsHandler, httpsManager.WrapHTTP)
 	stopLeaseReconciliation()
 	<-leaseDone
 	<-adapterReconcileDone

@@ -233,20 +233,13 @@ func run() error {
 		_ = httpsManager.Close(context.Background())
 		return fmt.Errorf("start HTTPS browser fixture: %w", err)
 	}
-	if err := httpsManager.EnableSelfSigned([]string{"localhost", "127.0.0.1"}, false); err != nil {
-		_ = httpsManager.Close(context.Background())
-		return fmt.Errorf("configure HTTPS browser fixture: %w", err)
-	}
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = httpsManager.Close(closeCtx)
 	}()
-	listenerAddress, listening := httpsManager.ListenerAddress()
-	if !listening {
-		return errors.New("HTTPS browser fixture listener did not start")
-	}
-	if err := os.WriteFile(filepath.Join(dataDir, "e2e-https-url"), []byte("https://"+listenerAddress), 0o600); err != nil {
+	initialHTTPSURL := "https://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(httpsPort))
+	if err := os.WriteFile(filepath.Join(dataDir, "e2e-https-url"), []byte(initialHTTPSURL), 0o600); err != nil {
 		return fmt.Errorf("record HTTPS browser fixture URL: %w", err)
 	}
 

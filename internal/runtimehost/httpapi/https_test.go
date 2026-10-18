@@ -18,10 +18,15 @@ type fakeHTTPSController struct {
 	key      string
 	redirect bool
 	ready    bool
+	nilHosts bool
 }
 
 func (f *fakeHTTPSController) Status() tlsserver.Status {
-	return tlsserver.Status{Enabled: f.enabled, Configured: f.host != "", Ready: f.ready, RedirectHTTP: f.redirect, RedirectActive: f.enabled && f.ready && f.redirect, HTTPRecovery: true, Port: 8443, HTTPPort: 8080, Hosts: []string{f.host}}
+	var hosts []string
+	if !f.nilHosts {
+		hosts = []string{f.host}
+	}
+	return tlsserver.Status{Enabled: f.enabled, Configured: f.host != "", Ready: f.ready, RedirectHTTP: f.redirect, RedirectActive: f.enabled && f.ready && f.redirect, HTTPRecovery: true, Port: 8443, HTTPPort: 8080, Hosts: hosts}
 }
 func (f *fakeHTTPSController) EnableSelfSigned(hosts []string, redirect bool) error {
 	f.enabled = true
@@ -44,6 +49,20 @@ func (f *fakeHTTPSController) EnableCertificate(hosts []string, cert, key string
 }
 func (f *fakeHTTPSController) EnableSaved() error { f.enabled = true; return nil }
 func (f *fakeHTTPSController) Disable() error     { f.enabled = false; return nil }
+
+func TestHTTPSStatusSerializesUnconfiguredHostsAsEmptyArray(t *testing.T) {
+	status := publicHTTPSStatus(&fakeHTTPSController{nilHosts: true}, false)
+	if status.Hosts == nil || len(status.Hosts) != 0 {
+		t.Fatalf("unconfigured hosts = %#v, want empty slice", status.Hosts)
+	}
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"hosts":[]`) || strings.Contains(string(encoded), `"hosts":null`) {
+		t.Fatalf("unconfigured host status JSON = %s", encoded)
+	}
+}
 
 func TestHTTPSSettingsAPIRequiresSessionAndCSRFAndUsesSecureCookieRefresh(t *testing.T) {
 	root := t.TempDir()

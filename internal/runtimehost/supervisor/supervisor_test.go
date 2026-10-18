@@ -545,6 +545,62 @@ func TestServeWithHostHandlerInterceptsOnlyItsPrefix(t *testing.T) {
 	}
 }
 
+func TestPublicMiddlewareWrapsHostAndControlRoutesBeforeDispatch(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "control:"+r.URL.Path)
+	}))
+	defer backend.Close()
+	s := newTestSupervisor(t, &fakeLauncher{}, ReadinessFunc(func(context.Context, ProcessSpec, Child) error { return nil }), &fakeLifecycle{})
+	if err := s.StageGeneration(context.Background(), fakeGeneration(generationA, backend.URL)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ActivateControl(context.Background(), generationA); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	host := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/runtime/update" {
+			_, _ = io.WriteString(w, "host")
+			return
+		}
+		s.ServeHTTP(w, r)
+	})
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Public-Middleware", r.URL.Path)
+			next.ServeHTTP(w, r)
+		})
+	}
+	go func() { serveDone <- s.ServeWithHostHandlerAndMiddleware(serveCtx, listener, "/api", host, middleware) }()
+	baseURL := "http://" + listener.Addr().String()
+	waitHTTPReady(t, baseURL)
+	for path, wantBody := range map[string]string{"/api/runtime/update": "host", "/api/recordings": "control:/api/recordings", "/system": "control:/system"} {
+		response, err := http.Get(baseURL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || string(body) != wantBody || response.Header.Get("X-Public-Middleware") != path {
+			t.Errorf("GET %s: status=%d body=%q middleware=%q", path, response.StatusCode, body, response.Header.Get("X-Public-Middleware"))
+		}
+	}
+	cancelServe()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("ServeWithHostHandlerAndMiddleware: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("middleware server did not stop within its bound")
+	}
+}
+
 func TestInFlightOldControlRequestCompletesBeforeControlStop(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})

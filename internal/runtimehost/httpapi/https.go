@@ -187,6 +187,9 @@ func WithHTTPSWithSecureCookiePolicy(auth *authn.Service, authDisabled bool, con
 
 func publicHTTPSStatus(controller HTTPSController, forceSecureCookies bool) tlsserver.Status {
 	status := controller.Status()
+	if status.Hosts == nil {
+		status.Hosts = []string{}
+	}
 	if forceSecureCookies {
 		// The browser remains behind its trusted TLS terminator when Runtime
 		// Host's own HTTPS listener is changed, so HTTP fallback is unavailable.

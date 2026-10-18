@@ -570,6 +570,13 @@ func (s *Supervisor) Serve(ctx context.Context, listener net.Listener) error {
 // as release update operations, while all other traffic follows the active
 // Control generation. hostHandler should use s as its fallback handler.
 func (s *Supervisor) ServeWithHostHandler(ctx context.Context, listener net.Listener, prefix string, hostHandler http.Handler) error {
+	return s.ServeWithHostHandlerAndMiddleware(ctx, listener, prefix, hostHandler, nil)
+}
+
+// ServeWithHostHandlerAndMiddleware applies middleware to the complete public
+// request path before Host-only API selection or active-Control routing. This
+// keeps public transport policies consistent without changing route ownership.
+func (s *Supervisor) ServeWithHostHandlerAndMiddleware(ctx context.Context, listener net.Listener, prefix string, hostHandler http.Handler, middleware func(http.Handler) http.Handler) error {
 	if ctx == nil || listener == nil {
 		return ErrInvalidConfig
 	}
@@ -596,6 +603,14 @@ func (s *Supervisor) ServeWithHostHandler(ctx context.Context, listener net.List
 			}
 			s.ServeHTTP(w, r)
 		})
+	}
+	if middleware != nil {
+		handler = middleware(handler)
+		if handler == nil {
+			s.mu.Unlock()
+			_ = listener.Close()
+			return ErrInvalidConfig
+		}
 	}
 	server := &http.Server{
 		Handler:           handler,

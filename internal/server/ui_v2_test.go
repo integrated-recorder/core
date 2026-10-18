@@ -64,7 +64,7 @@ func TestSPARoutesAreRestrictedAndDirectLoadsWork(t *testing.T) {
 		}
 	}
 	nonHTML := httptest.NewRecorder()
-	nonHTMLRequest := httptest.NewRequest(http.MethodGet, "/recordings/abc123", nil)
+	nonHTMLRequest := httptest.NewRequest(http.MethodGet, "/system", nil)
 	nonHTMLRequest.Header.Set("Accept", "application/json")
 	handler.ServeHTTP(nonHTML, nonHTMLRequest)
 	if nonHTML.Code != http.StatusNotFound {

@@ -209,7 +209,9 @@ func (m *Manager) SetHTTPPublicPort(port int) error {
 func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := Status{Enabled: m.state.Enabled, Configured: httpsConfigured(m.state), Listening: m.server != nil, RedirectHTTP: m.state.Redirect, Port: m.state.Port, HTTPPort: m.httpPort, HTTPRecovery: true, Hosts: append([]string(nil), m.state.Hosts...), SelfSigned: m.state.SelfSigned, ACME: m.state.ACME}
+	hosts := make([]string, len(m.state.Hosts))
+	copy(hosts, m.state.Hosts)
+	out := Status{Enabled: m.state.Enabled, Configured: httpsConfigured(m.state), Listening: m.server != nil, RedirectHTTP: m.state.Redirect, Port: m.state.Port, HTTPPort: m.httpPort, HTTPRecovery: true, Hosts: hosts, SelfSigned: m.state.SelfSigned, ACME: m.state.ACME}
 	if m.cert != nil && len(m.cert.Certificate) > 0 {
 		if leaf, err := x509.ParseCertificate(m.cert.Certificate[0]); err == nil {
 			out.ExpiresAt = leaf.NotAfter.UTC().Format(time.RFC3339)
@@ -549,6 +551,12 @@ func (m *Manager) WrapHTTP(next http.Handler) http.Handler {
 			acme.HTTPHandler(next).ServeHTTP(w, r)
 			return
 		}
+		// Keep the Docker/Host health probe on cleartext HTTP so enabling HTTPS
+		// does not make a healthy application appear unhealthy to its runtime.
+		if r.TLS == nil && r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if r.TLS == nil && enabled && redirect && m.Status().Ready {
 			host := requestHostName(r.Host)
 			found := false
@@ -567,7 +575,8 @@ func (m *Manager) WrapHTTP(next http.Handler) http.Handler {
 			if port != 443 {
 				host = net.JoinHostPort(host, fmt.Sprint(port))
 			}
-			http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusPermanentRedirect)
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusTemporaryRedirect)
 			return
 		}
 		next.ServeHTTP(w, r)

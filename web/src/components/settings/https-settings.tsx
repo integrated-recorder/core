@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { LockKeyhole, Save } from 'lucide-react'
 import { runtimeHTTPSAPI } from '@/api'
@@ -48,19 +48,20 @@ export function HTTPSSettings() {
     }
   } })
   const value = status.data as RuntimeHTTPSSettings | undefined
+  const savedHosts = useMemo(() => Array.isArray(value?.hosts) ? value.hosts.filter((host): host is string => typeof host === 'string') : [], [value?.hosts])
   useEffect(() => {
     if (!value?.configured) return
-    setHosts(value.hosts.join(', '))
+    setHosts(savedHosts.join(', '))
     setRedirectHTTP(value.redirect_http)
     setUseACME(value.acme)
-  }, [value?.configured, value?.hosts, value?.redirect_http, value?.acme])
+  }, [value?.configured, savedHosts, value?.redirect_http, value?.acme])
   return <Card className="xl:col-span-2">
     <CardHeader><CardTitle className="flex items-center gap-2"><LockKeyhole className="h-4 w-4" />{t('https.title')}</CardTitle></CardHeader>
     <CardContent className="space-y-4">
       <p className="text-sm leading-6 text-muted-foreground">{t('https.help')}</p>
       {status.isLoading ? <LoadingState /> : status.error || !value ? <ErrorState message={status.error ? errorMessage(status.error) : t('runtime.statusUnavailable')} retry={() => void status.refetch()} /> : <>
         <p role="status" className="text-sm">{!value.enabled ? t('https.disabled') : !value.listening ? t('https.listenerUnavailable') : value.issuance_failed ? t('https.issuanceFailed') : !value.certificate_ready ? t('https.pending') : t('https.enabled')} · :{value.port} · {value.redirect_active ? t('https.redirectActive') : t('https.redirectInactive')}{value.expires_at ? ` · ${t('https.expires')}: ${value.expires_at}` : ''}</p>
-        {value.hosts.length > 0 && <p className="break-all text-xs text-muted-foreground">{t('https.hostsCurrent')}: {value.hosts.join(', ')}</p>}
+        {savedHosts.length > 0 && <p className="break-all text-xs text-muted-foreground">{t('https.hostsCurrent')}: {savedHosts.join(', ')}</p>}
         {value.configured && !value.enabled && <Button type="button" disabled={enableSaved.isPending} onClick={() => enableSaved.mutate()}>{t('https.enableSaved')}</Button>}
         <form className="grid gap-3 md:grid-cols-2" onSubmit={event => { event.preventDefault(); save.mutate() }}>
           <label className="space-y-1 text-sm md:col-span-2">{t('https.hostsLabel')}<Input value={hosts} onChange={event => setHosts(event.currentTarget.value)} placeholder="recorder.example.com, 192.168.1.20" required /></label>

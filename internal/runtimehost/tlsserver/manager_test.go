@@ -26,6 +26,7 @@ func TestSelfSignedHTTPSListenerRedirectPersistenceAndDisable(t *testing.T) {
 	defer m.Close(testContext(t))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, r.URL.Path) })
 	wrapped := m.WrapHTTP(mux)
 	if err := m.SetHandler(wrapped); err != nil {
 		t.Fatal(err)
@@ -66,10 +67,17 @@ func TestSelfSignedHTTPSListenerRedirectPersistenceAndDisable(t *testing.T) {
 	if resp.StatusCode != 200 || string(body) != "ok" {
 		t.Fatalf("HTTPS response = %d %q", resp.StatusCode, body)
 	}
-	redirect := httptest.NewRecorder()
-	wrapped.ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "http://localhost/healthz?q=1", nil))
-	if redirect.Code != http.StatusPermanentRedirect || redirect.Header().Get("Location") != "https://localhost:19443/healthz?q=1" {
-		t.Fatalf("redirect = %d %q", redirect.Code, redirect.Header().Get("Location"))
+	for _, path := range []string{"/", "/setup", "/login", "/system", "/static/ui/assets/app.js", "/api/setup/status", "/api/runtime/https", "/unknown"} {
+		redirect := httptest.NewRecorder()
+		wrapped.ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "http://localhost"+path+"?q=1", nil))
+		if redirect.Code != http.StatusTemporaryRedirect || redirect.Header().Get("Location") != "https://localhost:19443"+path+"?q=1" || redirect.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("redirect %s = %d location=%q cache=%q", path, redirect.Code, redirect.Header().Get("Location"), redirect.Header().Get("Cache-Control"))
+		}
+	}
+	health := httptest.NewRecorder()
+	wrapped.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "http://localhost/healthz", nil))
+	if health.Code != http.StatusOK || health.Header().Get("Location") != "" {
+		t.Fatalf("health check should remain on HTTP: %d %q", health.Code, health.Header().Get("Location"))
 	}
 	if err := m.Disable(); err != nil {
 		t.Fatal(err)
@@ -78,10 +86,12 @@ func TestSelfSignedHTTPSListenerRedirectPersistenceAndDisable(t *testing.T) {
 	if status.Enabled || status.Listening || !status.Configured || !status.RedirectHTTP || status.RedirectActive || !status.SelfSigned || strings.Join(status.Hosts, ",") != hostsBefore {
 		t.Fatalf("disable did not preserve saved configuration while stopping listener/redirect: %+v", status)
 	}
-	noRedirect := httptest.NewRecorder()
-	wrapped.ServeHTTP(noRedirect, httptest.NewRequest(http.MethodGet, "http://localhost/healthz", nil))
-	if noRedirect.Code != http.StatusOK || noRedirect.Header().Get("Location") != "" {
-		t.Fatalf("HTTP redirect remained active while HTTPS disabled: %d %q", noRedirect.Code, noRedirect.Header().Get("Location"))
+	for _, path := range []string{"/", "/system", "/static/ui/assets/app.js", "/api/setup/status"} {
+		noRedirect := httptest.NewRecorder()
+		wrapped.ServeHTTP(noRedirect, httptest.NewRequest(http.MethodGet, "http://localhost"+path, nil))
+		if noRedirect.Code != http.StatusOK || noRedirect.Header().Get("Location") != "" {
+			t.Fatalf("HTTP route %s remained redirected while HTTPS disabled: %d %q", path, noRedirect.Code, noRedirect.Header().Get("Location"))
+		}
 	}
 	leafBefore, err := x509.ParseCertificate(m.cert.Certificate[0])
 	if err != nil {
@@ -116,10 +126,33 @@ func TestSelfSignedHTTPSListenerRedirectPersistenceAndDisable(t *testing.T) {
 	if err != nil || sha256.Sum256(leafAfterEnable.Raw) != fingerprintBefore {
 		t.Fatalf("reactivation did not reuse the valid certificate: err=%v", err)
 	}
-	redirect = httptest.NewRecorder()
-	reopened.WrapHTTP(mux).ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "http://localhost/healthz?q=2", nil))
-	if redirect.Code != http.StatusPermanentRedirect || redirect.Header().Get("Location") != "https://localhost:19443/healthz?q=2" {
+	redirect := httptest.NewRecorder()
+	reopened.WrapHTTP(mux).ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "http://localhost/system?q=2", nil))
+	if redirect.Code != http.StatusTemporaryRedirect || redirect.Header().Get("Location") != "https://localhost:19443/system?q=2" || redirect.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("HTTP redirect did not resume after activation: %d %q", redirect.Code, redirect.Header().Get("Location"))
+	}
+}
+
+func TestUnreadyHTTPSNeverRedirectsAndUnconfiguredHostsAreEmptyArray(t *testing.T) {
+	root := t.TempDir()
+	m, err := Open(root, "127.0.0.1:0", 19444)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(testContext(t))
+	if err := m.SetHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Status().Hosts; got == nil || len(got) != 0 {
+		t.Fatalf("unconfigured HTTPS hosts = %#v, want empty array", got)
+	}
+	m.mu.Lock()
+	m.state.Enabled, m.state.Redirect, m.state.Hosts = true, true, []string{"localhost"}
+	m.mu.Unlock()
+	response := httptest.NewRecorder()
+	m.WrapHTTP(http.NotFoundHandler()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://localhost/system", nil))
+	if response.Code != http.StatusNotFound || response.Header().Get("Location") != "" {
+		t.Fatalf("unready HTTPS emitted redirect: %d %q", response.Code, response.Header().Get("Location"))
 	}
 }
 
@@ -386,7 +419,7 @@ func TestACMEWaitsForARealCertificateBeforeRedirecting(t *testing.T) {
 	}
 	response = httptest.NewRecorder()
 	wrapped.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://recorder.example.test/", nil))
-	if response.Code != http.StatusPermanentRedirect || response.Header().Get("Location") != "https://recorder.example.test/" {
+	if response.Code != http.StatusTemporaryRedirect || response.Header().Get("Location") != "https://recorder.example.test/" || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("ready ACME redirect = %d %q", response.Code, response.Header().Get("Location"))
 	}
 	listenerAddress, listening := m.ListenerAddress()

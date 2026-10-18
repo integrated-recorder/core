@@ -5,7 +5,27 @@
 Integrated Recorder Core는 라이브 스트림의 원본 미디어 세그먼트와 방송 메타데이터를 보존하고 브라우저 재생을 제공하는 실행 본체입니다.
 
 > [!NOTE]
-> 프로젝트는 활발히 개발 중이며 Core의 안정적인 정식 공개 릴리스는 아직 없습니다.
+> 현재 공개 버전은 `v0.1.0-rc.8` prerelease입니다. 설치 스크립트는 공개 stable release가 있으면 stable을 선택하고, 없을 때만 가장 최신 prerelease를 선택합니다.
+
+## 빠른 설치
+
+Linux `amd64`/`arm64`, macOS의 Docker Desktop Linux engine, 또는 Docker 통합이 설정된 WSL2에서 설치할 수 있습니다. Docker Engine과 Compose v2.20 이상, Git, Python 3.9 이상이 필요합니다. Docker engine은 현재 host의 로컬 engine이어야 하며, recording 경로도 그 engine에서 볼 수 있어야 합니다.
+
+```sh
+git clone https://github.com/integrated-recorder/core.git
+cd core
+./scripts/install.sh --recordings-dir /absolute/path/to/recordings
+```
+
+스크립트는 공식 GitHub release를 선택하고 공개 release tag를 정확한 commit SHA로 확인한 뒤, 그 tag의 source로 이미지를 빌드합니다. Stable release가 없을 경우 prerelease를 선택했다는 알림을 출력합니다. 특정 버전을 고정하려면 `--version v0.1.0-rc.8`을 추가하세요. 기존 설치는 명시적으로 `--upgrade`를 지정하지 않는 한 기록된 버전을 유지합니다.
+
+Application state, 인증 정보, Runtime Host 및 plugin/generation state는 전용 Docker volume의 `/data`에 저장됩니다. Recording archive만 지정한 host directory를 `/data/recordings`에 bind mount합니다. 앱은 container UID:GID `10001:10001`로 실행되며 installer는 그 identity로 실제 파일 생성·읽기·rename·삭제를 검사합니다. 기본 host port `8080`이 사용 중이면 다른 loopback port를 선택해 결과에 표시합니다. UI는 안전하게 `127.0.0.1`에만 노출됩니다.
+
+설치 결과가 출력하는 browser URL을 열고 `/setup`에서 첫 Owner의 login과 password를 직접 선택하세요. One-time setup code는 installer가 저장하거나 출력하지 않습니다. 출력된 `docker compose ... exec ... runtime-host setup-code` 명령을 host에서 실행해 화면에 입력하세요. Owner 설정은 설치 스크립트가 완료하지 않습니다.
+
+Installer는 사용할 정확한 Compose project/file prefix와 실제 port를 출력합니다. 그 prefix에 `logs -f archiver`, `stop`, `start`, `restart`를 붙여 운영하고, 출력된 loopback URL의 `/api/setup/status`에서 version/channel을 확인할 수 있습니다. `/data`의 named volume과 지정한 recording directory를 함께 백업하세요. 일반 재실행은 버전을 고정하며, 업그레이드에는 `--upgrade`가 필요합니다. 권한 문제는 지정 archive directory에 대해서만 해결하고, 감지된 기존 데이터 volume을 삭제해 설치를 우회하지 마세요.
+
+운영 명령, 설치 경로, 백업/upgrade, NFS 권한과 장애 복구는 [Deployment guide](docs/DEPLOYMENT.ko.md)를 참고하세요. 영문 문서는 [Deployment guide (English)](docs/DEPLOYMENT.md)에 있습니다.
 
 ## 역할과 책임 경계
 
@@ -31,22 +51,11 @@ Owncast는 first-party Source Plugin이지만 Core나 Docker image에 bundled되
 
 ## 인증과 네트워크 노출
 
-기본 Runtime Host는 내장 사용자 인증을 사용합니다. 최초 설정에는 local console 또는 container log에 표시되는 one-time claim code가 필요하며, 완료 뒤 browser는 session cookie로 인증합니다. 모든 mutation 요청에는 CSRF token이 필요합니다. `AUTH_DISABLED=1`은 개발용 escape hatch이며 listener가 loopback에 bind된 경우에만 허용됩니다. public bind에서는 Runtime Host가 fail closed합니다.
+기본 Runtime Host는 내장 사용자 인증을 사용합니다. 최초 설정에는 installer가 안내하는 `runtime-host setup-code` 명령으로 host에서 조회한 one-time claim code가 필요하며, 완료 뒤 browser는 session cookie로 인증합니다. 모든 mutation 요청에는 CSRF token이 필요합니다. `AUTH_DISABLED=1`은 개발용 escape hatch이며 listener가 loopback에 bind된 경우에만 허용됩니다. public bind에서는 Runtime Host가 fail closed합니다.
 
 Production에서 network를 통해 접속하려면 HTTPS, trusted reverse proxy, 적절한 network boundary를 구성하세요. TLS reverse proxy 뒤에서는 `COOKIE_SECURE=1`로 Secure cookie를 강제하세요.
 
-## 빠른 시작
-
-Docker가 기본 실행 경로입니다.
-
-```sh
-docker compose up -d
-docker compose logs archiver
-```
-
-로컬 Runtime Host 콘솔 또는 container log에 표시된 one-time setup code를 사용해 브라우저에서 [http://localhost:8080/](http://localhost:8080/)의 `/setup`을 완료하세요. 로그에 접근할 수 없는 경우 `docker compose exec archiver runtime-host setup-code`를 실행하세요. 컨테이너는 named `/data` volume을 사용합니다.
-
-비밀번호 변경과 사용자·세션 관리는 Settings의 `계정·보안`에서 할 수 있습니다. 비밀번호를 잊은 경우 원격 reset endpoint는 제공하지 않습니다. 서버에 직접 접근할 수 있는 운영자는 `docker compose exec -it archiver runtime-host reset-password <login>`을 실행하고, 터미널에 표시되는 비밀번호 입력 prompt를 사용하세요. 비밀번호는 명령 인자로 전달되지 않습니다.
+비밀번호 변경과 사용자·세션 관리는 Settings의 `계정·보안`에서 할 수 있습니다. 비밀번호를 잊은 경우 원격 reset endpoint는 제공하지 않습니다. 서버에 직접 접근할 수 있는 운영자는 설치 시 출력된 Compose project/file prefix를 사용해 `exec -it archiver runtime-host reset-password <login>`을 실행하고, 터미널의 prompt에서 새 비밀번호를 입력하세요. 비밀번호는 명령 인자로 전달되지 않습니다.
 
 공식 Plugin Registry 주소는 `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`입니다. Registry는 plugin 배포 metadata이며 build 서비스가 아닙니다. 이미 설치된 plugin과 archive는 Registry에 연결할 수 없어도 사용할 수 있습니다.
 
@@ -69,6 +78,7 @@ Web UI 개발과 전체 검증 명령은 저장소의 Makefile 및 CI workflow�
 ## 자세한 문서
 
 - [아키텍처](docs/ARCHITECTURE.ko.md)
+- [배포와 운영](docs/DEPLOYMENT.ko.md)
 - [Plugin Trust Model](docs/PLUGIN_TRUST_MODEL.md)
 - [Storage Provider Protocol v1](docs/STORAGE_PROVIDER_PROTOCOL_V1.md)
 - [Storage Provider 수명주기](docs/STORAGE_PROVIDER_V1.md)
@@ -77,7 +87,7 @@ Web UI 개발과 전체 검증 명령은 저장소의 Makefile 및 CI workflow�
 
 ## 현재 제한
 
-프로젝트는 active development 상태입니다. Core는 platform-independent timed event archive와 replay 기반을 제공하지만 실제 platform chat/event integration은 아직 포함하지 않습니다. 다중 storage placement와 replication, DRM, 다중 사용자 role 관리 등도 제공하지 않습니다. 상세 기능과 제한은 문서를 참고하세요.
+Core는 platform-independent timed event archive와 replay 기반을 제공합니다. Streamer별 연동은 Source Plugin을 통해 제공됩니다. Multi-pool storage placement와 replication, DRM은 아직 제공하지 않습니다. 상세 기능과 제한은 문서를 참고하세요.
 
 ## 라이선스
 

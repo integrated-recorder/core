@@ -5,7 +5,27 @@
 Integrated Recorder Core is the runtime that preserves original live-stream media segments and broadcast metadata, then serves browser playback.
 
 > [!NOTE]
-> The project is under active development. Core does not yet have a stable public release.
+> The current public version is the `v0.1.0-rc.8` prerelease. The installer selects a published stable release when one exists, and otherwise selects the newest published prerelease.
+
+## Quick install
+
+Supported targets are Linux `amd64`/`arm64`, Docker Desktop's local Linux engine on macOS, and WSL2 with Docker integration enabled. Install Docker Engine with Compose v2.20 or newer, Git, and Python 3.9 or newer. The Docker engine must be local to the host and able to access the recording directory.
+
+```sh
+git clone https://github.com/integrated-recorder/core.git
+cd core
+./scripts/install.sh --recordings-dir /absolute/path/to/recordings
+```
+
+The installer selects an official GitHub release, resolves its published tag to an exact commit SHA, and builds the image from that tag's source. It prints a notice when it selects a prerelease because no stable release is available. Pin a version with `--version v0.1.0-rc.8`. An existing install keeps its recorded version unless you explicitly pass `--upgrade`.
+
+Application state, credentials, Runtime Host state, and plugin/generation metadata live in a dedicated Docker volume mounted at `/data`. Only the recording archive is bind-mounted from the requested host directory to `/data/recordings`. The application runs as container UID:GID `10001:10001`; the installer checks real file creation, read, rename, and deletion as that identity. It uses host port `8080` when free, otherwise selects and reports another loopback port. The UI binds only to `127.0.0.1` by default.
+
+Open the browser URL printed by the installer and complete `/setup`. Choose the first Owner's login and password yourself. The installer never creates or stores credentials or a setup code. Run the printed `docker compose ... exec ... runtime-host setup-code` command locally and enter that one-time code in the setup page. The installer does not claim that Owner onboarding is complete.
+
+The installer prints the exact Compose project/file prefix and selected port. Add `logs -f archiver`, `stop`, `start`, or `restart` to that prefix. Check the running version/channel at `/api/setup/status` on the printed loopback URL. Back up both the `/data` named volume and the selected recordings directory. A normal rerun keeps the pinned release; use `--upgrade` to select an upgrade. Correct permission failures only on the dedicated archive directory, and do not delete a detected existing state volume to bypass an installation check.
+
+See the [deployment guide](docs/DEPLOYMENT.md) for operations, backups/upgrades, NFS permissions, and recovery. The Korean guide is [here](docs/DEPLOYMENT.ko.md).
 
 ## Role and boundaries
 
@@ -31,22 +51,11 @@ Operator-supplied plugins are disabled by default; set `IR_ALLOW_OPERATOR_PLUGIN
 
 ## Authentication and network exposure
 
-The default Runtime Host uses built-in user authentication. First-run setup requires the one-time claim code printed to the local console or container logs. After setup, the browser authenticates with a session cookie. Mutation requests require a CSRF token. `AUTH_DISABLED=1` is a development escape hatch and is accepted only when the listener binds to loopback. The Runtime Host fails closed on public binds.
+The default Runtime Host uses built-in user authentication. First-run setup requires the one-time claim code retrieved on the host with the `runtime-host setup-code` command shown by the installer. After setup, the browser authenticates with a session cookie. Mutation requests require a CSRF token. `AUTH_DISABLED=1` is a development escape hatch and is accepted only when the listener binds to loopback. The Runtime Host fails closed on public binds.
 
 For production network access, configure HTTPS, a trusted reverse proxy, and an appropriate network boundary. Set `COOKIE_SECURE=1` behind a TLS reverse proxy to require Secure cookies.
 
-## Quick start
-
-Docker is the primary way to run Core.
-
-```sh
-docker compose up -d
-docker compose logs archiver
-```
-
-Use the one-time setup code printed to the local Runtime Host console or container logs, then open [http://localhost:8080/](http://localhost:8080/) and complete `/setup`. If logs are unavailable, run `docker compose exec archiver runtime-host setup-code`. The container uses a named `/data` volume.
-
-Change passwords and manage users or sessions under Settings → Account & security. There is no remote password-reset endpoint. An operator with direct server access can run `docker compose exec -it archiver runtime-host reset-password <login>` and enter the new password at the terminal prompt. The password is not passed as a command-line argument.
+Change passwords and manage users or sessions under Settings → Account & security. There is no remote password-reset endpoint. An operator with direct server access can use the Compose project/file prefix printed by the installer with `exec -it archiver runtime-host reset-password <login>`, then enter the new password at the terminal prompt. The password is not passed as a command-line argument.
 
 The official Plugin Registry catalog is `https://integrated-recorder.github.io/plugin-registry/catalog-v3.json`. The Registry distributes plugin metadata; it does not build plugins. Already installed plugins and archives remain usable when the Registry is unavailable.
 
@@ -69,6 +78,7 @@ See the Makefile and CI workflows for Web UI development and validation commands
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Deployment and operations](docs/DEPLOYMENT.md)
 - [Plugin Trust Model](docs/PLUGIN_TRUST_MODEL.md)
 - [Storage Provider Protocol v1](docs/STORAGE_PROVIDER_PROTOCOL_V1.md)
 - [Storage Provider lifecycle](docs/STORAGE_PROVIDER_V1.md)
@@ -77,7 +87,7 @@ See the Makefile and CI workflows for Web UI development and validation commands
 
 ## Current limitations
 
-The project is under active development. Core provides a platform-independent timed event archive and replay foundation, but does not include platform chat/event integrations. Multi-pool storage placement and replication, DRM, and multi-user role management are also not available yet. See the linked guides for current capabilities and limitations.
+Core provides a platform-independent timed-event archive and replay foundation. Streamer integrations are provided through Source Plugins. Multi-pool storage placement and replication, and DRM, are not yet available. See the linked guides for current capabilities and limitations.
 
 ## License
 

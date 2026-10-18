@@ -53,6 +53,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Installer unit tests
+        run: python3 -m unittest discover -s scripts -p 'test_install.py'
       - name: Test
         run: go test -short -timeout=30m ./...
       - name: Vet

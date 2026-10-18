@@ -1,3 +1,6 @@
+# Legacy/manual checkout Compose example. For supported production installs,
+# use scripts/install.sh so /data application state and /data/recordings are
+# separated and the selected release identity is pinned and verified.
 services:
   archiver:
     build: .

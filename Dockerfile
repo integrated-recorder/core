@@ -26,6 +26,10 @@ RUN set -eu; \
 	chmod 0555 /out/runtime-host /out/initial/control-plane /out/initial/recorder-engine /out/adapters/integrated-recorder-adapter-hls /out/plugins/storage.local
 
 FROM alpine:3.21
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
+ARG RELEASE_CHANNEL=development
 RUN apk add --no-cache ca-certificates ffmpeg && adduser -D -H -u 10001 archiver && mkdir -p /data /opt/integrated-recorder/initial /usr/local/lib/integrated-recorder/plugins && chown archiver:archiver /data
 COPY --from=build /out/runtime-host /usr/local/bin/runtime-host
 COPY --from=build /out/initial/ /opt/integrated-recorder/initial/
@@ -34,6 +38,11 @@ COPY --from=build /out/plugins/storage.local /usr/local/lib/integrated-recorder/
 RUN chmod 0555 /usr/local/bin/runtime-host /opt/integrated-recorder/initial/control-plane /opt/integrated-recorder/initial/recorder-engine /usr/local/lib/integrated-recorder/plugins/storage.local && chown -R root:root /opt/integrated-recorder /usr/local/lib/integrated-recorder /adapters
 USER 10001:10001
 ENV ADDR=:8080 DATA_DIR=/data ADAPTER_DIR=/external-adapters
+LABEL org.opencontainers.image.source="https://github.com/integrated-recorder/core" \
+	org.opencontainers.image.version="${VERSION}" \
+	org.opencontainers.image.revision="${COMMIT}" \
+	org.opencontainers.image.created="${BUILD_TIME}" \
+	com.integrated-recorder.release-channel="${RELEASE_CHANNEL}"
 EXPOSE 8080
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/local/bin/runtime-host"]

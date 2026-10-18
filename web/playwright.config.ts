@@ -23,6 +23,7 @@ export default defineConfig({
     // that shell so gracefulShutdown reaches the signal-aware Node runner.
     command: 'exec node e2e/run-backend.mjs',
     url: 'http://127.0.0.1:4173/healthz',
+    ignoreHTTPSErrors: true,
     timeout: 180_000,
     gracefulShutdown: { signal: 'SIGTERM', timeout: 30_000 },
     reuseExistingServer: false,

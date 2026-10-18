@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { LockKeyhole, Save } from 'lucide-react'
 import { runtimeHTTPSAPI } from '@/api'
@@ -27,15 +27,41 @@ export function HTTPSSettings() {
       : runtimeHTTPSAPI.enableSelfSigned({ hosts: parseHosts(hosts), redirect_http: redirectHTTP }),
     onSuccess: value => { client.setQueryData(['runtime', 'https'], value); setCertificate(''); setPrivateKey('') },
   })
-  const disable = useMutation({ mutationFn: runtimeHTTPSAPI.disable, onSuccess: value => client.setQueryData(['runtime', 'https'], value) })
+  const disable = useMutation({ mutationFn: runtimeHTTPSAPI.disable, onSuccess: value => {
+    client.setQueryData(['runtime', 'https'], value)
+    if (window.location.protocol === 'https:' && value.http_recovery_available && value.http_port > 0) {
+      const target = new URL(window.location.href)
+      target.protocol = 'http:'
+      target.port = String(value.http_port)
+      window.location.replace(target.toString())
+    }
+  } })
+  const enableSaved = useMutation({ mutationFn: runtimeHTTPSAPI.enableSaved, onSuccess: value => {
+    client.setQueryData(['runtime', 'https'], value)
+    setCertificate('')
+    setPrivateKey('')
+    if (value.certificate_ready && window.location.protocol === 'http:') {
+      const target = new URL(window.location.href)
+      target.protocol = 'https:'
+      target.port = String(value.port)
+      window.location.replace(target.toString())
+    }
+  } })
   const value = status.data as RuntimeHTTPSSettings | undefined
+  useEffect(() => {
+    if (!value?.configured) return
+    setHosts(value.hosts.join(', '))
+    setRedirectHTTP(value.redirect_http)
+    setUseACME(value.acme)
+  }, [value?.configured, value?.hosts, value?.redirect_http, value?.acme])
   return <Card className="xl:col-span-2">
     <CardHeader><CardTitle className="flex items-center gap-2"><LockKeyhole className="h-4 w-4" />{t('https.title')}</CardTitle></CardHeader>
     <CardContent className="space-y-4">
       <p className="text-sm leading-6 text-muted-foreground">{t('https.help')}</p>
       {status.isLoading ? <LoadingState /> : status.error || !value ? <ErrorState message={status.error ? errorMessage(status.error) : t('runtime.statusUnavailable')} retry={() => void status.refetch()} /> : <>
-        <p role="status" className="text-sm">{!value.enabled ? t('https.disabled') : !value.listening ? t('https.listenerUnavailable') : value.issuance_failed ? t('https.issuanceFailed') : !value.certificate_ready ? t('https.pending') : t('https.enabled')} · :{value.port}{value.expires_at ? ` · ${t('https.expires')}: ${value.expires_at}` : ''}</p>
+        <p role="status" className="text-sm">{!value.enabled ? t('https.disabled') : !value.listening ? t('https.listenerUnavailable') : value.issuance_failed ? t('https.issuanceFailed') : !value.certificate_ready ? t('https.pending') : t('https.enabled')} · :{value.port} · {value.redirect_active ? t('https.redirectActive') : t('https.redirectInactive')}{value.expires_at ? ` · ${t('https.expires')}: ${value.expires_at}` : ''}</p>
         {value.hosts.length > 0 && <p className="break-all text-xs text-muted-foreground">{t('https.hostsCurrent')}: {value.hosts.join(', ')}</p>}
+        {value.configured && !value.enabled && <Button type="button" disabled={enableSaved.isPending} onClick={() => enableSaved.mutate()}>{t('https.enableSaved')}</Button>}
         <form className="grid gap-3 md:grid-cols-2" onSubmit={event => { event.preventDefault(); save.mutate() }}>
           <label className="space-y-1 text-sm md:col-span-2">{t('https.hostsLabel')}<Input value={hosts} onChange={event => setHosts(event.currentTarget.value)} placeholder="recorder.example.com, 192.168.1.20" required /></label>
           <label className="flex items-center gap-2 text-sm md:col-span-2"><input type="checkbox" checked={redirectHTTP} onChange={event => setRedirectHTTP(event.currentTarget.checked)} />{t('https.redirect')}</label>
@@ -47,7 +73,7 @@ export function HTTPSSettings() {
             {value.enabled && <Button type="button" variant="outline" disabled={disable.isPending} onClick={() => disable.mutate()}>{t('https.disable')}</Button>}
           </div>
         </form>
-        {(save.error || disable.error) && <p role="alert" className="text-sm text-destructive">{errorMessage(save.error ?? disable.error)}</p>}
+        {(save.error || disable.error || enableSaved.error) && <p role="alert" className="text-sm text-destructive">{errorMessage(save.error ?? disable.error ?? enableSaved.error)}</p>}
         <p className="text-xs leading-5 text-muted-foreground">{t('https.warning')}</p>
       </>}
     </CardContent>

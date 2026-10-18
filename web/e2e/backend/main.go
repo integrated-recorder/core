@@ -208,16 +208,28 @@ func run() error {
 		Auth: auth, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage,
 		StartedAt: time.Now().UTC(), Version: "browser-e2e", Commit: "test-fixture",
 	})
-	httpsManager, err := tlsserver.Open(dataDir, "127.0.0.1:0", 4174)
+	httpsProbe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("select HTTPS browser fixture port: %w", err)
+	}
+	httpsPort := httpsProbe.Addr().(*net.TCPAddr).Port
+	_ = httpsProbe.Close()
+	httpsAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(httpsPort))
+	httpsManager, err := tlsserver.Open(dataDir, httpsAddress, httpsPort)
 	if err != nil {
 		return fmt.Errorf("initialize HTTPS browser fixture: %w", err)
 	}
-	httpsHandler, err := httpapi.WithHTTPS(auth, false, httpsManager, legacyWorkflowReadyHostProjection(api, auth))
+	if err := httpsManager.SetHTTPPublicPort(4173); err != nil {
+		_ = httpsManager.Close(context.Background())
+		return fmt.Errorf("configure HTTP browser fixture port: %w", err)
+	}
+	publicHandler, err := httpapi.WithHTTPS(auth, false, httpsManager, legacyWorkflowReadyHostProjection(api, auth))
 	if err != nil {
 		_ = httpsManager.Close(context.Background())
 		return err
 	}
-	if err := httpsManager.SetHandler(httpsManager.WrapHTTP(httpsHandler)); err != nil {
+	publicHandler = httpsManager.WrapHTTP(publicHandler)
+	if err := httpsManager.SetHandler(publicHandler); err != nil {
 		_ = httpsManager.Close(context.Background())
 		return fmt.Errorf("start HTTPS browser fixture: %w", err)
 	}
@@ -242,7 +254,7 @@ func run() error {
 	if addr == "" {
 		addr = "127.0.0.1:4173"
 	}
-	web := &http.Server{Addr: addr, Handler: legacyWorkflowReadyHostProjection(api, auth), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	web := &http.Server{Addr: addr, Handler: publicHandler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- web.ListenAndServe() }()
 	log.Printf("browser e2e API listening on %s", addr)

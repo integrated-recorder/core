@@ -82,6 +82,32 @@ func TestConfigFromEnvOperatorPluginOptIn(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvKeepsPublishedHTTPPortForHTTPSRecovery(t *testing.T) {
+	config, err := ConfigFromEnv(func(key string) string {
+		if key == "IR_HTTP_PUBLIC_PORT" {
+			return "18080"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.HTTPPublicPort != 18080 {
+		t.Fatalf("HTTP public port=%d, want installer-published port 18080", config.HTTPPublicPort)
+	}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("valid HTTP public port was rejected: %v", err)
+	}
+	if _, err := ConfigFromEnv(func(key string) string {
+		if key == "IR_HTTP_PUBLIC_PORT" {
+			return "not-a-port"
+		}
+		return ""
+	}); err == nil {
+		t.Fatal("malformed HTTP public port was accepted")
+	}
+}
+
 func TestPluginRegistryDefaultsToOfficialCatalogAndAllowsOverride(t *testing.T) {
 	config, err := ConfigFromEnv(func(string) string { return "" })
 	if err != nil {

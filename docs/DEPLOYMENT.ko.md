@@ -63,6 +63,8 @@ HTTPS 화면에서 DNS 도메인 하나에 대해 공개 ACME 인증서를 요�
 
 기존 설치는 일반 재실행 시 release pin, `/data` named volume, archive path, bind 설정을 보존합니다. `--bind`, `--port`, `--https-port`는 network mapping만 수정합니다. TLS 설정과 개인키는 영속 `/data`에 남습니다. UI에서 HTTPS를 끄면 listener만 닫고 설정·인증서·녹화 데이터를 지우지 않습니다. network 변경은 application release upgrade를 의미하지 않습니다.
 
+HTTPS 상태는 저장된 HTTP redirect 선호와 실제 redirect 동작을 따로 표시합니다. HTTPS를 끄면 TLS listener와 HTTP redirect가 중지되지만 인증서 방식, 호스트, 인증서·개인키와 redirect 선호는 보존됩니다. 설정 화면은 현재 브라우저를 공개된 HTTP 포트로 이동시키며 기존 로그인 세션과 CSRF token을 유지합니다. **저장된 HTTPS 설정 다시 켜기**는 기존 설정을 재사용합니다. 유효한 인증서는 그대로 쓰고, 자체 서명 인증서는 기존 만료 정책에 따라 필요할 때 갱신하며, 만료된 사용자 인증서는 안전하게 거부합니다. 비활성화 상태는 Runtime Host 재시작 후에도 유지됩니다.
+
 ## 일반 운영
 
 Installer는 생성된 Compose 파일을 참조하는 정확한 project/file command prefix를 출력합니다. 모든 동작에 그 prefix를 사용하세요.

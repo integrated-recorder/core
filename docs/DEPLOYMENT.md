@@ -63,6 +63,8 @@ The HTTPS screen can request a public ACME certificate for one DNS name. DNS mus
 
 Existing installs retain their release pin, data volume, archive path and bind settings on an ordinary rerun. `--bind`, `--port`, and `--https-port` update network publication only. HTTPS certificate configuration remains in persistent `/data` and is enabled or disabled through the authenticated UI. Disabling HTTPS removes only its listener and does not remove certificate/application/archive data. HTTP/HTTPS changes do not imply an application release upgrade.
 
+The HTTPS status separates the saved HTTP redirect preference from whether redirects are currently active. Disabling HTTPS stops the TLS listener and HTTP redirects while preserving the certificate mode, hosts, certificate/private key, and redirect preference. The settings page moves the current browser from the HTTPS URL to the published HTTP port and preserves the authenticated session and CSRF token. **Re-enable saved HTTPS settings** starts the existing configuration again; it reuses a valid certificate, renews a near-expiry self-signed certificate under the existing policy, and refuses an expired custom certificate. A disabled configuration remains disabled after Runtime Host restart.
+
 ## Normal operation
 
 The installer prints the exact project/file command prefix for the generated Compose file. Use that prefix for each operation:

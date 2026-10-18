@@ -48,6 +48,7 @@ import (
 const (
 	defaultDataDir           = "/data"
 	defaultListenAddr        = ":8080"
+	defaultHTTPPublicPort    = 8080
 	defaultHTTPSListenAddr   = ":8443"
 	defaultHTTPSPublicPort   = 8443
 	defaultAdapterDirs       = "/external-adapters"
@@ -84,6 +85,7 @@ type Config struct {
 	StorageLocalBinary   string
 	BundledHLSBinary     string
 	ListenAddr           string
+	HTTPPublicPort       int
 	HTTPSListenAddr      string
 	HTTPSPublicPort      int
 	AdapterDirs          string
@@ -111,7 +113,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		DataDir: defaultDataDir, BundleDir: defaultBundleDir, StorageLocalBinary: defaultStorageLocalBinary, BundledHLSBinary: defaultBundledHLSBinary,
-		ListenAddr: defaultListenAddr, HTTPSListenAddr: defaultHTTPSListenAddr, HTTPSPublicPort: defaultHTTPSPublicPort, AdapterDirs: defaultAdapterDirs, PluginRegistryURL: defaultPluginRegistryURL,
+		ListenAddr: defaultListenAddr, HTTPPublicPort: defaultHTTPPublicPort, HTTPSListenAddr: defaultHTTPSListenAddr, HTTPSPublicPort: defaultHTTPSPublicPort, AdapterDirs: defaultAdapterDirs, PluginRegistryURL: defaultPluginRegistryURL,
 		ControlReadyWait: defaultControlWait, ShutdownTimeout: defaultCloseWait,
 		PluginAutoUpdateInterval: defaultPluginAutoUpdateInterval,
 	}
@@ -129,6 +131,13 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if value := strings.TrimSpace(getenv("ADDR")); value != "" {
 		c.ListenAddr = value
+	}
+	if value := strings.TrimSpace(getenv("IR_HTTP_PUBLIC_PORT")); value != "" {
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return Config{}, errors.New("IR_HTTP_PUBLIC_PORT is invalid")
+		}
+		c.HTTPPublicPort = port
 	}
 	if value := strings.TrimSpace(getenv("IR_HTTPS_LISTEN_ADDR")); value != "" {
 		c.HTTPSListenAddr = value
@@ -210,6 +219,9 @@ func (c Config) Validate() error {
 	}
 	if err := validateListenAddress(c.HTTPSListenAddr); err != nil {
 		return err
+	}
+	if c.HTTPPublicPort < 1 || c.HTTPPublicPort > 65535 {
+		return errors.New("HTTP public port is invalid")
 	}
 	if c.HTTPSPublicPort < 1 || c.HTTPSPublicPort > 65535 {
 		return errors.New("HTTPS public port is invalid")
@@ -637,12 +649,15 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return fmt.Errorf("initialize Runtime Host HTTPS configuration: %w", err)
 	}
+	if err := httpsManager.SetHTTPPublicPort(config.HTTPPublicPort); err != nil {
+		return fmt.Errorf("configure Runtime Host HTTP public port: %w", err)
+	}
 	if config.AuthDisabled {
 		if err := httpsManager.Disable(); err != nil {
 			return fmt.Errorf("disable HTTPS for unauthenticated Runtime Host: %w", err)
 		}
 	}
-	httpsHandler, err := httpapi.WithHTTPS(hostAuth, config.AuthDisabled, httpsManager, setupHandler)
+	httpsHandler, err := httpapi.WithHTTPSWithSecureCookiePolicy(hostAuth, config.AuthDisabled, httpsManager, config.ForceSecureCookies, setupHandler)
 	if err != nil {
 		return fmt.Errorf("initialize Runtime Host HTTPS API: %w", err)
 	}

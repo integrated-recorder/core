@@ -244,7 +244,7 @@ export type SystemSettings = {
   restart_required: string[]
 }
 
-export type RuntimeHTTPSSettings = { enabled: boolean; listening: boolean; certificate_ready: boolean; issuance_failed: boolean; redirect_http: boolean; port: number; hosts: string[]; self_signed: boolean; acme: boolean; expires_at?: string }
+export type RuntimeHTTPSSettings = { enabled: boolean; configured: boolean; listening: boolean; certificate_ready: boolean; issuance_failed: boolean; redirect_http: boolean; redirect_active: boolean; http_recovery_available: boolean; port: number; http_port: number; hosts: string[]; self_signed: boolean; acme: boolean; expires_at?: string }
 export type SearchResult = { type: 'recording' | 'adapter' | 'resource' | 'workflow'; id?: string; workflow_id?: string; adapter_id?: string; resource_type?: string; resource_id?: string; title?: string; name?: string; display_name?: string; state?: string; resource?: ResourceRef }
 export type ArchiveEntry = { kind: string; path: string; size: number; sha256?: string }
 export type ArchiveIndexPage = { recording_id: string; entries: ArchiveEntry[]; next_cursor?: string; has_more: boolean }

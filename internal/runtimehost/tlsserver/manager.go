@@ -48,10 +48,14 @@ type state struct {
 
 type Status struct {
 	Enabled        bool     `json:"enabled"`
+	Configured     bool     `json:"configured"`
 	Listening      bool     `json:"listening"`
 	Ready          bool     `json:"certificate_ready"`
 	RedirectHTTP   bool     `json:"redirect_http"`
+	RedirectActive bool     `json:"redirect_active"`
 	Port           int      `json:"port"`
+	HTTPPort       int      `json:"http_port"`
+	HTTPRecovery   bool     `json:"http_recovery_available"`
 	Hosts          []string `json:"hosts"`
 	SelfSigned     bool     `json:"self_signed"`
 	ACME           bool     `json:"acme"`
@@ -64,12 +68,14 @@ type Manager struct {
 	path       string
 	listen     string
 	publicPort int
+	httpPort   int
 	state      state
 	cert       *tls.Certificate
 	acme       *autocert.Manager
 	handler    http.Handler
 	listener   net.Listener
 	server     *http.Server
+	stopDone   chan struct{}
 	acmeFailed atomic.Bool
 	lookupHost func(context.Context, string) ([]string, error)
 }
@@ -89,7 +95,7 @@ func Open(dataRoot, listenAddress string, publicPort int) (*Manager, error) {
 	if err := os.Chmod(dir, 0700); err != nil {
 		return nil, errors.New("HTTPS security storage could not be protected")
 	}
-	m := &Manager{path: filepath.Join(dir, "https.json"), listen: listenAddress, publicPort: publicPort, state: state{Version: 1, Port: publicPort}, lookupHost: net.DefaultResolver.LookupHost}
+	m := &Manager{path: filepath.Join(dir, "https.json"), listen: listenAddress, publicPort: publicPort, httpPort: 8080, state: state{Version: 1, Port: publicPort}, lookupHost: net.DefaultResolver.LookupHost}
 	info, err := os.Lstat(m.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return m, nil
@@ -106,11 +112,14 @@ func Open(dataRoot, listenAddress string, publicPort int) (*Manager, error) {
 		return nil, errors.New("HTTPS configuration is invalid")
 	}
 	m.state = loaded
-	if loaded.Enabled {
+	configured := httpsConfigured(loaded)
+	if loaded.Enabled || configured {
 		hosts, hostErr := normalizeHosts(loaded.Hosts)
-		if hostErr != nil || len(hosts) != len(loaded.Hosts) {
+		if hostErr != nil {
 			return nil, errors.New("persisted HTTPS hosts are invalid")
 		}
+		loaded.Hosts = hosts
+		m.state = loaded
 		if loaded.ACME {
 			if loaded.SelfSigned || loaded.Certificate != "" || loaded.PrivateKey != "" || len(hosts) != 1 || net.ParseIP(hosts[0]) != nil || !strings.Contains(hosts[0], ".") {
 				return nil, errors.New("persisted ACME configuration is invalid")
@@ -121,7 +130,7 @@ func Open(dataRoot, listenAddress string, publicPort int) (*Manager, error) {
 				return nil, errors.New("persisted HTTPS certificate is invalid")
 			}
 			leaf, parseErr := x509.ParseCertificate(cert.Certificate[0])
-			if parseErr != nil || time.Now().Before(leaf.NotBefore) || (!loaded.SelfSigned && time.Now().After(leaf.NotAfter)) {
+			if parseErr != nil || time.Now().Before(leaf.NotBefore) || (loaded.Enabled && !loaded.SelfSigned && time.Now().After(leaf.NotAfter)) {
 				return nil, errors.New("persisted HTTPS certificate is invalid")
 			}
 			for _, host := range hosts {
@@ -141,13 +150,13 @@ func Open(dataRoot, listenAddress string, publicPort int) (*Manager, error) {
 			return nil, errors.New("HTTPS public port could not be updated")
 		}
 	}
-	if loaded.Enabled {
+	if configured {
 		if loaded.ACME {
 			m.acme = m.newACME(loaded.Hosts[0])
 		} else {
 			// The certificate was parsed and checked against every configured SAN above.
 		}
-		if loaded.SelfSigned {
+		if loaded.Enabled && loaded.SelfSigned {
 			cert := *m.cert
 			leaf, parseErr := x509.ParseCertificate(cert.Certificate[0])
 			if parseErr != nil {
@@ -184,10 +193,23 @@ func (m *Manager) SetHandler(handler http.Handler) error {
 	return m.syncLocked(context.Background())
 }
 
+// SetHTTPPublicPort records the installer-published HTTP port so the browser
+// can return to the authenticated cleartext UI when HTTPS is intentionally
+// disabled. The application listener itself remains installer-configured.
+func (m *Manager) SetHTTPPublicPort(port int) error {
+	if port < 1 || port > 65535 {
+		return errors.New("HTTP public port is invalid")
+	}
+	m.mu.Lock()
+	m.httpPort = port
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := Status{Enabled: m.state.Enabled, Listening: m.server != nil, RedirectHTTP: m.state.Redirect, Port: m.state.Port, Hosts: append([]string(nil), m.state.Hosts...), SelfSigned: m.state.SelfSigned, ACME: m.state.ACME}
+	out := Status{Enabled: m.state.Enabled, Configured: httpsConfigured(m.state), Listening: m.server != nil, RedirectHTTP: m.state.Redirect, Port: m.state.Port, HTTPPort: m.httpPort, HTTPRecovery: true, Hosts: append([]string(nil), m.state.Hosts...), SelfSigned: m.state.SelfSigned, ACME: m.state.ACME}
 	if m.cert != nil && len(m.cert.Certificate) > 0 {
 		if leaf, err := x509.ParseCertificate(m.cert.Certificate[0]); err == nil {
 			out.ExpiresAt = leaf.NotAfter.UTC().Format(time.RFC3339)
@@ -205,7 +227,12 @@ func (m *Manager) Status() Status {
 		}
 		out.IssuanceFailed = m.acmeFailed.Load()
 	}
+	out.RedirectActive = out.Enabled && out.Listening && out.RedirectHTTP && out.Ready
 	return out
+}
+
+func httpsConfigured(config state) bool {
+	return len(config.Hosts) > 0 && (config.ACME || config.Certificate != "" || config.PrivateKey != "")
 }
 
 func cachedACMECertificate(data []byte) (tls.Certificate, error) {
@@ -295,24 +322,112 @@ func (m *Manager) EnableCertificate(hosts []string, certPEM, keyPEM string, redi
 
 func (m *Manager) Disable() error {
 	m.mu.Lock()
-	next := state{Version: 1, Port: m.state.Port}
+	next := m.state
+	next.Enabled = false
 	if err := m.persist(next); err != nil {
 		m.mu.Unlock()
 		return err
 	}
 	m.state = next
-	m.cert = nil
-	m.acme = nil
 	server := m.server
 	m.server, m.listener = nil, nil
+	if server != nil {
+		done := make(chan struct{})
+		m.stopDone = done
+	}
+	done := m.stopDone
 	m.mu.Unlock()
 	if server != nil {
-		// Let the HTTPS request that disabled TLS finish writing its response.
-		time.AfterFunc(500*time.Millisecond, func() {
+		// Stop accepting new TLS requests immediately while allowing the current
+		// authenticated disable response to finish before the browser moves to HTTP.
+		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_ = server.Shutdown(ctx)
-		})
+			if err := server.Shutdown(ctx); err != nil {
+				_ = server.Close()
+			}
+			m.mu.Lock()
+			if m.stopDone == done {
+				m.stopDone = nil
+			}
+			close(done)
+			m.mu.Unlock()
+		}()
+	}
+	return nil
+}
+
+// EnableSaved reactivates the last explicitly configured TLS mode without
+// changing its hosts, redirect preference, certificate, or key. Self-signed
+// certificates use the existing 30-day renewal policy; custom certificates
+// must still be currently valid. ACME uses its protected persistent cache.
+func (m *Manager) EnableSaved() error {
+	for {
+		m.mu.Lock()
+		stopping := m.stopDone
+		if stopping == nil {
+			break
+		}
+		m.mu.Unlock()
+		<-stopping
+	}
+	defer m.mu.Unlock()
+	previous := m.state
+	if !httpsConfigured(previous) {
+		return errors.New("no saved HTTPS configuration is available")
+	}
+	next := previous
+	next.Enabled = true
+	var nextCert *tls.Certificate
+	var nextACME *autocert.Manager
+	if next.ACME {
+		if len(next.Hosts) != 1 || net.ParseIP(next.Hosts[0]) != nil || !strings.Contains(next.Hosts[0], ".") {
+			return errors.New("saved ACME configuration is invalid")
+		}
+		nextACME = m.acme
+		if nextACME == nil {
+			nextACME = m.newACME(next.Hosts[0])
+		}
+	} else {
+		cert, err := parsePair(next.Certificate, next.PrivateKey)
+		if err != nil || len(cert.Certificate) == 0 {
+			return errors.New("saved HTTPS certificate is invalid")
+		}
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil || time.Now().Before(leaf.NotBefore) {
+			return errors.New("saved HTTPS certificate is not currently valid")
+		}
+		for _, host := range next.Hosts {
+			if leaf.VerifyHostname(host) != nil {
+				return errors.New("saved HTTPS certificate does not cover configured hosts")
+			}
+		}
+		if time.Now().After(leaf.NotAfter) || (next.SelfSigned && time.Until(leaf.NotAfter) <= 30*24*time.Hour) {
+			if !next.SelfSigned {
+				return errors.New("saved HTTPS certificate has expired")
+			}
+			certPEM, keyPEM, err := generateCertificate(next.Hosts)
+			if err != nil {
+				return errors.New("self-signed HTTPS certificate could not be renewed")
+			}
+			next.Certificate, next.PrivateKey = certPEM, keyPEM
+			cert, err = parsePair(certPEM, keyPEM)
+			if err != nil {
+				return errors.New("self-signed HTTPS certificate could not be renewed")
+			}
+		}
+		nextCert = &cert
+	}
+	if err := m.persist(next); err != nil {
+		return err
+	}
+	previousCert, previousACME := m.cert, m.acme
+	m.state, m.cert, m.acme = next, nextCert, nextACME
+	m.acmeFailed.Store(false)
+	if err := m.syncLocked(context.Background()); err != nil {
+		m.state, m.cert, m.acme = previous, previousCert, previousACME
+		_ = m.persist(previous)
+		return err
 	}
 	return nil
 }
@@ -430,7 +545,7 @@ func (m *Manager) WrapHTTP(next http.Handler) http.Handler {
 		redirect, enabled, port, acme := m.state.Redirect, m.state.Enabled, m.state.Port, m.acme
 		hosts := append([]string(nil), m.state.Hosts...)
 		m.mu.Unlock()
-		if r.TLS == nil && acme != nil && strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
+		if r.TLS == nil && enabled && acme != nil && strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
 			acme.HTTPHandler(next).ServeHTTP(w, r)
 			return
 		}
@@ -487,13 +602,25 @@ func (m *Manager) ListenerAddress() (string, bool) {
 func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	server := m.server
+	stopping := m.stopDone
 	m.server = nil
 	m.listener = nil
 	m.mu.Unlock()
 	if server == nil {
+		if stopping != nil {
+			select {
+			case <-stopping:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return nil
 	}
-	return server.Shutdown(ctx)
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) persist(next state) error {
@@ -541,10 +668,13 @@ func normalizeHosts(hosts []string) ([]string, error) {
 	set := map[string]bool{}
 	for _, host := range hosts {
 		host = strings.TrimSpace(strings.TrimSuffix(host, "."))
-		if host == "" || strings.ContainsAny(host, "/:@\\ \t\r\n") || len(host) > 253 {
+		if host == "" || strings.ContainsAny(host, "/@\\ \t\r\n") || len(host) > 253 {
 			return nil, errors.New("certificate host is invalid")
 		}
 		if net.ParseIP(host) == nil {
+			if strings.Contains(host, ":") {
+				return nil, errors.New("certificate host is invalid")
+			}
 			for _, label := range strings.Split(host, ".") {
 				if label == "" || len(label) > 63 {
 					return nil, errors.New("certificate host is invalid")

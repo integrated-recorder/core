@@ -152,6 +152,7 @@ class ReleaseSelectionTests(unittest.TestCase):
         self.assertIn('target: 8443\n        published: "18443"', rendered)
         self.assertIn('IR_HTTPS_LISTEN_ADDR: ":8443"', rendered)
         self.assertIn('IR_HTTPS_PUBLIC_PORT: "18443"', rendered)
+        self.assertIn('IR_HTTP_PUBLIC_PORT: "18080"', rendered)
         self.assertNotIn("caddy:", rendered.lower())
         self.assertNotIn("COOKIE_SECURE: \"1\"", rendered)
 

@@ -12,6 +12,13 @@ const SessionCookieName = "ir_session"
 // cookie. Secure is enabled for TLS requests or when the deployment is known
 // to terminate TLS at a trusted reverse proxy.
 func SetSessionCookie(w http.ResponseWriter, r *http.Request, session Session, forceSecure bool) {
+	SetSessionCookieSecure(w, r, session, (r != nil && r.TLS != nil) || forceSecure)
+}
+
+// SetSessionCookieSecure writes the session cookie with an explicit transport
+// policy. It is used only when the server deliberately transitions an
+// authenticated browser between its HTTPS and HTTP endpoints.
+func SetSessionCookieSecure(w http.ResponseWriter, _ *http.Request, session Session, secure bool) {
 	remaining := time.Until(session.ExpiresAt)
 	maxAge := int(remaining / time.Second)
 	if remaining > 0 && remaining%time.Second != 0 {
@@ -27,7 +34,7 @@ func SetSessionCookie(w http.ResponseWriter, r *http.Request, session Session, f
 		Expires:  session.ExpiresAt,
 		MaxAge:   maxAge,
 		HttpOnly: true,
-		Secure:   (r != nil && r.TLS != nil) || forceSecure,
+		Secure:   secure,
 		SameSite: http.SameSiteStrictMode,
 	})
 }

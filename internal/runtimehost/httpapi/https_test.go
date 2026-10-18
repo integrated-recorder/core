@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,7 +21,7 @@ type fakeHTTPSController struct {
 }
 
 func (f *fakeHTTPSController) Status() tlsserver.Status {
-	return tlsserver.Status{Enabled: f.enabled, Ready: f.ready, Hosts: []string{f.host}}
+	return tlsserver.Status{Enabled: f.enabled, Configured: f.host != "", Ready: f.ready, RedirectHTTP: f.redirect, RedirectActive: f.enabled && f.ready && f.redirect, HTTPRecovery: true, Port: 8443, HTTPPort: 8080, Hosts: []string{f.host}}
 }
 func (f *fakeHTTPSController) EnableSelfSigned(hosts []string, redirect bool) error {
 	f.enabled = true
@@ -41,7 +42,8 @@ func (f *fakeHTTPSController) EnableCertificate(hosts []string, cert, key string
 	f.redirect = redirect
 	return nil
 }
-func (f *fakeHTTPSController) Disable() error { f.enabled = false; return nil }
+func (f *fakeHTTPSController) EnableSaved() error { f.enabled = true; return nil }
+func (f *fakeHTTPSController) Disable() error     { f.enabled = false; return nil }
 
 func TestHTTPSSettingsAPIRequiresSessionAndCSRFAndUsesSecureCookieRefresh(t *testing.T) {
 	root := t.TempDir()
@@ -90,6 +92,81 @@ func TestHTTPSSettingsAPIRequiresSessionAndCSRFAndUsesSecureCookieRefresh(t *tes
 	}
 	if secureCookies != 2 {
 		t.Fatalf("HTTPS activation did not upgrade both auth cookies: %+v", response.Result().Cookies())
+	}
+	disableRequest := httptest.NewRequest(http.MethodDelete, HTTPSSettingsEndpoint, nil)
+	disableRequest.TLS = &tls.ConnectionState{}
+	disableRequest.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: session.Token})
+	disableRequest.AddCookie(&http.Cookie{Name: authn.CSRFCookieName, Value: session.CSRFToken})
+	disableRequest.Header.Set("X-CSRF-Token", session.CSRFToken)
+	disabled := httptest.NewRecorder()
+	handler.ServeHTTP(disabled, disableRequest)
+	if disabled.Code != http.StatusOK || controller.enabled {
+		t.Fatalf("HTTPS disable failed: %d %s", disabled.Code, disabled.Body.String())
+	}
+	var disabledStatus tlsserver.Status
+	if err := json.Unmarshal(disabled.Body.Bytes(), &disabledStatus); err != nil {
+		t.Fatal(err)
+	}
+	if !disabledStatus.Configured || disabledStatus.Enabled || disabledStatus.RedirectActive || !disabledStatus.RedirectHTTP {
+		t.Fatalf("disable response did not distinguish saved preference from active redirect: %+v", disabledStatus)
+	}
+	var insecureCookies int
+	for _, cookie := range disabled.Result().Cookies() {
+		if cookie.Name == authn.SessionCookieName && !cookie.Secure && cookie.HttpOnly && cookie.Value == session.Token && cookie.SameSite == http.SameSiteStrictMode {
+			insecureCookies++
+		}
+		if cookie.Name == authn.CSRFCookieName && !cookie.Secure && !cookie.HttpOnly && cookie.Value == session.CSRFToken && cookie.SameSite == http.SameSiteStrictMode {
+			insecureCookies++
+		}
+	}
+	if insecureCookies != 2 {
+		t.Fatalf("disable did not preserve auth and CSRF cookies for HTTP recovery: %+v", disabled.Result().Cookies())
+	}
+	if _, err := auth.Authenticate(session.Token); err != nil {
+		t.Fatalf("HTTPS transition invalidated the existing account session: %v", err)
+	}
+	enableRequest := httptest.NewRequest(http.MethodPost, HTTPSEnableSavedEndpoint, nil)
+	enableRequest.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: session.Token})
+	enableRequest.AddCookie(&http.Cookie{Name: authn.CSRFCookieName, Value: session.CSRFToken})
+	enableRequest.Header.Set("X-CSRF-Token", session.CSRFToken)
+	enabled := httptest.NewRecorder()
+	handler.ServeHTTP(enabled, enableRequest)
+	if enabled.Code != http.StatusOK || !controller.enabled {
+		t.Fatalf("saved HTTPS reactivation failed: %d %s", enabled.Code, enabled.Body.String())
+	}
+	secureCookies = 0
+	for _, cookie := range enabled.Result().Cookies() {
+		if (cookie.Name == authn.SessionCookieName || cookie.Name == authn.CSRFCookieName) && cookie.Secure {
+			secureCookies++
+		}
+	}
+	if secureCookies != 2 {
+		t.Fatalf("HTTPS reactivation did not restore Secure cookies: %+v", enabled.Result().Cookies())
+	}
+	proxyHandler, err := WithHTTPSWithSecureCookiePolicy(auth, false, controller, true, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyDisable := httptest.NewRecorder()
+	proxyRequest := httptest.NewRequest(http.MethodDelete, HTTPSSettingsEndpoint, nil)
+	proxyRequest.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: session.Token})
+	proxyRequest.AddCookie(&http.Cookie{Name: authn.CSRFCookieName, Value: session.CSRFToken})
+	proxyRequest.Header.Set("X-CSRF-Token", session.CSRFToken)
+	proxyHandler.ServeHTTP(proxyDisable, proxyRequest)
+	if proxyDisable.Code != http.StatusOK {
+		t.Fatalf("HTTPS listener disable behind secure proxy failed: %d %s", proxyDisable.Code, proxyDisable.Body.String())
+	}
+	var proxyStatus tlsserver.Status
+	if err := json.Unmarshal(proxyDisable.Body.Bytes(), &proxyStatus); err != nil {
+		t.Fatal(err)
+	}
+	if proxyStatus.HTTPRecovery || proxyStatus.HTTPPort != 8080 {
+		t.Fatalf("trusted TLS proxy was incorrectly given an HTTP recovery path: %+v", proxyStatus)
+	}
+	for _, cookie := range proxyDisable.Result().Cookies() {
+		if (cookie.Name == authn.SessionCookieName || cookie.Name == authn.CSRFCookieName) && !cookie.Secure {
+			t.Fatalf("proxy TLS transition downgraded a Secure cookie: %+v", cookie)
+		}
 	}
 	bad := httptest.NewRecorder()
 	badReq := httptest.NewRequest(http.MethodPut, HTTPSSettingsEndpoint, strings.NewReader(`{"hosts":["x"]}`))

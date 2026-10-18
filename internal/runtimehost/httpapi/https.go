@@ -15,15 +15,19 @@ import (
 )
 
 const HTTPSSettingsEndpoint = "/api/runtime/https"
+const HTTPSEnableSavedEndpoint = HTTPSSettingsEndpoint + "/enable"
 const maxHTTPSRequest = 2 << 20
 
 type HTTPSSettings struct {
 	Enabled          bool     `json:"enabled"`
+	Configured       bool     `json:"configured"`
 	Listening        bool     `json:"listening"`
 	CertificateReady bool     `json:"certificate_ready"`
 	IssuanceFailed   bool     `json:"issuance_failed"`
 	RedirectHTTP     bool     `json:"redirect_http"`
+	RedirectActive   bool     `json:"redirect_active"`
 	Port             int      `json:"port"`
+	HTTPPort         int      `json:"http_port"`
 	Hosts            []string `json:"hosts"`
 	SelfSigned       bool     `json:"self_signed"`
 	ACME             bool     `json:"acme"`
@@ -35,6 +39,7 @@ type HTTPSController interface {
 	EnableSelfSigned([]string, bool) error
 	EnableACME(string, bool) error
 	EnableCertificate([]string, string, string, bool) error
+	EnableSaved() error
 	Disable() error
 }
 
@@ -47,20 +52,50 @@ type httpsRequest struct {
 }
 
 func WithHTTPS(auth *authn.Service, authDisabled bool, controller HTTPSController, next http.Handler) (http.Handler, error) {
+	return WithHTTPSWithSecureCookiePolicy(auth, authDisabled, controller, false, next)
+}
+
+func WithHTTPSWithSecureCookiePolicy(auth *authn.Service, authDisabled bool, controller HTTPSController, forceSecureCookies bool, next http.Handler) (http.Handler, error) {
 	if controller == nil || next == nil || (!authDisabled && auth == nil) {
 		return nil, errors.New("HTTPS API dependencies are incomplete")
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != HTTPSSettingsEndpoint {
+		if r.URL.Path != HTTPSSettingsEndpoint && r.URL.Path != HTTPSEnableSavedEndpoint {
 			next.ServeHTTP(w, r)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
-		if r.Method == http.MethodGet {
+		if r.Method == http.MethodGet && r.URL.Path == HTTPSSettingsEndpoint {
 			if !authorizeHTTPS(w, r, auth, authDisabled, false) {
 				return
 			}
-			writeSetupJSON(w, http.StatusOK, controller.Status())
+			status := publicHTTPSStatus(controller, forceSecureCookies)
+			if status.Ready && (r.TLS != nil || forceSecureCookies) {
+				refreshHTTPSAuthCookies(w, r, auth, authDisabled, true)
+			}
+			writeSetupJSON(w, http.StatusOK, status)
+			return
+		}
+		if r.URL.Path == HTTPSEnableSavedEndpoint {
+			if r.Method != http.MethodPost {
+				writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed.")
+				return
+			}
+			if !authorizeHTTPS(w, r, auth, authDisabled, true) {
+				return
+			}
+			if !emptyHTTPSBody(w, r) {
+				return
+			}
+			if err := controller.EnableSaved(); err != nil {
+				writeAPIError(w, http.StatusServiceUnavailable, "https_enable_failed", "Saved HTTPS settings could not be activated. Check the saved certificate and listener configuration.")
+				return
+			}
+			status := publicHTTPSStatus(controller, forceSecureCookies)
+			if status.Ready {
+				refreshHTTPSAuthCookies(w, r, auth, authDisabled, true)
+			}
+			writeSetupJSON(w, http.StatusOK, status)
 			return
 		}
 		if r.Method == http.MethodDelete {
@@ -74,7 +109,12 @@ func WithHTTPS(auth *authn.Service, authDisabled bool, controller HTTPSControlle
 				writeAPIError(w, http.StatusServiceUnavailable, "https_disable_failed", "HTTPS could not be disabled safely.")
 				return
 			}
-			writeSetupJSON(w, http.StatusOK, controller.Status())
+			status := publicHTTPSStatus(controller, forceSecureCookies)
+			// A trusted TLS-terminating proxy keeps the browser on HTTPS even
+			// when Runtime Host's own listener is disabled. Preserve Secure only
+			// for that configured deployment; direct TLS callers move to HTTP.
+			refreshHTTPSAuthCookies(w, r, auth, authDisabled, forceSecureCookies)
+			writeSetupJSON(w, http.StatusOK, status)
 			return
 		}
 		if r.Method != http.MethodPut {
@@ -137,30 +177,44 @@ func WithHTTPS(auth *authn.Service, authDisabled bool, controller HTTPSControlle
 			writeAPIError(w, http.StatusBadRequest, "https_configuration_rejected", "HTTPS configuration was rejected. Check the host names and certificate/key pair.")
 			return
 		}
-		status := controller.Status()
-		if !authDisabled && auth != nil && (r.TLS != nil || status.Ready) {
-			if session, sessionErr := auth.Authenticate(authn.SessionToken(r)); sessionErr == nil {
-				// Upgrade an existing HTTP session once a TLS listener has a valid
-				// certificate. In particular, do not strand the administrator on
-				// HTTP while ACME has not yet issued its first certificate.
-				session.Token = authn.SessionToken(r)
-				authn.SetSessionCookie(w, r, session, true)
-				if status.Ready {
-					// The CSRF cookie contains the browser's existing readable
-					// token. Reissue it with Secure alongside the HttpOnly session
-					// cookie so both cookies use TLS after a successful transition.
-					if csrf, csrfErr := r.Cookie(authn.CSRFCookieName); csrfErr == nil && csrf.Value != "" {
-						maxAge := int(time.Until(session.ExpiresAt).Seconds())
-						if maxAge < 1 {
-							maxAge = 1
-						}
-						http.SetCookie(w, &http.Cookie{Name: authn.CSRFCookieName, Value: csrf.Value, Path: "/", Expires: session.ExpiresAt, MaxAge: maxAge, Secure: true, SameSite: http.SameSiteStrictMode})
-					}
-				}
-			}
+		status := publicHTTPSStatus(controller, forceSecureCookies)
+		if r.TLS != nil || forceSecureCookies || status.Ready {
+			refreshHTTPSAuthCookies(w, r, auth, authDisabled, true)
 		}
-		writeSetupJSON(w, http.StatusOK, controller.Status())
+		writeSetupJSON(w, http.StatusOK, status)
 	}), nil
+}
+
+func publicHTTPSStatus(controller HTTPSController, forceSecureCookies bool) tlsserver.Status {
+	status := controller.Status()
+	if forceSecureCookies {
+		// The browser remains behind its trusted TLS terminator when Runtime
+		// Host's own HTTPS listener is changed, so HTTP fallback is unavailable.
+		status.HTTPRecovery = false
+	}
+	return status
+}
+
+func refreshHTTPSAuthCookies(w http.ResponseWriter, r *http.Request, auth *authn.Service, disabled, secure bool) {
+	if disabled || auth == nil {
+		return
+	}
+	token := authn.SessionToken(r)
+	session, err := auth.Authenticate(token)
+	if err != nil {
+		return
+	}
+	session.Token = token
+	authn.SetSessionCookieSecure(w, r, session, secure)
+	csrf, err := r.Cookie(authn.CSRFCookieName)
+	if err != nil || csrf.Value == "" {
+		return
+	}
+	maxAge := int(time.Until(session.ExpiresAt).Seconds())
+	if maxAge < 1 {
+		maxAge = 1
+	}
+	http.SetCookie(w, &http.Cookie{Name: authn.CSRFCookieName, Value: csrf.Value, Path: "/", Expires: session.ExpiresAt, MaxAge: maxAge, Secure: secure, SameSite: http.SameSiteStrictMode})
 }
 
 func secureHTTPSManagementRequest(r *http.Request) bool {

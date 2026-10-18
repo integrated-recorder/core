@@ -306,6 +306,7 @@ services:
         protocol: tcp
     environment:
       ADDR: ":{CONTAINER_HTTP_PORT}"
+      IR_HTTP_PUBLIC_PORT: "{port}"
       IR_HTTPS_LISTEN_ADDR: ":{CONTAINER_HTTPS_PORT}"
       IR_HTTPS_PUBLIC_PORT: "{https_port}"
       COOKIE_SECURE: "0"

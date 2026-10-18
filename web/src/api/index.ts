@@ -155,5 +155,6 @@ export const runtimeHTTPSAPI = {
   enableSelfSigned: (body: { hosts: string[]; redirect_http: boolean }) => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https', { method: 'PUT', body }),
   enableACME: (body: { hosts: string[]; redirect_http: boolean; acme: true }) => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https', { method: 'PUT', body }),
   enableCertificate: (body: { hosts: string[]; redirect_http: boolean; certificate_pem: string; private_key_pem: string }) => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https', { method: 'PUT', body }),
+  enableSaved: () => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https/enable', { method: 'POST' }),
   disable: () => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https', { method: 'DELETE' }),
 }

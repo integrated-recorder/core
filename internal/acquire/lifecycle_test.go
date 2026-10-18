@@ -315,7 +315,10 @@ func TestSegmentHTTPStatusRefreshReplacesSourceAndRetriesLatestPlaylist(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolver.calls.Load() != 1 || oldManifest.Load() != 1 || oldSegment.Load() != 1 || newManifest.Load() != 1 || newSegment.Load() != 1 {
+	// Once the refreshed segment is committed, the live worker may observe one
+	// more manifest poll before Stop wins its race with the polling timer. That
+	// poll does not retry the source refresh or fetch the segment again.
+	if resolver.calls.Load() != 1 || oldManifest.Load() != 1 || oldSegment.Load() != 1 || newManifest.Load() < 1 || newSegment.Load() != 1 {
 		t.Fatalf("refresh/request counts = refresh:%d old manifest:%d old segment:%d new manifest:%d new segment:%d", resolver.calls.Load(), oldManifest.Load(), oldSegment.Load(), newManifest.Load(), newSegment.Load())
 	}
 	if len(stopped.Tracks["main"].Segments) != 1 {

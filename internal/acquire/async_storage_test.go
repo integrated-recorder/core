@@ -549,6 +549,14 @@ func TestPermanentStorageFailureIsNotRecordedAsSourceGap(t *testing.T) {
 		current, getErr := manager.Get(recording.ID)
 		return getErr == nil && current.State == domain.StateInterrupted
 	}, "storage failure terminal state")
+	e, ok := manager.entry(recording.ID)
+	if !ok {
+		t.Fatal("failed recording entry disappeared before terminal cleanup")
+	}
+	// StateInterrupted is persisted before runWorker has completed scheduler
+	// cleanup. Wait for the worker boundary so assertions observe the final
+	// archive projection rather than racing terminal cleanup.
+	waitDone(t, e.done)
 	current, err := manager.Get(recording.ID)
 	if err != nil {
 		t.Fatal(err)

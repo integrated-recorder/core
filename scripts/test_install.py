@@ -372,17 +372,60 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
                 install.docker_preflight()
 
     def test_permission_failure_is_actionable_and_does_not_chown_nonempty_archive(self):
-        directory = Path("/mnt/media/recordings with spaces")
-        message = install.permission_failure_message(directory)
-        self.assertIn("10001:10001", message)
-        self.assertIn("NFS with root-squash", message)
-        self.assertIn("'/mnt/media/recordings with spaces'", message)
-        with mock.patch.object(install, "run", return_value=subprocess.CompletedProcess([], 1, "", "permission denied")) as command:
-            with self.assertRaises(install.InstallError):
-                install.probe_archive_permissions("image:test", directory, created_or_empty=False)
-        self.assertEqual(command.call_count, 1)
-        self.assertIn("docker", command.call_args.args[0][0])
-        self.assertNotIn("chown", command.call_args.args[0])
+        with tempfile.TemporaryDirectory(prefix="archive permissions ") as temp_dir:
+            directory = Path(temp_dir) / "existing recordings"
+            directory.mkdir(mode=0o751)
+            original = directory / "keep.bin"
+            original.write_bytes(b"existing archive data")
+            directory.chmod(0o751)
+            before = directory.stat()
+            contents_before = original.read_bytes()
+
+            message = install.permission_failure_message(directory)
+            self.assertIn("10001:10001", message)
+            self.assertIn("NFS with root-squash", message)
+            self.assertIn(str(directory), message)
+            with mock.patch.object(
+                install,
+                "run",
+                return_value=subprocess.CompletedProcess([], 1, "", "permission denied"),
+            ) as command:
+                with self.assertRaises(install.InstallError):
+                    install.probe_archive_permissions("image:test", directory, created=False)
+
+            self.assertEqual(command.call_count, 1)
+            invocation = command.call_args.args[0]
+            self.assertIn("docker", invocation[0])
+            probe_command = invocation[-1]
+            self.assertNotIn("chmod", probe_command)
+            self.assertNotIn("chown", probe_command)
+            after = directory.stat()
+            self.assertEqual((after.st_uid, after.st_gid, after.st_mode), (before.st_uid, before.st_gid, before.st_mode))
+            self.assertEqual(original.read_bytes(), contents_before)
+            self.assertEqual(sorted(path.name for path in directory.iterdir()), ["keep.bin"])
+
+    def test_existing_empty_directory_is_not_chowned_or_chmodded(self):
+        with tempfile.TemporaryDirectory(prefix="empty archive permissions ") as temp_dir:
+            directory = Path(temp_dir) / "empty recordings"
+            directory.mkdir(mode=0o751)
+            directory.chmod(0o751)
+            before = directory.stat()
+
+            with mock.patch.object(
+                install,
+                "run",
+                return_value=subprocess.CompletedProcess([], 1, "", "permission denied"),
+            ) as command:
+                with self.assertRaises(install.InstallError):
+                    install.probe_archive_permissions("image:test", directory, created=False)
+
+            self.assertEqual(command.call_count, 1)
+            probe_command = command.call_args.args[0][-1]
+            self.assertNotIn("chmod", probe_command)
+            self.assertNotIn("chown", probe_command)
+            after = directory.stat()
+            self.assertEqual((after.st_uid, after.st_gid, after.st_mode), (before.st_uid, before.st_gid, before.st_mode))
+            self.assertEqual(list(directory.iterdir()), [])
 
     def test_new_empty_directory_can_only_receive_nonrecursive_directory_chown(self):
         directory = Path("/mnt/media/new folder, comma")
@@ -398,7 +441,7 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         with mock.patch.object(install, "run", side_effect=fake_run) as command:
-            install.probe_archive_permissions("image:test", directory, created_or_empty=True)
+            install.probe_archive_permissions("image:test", directory, created=True)
         self.assertEqual(command.call_count, 3)
         self.assertIn('source: "/mnt/media/new folder, comma"', seen_compose[0])
         self.assertIn("network_mode: none", seen_compose[0])

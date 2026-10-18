@@ -637,10 +637,9 @@ def render_permission_probe(image: str, path: Path, uid: int, gid: int) -> str:
 '''
 
 
-def probe_archive_permissions(image: str, path: Path, created_or_empty: bool) -> None:
+def probe_archive_permissions(image: str, path: Path, created: bool) -> None:
     probe = (
-        "set -eu; chmod 0700 /recordings; "
-        "p=/recordings/.ir-install-probe-" + os.urandom(12).hex() + "; q=$p.renamed; "
+        "set -eu; p=/recordings/.ir-install-probe-" + os.urandom(12).hex() + "; q=$p.renamed; "
         "trap 'rm -f \"$p\" \"$q\"' EXIT HUP INT TERM; "
         "printf probe > \"$p\"; test \"$(cat \"$p\")\" = probe; "
         "mv \"$p\" \"$q\"; test -f \"$q\"; rm \"$q\"; trap - EXIT HUP INT TERM"
@@ -660,7 +659,9 @@ def probe_archive_permissions(image: str, path: Path, created_or_empty: bool) ->
         checked = run_probe(CONTAINER_UID, CONTAINER_GID, probe)
         if checked.returncode == 0:
             return
-        if created_or_empty:
+        # Ownership changes are limited to a directory this invocation made.
+        # Existing directories, including empty ones, retain their metadata.
+        if created:
             chown = run_probe(0, 0, f"chown {CONTAINER_UID}:{CONTAINER_GID} /recordings")
             if chown.returncode == 0:
                 checked = run_probe(CONTAINER_UID, CONTAINER_GID, probe)
@@ -830,13 +831,6 @@ def validate_existing_recording_path(metadata: dict[str, Any], requested: Path |
     return stored
 
 
-def directory_is_empty(path: Path) -> bool:
-    try:
-        return next(path.iterdir(), None) is None
-    except OSError:
-        return False
-
-
 def cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build and run the official Integrated Recorder release as an isolated local Docker Compose project."
@@ -967,7 +961,7 @@ def install(args: argparse.Namespace) -> None:
     run(compose_command(candidate_compose, "build", "archiver"), capture=False)
     verify_image_labels(image, release_data)
     verify_image_binaries(image, release_data)
-    probe_archive_permissions(image, archive, archive_created or directory_is_empty(archive))
+    probe_archive_permissions(image, archive, archive_created)
 
     try:
         candidate["compose_started"] = True

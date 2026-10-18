@@ -3,7 +3,7 @@ import type { AccountAuthorization, AccountRole, AccountSession, AccountUser, Ad
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
-  bootstrap: (login: string, token: string, password: string) => api<ApiSession>('/api/auth/bootstrap', { method: 'POST', body: { login, token, password } }),
+  bootstrap: (login: string, password: string) => api<ApiSession>('/api/auth/bootstrap', { method: 'POST', body: { login, password } }),
   login: (login: string, password: string) => api<ApiSession>('/api/auth/login', { method: 'POST', body: { login, password } }),
   logout: () => api<void>('/api/auth/logout', { method: 'POST' }),
 }
@@ -149,4 +149,11 @@ export const runtimeUpdateAPI = {
   stage: () => api<RuntimeUpdateStatus>('/api/runtime/update/stage', { method: 'POST', body: {} }),
   activate: () => api<RuntimeUpdateStatus>('/api/runtime/update/activate', { method: 'POST', body: {} }),
   rollback: () => api<RuntimeUpdateStatus>('/api/runtime/update/rollback', { method: 'POST', body: {} }),
+}
+export const runtimeHTTPSAPI = {
+  status: () => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https'),
+  enableSelfSigned: (body: { hosts: string[]; redirect_http: boolean }) => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https', { method: 'PUT', body }),
+  enableACME: (body: { hosts: string[]; redirect_http: boolean; acme: true }) => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https', { method: 'PUT', body }),
+  enableCertificate: (body: { hosts: string[]; redirect_http: boolean; certificate_pem: string; private_key_pem: string }) => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https', { method: 'PUT', body }),
+  disable: () => api<import('@/types/api').RuntimeHTTPSSettings>('/api/runtime/https', { method: 'DELETE' }),
 }

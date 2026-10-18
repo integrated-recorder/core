@@ -40,9 +40,22 @@ func (p *fixedProxy) ServeHTTP(w http.ResponseWriter, incoming *http.Request) {
 	target.Fragment = ""
 	request.URL = &target
 	request.RequestURI = ""
-	request.Host = target.Host
+	// Preserve the browser authority while still dialing the fixed trusted
+	// Control Plane target. Security-sensitive same-origin checks (notably
+	// first Owner bootstrap) must compare the browser Origin against the Host
+	// actually used to reach Runtime Host. Untrusted Forwarded/X-Forwarded
+	// headers are stripped below and are not involved in this decision.
+	request.Host = incoming.Host
 	request.Header = incoming.Header.Clone()
 	removeHopHeaders(request.Header)
+	// This private marker is written only after discarding any client-supplied
+	// value. The Control Plane is behind this fixed Runtime Host proxy and uses
+	// it solely to apply Secure cookie attributes for browser requests that
+	// arrived over the trusted Runtime Host TLS listener.
+	request.Header.Del("X-IR-HTTPS")
+	if incoming.TLS != nil {
+		request.Header.Set("X-IR-HTTPS", "1")
+	}
 	request.Header.Del("Forwarded")
 	request.Header.Del("X-Forwarded-For")
 	request.Header.Del("X-Forwarded-Host")

@@ -5,8 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -36,12 +34,7 @@ func TestLoginAcceptsOptionalIdentityAndPersistsBoundSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokenPath := filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath()))
-	tokenBytes, err := os.ReadFile(tokenPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "owner-login-test-password"); err != nil {
+	if err := service.Bootstrap("owner", "owner-login-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	fixtureUser, err := service.CreateUser("fixture-user", "fixture-login-test-password", authn.RoleOwner)
@@ -52,6 +45,7 @@ func TestLoginAcceptsOptionalIdentityAndPersistsBoundSession(t *testing.T) {
 
 	login := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"login":"fixture-user","password":"fixture-login-test-password"}`))
+	request.Header.Set("X-IR-HTTPS", "1") // trusted Runtime Host proxy marker
 	handler.ServeHTTP(login, request)
 	if login.Code != http.StatusOK {
 		t.Fatalf("named login status=%d body=%s", login.Code, login.Body.String())
@@ -64,10 +58,19 @@ func TestLoginAcceptsOptionalIdentityAndPersistsBoundSession(t *testing.T) {
 		t.Fatalf("login response exposed internal user identity: %s", login.Body.String())
 	}
 	var sessionToken string
+	secureCookieCount := 0
 	for _, cookie := range login.Result().Cookies() {
+		if cookie.Name == authn.SessionCookieName || cookie.Name == csrfCookieName {
+			if cookie.Secure {
+				secureCookieCount++
+			}
+		}
 		if cookie.Name == authn.SessionCookieName {
 			sessionToken = cookie.Value
 		}
+	}
+	if secureCookieCount != 2 {
+		t.Fatalf("Runtime Host HTTPS did not secure both auth cookies: secure=%d cookies=%+v", secureCookieCount, login.Result().Cookies())
 	}
 	if sessionToken == "" {
 		t.Fatal("named login did not issue a session cookie")
@@ -103,11 +106,7 @@ func TestAuthenticatedUserPreferencesAreSessionScopedAndDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokenBytes, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath())))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "prefs-owner-password"); err != nil {
+	if err := service.Bootstrap("owner", "prefs-owner-password"); err != nil {
 		t.Fatal(err)
 	}
 	owner, err := service.FindByLogin("owner")
@@ -215,11 +214,7 @@ func TestLogoutRevokesSessionAndClearsCookies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokenBytes, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath())))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "logout-test-password"); err != nil {
+	if err := service.Bootstrap("owner", "logout-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := service.Login("logout-test-password")
@@ -362,11 +357,7 @@ func TestAuthenticatedUnknownReadRoutesAreDenied(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokenBytes, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath())))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "unknown-route-test-password"); err != nil {
+	if err := service.Bootstrap("owner", "unknown-route-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := service.Login("unknown-route-test-password")
@@ -411,11 +402,7 @@ func TestHTTPAuditBindsIndependentUserSessionsAndLogoutIsPerSession(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokenBytes, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath())))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "owner-a-password-123"); err != nil {
+	if err := service.Bootstrap("owner", "owner-a-password-123"); err != nil {
 		t.Fatal(err)
 	}
 	userB, err := service.CreateUser("fixture-user-b", "user-b-password-123", authn.RoleOwner)
@@ -475,12 +462,7 @@ func TestHTTPLogoutDoesNotClaimSuccessWhenRevocationFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokenPath := filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath()))
-	tokenBytes, err := os.ReadFile(tokenPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.Bootstrap("owner", strings.TrimSpace(string(tokenBytes)), "logout-failure-test-password"); err != nil {
+	if err := service.Bootstrap("owner", "logout-failure-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := service.Login("logout-failure-test-password")

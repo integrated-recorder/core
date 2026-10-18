@@ -99,12 +99,7 @@ async function login(page: Page) {
     return
   }
   if (session.needs_bootstrap) {
-    const token = readFileSync(join(dataDir!, 'security', 'bootstrap-token'), 'utf8').trim()
-    await page.goto('/login?mode=bootstrap')
-    await page.getByLabel('초기화 토큰').fill(token)
-    await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
-    await page.getByLabel('비밀번호 확인').fill('browser-e2e-strong-password')
-    await page.getByRole('button', { name: '서버 초기화' }).click()
+    throw new Error('The isolated backend E2E fixture must create its Owner before the browser test starts.')
   } else {
     await page.getByLabel(/계정 이름|Account name/).fill('owner')
     await page.getByLabel(/Password|비밀번호/).fill('browser-e2e-strong-password')

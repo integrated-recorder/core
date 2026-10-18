@@ -33,9 +33,6 @@ let lastRequestID = ''
 let restartPoll
 let restartFailure
 let hostLogs = ''
-let setupCodeForLogCheck = ''
-let hostLogContainsSetupCode = false
-let hostLogBoundary = ''
 let hostChildLeakDetected = false
 
 function run(command, args, options = {}) {
@@ -113,8 +110,6 @@ function startHost(binary, dataRoot = dataDir) {
   const child = spawn(binary, [], { cwd: repositoryRoot, env: productEnv(dataRoot), detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] })
   const collect = chunk => {
     const text = chunk.toString()
-    if (setupCodeForLogCheck && `${hostLogBoundary}${text}`.includes(setupCodeForLogCheck)) hostLogContainsSetupCode = true
-    if (setupCodeForLogCheck.length > 1) hostLogBoundary = `${hostLogBoundary}${text}`.slice(-(setupCodeForLogCheck.length - 1))
     hostLogs = (hostLogs + text).slice(-8_000)
   }
   child.stdout.on('data', collect)
@@ -127,8 +122,8 @@ function safeHostLogTail() {
   return hostLogs.split(/\r?\n/).filter(Boolean).slice(-12).map(line => line
     .replaceAll(root, '<acceptance-temp>')
     .replace(/((?:password|token|secret|cookie|authorization|private[_-]?key)\s*["=:]\s*)("[^"]*"|\S+)/ig, '$1<redacted>')
-    .replace(/([?&][^=\s]+)=([^&#\s]+)/g, '$1=<redacted>')
-    .replaceAll(setupCodeForLogCheck, '<redacted-setup-code>')).join('\n')
+    .replace(/([?&][^=\s]+)=([^&#\s]+)/g, '$1=<redacted>'))
+    .join('\n')
 }
 
 function hostExited(child) {
@@ -206,14 +201,6 @@ async function waitForHealth(child, timeoutMs = 45_000) {
   throw new Error('Runtime Host did not become healthy before the test timeout.')
 }
 
-function readSetupCode(binary) {
-  const result = spawnSync(binary, ['setup-code'], { env: { ...process.env, DATA_DIR: dataDir }, encoding: 'utf8', timeout: 10_000 })
-  if (result.error || result.status !== 0 || !result.stdout || !result.stdout.endsWith('\n') || result.stdout.trim().includes('\n')) {
-    throw new Error('Runtime Host did not provide a first-run setup code.')
-  }
-  return result.stdout.trim()
-}
-
 async function restartHostFromTest(binary) {
   const child = host
   if (await stopHost(child)) throw new Error('Runtime Host left product child processes running after graceful restart.')
@@ -253,9 +240,6 @@ async function main() {
   const hostBinary = build()
   host = startHost(hostBinary)
   await waitForHealth(host)
-  const setupCode = readSetupCode(hostBinary)
-  setupCodeForLogCheck = setupCode
-  hostLogContainsSetupCode ||= hostLogs.includes(setupCode)
   await processRestartRequests(hostBinary)
 
   const playwrightCLI = join(webDir, 'node_modules', '@playwright', 'test', 'cli.js')
@@ -265,7 +249,6 @@ async function main() {
     env: {
       ...process.env,
       IR_SETUP_E2E_DATA_DIR: dataDir,
-      IR_SETUP_E2E_CODE: setupCode,
       IR_SETUP_E2E_RESTART_FILE: controlFile,
     },
     stdio: 'inherit',
@@ -274,10 +257,7 @@ async function main() {
     playwright.once('error', reject)
     playwright.once('exit', (code, signal) => resolveExit(code ?? (signal ? 1 : 0)))
   })
-  if (!hostLogContainsSetupCode) {
-    console.error('Runtime Host local logs did not contain the one-time setup code.')
-    process.exitCode = 1
-  } else if (hostChildLeakDetected) {
+  if (hostChildLeakDetected) {
     console.error('Runtime Host left product child processes running after graceful shutdown; remaining processes were force-cleaned.')
     process.exitCode = 1
   } else {
@@ -340,7 +320,7 @@ try {
   await main()
 } catch (error) {
   const message = error instanceof Error ? error.message : 'Setup browser test failed.'
-  console.error(setupCodeForLogCheck ? message.replaceAll(setupCodeForLogCheck, '<redacted-setup-code>') : message)
+  console.error(message)
   process.exitCode = 1
 } finally {
   await cleanup()

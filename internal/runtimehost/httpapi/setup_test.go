@@ -54,11 +54,7 @@ func setupFixture(t *testing.T) (http.Handler, *installation.Store, authFixture,
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := os.ReadFile(filepath.Join(root, "security", "bootstrap-token"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.Bootstrap("owner", strings.TrimSpace(string(token)), "runtime-setup-api-password"); err != nil {
+	if err := service.Bootstrap("owner", "runtime-setup-api-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := service.Login("runtime-setup-api-password")
@@ -99,7 +95,7 @@ func TestSetupStatusIsBoundedAndDoesNotExposeCredentialsOrPaths(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.State != installation.StateUninitialized || !got.AdministratorConfigured || got.ClaimRequired || got.RecoveryRequired || got.Version != "1.2.3" || got.ReleaseChannel != "stable" {
+	if got.State != installation.StateUninitialized || !got.AdministratorConfigured || got.RecoveryRequired || got.Version != "1.2.3" || got.ReleaseChannel != "stable" {
 		t.Fatalf("unexpected status: %+v", got)
 	}
 	if strings.Contains(response.Body.String(), root) || strings.Contains(response.Body.String(), "bootstrap-token") || strings.Contains(response.Body.String(), "runtime/") {
@@ -195,7 +191,7 @@ func TestSetupStatusHasOnlyFrozenPublicFields(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &fields); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"state", "administrator_configured", "claim_required", "recovery_required", "auth_disabled", "version", "release_channel"}
+	want := []string{"state", "administrator_configured", "recovery_required", "auth_disabled", "version", "release_channel"}
 	for _, key := range want {
 		if _, ok := fields[key]; !ok {
 			t.Errorf("status omitted %q", key)

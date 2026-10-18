@@ -3,13 +3,12 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-const setupCode = process.env.IR_SETUP_E2E_CODE
 const selectedOwnerLogin = 'rc8-owner-test'
 const initialPassword = 'first-run-product-e2e-password-2026'
 const dataDir = process.env.IR_SETUP_E2E_DATA_DIR
 const restartFile = process.env.IR_SETUP_E2E_RESTART_FILE
 
-if (!setupCode || !dataDir || !restartFile) {
+if (!dataDir || !restartFile) {
   throw new Error('The real-product setup E2E runner did not provide its private test inputs.')
 }
 
@@ -67,25 +66,35 @@ test('fresh installation completes through product APIs and remains ready after 
   const context = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale: 'ko-KR' })
   const page = await context.newPage()
   let requestURLLeak = false
-  let disallowedRequestBodyLeak = false
-  let bootstrapBodyContainsCode = false
   let bootstrapLogin = ''
+  let bootstrapHasOnlyCredentials = false
+  let bootstrapResponseStatus = 0
+  let bootstrapResponseBody = ''
+  let bootstrapRequestOrigin = ''
+  let bootstrapRequestHost = ''
+  const requestChecks: Promise<void>[] = []
   let responseBodyLeak = false
   const responseChecks: Promise<void>[] = []
   page.on('request', request => {
     const url = request.url()
-    if (url.includes(setupCode!) || url.includes('bootstrap-token') || url.includes(dataDir!)) requestURLLeak = true
-    const body = request.postData() ?? ''
+    if (url.includes(dataDir!)) requestURLLeak = true
     if (request.method() === 'POST' && new URL(url).pathname === '/api/auth/bootstrap') {
-      bootstrapBodyContainsCode ||= body.includes(setupCode!)
-      bootstrapLogin = String(request.postDataJSON()?.login ?? '')
-    } else if (body.includes(setupCode!)) {
-      disallowedRequestBodyLeak = true
+      const payload = request.postDataJSON() as Record<string, unknown> | null
+      bootstrapLogin = String(payload?.login ?? '')
+      bootstrapHasOnlyCredentials = Boolean(payload && Object.keys(payload).sort().join(',') === 'login,password')
+      requestChecks.push(request.allHeaders().then(headers => {
+        bootstrapRequestOrigin = headers.origin ?? ''
+        bootstrapRequestHost = new URL(request.url()).host
+      }))
     }
   })
   page.on('response', response => {
+    if (new URL(response.url()).pathname === '/api/auth/bootstrap') {
+      bootstrapResponseStatus = response.status()
+      responseChecks.push(response.text().then(body => { bootstrapResponseBody = body }).catch(() => undefined))
+    }
     responseChecks.push(response.body().then(body => {
-      if (body.toString('utf8').includes(setupCode!)) responseBodyLeak = true
+      if (body.includes(dataDir!)) responseBodyLeak = true
     }).catch(() => undefined))
   })
 
@@ -97,10 +106,8 @@ test('fresh installation completes through product APIs and remains ready after 
   const initialStatusResponse = await page.request.get('/api/setup/status')
   expect(initialStatusResponse.ok()).toBeTruthy()
   const initialStatusBody = await initialStatusResponse.text()
-  expect(initialStatusBody.includes(setupCode!)).toBe(false)
   const initialStatus = JSON.parse(initialStatusBody)
   expect(initialStatus.state).toBe('uninitialized')
-  expect(initialStatus.claim_required).toBe(true)
   expect(initialStatus.recovery_required).toBe(false)
 
   await page.goto('/')
@@ -113,12 +120,13 @@ test('fresh installation completes through product APIs and remains ready after 
   await expect(setupUsername).toHaveAttribute('autocomplete', 'username')
   await expect(setupUsername).not.toHaveAttribute('readonly')
   await setupUsername.fill(selectedOwnerLogin)
-  await page.getByLabel('설치 코드').fill(setupCode)
-  expect((await page.locator('body').innerText()).includes(setupCode!)).toBe(false)
   await page.getByLabel('관리자 비밀번호').fill(initialPassword)
   await page.getByLabel('비밀번호 확인').fill(initialPassword)
   await page.getByRole('button', { name: '관리자 계정 만들기' }).click()
 
+  await expect.poll(() => bootstrapResponseStatus).not.toBe(0)
+  await Promise.all([...requestChecks, ...responseChecks])
+  expect(bootstrapResponseStatus, `bootstrap API response ${bootstrapResponseStatus}: ${bootstrapResponseBody}; origin=${bootstrapRequestOrigin}; host=${bootstrapRequestHost}`).toBe(200)
   await expect(page.getByRole('heading', { name: '저장소 확인' })).toBeVisible()
   const setupInProgress = persistedInstallation()
   expect(setupInProgress.state).toBe('setup_in_progress')
@@ -129,7 +137,6 @@ test('fresh installation completes through product APIs and remains ready after 
   const resumedStatusResponse = await page.request.get('/api/setup/status')
   expect(resumedStatusResponse.ok()).toBeTruthy()
   const resumedStatusBody = await resumedStatusResponse.text()
-  expect(resumedStatusBody.includes(setupCode!)).toBe(false)
   const resumedStatus = JSON.parse(resumedStatusBody)
   expect(resumedStatus.state).toBe('setup_in_progress')
   const resumed = persistedInstallation()
@@ -138,7 +145,6 @@ test('fresh installation completes through product APIs and remains ready after 
   const resumedSessionResponse = await page.request.get('/api/auth/session')
   expect(resumedSessionResponse.ok()).toBeTruthy()
   const resumedSessionBody = await resumedSessionResponse.text()
-  expect(resumedSessionBody.includes(setupCode!)).toBe(false)
   expect(JSON.parse(resumedSessionBody).authenticated).toBe(true)
 
   await page.getByRole('button', { name: '저장소 검사 실행' }).click()
@@ -171,7 +177,6 @@ test('fresh installation completes through product APIs and remains ready after 
   expect(readyResponse.ok()).toBeTruthy()
   const readyStatus = await readyResponse.json()
   expect(readyStatus.state).toBe('ready')
-  expect(readyStatus.claim_required).toBe(false)
   const readyOnDisk = persistedInstallation()
   expect(readyOnDisk.state).toBe('ready')
   expect(readyOnDisk.installation_id).toBe(installationID)
@@ -304,12 +309,10 @@ test('fresh installation completes through product APIs and remains ready after 
   await page.getByRole('button', { name: '로그인' }).click()
   await expect(page).toHaveURL('/')
 
-  expect((await page.locator('body').innerText()).includes(setupCode!)).toBe(false)
   await Promise.all(responseChecks)
   expect(requestURLLeak).toBe(false)
-  expect(disallowedRequestBodyLeak).toBe(false)
-  expect(bootstrapBodyContainsCode).toBe(true)
-  expect(bootstrapLogin).toBe(selectedOwnerLogin)
   expect(responseBodyLeak).toBe(false)
+  expect(bootstrapHasOnlyCredentials).toBe(true)
+  expect(bootstrapLogin).toBe(selectedOwnerLogin)
   await context.close()
 })

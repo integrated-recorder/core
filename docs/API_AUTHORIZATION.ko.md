@@ -7,7 +7,7 @@
 | Method | Path | Access |
 |---|---|---|
 | `GET`, `HEAD` | `/healthz`, `/api/auth/session`, `/api/setup`, `/api/setup/status` | Public, bounded status only |
-| `POST` | `/api/auth/login`, `/api/auth/bootstrap` | Public credential operation; rate/claim controls apply |
+| `POST` | `/api/auth/login`, `/api/auth/bootstrap` | Public credential operation; bootstrap은 Origin 검증·요청 제한·1회 생성 적용 |
 | `GET`, `HEAD` | allowlisted SPA routes and `/static/*` | Public web assets |
 
 ## Control Plane product API

@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -10,7 +11,15 @@ import (
 	"github.com/integrated-recorder/core/internal/runtimehost/installation"
 )
 
-const csrfCookieName = "ir_csrf"
+const csrfCookieName = authn.CSRFCookieName
+
+// secureBrowserRequest trusts the TLS marker only because the Runtime Host's
+// fixed local proxy strips any client-provided copy and sets it from the
+// actual incoming TLS connection. Direct Control Plane HTTP tests and local
+// development continue to use ordinary request TLS state.
+func secureBrowserRequest(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-IR-HTTPS") == "1"
+}
 
 func (s *Server) registerAuthRoutes() {
 	s.mux.HandleFunc("GET /api/auth/session", s.authSession)
@@ -85,11 +94,14 @@ func (s *Server) authSession(w http.ResponseWriter, r *http.Request) {
 
 type authCredentialRequest struct {
 	Login    string `json:"login"`
-	Token    string `json:"token,omitempty"`
 	Password string `json:"password"`
 }
 
 func (s *Server) authBootstrap(w http.ResponseWriter, r *http.Request) {
+	if !sameOriginBootstrapRequest(r) {
+		writeCodedError(w, http.StatusForbidden, "bootstrap_origin_invalid", "Open the setup page from this application before creating its first account.")
+		return
+	}
 	if s.installationManaged {
 		state := installationStateForServer(s)
 		if state != installation.StateUninitialized {
@@ -106,7 +118,7 @@ func (s *Server) authBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid bootstrap request")
 		return
 	}
-	if err := s.auth.Bootstrap(strings.TrimSpace(request.Login), request.Token, request.Password); err != nil {
+	if err := s.auth.Bootstrap(strings.TrimSpace(request.Login), request.Password); err != nil {
 		if errors.Is(err, authn.ErrInvalidLogin) {
 			writeCodedError(w, http.StatusBadRequest, "login_invalid", "Choose a valid login name.")
 			return
@@ -122,6 +134,42 @@ func (s *Server) authBootstrap(w http.ResponseWriter, r *http.Request) {
 		s.auditMutation(w, r, "user_created", user.ID)
 	}
 	s.finishLoginAs(w, r, login, request.Password)
+}
+
+// The first Owner endpoint is unauthenticated by design, so require a
+// browser same-origin request and an Origin authority matching Host. No
+// forwarded headers are trusted here; a TLS proxy preserves the public Host.
+func sameOriginBootstrapRequest(r *http.Request) bool {
+	origin, err := url.Parse(r.Header.Get("Origin"))
+	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return false
+	}
+	requestHost, err := normalizedOriginHost(r.Host, origin.Scheme)
+	if err != nil {
+		return false
+	}
+	originHost, err := normalizedOriginHost(origin.Host, origin.Scheme)
+	return err == nil && strings.EqualFold(requestHost, originHost)
+}
+
+func normalizedOriginHost(host, scheme string) (string, error) {
+	parsed, err := url.Parse("//" + host)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" {
+		return "", errors.New("invalid host")
+	}
+	name := strings.ToLower(parsed.Hostname())
+	if name == "" {
+		return "", errors.New("invalid host")
+	}
+	port := parsed.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return name + ":" + port, nil
 }
 
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
@@ -149,11 +197,12 @@ func (s *Server) finishLoginAs(w http.ResponseWriter, r *http.Request, login, pa
 		writeError(w, http.StatusUnauthorized, "login failed")
 		return
 	}
-	authn.SetSessionCookie(w, r, session, s.forceSecureCookie)
+	secure := secureBrowserRequest(r) || s.forceSecureCookie
+	authn.SetSessionCookie(w, r, session, secure)
 	http.SetCookie(w, &http.Cookie{
 		Name: csrfCookieName, Value: session.CSRFToken, Path: "/", Expires: session.ExpiresAt,
 		MaxAge: maxInt(1, int(time.Until(session.ExpiresAt)/time.Second)), HttpOnly: false,
-		Secure: (r.TLS != nil) || s.forceSecureCookie, SameSite: http.SameSiteStrictMode,
+		Secure: secure, SameSite: http.SameSiteStrictMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"auth_enabled": s.auth != nil, "authenticated": true, "needs_bootstrap": false, "csrf_token": session.CSRFToken, "expires_at": session.ExpiresAt})
 }
@@ -177,7 +226,7 @@ func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	authn.ClearSessionCookie(w, r, s.forceSecureCookie)
-	http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: r.TLS != nil || s.forceSecureCookie, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: secureBrowserRequest(r) || s.forceSecureCookie, SameSite: http.SameSiteStrictMode})
 	w.WriteHeader(http.StatusNoContent)
 }
 

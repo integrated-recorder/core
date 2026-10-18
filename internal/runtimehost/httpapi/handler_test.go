@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -125,13 +124,7 @@ func testAuth(t *testing.T) authFixture {
 			fixtureErr = err
 			return
 		}
-		bootstrapPath := filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath()))
-		token, err := os.ReadFile(bootstrapPath)
-		if err != nil {
-			fixtureErr = err
-			return
-		}
-		if err := service.Bootstrap("owner", strings.TrimSpace(string(token)), "runtime-httpapi-test-password"); err != nil {
+		if err := service.Bootstrap("owner", "runtime-httpapi-test-password"); err != nil {
 			fixtureErr = err
 			return
 		}

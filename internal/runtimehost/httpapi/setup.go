@@ -46,7 +46,6 @@ type setupHandler struct {
 type SetupStatus struct {
 	State                   installation.State `json:"state"`
 	AdministratorConfigured bool               `json:"administrator_configured"`
-	ClaimRequired           bool               `json:"claim_required"`
 	RecoveryRequired        bool               `json:"recovery_required"`
 	AuthDisabled            bool               `json:"auth_disabled"`
 	Version                 string             `json:"version"`
@@ -144,7 +143,6 @@ func (h *setupHandler) statusFrom(snapshot installation.Snapshot) SetupStatus {
 	diagnostic := snapshot.DiagnosticCode
 	return SetupStatus{
 		State: snapshot.State, AdministratorConfigured: adminConfigured,
-		ClaimRequired:    !h.authDisabled && !adminConfigured && snapshot.State == installation.StateUninitialized,
 		RecoveryRequired: snapshot.State == installation.StateRecoveryRequired,
 		AuthDisabled:     h.authDisabled, Version: safeBuildVersion(h.build.Version),
 		ReleaseChannel: safeReleaseChannel(h.build.ReleaseChannel), DiagnosticCode: diagnostic,

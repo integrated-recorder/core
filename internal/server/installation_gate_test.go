@@ -44,11 +44,7 @@ func newManagedSetupServerWithStorage(t *testing.T, root string, archive *storag
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := os.ReadFile(filepath.Join(root, "security", "bootstrap-token"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := auth.Bootstrap("owner", strings.TrimSpace(string(token)), "server-setup-test-password"); err != nil {
+	if err := auth.Bootstrap("owner", "server-setup-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := auth.Login("server-setup-test-password")

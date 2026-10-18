@@ -130,6 +130,51 @@ class ReleaseSelectionTests(unittest.TestCase):
             with self.assertRaises(install.InstallError):
                 install.validate_manifest(json.dumps(bad).encode(), selected, COMMIT, "amd64", BUILD_TIME_GIT)
 
+    def test_compose_injects_release_labels_for_rc8_dockerfile_without_final_labels(self):
+        config = deployment_config(version="0.1.0-rc.8", channel="prerelease")
+        config["release"].update(tag="v0.1.0-rc.8", build_time=BUILD_TIME_GIT)
+        config.update(bind="127.0.0.1", tls=None)
+        # RC8's final stage ended at ENTRYPOINT and had no LABEL declarations.
+        rc8_final_stage = "FROM alpine:3.21\nUSER 10001:10001\nENTRYPOINT [\"/usr/local/bin/runtime-host\"]\n"
+        self.assertNotIn("LABEL", rc8_final_stage)
+        rendered = install.render_compose(config)
+        self.assertIn("      labels:\n        org.opencontainers.image.source:", rendered)
+        for value in ("0.1.0-rc.8", COMMIT, BUILD_TIME_GIT, "prerelease"):
+            self.assertIn(f'"{value}"', rendered)
+        for argument in ("VERSION", "COMMIT", "BUILD_TIME", "RELEASE_CHANNEL"):
+            self.assertIn(f"        {argument}:", rendered)
+
+    def test_direct_tls_ports_are_mapped_to_runtime_host_without_proxy_container(self):
+        config = deployment_config()
+        config.update(bind="0.0.0.0", https_port=18443)
+        rendered = install.render_compose(config)
+        self.assertIn('host_ip: "0.0.0.0"', rendered)
+        self.assertIn('target: 8443\n        published: "18443"', rendered)
+        self.assertIn('IR_HTTPS_LISTEN_ADDR: ":8443"', rendered)
+        self.assertIn('IR_HTTPS_PUBLIC_PORT: "18443"', rendered)
+        self.assertNotIn("caddy:", rendered.lower())
+        self.assertNotIn("COOKIE_SECURE: \"1\"", rendered)
+
+    def test_network_options_are_persisted_and_existing_defaults_are_preserved(self):
+        parser = install.cli_parser()
+        with tempfile.TemporaryDirectory() as root:
+            args = parser.parse_args(["--recordings-dir", "/tmp/records", "--bind", "0.0.0.0"])
+            with mock.patch.object(install, "bind_port_available", return_value=True):
+                bind, tls_port = install.network_settings(args, None, Path(root))
+            self.assertEqual(bind, "0.0.0.0")
+            self.assertTrue(1 <= tls_port <= 65535)
+            args = parser.parse_args(["--recordings-dir", "/tmp/records"])
+            bind, tls_port = install.network_settings(args, {"bind": "192.0.2.10", "https_port": 18443}, Path(root))
+            self.assertEqual(bind, "192.0.2.10")
+            self.assertEqual(tls_port, 18443)
+
+    def test_https_port_is_user_configurable(self):
+        args = install.cli_parser().parse_args(["--recordings-dir", "/tmp/x", "--https-port", "19443"])
+        with mock.patch.object(install, "bind_port_available", return_value=True):
+            bind, tls_port = install.network_settings(args, None, Path("/tmp"))
+        self.assertEqual(bind, "127.0.0.1")
+        self.assertEqual(tls_port, 19443)
+
     def test_exact_tag_checkout_is_verified_against_the_selected_sha(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
@@ -183,7 +228,7 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
         self.assertIn('source: "/mnt/archive with spaces/recordings"', compose)
         self.assertIn("create_host_path: false", compose)
         self.assertIn('published: "18080"', compose)
-        self.assertIn("host_ip: 127.0.0.1", compose)
+        self.assertIn('host_ip: "127.0.0.1"', compose)
         self.assertIn('COOKIE_SECURE: "0"', compose)
         self.assertNotIn("AUTH_DISABLED", compose)
         self.assertNotIn("auth_disabled: \"1\"", compose)
@@ -311,8 +356,9 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
                     "version": "0.1.0-rc.8", "release_channel": "prerelease",
                 }),
                 mock.patch.object(install, "run", side_effect=fake_run),
+                mock.patch.object(install, "network_settings", return_value=("127.0.0.1", 8443)),
             )
-            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4], common_patches[5], common_patches[6]:
+            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4], common_patches[5], common_patches[6], common_patches[7]:
                 with self.assertRaisesRegex(install.InstallError, "image labels do not match"):
                     install.install(args)
                 pending_after_failure = install.read_pending(pending_path)
@@ -410,7 +456,6 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
             status = {
                 "state": "uninitialized",
                 "administrator_configured": False,
-                "claim_required": True,
                 "auth_disabled": False,
                 "version": "1.2.3",
                 "release_channel": "stable",
@@ -423,7 +468,6 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
         status = {
             "state": "uninitialized",
             "administrator_configured": False,
-            "claim_required": True,
             "auth_disabled": False,
             "version": "1.2.3",
             "release_channel": "stable",

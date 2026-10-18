@@ -18,7 +18,6 @@ function dashboardResponse() {
 }
 
 test('first-run setup claims the installation, runs diagnostics, and completes without exposing a token path', async ({ page }) => {
-  const testOnlySetupCode = 'in-memory-one-time-test-code'
   const selectedOwnerLogin = 'sangwook-e2e'
   let installationState: 'uninitialized' | 'setup_in_progress' | 'ready' = 'uninitialized'
   let administratorConfigured = false
@@ -31,14 +30,14 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
     const request = route.request()
     const path = new URL(request.url()).pathname
     if (path === '/api/setup/status') {
-      await route.fulfill({ json: { state: installationState, administrator_configured: administratorConfigured, claim_required: !administratorConfigured, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
+      await route.fulfill({ json: { state: installationState, administrator_configured: administratorConfigured, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     } else if (path === '/api/auth/session') {
       await route.fulfill({ json: { auth_enabled: true, authenticated, needs_bootstrap: !administratorConfigured, csrf_token: authenticated ? 'csrf-after-bootstrap' : 'csrf-before-bootstrap' } })
     } else if (path === '/api/user/authorization') {
       await route.fulfill({ json: { user_id: 'usr-e2e-owner', login: selectedOwnerLogin, roles: ['owner'], permissions: ['recording.read', 'recording.create', 'recording.workflow.manage', 'storage.read', 'system.diagnostics.read'] } })
     } else if (path === '/api/auth/bootstrap') {
       bootstrapCSRF = request.headers()['x-csrf-token'] ?? ''
-      expect(request.postDataJSON()).toEqual({ login: selectedOwnerLogin, token: testOnlySetupCode, password: 'a-strong-passphrase' })
+      expect(request.postDataJSON()).toEqual({ login: selectedOwnerLogin, password: 'a-strong-passphrase' })
       administratorConfigured = true
       authenticated = true
       await route.fulfill({ json: { auth_enabled: true, authenticated: true, needs_bootstrap: false, csrf_token: 'csrf-after-bootstrap' } })
@@ -46,7 +45,7 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
       beginCSRF = request.headers()['x-csrf-token'] ?? ''
       expect(request.postDataJSON()).toEqual({})
       installationState = 'setup_in_progress'
-      await route.fulfill({ json: { state: installationState, administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
+      await route.fulfill({ json: { state: installationState, administrator_configured: true, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     } else if (path === '/api/setup/storage-test') {
       await route.fulfill({ json: { status: 'ready', free_bytes: 4000000000, write_test: 'passed', durability_test: 'passed' } })
     } else if (path === '/api/system/storage') {
@@ -58,7 +57,7 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
     } else if (path === '/api/setup/complete') {
       expect(request.headers()['x-csrf-token']).toBe('csrf-after-bootstrap')
       installationState = 'ready'
-      await route.fulfill({ json: { state: installationState, administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
+      await route.fulfill({ json: { state: installationState, administrator_configured: true, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     } else if (path === '/api/dashboard') {
       await route.fulfill({ json: dashboardResponse() })
     } else if (path === '/api/notifications') {
@@ -76,10 +75,7 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
   await expect(page).toHaveURL('/setup')
   await expect(page.locator('html')).toHaveAttribute('lang', 'ko-KR')
   await expect(page.getByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeVisible()
-  await expect(page.getByText(/docker compose exec archiver runtime-host setup-code/)).toHaveCount(0)
   await page.getByRole('button', { name: '시작하기' }).click()
-  await expect(page.getByText('docker compose logs archiver', { exact: true })).toBeVisible()
-  await expect(page.getByText(/runtime-host setup-code/)).toBeVisible()
   const setupForm = page.locator('form').filter({ has: page.getByRole('button', { name: '관리자 계정 만들기' }) })
   const setupUsername = setupForm.locator('input[name="username"]')
   await expect(setupUsername).toHaveAttribute('type', 'text')
@@ -87,11 +83,9 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
   await expect(setupUsername).toHaveAttribute('autocomplete', 'username')
   await expect(setupUsername).not.toHaveAttribute('readonly')
   await expect(setupUsername).not.toBeDisabled()
-  await expect(setupForm.locator('input[name="setup_code"]')).toHaveAttribute('autocomplete', 'one-time-code')
   await expect(setupForm.locator('input[name="password"]')).toHaveAttribute('autocomplete', 'new-password')
   await expect(setupForm.locator('input[name="password_confirmation"]')).toHaveAttribute('autocomplete', 'new-password')
   await setupUsername.fill(selectedOwnerLogin)
-  await page.getByLabel(/Setup code|설치 코드/).fill(testOnlySetupCode)
   await page.getByLabel('관리자 비밀번호').fill('a-strong-passphrase')
   await page.getByLabel('비밀번호 확인').fill('a-strong-passphrase')
   await page.getByRole('button', { name: '관리자 계정 만들기' }).click()
@@ -110,8 +104,7 @@ test('first-run setup claims the installation, runs diagnostics, and completes w
   await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
   expect(bootstrapCSRF).toBe('csrf-before-bootstrap')
   expect(beginCSRF).toBe('csrf-after-bootstrap')
-  expect(requestedURLs.some(url => url.includes(testOnlySetupCode))).toBe(false)
-  expect(requestedURLs.some(url => url.includes('bootstrap-token') || url.includes('/data/'))).toBe(false)
+  expect(requestedURLs.some(url => url.includes('/data/'))).toBe(false)
   for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }, { width: 768, height: 1024 }, { width: 390, height: 844 }]) {
     await page.setViewportSize(viewport)
     await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
@@ -132,7 +125,7 @@ test('administrator can log in, use the application, and log out', async ({ page
     const request = route.request()
     const path = new URL(request.url()).pathname
     if (path === '/api/setup/status') {
-      await route.fulfill({ json: { state: 'ready', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
+      await route.fulfill({ json: { state: 'ready', administrator_configured: true, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     } else if (path === '/api/auth/session') {
       await route.fulfill({ json: { auth_enabled: true, authenticated, needs_bootstrap: false, csrf_token: authenticated ? 'session-csrf' : '' } })
     } else if (path === '/api/user/authorization') {
@@ -188,7 +181,7 @@ test('login submits an explicit native username and password pair', async ({ pag
     const request = route.request()
     const path = new URL(request.url()).pathname
     if (path === '/api/setup/status') {
-      await route.fulfill({ json: { state: 'ready', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false } })
+      await route.fulfill({ json: { state: 'ready', administrator_configured: true, recovery_required: false, auth_disabled: false } })
     } else if (path === '/api/auth/session') {
       await route.fulfill({ json: { auth_enabled: true, authenticated: false, needs_bootstrap: false, csrf_token: '' } })
     } else if (path === '/api/auth/login') {
@@ -214,7 +207,7 @@ test('setup resume exposes an editable account credential pair', async ({ page }
     const request = route.request()
     const path = new URL(request.url()).pathname
     if (path === '/api/setup/status') {
-      await route.fulfill({ json: { state: 'setup_in_progress', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
+      await route.fulfill({ json: { state: 'setup_in_progress', administrator_configured: true, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     } else if (path === '/api/auth/session') {
       await route.fulfill({ json: { auth_enabled: true, authenticated, needs_bootstrap: false, csrf_token: authenticated ? 'session-csrf' : 'initial-csrf' } })
     } else if (path === '/api/auth/login') {
@@ -247,7 +240,7 @@ test('login stays compact at desktop and mobile widths in both locales', async (
     await page.route('**/api/**', async route => {
       const path = new URL(route.request().url()).pathname
       if (path === '/api/setup/status') {
-        await route.fulfill({ json: { state: 'ready', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false } })
+        await route.fulfill({ json: { state: 'ready', administrator_configured: true, recovery_required: false, auth_disabled: false } })
       } else if (path === '/api/auth/session') {
         await route.fulfill({ json: { auth_enabled: true, authenticated: false, needs_bootstrap: false, csrf_token: '' } })
       } else {

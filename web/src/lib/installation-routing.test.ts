@@ -3,7 +3,7 @@ import type { InstallationStatus } from '@/types/api'
 import { installationRouteRedirect } from './installation-routing'
 
 function status(state: InstallationStatus['state']): InstallationStatus {
-  return { state, administrator_configured: state !== 'uninitialized', claim_required: state === 'uninitialized', recovery_required: state === 'recovery_required', auth_disabled: false, version: 'dev', release_channel: 'development' }
+  return { state, administrator_configured: state !== 'uninitialized', recovery_required: state === 'recovery_required', auth_disabled: false, version: 'dev', release_channel: 'development' }
 }
 
 describe('installation route policy', () => {

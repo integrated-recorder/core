@@ -542,12 +542,35 @@ func newLivePlaybackFixture(t *testing.T, segmentCount int) (http.Handler, *acqu
 		}
 		<-ticker.C
 	}
+	// Canonical header publication can be observed just before the in-memory
+	// bounded live-playback projection is refreshed for that same commit. Wait
+	// for the exact serving projection this fixture is about to assert instead
+	// of treating that short publication boundary as a missing media segment.
+	wantLiveSegments := segmentCount
+	if wantLiveSegments > acquire.LivePlaybackWindowSize {
+		wantLiveSegments = acquire.LivePlaybackWindowSize
+	}
+	projectionDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(projectionDeadline) {
+		view, viewErr := manager.LivePlaybackSnapshot(context.Background(), started.ID)
+		if viewErr != nil {
+			t.Fatal(viewErr)
+		}
+		if len(view.Segments) == wantLiveSegments {
+			break
+		}
+		<-ticker.C
+	}
 	recording, err := manager.Get(started.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(recording.Tracks["main"].Segments) != segmentCount {
 		t.Fatalf("committed segments=%d, want %d; state=%s last_error=%s", len(recording.Tracks["main"].Segments), segmentCount, recording.State, recording.LastError)
+	}
+	view, err := manager.LivePlaybackSnapshot(context.Background(), started.ID)
+	if err != nil || len(view.Segments) != wantLiveSegments {
+		t.Fatalf("live playback projection has %d segments, want %d; err=%v", len(view.Segments), wantLiveSegments, err)
 	}
 	return New(manager, nil, nil), manager, started.ID
 }

@@ -31,6 +31,7 @@ import (
 	"github.com/integrated-recorder/core/internal/pluginconfig"
 	"github.com/integrated-recorder/core/internal/preview"
 	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
+	"github.com/integrated-recorder/core/internal/runtimehost/tlsserver"
 	"github.com/integrated-recorder/core/internal/server"
 	"github.com/integrated-recorder/core/internal/storage"
 	"github.com/integrated-recorder/core/internal/storageproto"
@@ -192,17 +193,7 @@ func run() error {
 		adapters.Close()
 		return err
 	}
-	setupCode, err := authn.ReadSetupCode(dataDir)
-	if err != nil {
-		_ = watchService.Close(context.Background())
-		_ = previewService.Close(context.Background())
-		_ = exportService.Close(context.Background())
-		_ = integrityService.Close(context.Background())
-		_ = manager.Close(context.Background())
-		adapters.Close()
-		return fmt.Errorf("read isolated E2E setup credential: %w", err)
-	}
-	if err := auth.Bootstrap("owner", setupCode, "browser-e2e-strong-password"); err != nil {
+	if err := auth.Bootstrap("owner", "browser-e2e-strong-password"); err != nil {
 		_ = watchService.Close(context.Background())
 		_ = previewService.Close(context.Background())
 		_ = exportService.Close(context.Background())
@@ -217,6 +208,35 @@ func run() error {
 		Auth: auth, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage,
 		StartedAt: time.Now().UTC(), Version: "browser-e2e", Commit: "test-fixture",
 	})
+	httpsManager, err := tlsserver.Open(dataDir, "127.0.0.1:0", 4174)
+	if err != nil {
+		return fmt.Errorf("initialize HTTPS browser fixture: %w", err)
+	}
+	httpsHandler, err := httpapi.WithHTTPS(auth, false, httpsManager, legacyWorkflowReadyHostProjection(api, auth))
+	if err != nil {
+		_ = httpsManager.Close(context.Background())
+		return err
+	}
+	if err := httpsManager.SetHandler(httpsManager.WrapHTTP(httpsHandler)); err != nil {
+		_ = httpsManager.Close(context.Background())
+		return fmt.Errorf("start HTTPS browser fixture: %w", err)
+	}
+	if err := httpsManager.EnableSelfSigned([]string{"localhost", "127.0.0.1"}, false); err != nil {
+		_ = httpsManager.Close(context.Background())
+		return fmt.Errorf("configure HTTPS browser fixture: %w", err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = httpsManager.Close(closeCtx)
+	}()
+	listenerAddress, listening := httpsManager.ListenerAddress()
+	if !listening {
+		return errors.New("HTTPS browser fixture listener did not start")
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "e2e-https-url"), []byte("https://"+listenerAddress), 0o600); err != nil {
+		return fmt.Errorf("record HTTPS browser fixture URL: %w", err)
+	}
 
 	addr := strings.TrimSpace(os.Getenv("ADDR"))
 	if addr == "" {
@@ -287,8 +307,8 @@ func legacyWorkflowReadyHostProjection(next http.Handler, auth *authn.Service) h
 			w.Header().Set("Cache-Control", "no-store")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"state": "ready", "administrator_configured": true,
-				"claim_required": false, "recovery_required": false,
-				"auth_disabled": false, "version": "browser-e2e",
+				"recovery_required": false,
+				"auth_disabled":     false, "version": "browser-e2e",
 				"release_channel": "development",
 			})
 			return

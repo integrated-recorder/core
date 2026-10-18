@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import ipaddress
 import mmap
 import os
 import re
@@ -32,6 +33,7 @@ STATE_VOLUME = "integrated-recorder_application-state"
 CONTAINER_UID = 10001
 CONTAINER_GID = 10001
 CONTAINER_HTTP_PORT = 8080
+CONTAINER_HTTPS_PORT = 8443
 MANIFEST_ROLES = ("runtime-host", "control-plane", "recorder-engine", "adapter-runtime")
 SEMVER = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
@@ -136,21 +138,24 @@ def pinned_release_decision(
     return "select-fresh", None
 
 
-def choose_port(requested: int | None, existing: int | None = None, available: Callable[[int], bool] | None = None) -> int:
+def choose_port(requested: int | None, existing: int | None = None, available: Callable[[int], bool] | None = None, default_port: int = 8080, option: str = "--port") -> int:
     available = available or local_port_available
     if requested is not None:
         if not 1 <= requested <= 65535:
             raise InstallError("Host port must be between 1 and 65535.")
         if requested != existing and not available(requested):
-            raise InstallError(f"Host port {requested} is already in use. Choose another port with --port.")
+            raise InstallError(f"Host port {requested} is unavailable. Choose another port with {option}.")
         return requested
     if existing is not None:
         return existing
-    if available(8080):
-        return 8080
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
+    if available(default_port):
+        return default_port
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            return int(probe.getsockname()[1])
+    except OSError:
+        raise InstallError(f"No available host port could be selected; specify {option} explicitly.") from None
 
 
 def local_port_available(port: int) -> bool:
@@ -158,8 +163,29 @@ def local_port_available(port: int) -> bool:
         try:
             probe.bind(("127.0.0.1", port))
             return True
-        except OSError:
+        except OSError as exc:
+            if exc.errno in (1, 13):
+                raise InstallError(f"Cannot verify host port {port}; check it from an environment with local socket access.") from None
             return False
+
+
+def bind_port_available(bind: str, port: int) -> bool:
+    family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((bind, port, 0, 0) if family == socket.AF_INET6 else (bind, port))
+            return True
+        except OSError as exc:
+            if exc.errno in (1, 13):
+                raise InstallError(f"Cannot verify port {port} on bind address {bind}; check it from an environment with local socket access.") from None
+            return False
+
+
+def normalize_bind(value: str) -> str:
+    try:
+        return ipaddress.ip_address(value).compressed
+    except ValueError:
+        raise InstallError("--bind must be an IPv4 or IPv6 interface address such as 127.0.0.1 or 0.0.0.0.") from None
 
 
 def docker_architecture(value: str) -> str:
@@ -242,6 +268,9 @@ def render_compose(config: dict[str, Any]) -> str:
     image = quote_yaml(config["image"])
     architecture = config["architecture"]
     port = str(config["port"])
+    https_port = str(config.get("https_port", CONTAINER_HTTPS_PORT))
+    bind = config.get("bind", "127.0.0.1")
+    bind_yaml = quote_yaml(bind)
     return f'''name: {COMPOSE_PROJECT}
 services:
   archiver:
@@ -269,10 +298,16 @@ services:
     ports:
       - target: {CONTAINER_HTTP_PORT}
         published: "{port}"
-        host_ip: 127.0.0.1
+        host_ip: {bind_yaml}
+        protocol: tcp
+      - target: {CONTAINER_HTTPS_PORT}
+        published: "{https_port}"
+        host_ip: {bind_yaml}
         protocol: tcp
     environment:
       ADDR: ":{CONTAINER_HTTP_PORT}"
+      IR_HTTPS_LISTEN_ADDR: ":{CONTAINER_HTTPS_PORT}"
+      IR_HTTPS_PUBLIC_PORT: "{https_port}"
       COOKIE_SECURE: "0"
       DATA_DIR: /data
       ADAPTER_DIR: /external-adapters
@@ -294,7 +329,7 @@ services:
       org.opencontainers.image.revision: {commit}
       org.opencontainers.image.created: {build_time}
       com.integrated-recorder.release-channel: {channel}
-      com.integrated-recorder.release-tag: {quote_yaml(release['tag'])}
+      com.integrated-recorder.release-tag: {quote_yaml(release["tag"])}
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:{CONTAINER_HTTP_PORT}/healthz >/dev/null"]
       interval: 10s
@@ -305,7 +340,6 @@ volumes:
   application-state:
     name: {STATE_VOLUME}
 '''
-
 
 def validate_setup_status(status: dict[str, Any], release: dict[str, Any]) -> None:
     if status.get("auth_disabled") is not False:
@@ -796,6 +830,18 @@ def wait_for_runtime(port: int, release: dict[str, Any], timeout: int = 180) -> 
     raise InstallError(f"Runtime Host did not become healthy within {timeout} seconds ({last_error}). Check local container logs.")
 
 
+def network_settings(args: argparse.Namespace, existing: dict[str, Any] | None, install_dir: Path) -> tuple[str, int]:
+    if args.bind:
+        bind = normalize_bind(args.bind)
+    elif existing and existing.get("bind"):
+        bind = normalize_bind(existing["bind"])
+    else:
+        bind = "127.0.0.1"
+    previous_port = (existing or {}).get("https_port")
+    port = choose_port(args.https_port, int(previous_port) if previous_port else None, lambda value: bind_port_available(bind, value), CONTAINER_HTTPS_PORT, "--https-port")
+    return bind, port
+
+
 def release_record(release: dict[str, Any], commit: str, build_time: str, manifest: dict[str, Any]) -> dict[str, Any]:
     tag = release["tag_name"]
     return {
@@ -850,7 +896,9 @@ def cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--recordings-dir", help="absolute host directory for canonical recording archives")
     parser.add_argument("--version", help="pin a published official release tag, for example v0.1.0-rc.8")
-    parser.add_argument("--port", type=int, help="host loopback port (default: 8080 if free, otherwise an available port)")
+    parser.add_argument("--port", type=int, help="application host port (default: 8080 if free, otherwise an available port)")
+    parser.add_argument("--bind", help="explicit host interface IPv4/IPv6 address (default: 127.0.0.1)")
+    parser.add_argument("--https-port", type=int, help="host port mapped to Runtime Host HTTPS (default: 8443 if free)")
     parser.add_argument("--install-dir", help="deployment metadata and exact release source (platform-specific user-data default)")
     parser.add_argument("--upgrade", action="store_true", help="explicitly select/build another release for an existing installation")
     return parser
@@ -883,6 +931,9 @@ def install(args: argparse.Namespace) -> None:
         if requested_recordings is None:
             raise InstallError("A fresh installation requires --recordings-dir with an absolute host path.")
         archive = requested_recordings
+
+    prior_deployment = pending or current
+    selected_bind, selected_https_port = network_settings(args, prior_deployment, install_dir)
 
     policy, stored_release = pinned_release_decision(
         current.get("release") if current else None,
@@ -963,7 +1014,9 @@ def install(args: argparse.Namespace) -> None:
         "state_volume": STATE_VOLUME,
         "source_dir": str(source_dir),
         "image": image,
-        "network_exposure": "127.0.0.1",
+        "network_exposure": selected_bind,
+        "bind": selected_bind,
+        "https_port": selected_https_port,
         "container_uid": CONTAINER_UID,
         "container_gid": CONTAINER_GID,
     }
@@ -980,7 +1033,7 @@ def install(args: argparse.Namespace) -> None:
     try:
         candidate["compose_started"] = True
         write_metadata(pending_path, candidate)
-        run(compose_command(candidate_compose, "up", "-d", "--no-build", "--wait", "--wait-timeout", "180", "archiver"), capture=False)
+        run(compose_command(candidate_compose, "up", "-d", "--no-build", "--wait", "--wait-timeout", "180", "--remove-orphans", "archiver"), capture=False)
         setup_status = wait_for_runtime(selected_port, release_data)
     except InstallError:
         if old_compose.is_file() and current is not None:
@@ -1006,7 +1059,13 @@ def install(args: argparse.Namespace) -> None:
 
 def print_install_result(install_dir: Path, metadata: dict[str, Any]) -> None:
     release = metadata["release"]
-    url = f"http://127.0.0.1:{metadata['port']}/"
+    bind = metadata.get("bind", "127.0.0.1")
+    display_host = discover_host_address() if bind == "0.0.0.0" else bind
+    if ":" in display_host and not display_host.startswith("["):
+        display_host = f"[{display_host}]"
+    url = f"http://{display_host}:{metadata['port']}/"
+    https_url = f"https://{display_host}:{metadata.get('https_port', CONTAINER_HTTPS_PORT)}/"
+    bind_description = f"{bind}:{metadata['port']} (HTTP), {bind}:{metadata.get('https_port', CONTAINER_HTTPS_PORT)} (HTTPS; enable in Web UI)"
     print("Integrated Recorder is running.")
     print(f"Release: {release['tag']} ({release['channel']})")
     print(f"Source commit: {release['commit']}")
@@ -1014,12 +1073,14 @@ def print_install_result(install_dir: Path, metadata: dict[str, Any]) -> None:
     print(f"Application state: Docker volume {metadata['state_volume']} mounted at /data")
     print(f"Recording archives: {metadata['recordings_dir']} mounted at /data/recordings")
     print(f"Container identity: {metadata['container_uid']}:{metadata['container_gid']}")
-    print(f"Network exposure: {metadata['network_exposure']}:{metadata['port']} only")
-    print(f"First-run browser URL: {url}setup")
+    print(f"Network exposure: {bind_description}")
+    print(f"First-run browser URL: {url.rstrip('/')}/setup")
+    print(f"HTTPS URL after enabling it in Web UI: {https_url}")
     if metadata.get("owner_setup_required"):
         print("Create the first Owner account in the browser. Choose its login and password; the installer does not create credentials.")
-        print("Retrieve the one-time setup code locally with:")
-        print(f"  docker compose --project-name {COMPOSE_PROJECT} --file {shlex_quote(str(install_dir / 'compose.yaml'))} exec -T archiver runtime-host setup-code")
+        if bind not in ("127.0.0.1", "::1"):
+            print("Warning: the first browser to create an account becomes Owner. Restrict network access until you create your account.")
+            print("Warning: this explicit LAN binding is not encrypted until HTTPS is enabled in the Web UI.")
     else:
         print("Existing account state was preserved; Owner onboarding was not repeated.")
     compose = f"docker compose --project-name {COMPOSE_PROJECT} --file {shlex_quote(str(install_dir / 'compose.yaml'))}"
@@ -1028,7 +1089,16 @@ def print_install_result(install_dir: Path, metadata: dict[str, Any]) -> None:
     print(f"  {compose} stop")
     print(f"  {compose} start")
     print(f"  {compose} restart")
-    print("Future signed application updates are disabled until a trusted public release key is configured.")
+    print("Future signed application updates are disabled until an authentic public release trust root is configured.")
+
+
+def discover_host_address() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("1.1.1.1", 53))
+            return probe.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 if __name__ == "__main__":

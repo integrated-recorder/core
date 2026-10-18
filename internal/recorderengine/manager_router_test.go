@@ -223,11 +223,11 @@ func TestManagerRouterGenerationRoutingAndDetachAfterInventoryDrains(t *testing.
 		t.Fatalf("start on initial generation: recording=%#v err=%v", recordingA, err)
 	}
 	waitForSegment(t, router, recordingAID)
-	liveView, err := router.LivePlaybackSnapshot(context.Background(), recordingAID)
-	if err != nil || len(liveView.Segments) != 1 || liveView.Segments[0].SourceURI != "" {
-		t.Fatalf("live playback snapshot=%#v err=%v", liveView, err)
+	liveView := waitForLivePlaybackSegment(t, router, recordingAID)
+	if len(liveView.Segments) != 1 || liveView.Segments[0].SourceURI != "" {
+		t.Fatalf("live playback snapshot=%#v", liveView)
 	}
-	if engineA.count.count(recorderengine.OperationLivePlaybackSnapshot) != 1 || engineB.count.count(recorderengine.OperationLivePlaybackSnapshot) != 0 {
+	if engineA.count.count(recorderengine.OperationLivePlaybackSnapshot) == 0 || engineB.count.count(recorderengine.OperationLivePlaybackSnapshot) != 0 {
 		t.Fatalf("live snapshot did not route to the owning generation: A=%d B=%d", engineA.count.count(recorderengine.OperationLivePlaybackSnapshot), engineB.count.count(recorderengine.OperationLivePlaybackSnapshot))
 	}
 	flow, err := router.AcquisitionFlowSnapshot(context.Background(), recordingAID, 0, 96)
@@ -287,6 +287,22 @@ func TestManagerRouterGenerationRoutingAndDetachAfterInventoryDrains(t *testing.
 	if engineB.count.count(recorderengine.OperationStop) != 1 {
 		t.Fatalf("generation b Stop invocation count=%d", engineB.count.count(recorderengine.OperationStop))
 	}
+}
+
+func waitForLivePlaybackSegment(t *testing.T, manager interface {
+	LivePlaybackSnapshot(context.Context, string) (acquire.LivePlaybackView, error)
+}, id string) acquire.LivePlaybackView {
+	t.Helper()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		view, err := manager.LivePlaybackSnapshot(context.Background(), id)
+		if err == nil && len(view.Segments) == 1 {
+			return view
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("recording %s did not publish its live playback projection", id)
+	return acquire.LivePlaybackView{}
 }
 
 func TestManagerRouterInvalidatesManagementRootsOnGenerationReactivation(t *testing.T) {

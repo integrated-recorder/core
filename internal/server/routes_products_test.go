@@ -673,12 +673,7 @@ func TestAuthMiddlewareProtectsProductMutationsAndRequiresCSRF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrapBytes, err := os.ReadFile(filepath.Join(root, "security", "bootstrap-token"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	bootstrapToken := strings.TrimSpace(string(bootstrapBytes))
-	if err := auth.Bootstrap("owner", bootstrapToken, "correct horse battery staple"); err != nil {
+	if err := auth.Bootstrap("owner", "correct horse battery staple"); err != nil {
 		t.Fatal(err)
 	}
 	manager, err := acquire.NewManager(store, nil, nil, nil)

@@ -20,17 +20,6 @@ import (
 )
 
 func main() {
-	if len(os.Args) == 2 && os.Args[1] == "setup-code" {
-		dataDir := os.Getenv("DATA_DIR")
-		if dataDir == "" {
-			dataDir = "/data"
-		}
-		if err := bootstrap.PrintSetupCode(dataDir, os.Stdout); err != nil {
-			log.Printf("runtime-host: setup code is unavailable")
-			os.Exit(1)
-		}
-		return
-	}
 	if len(os.Args) == 3 && os.Args[1] == "reset-password" {
 		dataDir := os.Getenv("DATA_DIR")
 		if dataDir == "" {
@@ -43,7 +32,7 @@ func main() {
 		return
 	}
 	if len(os.Args) != 1 {
-		log.Printf("runtime-host: supported commands: setup-code, reset-password <login>")
+		log.Printf("runtime-host: supported command: reset-password <login>")
 		os.Exit(2)
 	}
 	config, err := bootstrap.ConfigFromEnv(os.Getenv)

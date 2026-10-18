@@ -15,8 +15,8 @@ import (
 
 func TestBootstrapSupportsArbitraryOwnerLoginAndRenamePreservesIdentity(t *testing.T) {
 	root := t.TempDir()
-	service, token := openForTest(t, root)
-	if err := service.Bootstrap("sangwook", token, testPassword); err != nil {
+	service, _ := openForTest(t, root)
+	if err := service.Bootstrap("sangwook", testPassword); err != nil {
 		t.Fatalf("bootstrap selected login: %v", err)
 	}
 	owner, err := service.FindByLogin("sangwook")

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Clipboard, HardDrive, LoaderCircle, RefreshCw, Server } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, HardDrive, LoaderCircle, RefreshCw, Server } from 'lucide-react'
 import { adaptersAPI, authAPI, dashboardAPI, setupAPI } from '@/api'
 import { installationQuery, qk, sessionQuery } from '@/api/queries'
 import { AdapterMark } from '@/components/adapter/adapter-mark'
@@ -90,7 +90,6 @@ export function SetupPage() {
   const [isLoggingIn, setIsLoggingIn] = useState(false)
   const [beginError, setBeginError] = useState<TranslationKey | undefined>()
   const [storageResult, setStorageResult] = useState<SetupStorageTest>()
-  const [copied, setCopied] = useState(false)
 
   const begin = useMutation({
     mutationFn: setupAPI.begin,
@@ -127,17 +126,15 @@ export function SetupPage() {
     setFormError(undefined)
     const data = new FormData(event.currentTarget)
     const login = String(data.get('username') ?? '').trim()
-    const setupCode = String(data.get('setup_code') ?? '')
     const password = String(data.get('password') ?? '')
     const confirmation = String(data.get('password_confirmation') ?? '')
     if (!login) return setFormError('login.usernameRequired')
-    if (!setupCode.trim()) return setFormError('setup.error.setupCodeRequired')
     const passwordError = setupPasswordError(password, confirmation)
     if (passwordError) return setFormError(passwordError)
     if (isBootstrapping) return
     setIsBootstrapping(true)
     try {
-      const result = await authAPI.bootstrap(login, setupCode, password)
+      const result = await authAPI.bootstrap(login, password)
       client.setQueryData(qk.session, result)
       setFormError(undefined)
       try {
@@ -174,16 +171,6 @@ export function SetupPage() {
       setFormError('setup.error.loginFailed')
     } finally {
       setIsLoggingIn(false)
-    }
-  }
-
-  const copySetupCommand = async () => {
-    try {
-      await navigator.clipboard.writeText(t('setup.claim.command'))
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 1800)
-    } catch {
-      setCopied(false)
     }
   }
 
@@ -247,29 +234,23 @@ export function SetupPage() {
           <CardHeader className="border-b border-border bg-muted/20"><CardTitle className="text-lg">{t(stepHeadingKeys[visibleStep])}</CardTitle>{visibleStep !== 'welcome' && <p className="text-sm text-muted-foreground">{t(stepDescriptionKeys[visibleStep])}</p>}</CardHeader>
           <CardContent className="py-5">
             {visibleStep === 'welcome' && <div>
-              <div className="flex justify-end"><Button onClick={() => status.claim_required && !status.auth_disabled ? setStep('administrator') : begin.mutate()} disabled={begin.isPending}>{begin.isPending ? t('setup.welcome.starting') : t('setup.welcome.start')}<ArrowRight className="h-4 w-4" /></Button></div>
+              <div className="flex justify-end"><Button onClick={() => status.state === 'uninitialized' && !status.auth_disabled ? setStep('administrator') : begin.mutate()} disabled={begin.isPending}>{begin.isPending ? t('setup.welcome.starting') : t('setup.welcome.start')}<ArrowRight className="h-4 w-4" /></Button></div>
             </div>}
 
             {visibleStep === 'administrator' && <form ref={administratorForm} className="max-w-xl space-y-5" onSubmit={submitAdministrator}>
               <div>
-                <p className="text-sm leading-6 text-muted-foreground">{t('setup.claim.description')}</p>
-                <div className="mt-4 flex flex-col gap-2 rounded-lg border border-border bg-muted/30 p-3 sm:flex-row sm:items-center sm:justify-between">
-                  <code className="break-all text-xs">{t('setup.claim.command')}</code>
-                  <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => void copySetupCommand()}><Clipboard className="h-3.5 w-3.5" />{copied ? t('setup.claim.copied') : t('setup.claim.copy')}</Button>
-                </div>
-                <p className="mt-2 text-xs text-muted-foreground">{t('setup.claim.directRun')}</p>
+                <p className="text-sm leading-6 text-muted-foreground">{t('setup.owner.description')}</p>
               </div>
-              <div className="space-y-2"><Label htmlFor="setup-username">{t('setup.claim.usernameLabel')}</Label><Input id="setup-username" type="text" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} autoCorrect="off" required /></div>
-              <div className="space-y-2"><Label htmlFor="setup-code">{t('setup.claim.codeLabel')}</Label><Input id="setup-code" type="password" name="setup_code" autoComplete="one-time-code" spellCheck={false} required /></div>
+              <div className="space-y-2"><Label htmlFor="setup-username">{t('setup.owner.usernameLabel')}</Label><Input id="setup-username" type="text" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} autoCorrect="off" required /></div>
               <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2"><Label htmlFor="setup-password">{t('setup.claim.passwordLabel')}</Label><Input id="setup-password" type="password" name="password" autoComplete="new-password" required /></div>
-                <div className="space-y-2"><Label htmlFor="setup-password-confirm">{t('setup.claim.confirmLabel')}</Label><Input id="setup-password-confirm" type="password" name="password_confirmation" autoComplete="new-password" required /></div>
+                <div className="space-y-2"><Label htmlFor="setup-password">{t('setup.owner.passwordLabel')}</Label><Input id="setup-password" type="password" name="password" autoComplete="new-password" required /></div>
+                <div className="space-y-2"><Label htmlFor="setup-password-confirm">{t('setup.owner.confirmLabel')}</Label><Input id="setup-password-confirm" type="password" name="password_confirmation" autoComplete="new-password" required /></div>
               </div>
-              <p className="text-xs text-muted-foreground">{t('setup.claim.passwordHelp')}</p>
+              <p className="text-xs text-muted-foreground">{t('setup.owner.passwordHelp')}</p>
               {formError && <p role="alert" className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">{t(formError)}</p>}
               <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
-                <Button type="button" variant="outline" onClick={() => setStep('welcome')}><ArrowLeft className="h-4 w-4" />{t('setup.claim.previous')}</Button>
-                <Button type="submit" disabled={isBootstrapping || session.isLoading}>{isBootstrapping ? t('setup.claim.pending') : t('setup.claim.submit')}<ArrowRight className="h-4 w-4" /></Button>
+                <Button type="button" variant="outline" onClick={() => setStep('welcome')}><ArrowLeft className="h-4 w-4" />{t('setup.owner.previous')}</Button>
+                <Button type="submit" disabled={isBootstrapping || session.isLoading}>{isBootstrapping ? t('setup.owner.pending') : t('setup.owner.submit')}<ArrowRight className="h-4 w-4" /></Button>
               </div>
             </form>}
 
@@ -287,7 +268,7 @@ export function SetupPage() {
               </div>
               {beginError && <p role="alert" className="text-sm text-destructive">{t(beginError)}</p>}
               <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
-                <Button variant="outline" onClick={() => setStep('welcome')}><ArrowLeft className="h-4 w-4" />{t('setup.claim.previous')}</Button>
+                <Button variant="outline" onClick={() => setStep('welcome')}><ArrowLeft className="h-4 w-4" />{t('setup.owner.previous')}</Button>
                 <Button onClick={() => setStep('adapters')} disabled={storageTest.isPending || !storageResult || storageResult.status === 'error'}>{t('setup.storage.next')}<ArrowRight className="h-4 w-4" /></Button>
               </div>
             </div>}

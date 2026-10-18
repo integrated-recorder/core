@@ -24,7 +24,7 @@ vi.mock('@/api', async importOriginal => {
 vi.mock('@tanstack/react-router', async importOriginal => ({ ...await importOriginal<typeof import('@tanstack/react-router')>(), useNavigate: () => mocks.navigate }))
 
 const status = (state: 'uninitialized' | 'setup_in_progress' | 'ready' | 'recovery_required', overrides: Record<string, unknown> = {}) => ({
-  state, administrator_configured: state !== 'uninitialized', claim_required: state === 'uninitialized', recovery_required: state === 'recovery_required',
+  state, administrator_configured: state !== 'uninitialized', recovery_required: state === 'recovery_required',
   auth_disabled: false, version: '1.2.3', release_channel: 'stable', ...overrides,
 })
 const session = (authenticated: boolean) => ({ auth_enabled: true, authenticated, needs_bootstrap: !authenticated, csrf_token: authenticated ? 'session-csrf' : 'initial-csrf' })
@@ -91,13 +91,10 @@ describe('first-run setup flow', () => {
     expect(visibleLiterals).toEqual([])
   })
 
-  it('lets the user choose the first Owner login and bootstraps from native form values', async () => {
+  it('lets the user choose the first Owner login and bootstraps from native form values without a setup code', async () => {
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
-    expect(await screen.findByText(/로컬 콘솔과 container logs/)).toBeInTheDocument()
-    expect(screen.getByText('docker compose logs archiver')).toBeInTheDocument()
     const username = screen.getByLabelText('계정') as HTMLInputElement
-    const setupCode = screen.getByLabelText('설치 코드') as HTMLInputElement
     const password = screen.getByLabelText('관리자 비밀번호') as HTMLInputElement
     const confirmation = screen.getByLabelText('비밀번호 확인') as HTMLInputElement
     expect(username).toHaveAttribute('type', 'text')
@@ -107,8 +104,6 @@ describe('first-run setup flow', () => {
     expect(username).not.toHaveAttribute('readonly')
     expect(username).not.toBeDisabled()
     expect(username).not.toHaveAttribute('type', 'hidden')
-    expect(setupCode).toHaveAttribute('name', 'setup_code')
-    expect(setupCode).toHaveAttribute('autocomplete', 'one-time-code')
     expect(password).toHaveAttribute('name', 'password')
     expect(password).toHaveAttribute('autocomplete', 'new-password')
     expect(confirmation).toHaveAttribute('name', 'password_confirmation')
@@ -119,21 +114,18 @@ describe('first-run setup flow', () => {
     expect(form).toContainElement(screen.getByRole('button', { name: '관리자 계정 만들기' }))
 
     setNativeInputValue(username, 'sangwook')
-    setNativeInputValue(setupCode, 'test-only-code')
     setNativeInputValue(password, 'a-strong-passphrase')
     setNativeInputValue(confirmation, 'a-strong-passphrase')
     fireEvent.submit(form)
-    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledWith('sangwook', 'test-only-code', 'a-strong-passphrase'))
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledWith('sangwook', 'a-strong-passphrase'))
     await waitFor(() => expect(mocks.begin).toHaveBeenCalledTimes(1))
     expect(await screen.findByRole('heading', { name: '저장소 확인' })).toBeInTheDocument()
-    expect(screen.queryByDisplayValue('test-only-code')).not.toBeInTheDocument()
   })
 
-  it('rejects password mismatch before submitting the bootstrap code', async () => {
+  it('rejects password mismatch before submitting the bootstrap request', async () => {
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
     fireEvent.change(screen.getByLabelText('계정'), { target: { value: 'setup-user' } })
-    fireEvent.change(screen.getByLabelText('설치 코드'), { target: { value: 'test-only-code' } })
     fireEvent.change(screen.getByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.change(screen.getByLabelText('비밀번호 확인'), { target: { value: 'different-passphrase' } })
     fireEvent.click(screen.getByRole('button', { name: '관리자 계정 만들기' }))
@@ -142,16 +134,15 @@ describe('first-run setup flow', () => {
   })
 
   it('shows a bootstrap error without leaving setup or exposing a filesystem path', async () => {
-    mocks.bootstrap.mockRejectedValueOnce(new Error('Setup code was rejected'))
+    mocks.bootstrap.mockRejectedValueOnce(new Error('Bootstrap was rejected'))
     renderSetup()
     fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
     fireEvent.change(screen.getByLabelText('계정'), { target: { value: 'setup-user' } })
-    fireEvent.change(screen.getByLabelText('설치 코드'), { target: { value: 'bad-code' } })
     fireEvent.change(screen.getByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.change(screen.getByLabelText('비밀번호 확인'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.click(screen.getByRole('button', { name: '관리자 계정 만들기' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('설치 코드 또는 서버 연결을 확인한 뒤 다시 시도하세요.')
-    expect(screen.queryByText('Setup code was rejected')).not.toBeInTheDocument()
+    expect(await screen.findByRole('alert')).toHaveTextContent('계정을 만들지 못했습니다.')
+    expect(screen.queryByText('Bootstrap was rejected')).not.toBeInTheDocument()
     expect(document.body.textContent).not.toContain('/data/')
     expect(mocks.begin).not.toHaveBeenCalled()
   })

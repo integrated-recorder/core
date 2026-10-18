@@ -7,7 +7,7 @@ This is the complete product API authorization inventory. The product API table 
 | Method | Path | Access |
 |---|---|---|
 | `GET`, `HEAD` | `/healthz`, `/api/auth/session`, `/api/setup`, `/api/setup/status` | Public, bounded status only |
-| `POST` | `/api/auth/login`, `/api/auth/bootstrap` | Public credential operation; rate/claim controls apply |
+| `POST` | `/api/auth/login`, `/api/auth/bootstrap` | Public credential operation; bootstrap is origin-checked, bounded, and one-time |
 | `GET`, `HEAD` | allowlisted SPA routes and `/static/*` | Public web assets |
 
 ## Control Plane product API

@@ -49,15 +49,19 @@ Installer는 설치 시 경로만 검증하고, 기존 NFS mount가 계속 연�
 
 Runtime Host는 container 내부 port `8080`을 사용합니다. Installer는 host의 `8080`이 비어 있으면 사용하고, 이미 사용 중이면 `127.0.0.1`에 사용 가능한 다른 port를 선택해 실제 URL을 출력합니다. `--port N`은 loopback의 특정 port를 요청하며 이미 사용 중이면 실패합니다. 기본 설치는 UI를 LAN이나 public internet에 노출하지 않습니다.
 
-출력된 `/setup` URL을 열고 Installer가 출력한 Compose command prefix 뒤에 다음을 붙여 host에서 one-time claim code를 확인합니다.
+출력된 `/setup` URL을 열고 첫 Owner의 login과 password를 정하세요. setup code나 CLI claim 단계가 없습니다. 최초 계정은 브라우저에서 한 번만 생성되고 바로 로그인됩니다. 초기 설정 전 LAN 접근을 허용하면 먼저 접속한 사람이 Owner가 될 수 있으므로 본인이 먼저 계정을 만들고 방화벽을 제한하세요.
 
-```sh
-exec -T archiver runtime-host setup-code
-```
+### 네트워크 바인딩과 HTTPS
 
-코드를 browser에 입력하고 첫 Owner의 login/password를 직접 선택하세요. Login은 사용자가 정하며 `owner` 문자열을 요구하지 않습니다. Installer는 setup code, login, password를 생성하거나 저장하거나 보고하지 않습니다. 인증은 계속 활성화됩니다.
+기본 설치는 HTTP를 `127.0.0.1`에 bind합니다. LAN 접근을 명시하려면 `--bind 0.0.0.0` 또는 host interface IP를 지정하세요. LAN의 HTTP는 암호화되지 않으므로 방화벽을 제한하고 자격 증명을 다룰 때 HTTPS를 우선하세요. 최초 설정을 LAN에 노출하면 첫 방문자가 Owner를 선점할 수 있습니다.
 
-다른 컴퓨터에서 loopback 설치에 접근하려면 SSH tunnel을 사용하거나 host에 신뢰되는 HTTPS reverse proxy를 구성하세요. HTTPS proxy 사용 시 proxy만 허용된 private network에 노출하고 Runtime Host port는 loopback에 두세요. 생성된 Compose 파일에서 `COOKIE_SECURE`를 `"0"`에서 `"1"`로 바꾸고 service를 재생성해 Secure cookie를 강제하세요. Port 8080을 신뢰하지 않는 network에 직접 공개하지 마세요.
+Runtime Host가 Go TLS listener로 HTTPS를 직접 제공합니다. proxy/TLS container는 없습니다. Compose는 HTTP port(기본 `8080`)와 HTTPS port(기본 `8443`)를 선택한 host address에 publish하고, 기본 address는 loopback입니다. `--port`, `--https-port`로 port를, `--bind 0.0.0.0` 또는 특정 interface IP로 LAN 공개를 명시할 수 있습니다. 기존 설치에서 installer를 다시 실행하면 application release를 변경하지 않고 port/bind mapping만 갱신합니다. 방화벽을 설정하고, 최초 설정 전에 LAN을 열면 첫 방문자가 Owner를 만들 수 있음을 고려하세요.
+
+첫 Owner 생성 후 **설정 → 실행 환경 → HTTPS**에서 실제 client가 사용할 DNS 이름/IP를 입력하고 먼저 자체 서명 listener를 켭니다. HTTPS URL로 다시 접속해 해당 이름의 인증서를 신뢰한 뒤 교체할 PEM chain과 일치하는 private key를 업로드합니다. 서버는 key 일치, 유효 기간, 지정한 모든 hostname/IP SAN을 확인합니다. private key 업로드는 HTTPS 연결에서만 허용하고 cleartext HTTP로는 보내지 않습니다. 개인키는 `/data/security/https.json`에 0600 권한으로 저장되고 API 응답에 포함되지 않습니다. HTTPS 요청의 session cookie는 Secure·HttpOnly이며 기존 SameSite/CSRF 정책이 유지됩니다.
+
+HTTPS 화면에서 DNS 도메인 하나에 대해 공개 ACME 인증서를 요청할 수 있습니다. DNS가 이 호스트의 공개 주소를 가리키고 외부 TCP 443이 HTTPS 포트 매핑에 도달해야 하며 설치기에서 `--https-port 443`으로 호스트 443을 공개해야 합니다. Runtime Host가 ACME TLS-ALPN으로 직접 발급하고 개인키는 보호된 ACME 캐시에 저장합니다. 첫 HTTPS 접속에서 발급이 시작되며 실제 인증서를 얻을 때까지 상태는 대기 중이고 인증서가 준비될 때까지 HTTP 리다이렉트는 시작하지 않습니다. 발급 전에는 HTTP 복구 경로가 남으므로 외부 공개를 방화벽으로 제한하세요. 발급 실패는 DNS와 외부 443 접근을 확인하라는 안전한 상태로 표시됩니다. 조건을 확인한 뒤 도메인으로 다시 접속해 재시도하세요. 인증서는 자동 갱신됩니다. 내부 CA는 HTTPS에서 일치하는 PEM 쌍을 입력하며 각 클라이언트가 CA를 신뢰해야 합니다. 자체 서명 인증서는 2년 유효하고 만료 30일 전 Runtime Host 시작 시 자동 교체됩니다. UI에서 미리 교체할 수도 있습니다. 포트 충돌은 안전한 오류로 표시하며 관련 없는 서비스를 중지하지 않습니다.
+
+기존 설치는 일반 재실행 시 release pin, `/data` named volume, archive path, bind 설정을 보존합니다. `--bind`, `--port`, `--https-port`는 network mapping만 수정합니다. TLS 설정과 개인키는 영속 `/data`에 남습니다. UI에서 HTTPS를 끄면 listener만 닫고 설정·인증서·녹화 데이터를 지우지 않습니다. network 변경은 application release upgrade를 의미하지 않습니다.
 
 ## 일반 운영
 

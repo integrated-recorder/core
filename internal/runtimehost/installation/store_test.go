@@ -99,11 +99,7 @@ func TestValidLegacyAdministratorMigratesReadyWithoutChangingProductData(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	setupCode, err := authn.ReadSetupCode(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := auth.Bootstrap("owner", setupCode, "legacy-install-migration-password"); err != nil {
+	if err := auth.Bootstrap("owner", "legacy-install-migration-password"); err != nil {
 		t.Fatal(err)
 	}
 	installationPath := filepath.Join(root, "runtime", Filename)
@@ -152,9 +148,7 @@ func TestValidLegacyAdministratorMigratesReadyWithoutChangingProductData(t *test
 			t.Fatalf("legacy data changed at %s: got=%q err=%v", filepath.Base(path), got, err)
 		}
 	}
-	if _, err := authn.ReadSetupCode(root); !errors.Is(err, authn.ErrBootstrapUnavailable) {
-		t.Fatalf("legacy administrator migration left a claimable setup code: %v", err)
-	}
+
 	watchStore, err := watch.Open(root)
 	if err != nil {
 		t.Fatalf("legacy Watch definitions did not remain readable after migration: %v", err)

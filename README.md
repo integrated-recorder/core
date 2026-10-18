@@ -19,9 +19,11 @@ cd core
 
 스크립트는 공식 GitHub release를 선택하고 공개 release tag를 정확한 commit SHA로 확인한 뒤, 그 tag의 source로 이미지를 빌드합니다. Stable release가 없을 경우 prerelease를 선택했다는 알림을 출력합니다. 특정 버전을 고정하려면 `--version v0.1.0-rc.8`을 추가하세요. 기존 설치는 명시적으로 `--upgrade`를 지정하지 않는 한 기록된 버전을 유지합니다.
 
-Application state, 인증 정보, Runtime Host 및 plugin/generation state는 전용 Docker volume의 `/data`에 저장됩니다. Recording archive만 지정한 host directory를 `/data/recordings`에 bind mount합니다. 앱은 container UID:GID `10001:10001`로 실행되며 installer는 그 identity로 실제 파일 생성·읽기·rename·삭제를 검사합니다. 기본 host port `8080`이 사용 중이면 다른 loopback port를 선택해 결과에 표시합니다. UI는 안전하게 `127.0.0.1`에만 노출됩니다.
+Application state, 인증 정보, Runtime Host 및 plugin/generation state는 전용 Docker volume의 `/data`에 저장됩니다. Recording archive만 지정한 host directory를 `/data/recordings`에 bind mount합니다. 앱은 container UID:GID `10001:10001`로 실행되며 installer는 그 identity로 파일 생성·읽기·rename·삭제를 검사합니다. 기본 host port `8080`이 사용 중이면 다른 loopback port를 선택합니다. 기본 network는 `127.0.0.1`이며 LAN 접근은 `--bind 0.0.0.0` 또는 특정 interface 주소를 명시해야 합니다.
 
-설치 결과가 출력하는 browser URL을 열고 `/setup`에서 첫 Owner의 login과 password를 직접 선택하세요. One-time setup code는 installer가 저장하거나 출력하지 않습니다. 출력된 `docker compose ... exec ... runtime-host setup-code` 명령을 host에서 실행해 화면에 입력하세요. Owner 설정은 설치 스크립트가 완료하지 않습니다.
+설치 결과의 browser URL을 열고 `/setup`에서 첫 Owner의 login과 password를 입력하세요. 별도 setup code나 CLI 단계는 없습니다. 최초 계정 생성은 원자적으로 한 번만 허용되고 성공하면 바로 로그인됩니다. LAN binding 상태에서 초기 설정을 열어 두면 먼저 접속한 사람이 Owner를 선점할 수 있으므로 방화벽을 제한하고 본인이 먼저 설정하세요.
+
+기본 설치는 loopback HTTP입니다. LAN 접근은 설치할 때 명시적으로 `--bind 0.0.0.0`을 선택하고 방화벽을 제한하세요. 첫 Owner를 만들기 전에 LAN에 열면 먼저 접속한 사람이 계정을 선점할 수 있습니다. HTTPS는 최초 Owner 생성 후 **설정 → 실행 환경 → HTTPS**에서 켭니다. 자체 서명 인증서는 지정한 실제 호스트명/IP 및 감지된 인터페이스 IP를 SAN에 넣어 생성되며 브라우저 경고가 표시됩니다. 도메인 공개 인증서는 도메인을 한 개 입력하고 ACME 자동 발급을 선택하세요. DNS가 이 host를 가리키고 외부 TCP 443이 도달해야 하며 설치기를 `--https-port 443`로 다시 실행해 포트를 연결해야 합니다. Runtime Host가 첫 HTTPS 접속 시 Go TLS-ALPN challenge로 발급하고 자동 갱신합니다. DNS/포트 사전 검사와 실제 인증서가 준비되기 전에는 HTTP→HTTPS redirect가 시작되지 않으므로, 발급 전 외부 접근은 방화벽으로 막아 두세요. 내부 CA 인증서는 먼저 자체 서명 HTTPS를 켜고 HTTPS URL로 재접속한 뒤 해당 호스트 SAN에 맞는 PEM 인증서와 개인키를 업로드하세요. private key는 cleartext HTTP로 전송되지 않습니다. 자체 서명 인증서는 만료 30일 전 Runtime Host 시작 시 자동 갱신되며 UI에서 즉시 교체할 수도 있습니다. 업로드 인증서는 새 PEM 쌍으로 갱신합니다. 자체 CA를 쓰면 각 클라이언트가 CA를 신뢰하도록 설정해야 합니다. 설치 시 HTTP/HTTPS 호스트 포트는 `--port`와 `--https-port`로 선택할 수 있고, 이후 Web UI에서 HTTP→HTTPS redirect를 설정합니다. 기존 설치의 포트 변경은 같은 설치기를 다시 실행하면 앱 release를 바꾸지 않고 Compose mapping만 갱신합니다.
 
 Installer는 사용할 정확한 Compose project/file prefix와 실제 port를 출력합니다. 그 prefix에 `logs -f archiver`, `stop`, `start`, `restart`를 붙여 운영하고, 출력된 loopback URL의 `/api/setup/status`에서 version/channel을 확인할 수 있습니다. `/data`의 named volume과 지정한 recording directory를 함께 백업하세요. 일반 재실행은 버전을 고정하며, 업그레이드에는 `--upgrade`가 필요합니다. 권한 문제는 지정 archive directory에 대해서만 해결하고, 감지된 기존 데이터 volume을 삭제해 설치를 우회하지 마세요.
 
@@ -51,9 +53,9 @@ Owncast는 first-party Source Plugin이지만 Core나 Docker image에 bundled되
 
 ## 인증과 네트워크 노출
 
-기본 Runtime Host는 내장 사용자 인증을 사용합니다. 최초 설정에는 installer가 안내하는 `runtime-host setup-code` 명령으로 host에서 조회한 one-time claim code가 필요하며, 완료 뒤 browser는 session cookie로 인증합니다. 모든 mutation 요청에는 CSRF token이 필요합니다. `AUTH_DISABLED=1`은 개발용 escape hatch이며 listener가 loopback에 bind된 경우에만 허용됩니다. public bind에서는 Runtime Host가 fail closed합니다.
+기본 Runtime Host는 내장 사용자 인증을 사용합니다. 브라우저에서 첫 Owner login/password를 정해 계정을 만들며, 원자적 사용자 저장소가 최초 계정 생성 여부를 표시하므로 bootstrap은 재사용할 수 없습니다. 완료 뒤 browser는 HttpOnly session cookie로 인증하고 mutation 요청에는 CSRF token이 필요합니다. 설치기는 인증을 비활성화하지 않습니다. LAN 또는 domain 공개 전에 방화벽과 HTTPS를 준비하고, plain HTTP LAN에서는 자격 증명이 암호화되지 않는 점을 고려하세요.
 
-Production에서 network를 통해 접속하려면 HTTPS, trusted reverse proxy, 적절한 network boundary를 구성하세요. TLS reverse proxy 뒤에서는 `COOKIE_SECURE=1`로 Secure cookie를 강제하세요.
+HTTPS는 Runtime Host 프로세스가 Go 표준 TLS listener로 직접 제공합니다. 외부 TLS 컨테이너나 프록시는 필요하지 않습니다. TLS 요청으로 발급·갱신되는 세션 cookie에는 Secure와 HttpOnly가 적용되며 SameSite 및 CSRF 검증은 유지됩니다. 설치기 기본은 `127.0.0.1`이며 인터넷에 포트를 공개하지 않습니다. Image-bundled release 설치와 향후 signed application update 신뢰는 별개입니다. 정식 public Ed25519 trust root를 설정하기 전까지 원격 signed update는 비활성화됩니다.
 
 비밀번호 변경과 사용자·세션 관리는 Settings의 `계정·보안`에서 할 수 있습니다. 비밀번호를 잊은 경우 원격 reset endpoint는 제공하지 않습니다. 서버에 직접 접근할 수 있는 운영자는 설치 시 출력된 Compose project/file prefix를 사용해 `exec -it archiver runtime-host reset-password <login>`을 실행하고, 터미널의 prompt에서 새 비밀번호를 입력하세요. 비밀번호는 명령 인자로 전달되지 않습니다.
 

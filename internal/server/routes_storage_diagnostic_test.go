@@ -4,8 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -47,11 +45,7 @@ func TestStorageFailureDiagnosticRequiresAdministratorAndReturnsSafeRecord(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, err := os.ReadFile(filepath.Join(root, "security", "bootstrap-token"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := auth.Bootstrap("owner", strings.TrimSpace(string(bootstrap)), "storage-diagnostic-test-password"); err != nil {
+	if err := auth.Bootstrap("owner", "storage-diagnostic-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	session, err := auth.Login("storage-diagnostic-test-password")

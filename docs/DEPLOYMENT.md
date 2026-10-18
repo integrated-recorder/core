@@ -49,15 +49,19 @@ The installer validates the directory at install time and assumes an existing NF
 
 The Runtime Host listens inside the container on port `8080`. The installer uses host port `8080` when available; otherwise it binds an available port on `127.0.0.1` and prints the actual URL. `--port N` requests a specific loopback port and fails if it is already occupied. The installer does not expose the login/setup UI to the LAN or public internet.
 
-Open the printed `/setup` URL. Retrieve the one-time claim code on the host with the exact Compose command printed by the installer, ending in:
+Open the printed `/setup` URL and choose the first Owner login and password. There is no setup code or CLI claim step. The first account is created once through the browser and is signed in immediately. If LAN access is enabled before setup, the first person to reach the page can become Owner; restrict network access and create the account yourself first.
 
-```sh
-exec -T archiver runtime-host setup-code
-```
+### Network binding and HTTPS
 
-Enter that code in the browser and choose the first Owner login and password. The login is user-selected; `owner` is a role name, not a required login. The installer does not generate, persist, or report the setup code, login, or password. Authentication remains enabled.
+Default installation binds HTTP to `127.0.0.1`. To explicitly allow LAN access, add `--bind 0.0.0.0`, or provide a specific host interface IP. HTTP on a LAN is unencrypted; use a firewall and prefer HTTPS for credentials. A first-run LAN setup can be claimed by the first visitor.
 
-To reach a loopback-only deployment from another computer, use an SSH tunnel or configure a trusted HTTPS reverse proxy on the host. For an HTTPS reverse proxy, expose only the proxy to the intended private network, keep Runtime Host reachable only on loopback, change `COOKIE_SECURE` from `"0"` to `"1"` in the generated Compose file, and recreate the service. Do not publish port 8080 directly to an untrusted network.
+The Runtime Host directly serves HTTPS with Go's TLS stack; there is no proxy/TLS container. Compose publishes the HTTP port (default `8080`) and TLS port (default `8443`) on the selected host address. Both bind to loopback by default. Choose ports with `--port` and `--https-port`, and choose LAN exposure explicitly with `--bind 0.0.0.0` or a specific interface IP. These mappings can be changed by rerunning the installer without changing the pinned app release. Confirm firewall policy before using LAN binding; the first browser to complete setup becomes Owner.
+
+After first Owner setup, use **Settings → Runtime environment → HTTPS**. Enter the DNS name or IP clients actually use and first enable the generated self-signed listener. Reopen the UI at its HTTPS URL, accept/trust that certificate for the configured name, then upload a replacement PEM certificate chain and matching private key. The server validates key match, validity, and all configured names. Private-key uploads are accepted only over HTTPS, never over cleartext HTTP. Key material is saved in `/data/security/https.json` inside the private application data volume with 0600 file permissions and is never returned by the API. Session cookies set over HTTPS are Secure, HttpOnly, and retain the existing SameSite/CSRF rules.
+
+The HTTPS screen can request a public ACME certificate for one DNS name. DNS must resolve to this host's public address, inbound TCP 443 must reach the configured HTTPS mapping, and the installer must publish host port 443 with `--https-port 443`. Runtime Host uses ACME TLS-ALPN directly and stores the resulting private key in its protected ACME cache. Issuance starts on the first HTTPS connection; status remains pending until the certificate is actually obtained, and HTTP redirect stays off until the certificate is ready. Keep public access restricted until the first HTTPS request succeeds; while issuance is pending, the application remains available over its explicitly configured HTTP binding for recovery. An issuance failure is reported without exposing provider errors; verify DNS and port forwarding, then retry by visiting the domain. Certificates renew automatically. For private CA, upload a matching PEM pair over HTTPS; clients must trust that CA. Self-signed certificates have a two-year lifetime and are regenerated automatically at Runtime Host startup within 30 days of expiration; operators can rotate them sooner from the UI. Replacing a user-provided certificate uploads a new validated pair. Port conflicts prevent TLS listener activation and are shown as a safe status/error; no unrelated service is stopped.
+
+Existing installs retain their release pin, data volume, archive path and bind settings on an ordinary rerun. `--bind`, `--port`, and `--https-port` update network publication only. HTTPS certificate configuration remains in persistent `/data` and is enabled or disabled through the authenticated UI. Disabling HTTPS removes only its listener and does not remove certificate/application/archive data. HTTP/HTTPS changes do not imply an application release upgrade.
 
 ## Normal operation
 

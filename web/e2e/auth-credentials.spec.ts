@@ -10,7 +10,7 @@ const ownerPermissions = [
   'plugin.read', 'plugin.manage', 'plugin.configure', 'storage.read', 'storage.manage', 'system.read', 'system.settings.manage',
   'system.update.manage', 'system.diagnostics.read', 'user.read', 'user.create', 'user.manage', 'role.read', 'role.manage', 'audit.read',
 ]
-const readyStatus = { state: 'ready', administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' }
+const readyStatus = { state: 'ready', administrator_configured: true, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' }
 const emptyDashboard = { active_recordings_count: 0, completed_last_24h: 0, interrupted_last_24h: 0, recordings_total: 0, segments_total: 0, gaps_total: 0, archive_bytes: 0, filesystem_total_bytes: 0, filesystem_free_bytes: 0, filesystem_used_bytes: 0, integrity: {}, adapters: {}, export_available: false, recent_recordings: [], active_recordings: [] }
 const defaultPreferences = { locale: 'ko-KR', theme: 'system', timezone: 'Asia/Seoul' }
 const user = (login = 'test-admin') => ({ user_id: ownerID, login, roles: ['owner'], status: 'active', created_at: '2026-10-17T00:00:00Z' })
@@ -72,16 +72,16 @@ test('WebKit bootstrap uses an editable username and native UTF-8 password const
   await page.route('**/api/**', async route => {
     const request = route.request()
     const path = new URL(request.url()).pathname
-    if (path === '/api/setup/status') return route.fulfill({ json: { state, administrator_configured: state !== 'uninitialized', claim_required: state === 'uninitialized', recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
+    if (path === '/api/setup/status') return route.fulfill({ json: { state, administrator_configured: state !== 'uninitialized', recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     if (path === '/api/auth/session') return route.fulfill({ json: { auth_enabled: true, authenticated, needs_bootstrap: !authenticated, csrf_token: authenticated ? 'session-csrf' : 'setup-csrf' } })
     if (path === '/api/auth/bootstrap') {
-      expect(request.postDataJSON()).toEqual({ login: 'chosen-admin', token: 'one-time-code', password: 'é'.repeat(6) })
+      expect(request.postDataJSON()).toEqual({ login: 'chosen-admin', password: 'é'.repeat(6) })
       authenticated = true
       return route.fulfill({ json: { auth_enabled: true, authenticated: true, needs_bootstrap: false, csrf_token: 'session-csrf' } })
     }
     if (path === '/api/setup/begin') {
       state = 'setup_in_progress'
-      return route.fulfill({ json: { state, administrator_configured: true, claim_required: false, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
+      return route.fulfill({ json: { state, administrator_configured: true, recovery_required: false, auth_disabled: false, version: '1.2.3', release_channel: 'stable' } })
     }
     if (path === '/api/system/info') return route.fulfill({ json: { version: '1.2.3', commit: 'test', go_version: 'go', goos: 'darwin', goarch: 'arm64', started_at: new Date().toISOString(), uptime_seconds: 1, export_available: true } })
     if (path === '/api/adapters') return route.fulfill({ json: [] })
@@ -102,7 +102,6 @@ test('WebKit bootstrap uses an editable username and native UTF-8 password const
   await expect(password).not.toHaveAttribute('maxlength')
   await expect(confirmation).toHaveAttribute('autocomplete', 'new-password')
   await setNativeValue(username, 'chosen-admin')
-  await setNativeValue(form.locator('[name="setup_code"]'), 'one-time-code')
   // Six two-byte characters satisfy the server's 12-byte rule; HTML minlength would miscount them.
   await setNativeValue(password, 'é'.repeat(6))
   await setNativeValue(confirmation, 'é'.repeat(6))

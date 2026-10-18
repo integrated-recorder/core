@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -41,6 +40,7 @@ import (
 	"github.com/integrated-recorder/core/internal/runtimehost/resources"
 	"github.com/integrated-recorder/core/internal/runtimehost/storagecatalog"
 	"github.com/integrated-recorder/core/internal/runtimehost/supervisor"
+	"github.com/integrated-recorder/core/internal/runtimehost/tlsserver"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
 	"github.com/integrated-recorder/core/internal/systemsettings"
 )
@@ -48,12 +48,13 @@ import (
 const (
 	defaultDataDir           = "/data"
 	defaultListenAddr        = ":8080"
+	defaultHTTPSListenAddr   = ":8443"
+	defaultHTTPSPublicPort   = 8443
 	defaultAdapterDirs       = "/external-adapters"
 	defaultPluginRegistryURL = pluginregistry.OfficialCatalogV3URL
 	defaultControlWait       = 45 * time.Second
 	controlPrepareWait       = 2 * time.Minute
 	defaultCloseWait         = 20 * time.Second
-	maximumTokenFileSize     = 32
 	maxControlTrustBytes     = 64 << 10
 )
 
@@ -83,6 +84,8 @@ type Config struct {
 	StorageLocalBinary   string
 	BundledHLSBinary     string
 	ListenAddr           string
+	HTTPSListenAddr      string
+	HTTPSPublicPort      int
 	AdapterDirs          string
 	AllowOperatorPlugins bool
 	FFmpegPath           string
@@ -108,7 +111,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		DataDir: defaultDataDir, BundleDir: defaultBundleDir, StorageLocalBinary: defaultStorageLocalBinary, BundledHLSBinary: defaultBundledHLSBinary,
-		ListenAddr: defaultListenAddr, AdapterDirs: defaultAdapterDirs, PluginRegistryURL: defaultPluginRegistryURL,
+		ListenAddr: defaultListenAddr, HTTPSListenAddr: defaultHTTPSListenAddr, HTTPSPublicPort: defaultHTTPSPublicPort, AdapterDirs: defaultAdapterDirs, PluginRegistryURL: defaultPluginRegistryURL,
 		ControlReadyWait: defaultControlWait, ShutdownTimeout: defaultCloseWait,
 		PluginAutoUpdateInterval: defaultPluginAutoUpdateInterval,
 	}
@@ -126,6 +129,16 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if value := strings.TrimSpace(getenv("ADDR")); value != "" {
 		c.ListenAddr = value
+	}
+	if value := strings.TrimSpace(getenv("IR_HTTPS_LISTEN_ADDR")); value != "" {
+		c.HTTPSListenAddr = value
+	}
+	if value := strings.TrimSpace(getenv("IR_HTTPS_PUBLIC_PORT")); value != "" {
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return Config{}, errors.New("IR_HTTPS_PUBLIC_PORT is invalid")
+		}
+		c.HTTPSPublicPort = port
 	}
 	if value := strings.TrimSpace(getenv("ADAPTER_DIR")); value != "" {
 		c.AdapterDirs = value
@@ -195,6 +208,12 @@ func (c Config) Validate() error {
 	if err := validateListenAddress(c.ListenAddr); err != nil {
 		return err
 	}
+	if err := validateListenAddress(c.HTTPSListenAddr); err != nil {
+		return err
+	}
+	if c.HTTPSPublicPort < 1 || c.HTTPSPublicPort > 65535 {
+		return errors.New("HTTPS public port is invalid")
+	}
 	if c.AuthDisabled && !listenIsLoopback(c.ListenAddr) {
 		return errors.New("AUTH_DISABLED is allowed only when the Runtime Host listener binds to loopback")
 	}
@@ -247,7 +266,7 @@ func Run(ctx context.Context, config Config) error {
 		}
 	}
 	if installState.Snapshot().State == installation.StateUninitialized || installState.Snapshot().State == installation.StateSetupInProgress {
-		log.Print(firstRunSetupConsoleMessage(config.DataDir))
+		log.Print("First-run setup is required. Open the local browser setup page to create the first Owner account.")
 	} else if installState.Snapshot().State == installation.StateRecoveryRequired {
 		log.Printf("Installation recovery is required (diagnostic: %s).", installState.Snapshot().DiagnosticCode)
 	}
@@ -614,6 +633,31 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return fmt.Errorf("initialize Runtime Host setup API: %w", err)
 	}
+	httpsManager, err := tlsserver.Open(config.DataDir, config.HTTPSListenAddr, config.HTTPSPublicPort)
+	if err != nil {
+		return fmt.Errorf("initialize Runtime Host HTTPS configuration: %w", err)
+	}
+	if config.AuthDisabled {
+		if err := httpsManager.Disable(); err != nil {
+			return fmt.Errorf("disable HTTPS for unauthenticated Runtime Host: %w", err)
+		}
+	}
+	httpsHandler, err := httpapi.WithHTTPS(hostAuth, config.AuthDisabled, httpsManager, setupHandler)
+	if err != nil {
+		return fmt.Errorf("initialize Runtime Host HTTPS API: %w", err)
+	}
+	publicHandler := httpsManager.WrapHTTP(httpsHandler)
+	if err := httpsManager.SetHandler(publicHandler); err != nil {
+		// HTTPS is an optional operator setting. A conflicting TLS port must not
+		// take down the authenticated HTTP management plane; redirects remain
+		// disabled until the TLS listener is actually ready.
+		log.Print("Configured HTTPS listener is unavailable; HTTP remains active and no HTTPS redirect is being served.")
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+		defer cancel()
+		_ = httpsManager.Close(closeCtx)
+	}()
 	if err := updates.ReconcileLeases(ctx); err != nil {
 		return fmt.Errorf("confirm initial Recorder Engine inventory: %w", err)
 	}
@@ -649,53 +693,13 @@ func Run(ctx context.Context, config Config) error {
 	}()
 	adapterReconcileDone := startPeriodicAdapterReconciliation(leaseCtx, installState, updates, 3*time.Second)
 	pluginUpdateDone := startPeriodicPluginAutoUpdateReconciliation(leaseCtx, installState, updates, config.PluginAutoUpdateInterval, jitterPluginAutoUpdateInterval)
-	serveErr := sup.ServeWithHostHandler(ctx, listener, "/api", setupHandler)
+	serveErr := sup.ServeWithHostHandler(ctx, listener, "/api", publicHandler)
 	stopLeaseReconciliation()
 	<-leaseDone
 	<-adapterReconcileDone
 	<-pluginUpdateDone
 	supervisorClosed = true
 	return serveErr
-}
-
-// PrintSetupCode writes the already-created one-time setup credential to the
-// caller's local terminal. It performs no mutation and refuses to expose a
-// credential after administrator claim or installation completion.
-func PrintSetupCode(dataDir string, output io.Writer) error {
-	if output == nil || strings.TrimSpace(dataDir) == "" || !filepath.IsAbs(dataDir) || filepath.Clean(dataDir) != dataDir {
-		return errors.New("setup code is unavailable")
-	}
-	snapshot := installation.ReadOnly(dataDir)
-	if snapshot.State != installation.StateUninitialized && snapshot.State != installation.StateSetupInProgress {
-		return errors.New("setup code is unavailable")
-	}
-	code, err := authn.ReadSetupCode(dataDir)
-	if err != nil || code == "" || strings.ContainsAny(code, "\r\n") {
-		return errors.New("setup code is unavailable")
-	}
-	// Bootstrap runs in another process. Recheck shared durable state before
-	// writing any bytes so a setup code cannot be printed after a concurrent
-	// administrator claim. Keep the error deliberately generic and path-free.
-	configured, inspectErr := authn.InspectAdministrator(dataDir)
-	if inspectErr != nil || configured {
-		return errors.New("setup code is unavailable")
-	}
-	snapshot = installation.ReadOnly(dataDir)
-	if snapshot.State != installation.StateUninitialized && snapshot.State != installation.StateSetupInProgress {
-		return errors.New("setup code is unavailable")
-	}
-	if _, err := io.WriteString(output, code+"\n"); err != nil {
-		return errors.New("setup code could not be written")
-	}
-	return nil
-}
-
-func firstRunSetupConsoleMessage(dataDir string) string {
-	var output strings.Builder
-	if err := PrintSetupCode(dataDir, &output); err != nil {
-		return "First-run setup is required. Obtain the one-time setup code with `runtime-host setup-code` inside the runtime."
-	}
-	return fmt.Sprintf("First-run setup is required. Enter one-time setup code from local Runtime Host console/container logs: %s. CLI fallback: `runtime-host setup-code`.", strings.TrimSpace(output.String()))
 }
 
 func releaseProcessResources(coordinator *resources.Coordinator, spec supervisor.ProcessSpec) {
@@ -1117,7 +1121,7 @@ func newGenerationID() (string, error) {
 }
 
 func randomSecret() ([]byte, error) {
-	secret := make([]byte, maximumTokenFileSize)
+	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
 		return nil, errors.New("runtime IPC credential could not be created")
 	}

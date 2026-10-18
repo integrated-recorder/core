@@ -19,7 +19,7 @@ import (
 
 var loginRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
-func (s *Service) loadOrMigrateUsers(allowToken bool) error {
+func (s *Service) loadOrMigrateUsers() error {
 	path := filepath.Join(s.securityDir, usersFilename)
 	if store, err := readUserStore(path); err == nil {
 		if store.migratedFromV1 {
@@ -45,9 +45,6 @@ func (s *Service) loadOrMigrateUsers(allowToken bool) error {
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
-	}
-	if allowToken {
-		return ensureBootstrapToken(s.securityDir)
 	}
 	return nil
 }

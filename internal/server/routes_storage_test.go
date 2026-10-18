@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -118,11 +116,7 @@ func TestStoragePoolAPIRequiresSessionWhenAuthIsEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, err := os.ReadFile(filepath.Join(root, "security", "bootstrap-token"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := auth.Bootstrap("owner", strings.TrimSpace(string(bootstrap)), "storage-api-test-strong-password"); err != nil {
+	if err := auth.Bootstrap("owner", "storage-api-test-strong-password"); err != nil {
 		t.Fatal(err)
 	}
 	handler := NewWithOptions(manager, nil, nil, Options{Auth: auth})

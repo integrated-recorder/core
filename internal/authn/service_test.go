@@ -29,96 +29,52 @@ func openForTest(t *testing.T, root string) (*Service, string) {
 		t.Fatalf("Open: %v", err)
 	}
 	service.bcryptCost = bcrypt.MinCost
-	bootstrapPath := filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath()))
-	token, err := os.ReadFile(bootstrapPath)
-	if err != nil {
-		t.Fatalf("read test bootstrap token: %v", err)
-	}
-	return service, string(token)
+	return service, "unused"
 }
 
-func bootstrapForTest(t *testing.T, service *Service, token string) {
+func bootstrapForTest(t *testing.T, service *Service, _ string) {
 	t.Helper()
-	if err := service.Bootstrap("owner", token, testPassword); err != nil {
+	if err := service.Bootstrap("owner", testPassword); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
 }
 
-func TestFirstRunTokenPermissionsPersistenceAndNoDisclosure(t *testing.T) {
+func TestFirstRunHasNoClaimCredentialAndBootstrapIsOneTime(t *testing.T) {
 	root := t.TempDir()
 	service, err := Open(root)
 	if err != nil {
 		t.Fatal(err)
 	}
+	service.bcryptCost = bcrypt.MinCost
 	if !service.NeedsBootstrap() {
 		t.Fatal("new installation does not need bootstrap")
 	}
-	if got := service.BootstrapTokenRelativePath(); got != "security/bootstrap-token" {
-		t.Fatalf("bootstrap token path = %q", got)
+	if _, err := os.Stat(filepath.Join(root, securityDirectory, "bootstrap-token")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy setup credential exists: %v", err)
 	}
-	tokenPath := filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath()))
-	token, err := os.ReadFile(tokenPath)
-	if err != nil {
-		t.Fatal(err)
+	if got, err := os.Stat(filepath.Join(root, securityDirectory)); err != nil || got.Mode().Perm() != 0700 {
+		t.Fatalf("security directory mode/stat: %v %v", got, err)
 	}
-	if len(token) == 0 || strings.Contains(service.BootstrapTokenRelativePath(), string(token)) {
-		t.Fatal("token missing or disclosed by path API")
+	if err := service.Bootstrap("chosen-owner", testPassword); err != nil {
+		t.Fatalf("bootstrap: %v", err)
 	}
-	for path, want := range map[string]os.FileMode{
-		filepath.Join(root, "security"): 0700,
-		tokenPath:                       0600,
-	} {
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := info.Mode().Perm(); got != want {
-			t.Errorf("%s mode = %#o, want %#o", filepath.Base(path), got, want)
-		}
+	if err := service.Bootstrap("attacker", "another-valid-password"); !errors.Is(err, ErrBootstrapUnavailable) {
+		t.Fatalf("bootstrap replay = %v", err)
 	}
-
-	reopened, err := Open(root)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := Open(root); err != nil {
+		t.Fatalf("reopen: %v", err)
 	}
-	reopened.bcryptCost = bcrypt.MinCost
-	tokenAgain, err := os.ReadFile(tokenPath)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := Open(root); err != nil {
+		t.Fatalf("second reopen: %v", err)
 	}
-	if string(tokenAgain) != string(token) {
-		t.Fatal("reopen rotated the persisted bootstrap token")
-	}
-}
-
-func TestBootstrapRejectsWrongTokenConsumesTokenAndRejectsReplay(t *testing.T) {
-	root := t.TempDir()
-	service, token := openForTest(t, root)
-	tokenPath := filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath()))
-	wrong := "wrong bootstrap token"
-	if err := service.Bootstrap("owner", wrong, testPassword); !errors.Is(err, ErrInvalidBootstrapToken) {
-		t.Fatalf("wrong token error = %v", err)
-	}
-	if err := service.Bootstrap("owner", token, testPassword); err != nil {
-		t.Fatalf("valid bootstrap: %v", err)
-	}
-	if service.NeedsBootstrap() {
-		t.Fatal("bootstrap did not install administrator")
-	}
-	if _, err := os.Stat(tokenPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("bootstrap token still exists: %v", err)
-	}
-	if err := service.Bootstrap("owner", token, testPassword); !errors.Is(err, ErrBootstrapUnavailable) {
-		t.Fatalf("bootstrap replay error = %v", err)
-	}
-	if strings.Contains(ErrInvalidBootstrapToken.Error(), token) || strings.Contains(ErrInvalidBootstrapToken.Error(), testPassword) {
-		t.Fatal("auth error disclosed sensitive input")
+	if _, err := service.LoginAs("chosen-owner", testPassword); err != nil {
+		t.Fatalf("owner credentials did not persist: %v", err)
 	}
 }
 
 func TestConcurrentBootstrapCreatesOneOwner(t *testing.T) {
 	root := t.TempDir()
-	first, token := openForTest(t, root)
+	first, _ := openForTest(t, root)
 	second, err := Open(root)
 	if err != nil {
 		t.Fatal(err)
@@ -132,9 +88,9 @@ func TestConcurrentBootstrapCreatesOneOwner(t *testing.T) {
 	for i := 0; i < callers; i++ {
 		service := services[i%len(services)]
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			err := service.Bootstrap("owner", token, testPassword)
+			err := service.Bootstrap(fmt.Sprintf("owner-%d", i), testPassword)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -145,7 +101,7 @@ func TestConcurrentBootstrapCreatesOneOwner(t *testing.T) {
 			default:
 				t.Errorf("concurrent bootstrap: %v", err)
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 	store, err := readUserStore(filepath.Join(root, securityDirectory, usersFilename))
@@ -157,30 +113,15 @@ func TestConcurrentBootstrapCreatesOneOwner(t *testing.T) {
 	}
 }
 
-func TestReadSetupCodeIsReadOnlyAndRefusesAfterClaim(t *testing.T) {
-	root := t.TempDir()
-	service, token := openForTest(t, root)
-	got, err := ReadSetupCode(root)
-	if err != nil || got != token {
-		t.Fatalf("ReadSetupCode = %q, %v; want existing token", got, err)
-	}
-	if err := service.Bootstrap("owner", token, testPassword); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := ReadSetupCode(root); got != "" || !errors.Is(err, ErrBootstrapUnavailable) {
-		t.Fatalf("claimed ReadSetupCode = %q, %v; want unavailable", got, err)
-	}
-}
-
 func TestAuthenticationInstancesRefreshAdministratorAfterCrossProcessBootstrap(t *testing.T) {
 	root := t.TempDir()
-	host, token := openForTest(t, root)
+	host, _ := openForTest(t, root)
 	control, err := Open(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	control.bcryptCost = bcrypt.MinCost
-	if err := control.Bootstrap("owner", token, testPassword); err != nil {
+	if err := control.Bootstrap("owner", testPassword); err != nil {
 		t.Fatal(err)
 	}
 	configured, err := host.AdministratorConfigured()
@@ -193,12 +134,12 @@ func TestAuthenticationInstancesRefreshAdministratorAfterCrossProcessBootstrap(t
 	if _, err := host.Login(testPassword); err != nil {
 		t.Fatalf("Host auth instance could not log in after Control bootstrap: %v", err)
 	}
-	if err := host.Bootstrap("owner", token, "another-valid-password"); !errors.Is(err, ErrBootstrapUnavailable) {
+	if err := host.Bootstrap("owner", "another-valid-password"); !errors.Is(err, ErrBootstrapUnavailable) {
 		t.Fatalf("stale Host instance bootstrap replay error=%v", err)
 	}
 }
 
-func TestOpenWithoutBootstrapNeverCreatesReplacementToken(t *testing.T) {
+func TestOpenWithoutBootstrapNeverAllowsOwnerCreation(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, securityDirectory), 0700); err != nil {
 		t.Fatal(err)
@@ -207,12 +148,10 @@ func TestOpenWithoutBootstrapNeverCreatesReplacementToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Bootstrap("owner", "no-token", testPassword); !errors.Is(err, ErrBootstrapUnavailable) {
+	if err := service.Bootstrap("owner", testPassword); !errors.Is(err, ErrBootstrapUnavailable) {
 		t.Fatalf("recovery-only auth bootstrap error=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, securityDirectory, bootstrapTokenFilename)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("recovery auth created bootstrap token: %v", err)
-	}
+
 }
 
 func TestOpenWithoutBootstrapServesFailClosedOnCorruptAdmin(t *testing.T) {
@@ -228,9 +167,7 @@ func TestOpenWithoutBootstrapServesFailClosedOnCorruptAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recovery auth should still start read-only: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, securityDirectory, bootstrapTokenFilename)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("corrupt admin generated setup token: %v", err)
-	}
+
 	if _, err := service.Login(testPassword); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("login against corrupt admin error=%v", err)
 	}
@@ -240,7 +177,7 @@ func TestPasswordPolicyAndBcryptPersistence(t *testing.T) {
 	root := t.TempDir()
 	service, token := openForTest(t, root)
 	for _, password := range []string{"short-pass", strings.Repeat("x", 73)} {
-		if err := service.Bootstrap("owner", token, password); !errors.Is(err, ErrInvalidPassword) {
+		if err := service.Bootstrap("owner", password); !errors.Is(err, ErrInvalidPassword) {
 			t.Errorf("Bootstrap(%d bytes) error = %v", len(password), err)
 		}
 	}
@@ -552,7 +489,7 @@ func TestSessionExpiryAndCrossProcessPersistence(t *testing.T) {
 	if _, err := reopenedAgain.Authenticate(restartSession.Token); err != nil {
 		t.Fatalf("new session did not survive another control-plane replacement: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "security", bootstrapTokenFilename)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(root, "security", "bootstrap-token")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("consumed token exists after restart: %v", err)
 	}
 }

@@ -22,37 +22,35 @@ import (
 )
 
 const (
-	securityDirectory       = "security"
-	sessionDirectory        = "sessions"
-	adminFilename           = "admin.json"
-	usersFilename           = "users.json"
-	bootstrapTokenFilename  = "bootstrap-token"
-	maxPasswordBytes        = 72 // bcrypt's input limit.
-	minPasswordBytes        = 12
-	maxActiveSessions       = 1024
-	defaultSessionLifetime  = 12 * time.Hour
-	defaultBcryptCost       = bcrypt.DefaultCost
-	maxBootstrapTokenLength = 256
-	maxSessionRecordBytes   = 1024
-	maxUserStoreBytes       = 1 << 20
+	securityDirectory      = "security"
+	sessionDirectory       = "sessions"
+	adminFilename          = "admin.json"
+	usersFilename          = "users.json"
+	CSRFCookieName         = "ir_csrf"
+	maxPasswordBytes       = 72 // bcrypt's input limit.
+	minPasswordBytes       = 12
+	maxActiveSessions      = 1024
+	defaultSessionLifetime = 12 * time.Hour
+	defaultBcryptCost      = bcrypt.DefaultCost
+	maxSessionRecordBytes  = 1024
+	maxUserStoreBytes      = 1 << 20
 )
 
 var (
-	ErrBootstrapUnavailable  = errors.New("authentication bootstrap is unavailable")
-	ErrInvalidBootstrapToken = errors.New("invalid bootstrap token")
-	ErrInvalidPassword       = errors.New("password must be between 12 and 72 bytes")
-	ErrInvalidLogin          = errors.New("login must use 1-64 ASCII letters, digits, dot, underscore, or hyphen")
-	ErrInvalidCredentials    = errors.New("invalid credentials")
-	ErrUnauthenticated       = errors.New("unauthenticated")
-	ErrSessionCapacity       = errors.New("session capacity reached")
-	ErrNotBootstrapped       = errors.New("administrator is not configured")
-	ErrUserNotFound          = errors.New("user not found")
-	ErrDuplicateLogin        = errors.New("login identity already exists")
-	ErrCurrentPassword       = errors.New("current credentials could not be verified")
-	ErrLastOwner             = errors.New("the last active owner cannot be disabled")
-	ErrSelfDisable           = errors.New("the current user cannot disable their own account")
-	ErrStorage               = errors.New("authentication storage failure")
-	ErrCorruptStore          = errors.New("authentication store is invalid")
+	ErrBootstrapUnavailable = errors.New("authentication bootstrap is unavailable")
+	ErrInvalidPassword      = errors.New("password must be between 12 and 72 bytes")
+	ErrInvalidLogin         = errors.New("login must use 1-64 ASCII letters, digits, dot, underscore, or hyphen")
+	ErrInvalidCredentials   = errors.New("invalid credentials")
+	ErrUnauthenticated      = errors.New("unauthenticated")
+	ErrSessionCapacity      = errors.New("session capacity reached")
+	ErrNotBootstrapped      = errors.New("administrator is not configured")
+	ErrUserNotFound         = errors.New("user not found")
+	ErrDuplicateLogin       = errors.New("login identity already exists")
+	ErrCurrentPassword      = errors.New("current credentials could not be verified")
+	ErrLastOwner            = errors.New("the last active owner cannot be disabled")
+	ErrSelfDisable          = errors.New("the current user cannot disable their own account")
+	ErrStorage              = errors.New("authentication storage failure")
+	ErrCorruptStore         = errors.New("authentication store is invalid")
 )
 
 // Session is returned to the caller exactly once after login. The session
@@ -140,7 +138,7 @@ type Service struct {
 
 	securityDir          string
 	sessionsDir          string
-	allowToken           bool
+	allowBootstrap       bool
 	removeSessionFile    func(string) error
 	syncSessionDirectory func(string) error
 	persistUsers         func(string, []byte) error
@@ -157,9 +155,8 @@ type SessionInfo struct {
 	Current   bool      `json:"current"`
 }
 
-// Open loads authentication state and prepares first-run bootstrap if no
-// administrator exists. The bootstrap token is persisted in a restricted
-// file and is never returned by this API.
+// Open loads authentication state and permits the one-time first Owner
+// creation while the installation is uninitialized.
 func Open(dataRoot string) (*Service, error) {
 	return open(dataRoot, true)
 }
@@ -188,7 +185,7 @@ func OpenWithoutBootstrap(dataRoot string) (*Service, error) {
 	return open(dataRoot, false)
 }
 
-func open(dataRoot string, allowToken bool) (*Service, error) {
+func open(dataRoot string, allowBootstrap bool) (*Service, error) {
 	if strings.TrimSpace(dataRoot) == "" {
 		return nil, ErrStorage
 	}
@@ -220,12 +217,12 @@ func open(dataRoot string, allowToken bool) (*Service, error) {
 		sessionsDir:          sessionsDir,
 		now:                  time.Now,
 		bcryptCost:           defaultBcryptCost,
-		allowToken:           allowToken,
+		allowBootstrap:       allowBootstrap,
 		removeSessionFile:    os.Remove,
 		syncSessionDirectory: syncDirectory,
 	}
-	if err := s.loadOrMigrateUsers(allowToken); err != nil {
-		if !allowToken && errors.Is(err, ErrCorruptStore) {
+	if err := s.loadOrMigrateUsers(); err != nil {
+		if !allowBootstrap && errors.Is(err, ErrCorruptStore) {
 			// Recovery mode can serve its bounded UI, but corrupt identity state
 			// never becomes claimable or writable.
 			return s, nil
@@ -238,12 +235,24 @@ func open(dataRoot string, allowToken bool) (*Service, error) {
 		if err := s.withAuthLock(s.invalidateUnboundSessions); err != nil {
 			return nil, err
 		}
-		if err := removeIfExists(filepath.Join(securityDir, bootstrapTokenFilename)); err != nil {
-			return nil, fmt.Errorf("%w: remove consumed bootstrap token", ErrStorage)
+		if err := syncDirectory(securityDir); err != nil {
+			return nil, fmt.Errorf("%w: sync security directory", ErrStorage)
+		}
+	}
+	// RC8 wrote a one-time token before an Owner existed. It is no longer an
+	// authentication input; remove that legacy artifact only after the current
+	// user store has been validated or migrated successfully. A corrupt store
+	// returns above and therefore never reopens bootstrap.
+	legacyTokenPath := filepath.Join(securityDir, "bootstrap-token")
+	if _, err := os.Lstat(legacyTokenPath); err == nil {
+		if err := removeIfExists(legacyTokenPath); err != nil {
+			return nil, fmt.Errorf("%w: remove legacy bootstrap token", ErrStorage)
 		}
 		if err := syncDirectory(securityDir); err != nil {
 			return nil, fmt.Errorf("%w: sync security directory", ErrStorage)
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w: inspect legacy bootstrap token", ErrStorage)
 	}
 	return s, nil
 }
@@ -278,33 +287,6 @@ func InspectAdministrator(dataRoot string) (bool, error) {
 		return false, nil
 	}
 	return err == nil, err
-}
-
-// ReadSetupCode returns the existing one-time bootstrap credential for a
-// local CLI. It is deliberately read-only and never rotates or creates a
-// credential. Callers must not expose it through an HTTP API or logs.
-func ReadSetupCode(dataRoot string) (string, error) {
-	configured, err := InspectAdministrator(dataRoot)
-	if err != nil {
-		return "", err
-	}
-	if configured {
-		return "", ErrBootstrapUnavailable
-	}
-	root, err := filepath.Abs(dataRoot)
-	if err != nil {
-		return "", ErrStorage
-	}
-	path := filepath.Join(root, securityDirectory, bootstrapTokenFilename)
-	token, err := readBootstrapTokenReadOnly(path)
-	if err != nil {
-		return "", err
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(string(token))
-	if err != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != string(token) {
-		return "", ErrCorruptStore
-	}
-	return string(token), nil
 }
 
 // AdministratorConfigured re-reads the shared durable user store so Host
@@ -342,9 +324,9 @@ func (s *Service) NeedsBootstrap() bool {
 	return err != nil || !configured
 }
 
-// Bootstrap creates first owner if token matches the
-// persisted first-run token. A successful call consumes the bootstrap token.
-func (s *Service) Bootstrap(login, token, password string) error {
+// Bootstrap atomically creates the first Owner. The durable users file is the
+// one-time marker; no separate claim credential exists.
+func (s *Service) Bootstrap(login, password string) error {
 	if !loginRE.MatchString(login) {
 		return ErrInvalidLogin
 	}
@@ -352,7 +334,7 @@ func (s *Service) Bootstrap(login, token, password string) error {
 		return ErrInvalidPassword
 	}
 	return s.withAuthLock(func() error {
-		if !s.allowToken {
+		if !s.allowBootstrap {
 			return ErrBootstrapUnavailable
 		}
 		if users, err := readUserStore(filepath.Join(s.securityDir, usersFilename)); err == nil && len(users.Users) > 0 {
@@ -364,19 +346,6 @@ func (s *Service) Bootstrap(login, token, password string) error {
 			return ErrBootstrapUnavailable
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return ErrBootstrapUnavailable
-		}
-
-		storedToken, err := readBootstrapToken(filepath.Join(s.securityDir, bootstrapTokenFilename))
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return ErrBootstrapUnavailable
-			}
-			return err
-		}
-		providedHash := sha256.Sum256([]byte(token))
-		storedHash := sha256.Sum256(storedToken)
-		if subtle.ConstantTimeCompare(providedHash[:], storedHash[:]) != 1 {
-			return ErrInvalidBootstrapToken
 		}
 
 		hash, err := bcrypt.GenerateFromPassword([]byte(password), s.bcryptCost)
@@ -397,23 +366,11 @@ func (s *Service) Bootstrap(login, token, password string) error {
 			}
 			return err
 		}
-		if err := removeIfExists(filepath.Join(s.securityDir, bootstrapTokenFilename)); err != nil {
-			return fmt.Errorf("%w: consume bootstrap token", ErrStorage)
-		}
-		if err := syncDirectory(s.securityDir); err != nil {
-			return fmt.Errorf("%w: sync consumed bootstrap token", ErrStorage)
-		}
 		return nil
 	})
 }
 
 // NeedsBootstrap reports whether the administrator has not yet been set up.
-// BootstrapTokenRelativePath returns the stable, data-root-relative path
-// where the first-run token is stored. It never returns the token itself or
-// an absolute filesystem path.
-func (s *Service) BootstrapTokenRelativePath() string {
-	return filepath.ToSlash(filepath.Join(securityDirectory, bootstrapTokenFilename))
-}
 
 // Login is an internal legacy helper only. Browser and HTTP callers must use
 // LoginAs with an explicit mutable login identity. For old local callers it
@@ -835,99 +792,6 @@ func readAdminHashReadOnly(path string) ([]byte, error) {
 		return nil, ErrCorruptStore
 	}
 	return hash, nil
-}
-
-func ensureBootstrapToken(securityDir string) error {
-	path := filepath.Join(securityDir, bootstrapTokenFilename)
-	token, err := randomToken()
-	if err != nil {
-		return fmt.Errorf("%w: generate bootstrap token", ErrStorage)
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if errors.Is(err, os.ErrExist) {
-		if _, readErr := readBootstrapToken(path); readErr != nil {
-			return readErr
-		}
-		if chmodErr := os.Chmod(path, 0600); chmodErr != nil {
-			return fmt.Errorf("%w: secure bootstrap token", ErrStorage)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("%w: create bootstrap token", ErrStorage)
-	}
-	cleanup := true
-	defer func() {
-		_ = f.Close()
-		if cleanup {
-			_ = os.Remove(path)
-		}
-	}()
-	if _, err := io.WriteString(f, token); err != nil {
-		return fmt.Errorf("%w: write bootstrap token", ErrStorage)
-	}
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("%w: sync bootstrap token", ErrStorage)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("%w: close bootstrap token", ErrStorage)
-	}
-	if err := syncDirectory(securityDir); err != nil {
-		return fmt.Errorf("%w: sync security directory", ErrStorage)
-	}
-	cleanup = false
-	return nil
-}
-
-func readBootstrapToken(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, os.ErrNotExist
-		}
-		return nil, fmt.Errorf("%w: inspect bootstrap token", ErrStorage)
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxBootstrapTokenLength {
-		return nil, ErrCorruptStore
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return nil, fmt.Errorf("%w: secure bootstrap token", ErrStorage)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("%w: read bootstrap token", ErrStorage)
-	}
-	if len(data) == 0 || len(data) > maxBootstrapTokenLength {
-		return nil, ErrCorruptStore
-	}
-	return data, nil
-}
-
-func readBootstrapTokenReadOnly(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, os.ErrNotExist
-		}
-		return nil, ErrStorage
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxBootstrapTokenLength {
-		return nil, ErrCorruptStore
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, ErrStorage
-	}
-	defer f.Close()
-	opened, err := f.Stat()
-	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, ErrCorruptStore
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxBootstrapTokenLength+1))
-	if err != nil || len(data) == 0 || len(data) > maxBootstrapTokenLength {
-		return nil, ErrCorruptStore
-	}
-	return data, nil
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) (retErr error) {

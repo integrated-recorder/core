@@ -344,5 +344,5 @@ func (s *Server) userDelete(w http.ResponseWriter, r *http.Request) {
 
 func clearAccountCookies(w http.ResponseWriter, r *http.Request, forceSecure bool) {
 	authn.ClearSessionCookie(w, r, forceSecure)
-	http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: r.TLS != nil || forceSecure, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: secureBrowserRequest(r) || forceSecure, SameSite: http.SameSiteStrictMode})
 }

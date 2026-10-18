@@ -5,13 +5,13 @@ if (!e2eDataDir) throw new Error('Run the focused credential suite through `npm 
 
 export default defineConfig({
   testDir: './e2e',
-  testMatch: ['auth-credentials.spec.ts'],
+  testMatch: ['auth-credentials.spec.ts', 'https-server.spec.ts'],
   fullyParallel: false,
   workers: 1,
   reporter: 'list',
   timeout: 90_000,
-  use: { ...devices['Desktop Safari'], locale: 'ko-KR', baseURL: 'http://127.0.0.1:4173', trace: 'retain-on-failure' },
-  projects: [{ name: 'webkit-auth', use: { ...devices['Desktop Safari'], locale: 'ko-KR' } }],
+  use: { ...devices['Desktop Safari'], locale: 'ko-KR', baseURL: 'http://127.0.0.1:4173', trace: 'retain-on-failure', ignoreHTTPSErrors: true },
+  projects: [{ name: 'webkit-auth', use: { ...devices['Desktop Safari'], locale: 'ko-KR', ignoreHTTPSErrors: true } }],
   webServer: {
     command: 'exec node e2e/run-backend.mjs',
     url: 'http://127.0.0.1:4173/healthz',

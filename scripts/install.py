@@ -25,6 +25,7 @@ from typing import Any, Callable, Iterable
 
 REPOSITORY = "integrated-recorder/core"
 REPOSITORY_URL = "https://github.com/integrated-recorder/core.git"
+REPOSITORY_SOURCE = "https://github.com/integrated-recorder/core"
 API_ROOT = "https://api.github.com/repos/integrated-recorder/core"
 COMPOSE_PROJECT = "integrated-recorder"
 STATE_VOLUME = "integrated-recorder_application-state"
@@ -236,6 +237,8 @@ def render_compose(config: dict[str, Any]) -> str:
     commit = quote_yaml(release["commit"])
     build_time = quote_yaml(release["build_time"])
     channel = quote_yaml(release["channel"])
+    source = quote_yaml(release.get("source", REPOSITORY_SOURCE))
+    tag = quote_yaml(release["tag"])
     image = quote_yaml(config["image"])
     architecture = config["architecture"]
     port = str(config["port"])
@@ -252,6 +255,13 @@ services:
         COMMIT: {commit}
         BUILD_TIME: {build_time}
         RELEASE_CHANNEL: {channel}
+      labels:
+        org.opencontainers.image.source: {source}
+        org.opencontainers.image.version: {version}
+        org.opencontainers.image.revision: {commit}
+        org.opencontainers.image.created: {build_time}
+        com.integrated-recorder.release-channel: {channel}
+        com.integrated-recorder.release-tag: {tag}
     user: "{CONTAINER_UID}:{CONTAINER_GID}"
     init: true
     restart: unless-stopped
@@ -315,7 +325,7 @@ def permission_failure_message(path: Path) -> str:
         f"The installer did not change its contents. For a dedicated empty directory, set only its owner with:\n"
         f"  sudo chown {CONTAINER_UID}:{CONTAINER_GID} -- {quoted}\n"
         "For NFS with root-squash, set numeric ownership/ACLs on the NFS server instead. "
-        "Then rerun the installer; it validates write, rename, delete, and chmod as the application user."
+        "Then rerun the installer; it validates create, read, rename, and delete as the application user."
     )
 
 
@@ -712,10 +722,12 @@ def verify_image_labels(image: str, release: dict[str, Any]) -> None:
     except json.JSONDecodeError:
         raise InstallError("Docker image does not expose readable build-identity labels.") from None
     expected = {
+        "org.opencontainers.image.source": release.get("source", REPOSITORY_SOURCE),
         "org.opencontainers.image.version": release["version"],
         "org.opencontainers.image.revision": release["commit"],
         "org.opencontainers.image.created": release["build_time"],
         "com.integrated-recorder.release-channel": release["channel"],
+        "com.integrated-recorder.release-tag": release["tag"],
     }
     if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in expected.items()):
         raise InstallError("Docker image labels do not match the selected release identity.")
@@ -788,6 +800,7 @@ def release_record(release: dict[str, Any], commit: str, build_time: str, manife
     tag = release["tag_name"]
     return {
         "tag": tag,
+        "source": REPOSITORY_SOURCE,
         "version": tag[1:],
         "commit": commit,
         "build_time": build_time,
@@ -930,6 +943,7 @@ def install(args: argparse.Namespace) -> None:
     image = f"localhost/integrated-recorder-core:{commit}"
     release_data = {
         "tag": tag,
+        "source": REPOSITORY_SOURCE,
         "version": version,
         "commit": commit,
         "build_time": build_time,

@@ -49,6 +49,7 @@ def deployment_config(recordings_dir="/mnt/archive with spaces/recordings", vers
     return {
         "release": {
             "tag": "v" + version,
+            "source": install.REPOSITORY_SOURCE,
             "version": version,
             "commit": COMMIT,
             "build_time": BUILD_TIME_GIT,
@@ -166,6 +167,16 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
         self.assertIn(f'COMMIT: "{COMMIT}"', compose)
         self.assertIn(f'BUILD_TIME: "{BUILD_TIME_GIT}"', compose)
         self.assertIn('RELEASE_CHANNEL: "stable"', compose)
+        build_labels = compose.split("      labels:\n", 1)[1].split("    user:", 1)[0]
+        for label, value in (
+            ("org.opencontainers.image.source", install.REPOSITORY_SOURCE),
+            ("org.opencontainers.image.version", "1.2.3"),
+            ("org.opencontainers.image.revision", COMMIT),
+            ("org.opencontainers.image.created", BUILD_TIME_GIT),
+            ("com.integrated-recorder.release-channel", "stable"),
+            ("com.integrated-recorder.release-tag", "v1.2.3"),
+        ):
+            self.assertIn(f'{label}: "{value}"', build_labels)
         self.assertIn('com.integrated-recorder.release-channel: "stable"', compose)
         self.assertIn("source: application-state\n        target: /data", compose)
         self.assertIn("target: /data/recordings", compose)
@@ -177,17 +188,151 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
         self.assertNotIn("AUTH_DISABLED", compose)
         self.assertNotIn("auth_disabled: \"1\"", compose)
 
-    def test_dockerfile_accepts_selected_build_identity_and_labels_final_image(self):
-        dockerfile = (Path(install.__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
+    def test_rc8_dockerfile_without_labels_gets_verified_labels_from_compose(self):
+        dockerfile = (Path(install.__file__).resolve().parent / "testdata" / "Dockerfile.v0.1.0-rc.8").read_text(encoding="utf-8")
+        self.assertNotIn("LABEL ", dockerfile)
         for name in ("VERSION", "COMMIT", "BUILD_TIME", "RELEASE_CHANNEL"):
             self.assertIn(f"ARG {name}=", dockerfile)
-        for label in (
-            "org.opencontainers.image.version=",
-            "org.opencontainers.image.revision=",
-            "org.opencontainers.image.created=",
-            "com.integrated-recorder.release-channel=",
-        ):
-            self.assertIn(label, dockerfile)
+        config = deployment_config("/srv/recordings", version="0.1.0-rc.8", channel="prerelease")
+        compose = install.render_compose(config)
+        build_section = compose.split("    build:\n", 1)[1].split("    user:", 1)[0]
+        self.assertIn('VERSION: "0.1.0-rc.8"', build_section)
+        self.assertIn(f'COMMIT: "{COMMIT}"', build_section)
+        self.assertIn(f'BUILD_TIME: "{BUILD_TIME_GIT}"', build_section)
+        self.assertIn('RELEASE_CHANNEL: "prerelease"', build_section)
+        self.assertIn(f'org.opencontainers.image.source: "{install.REPOSITORY_SOURCE}"', build_section)
+        self.assertIn('com.integrated-recorder.release-tag: "v0.1.0-rc.8"', build_section)
+
+    def test_compose_build_labels_follow_future_pinned_release_metadata(self):
+        config = deployment_config(version="2.4.0-rc.2", channel="prerelease")
+        config["release"].update({"tag": "v2.4.0-rc.2", "commit": "c" * 40, "build_time": "2030-01-02T03:04:05+00:00"})
+        build_section = install.render_compose(config).split("    build:\n", 1)[1].split("    user:", 1)[0]
+        self.assertIn('VERSION: "2.4.0-rc.2"', build_section)
+        self.assertIn(f'COMMIT: "{"c" * 40}"', build_section)
+        self.assertIn('BUILD_TIME: "2030-01-02T03:04:05+00:00"', build_section)
+        self.assertIn('com.integrated-recorder.release-tag: "v2.4.0-rc.2"', build_section)
+        self.assertIn('org.opencontainers.image.source: "https://github.com/integrated-recorder/core"', build_section)
+
+    def test_image_label_verification_rejects_wrong_release_metadata(self):
+        expected = deployment_config()["release"]
+        expected_labels = {
+            "org.opencontainers.image.source": install.REPOSITORY_SOURCE,
+            "org.opencontainers.image.version": expected["version"],
+            "org.opencontainers.image.revision": expected["commit"],
+            "org.opencontainers.image.created": expected["build_time"],
+            "com.integrated-recorder.release-channel": expected["channel"],
+            "com.integrated-recorder.release-tag": expected["tag"],
+        }
+        with mock.patch.object(install, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(expected_labels), "")):
+            install.verify_image_labels("image:test", expected)
+        for key in expected_labels:
+            wrong = dict(expected_labels, **{key: "incorrect"})
+            with self.subTest(label=key), mock.patch.object(
+                install, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(wrong), "")
+            ):
+                with self.assertRaisesRegex(install.InstallError, "labels do not match"):
+                    install.verify_image_labels("image:test", expected)
+
+    def test_retry_after_rc8_image_label_failure_preserves_pending_source_and_archives(self):
+        with tempfile.TemporaryDirectory(prefix="installer rc8 retry ") as root:
+            install_dir = Path(root) / "install"
+            archive = Path(root) / "recordings"
+            source = install_dir / "source" / COMMIT
+            install_dir.mkdir()
+            archive.mkdir()
+            source.mkdir(parents=True)
+            (source / ".git").mkdir()
+            (source / "Dockerfile").write_text(
+                (Path(install.__file__).resolve().parent / "testdata" / "Dockerfile.v0.1.0-rc.8").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            source_marker = source / "keep-source.txt"
+            source_marker.write_text("cached official RC8 source", encoding="utf-8")
+            archive_marker = archive / "keep-recording.bin"
+            archive_marker.write_bytes(b"existing recording archive")
+            release_data = {
+                "tag": "v0.1.0-rc.8",
+                "source": install.REPOSITORY_SOURCE,
+                "version": "0.1.0-rc.8",
+                "commit": COMMIT,
+                "build_time": BUILD_TIME_GIT,
+                "channel": "prerelease",
+                "architecture_manifest": "amd64",
+                "manifest_identity_checked": True,
+                "manifest_signature_independently_verified": False,
+            }
+            pending = {
+                "schema_version": 1,
+                "repository": install.REPOSITORY,
+                "release": release_data,
+                "recordings_dir": str(archive),
+                "port": 18080,
+                "architecture": "amd64",
+                "compose_project": install.COMPOSE_PROJECT,
+                "state_volume": install.STATE_VOLUME,
+                "source_dir": str(source),
+                "image": f"localhost/integrated-recorder-core:{COMMIT}",
+                "network_exposure": "127.0.0.1",
+                "container_uid": install.CONTAINER_UID,
+                "container_gid": install.CONTAINER_GID,
+            }
+            pending_path = install_dir / "deployment.pending.json"
+            install.write_metadata(pending_path, pending)
+            args = install.cli_parser().parse_args([
+                "--install-dir", str(install_dir), "--recordings-dir", str(archive),
+            ])
+            image_labels = {
+                "org.opencontainers.image.source": install.REPOSITORY_SOURCE,
+                "org.opencontainers.image.version": "0.1.0-rc.8",
+                "org.opencontainers.image.revision": COMMIT,
+                "org.opencontainers.image.created": BUILD_TIME_GIT,
+                "com.integrated-recorder.release-channel": "prerelease",
+                "com.integrated-recorder.release-tag": "v0.1.0-rc.8",
+            }
+            failure_labels = dict(image_labels, **{"org.opencontainers.image.revision": "wrong-commit"})
+            inspect_attempts = 0
+
+            def fake_run(argv, **kwargs):
+                nonlocal inspect_attempts
+                if argv[1:3] == ["image", "inspect"]:
+                    inspect_attempts += 1
+                    labels = failure_labels if inspect_attempts == 1 else image_labels
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(labels), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            common_patches = (
+                mock.patch.object(install, "docker_preflight", return_value="amd64"),
+                mock.patch.object(install, "verify_existing_state_volume"),
+                mock.patch.object(install, "prepare_source", return_value=(source, BUILD_TIME_GIT)),
+                mock.patch.object(install, "verify_image_binaries"),
+                mock.patch.object(install, "probe_archive_permissions"),
+                mock.patch.object(install, "wait_for_runtime", return_value={
+                    "state": "uninitialized", "administrator_configured": False, "auth_disabled": False,
+                    "version": "0.1.0-rc.8", "release_channel": "prerelease",
+                }),
+                mock.patch.object(install, "run", side_effect=fake_run),
+            )
+            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4], common_patches[5], common_patches[6]:
+                with self.assertRaisesRegex(install.InstallError, "image labels do not match"):
+                    install.install(args)
+                pending_after_failure = install.read_pending(pending_path)
+                self.assertEqual(pending_after_failure["release"], release_data)
+                self.assertEqual(pending_after_failure["recordings_dir"], str(archive.resolve()))
+                self.assertFalse(pending_after_failure.get("compose_started", False))
+                self.assertTrue((install_dir / "compose.pending.yaml").is_file())
+                self.assertEqual(source_marker.read_text(encoding="utf-8"), "cached official RC8 source")
+                self.assertEqual(archive_marker.read_bytes(), b"existing recording archive")
+
+                install.install(args)
+
+            self.assertEqual(inspect_attempts, 2)
+            self.assertIsNone(install.read_pending(pending_path))
+            current = install.load_metadata(install_dir / "deployment.json")
+            self.assertEqual(current["release"]["tag"], "v0.1.0-rc.8")
+            self.assertEqual(current["release"]["commit"], COMMIT)
+            self.assertEqual(current["recordings_dir"], str(archive.resolve()))
+            self.assertEqual(source_marker.read_text(encoding="utf-8"), "cached official RC8 source")
+            self.assertEqual(archive_marker.read_bytes(), b"existing recording archive")
 
     def test_compose_escapes_compose_interpolation_for_dollar_in_paths(self):
         compose = install.render_compose(deployment_config("/mnt/archive/$recordings"))

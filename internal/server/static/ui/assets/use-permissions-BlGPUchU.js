@@ -1,1 +1,0 @@
-import{d as u,T as r,aV as c}from"./index-wFuUQrVe.js";function f(){var e;const a=u(c),s=u({...r,enabled:((e=a.data)==null?void 0:e.auth_enabled)!==!1});return{can:i=>{var n,t,o;return((n=a.data)==null?void 0:n.auth_enabled)===!1||((o=(t=s.data)==null?void 0:t.permissions)==null?void 0:o.includes(i))===!0},authorization:s,session:a}}export{f as u};

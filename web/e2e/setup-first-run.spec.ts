@@ -52,11 +52,31 @@ test('fresh setup resolves browser locale before authentication', async ({ brows
       await expect(page.getByText('몇 가지 확인을 마치면 보관 작업을 시작할 수 있습니다.')).toHaveCount(0)
       expect(await page.locator('body').innerText()).toMatch(/[\uac00-\ud7a3]/)
     }
-    for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }]) {
+    for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }, { name: 'compact-mobile', width: 320, height: 720 }]) {
       await page.setViewportSize({ width: viewport.width, height: viewport.height })
       const dimensions = await page.evaluate(() => ({ body: document.body.scrollWidth, viewport: window.innerWidth }))
       expect(dimensions.body).toBeLessThanOrEqual(dimensions.viewport)
       await page.screenshot({ path: testInfo.outputPath(`setup-${locale}-${viewport.name}.png`), fullPage: true })
+    }
+
+    await page.getByRole('button', { name: locale === 'en-US' ? 'Get started' : '시작하기' }).click()
+    const stepper = page.getByRole('navigation', { name: locale === 'en-US' ? 'Setup steps' : '설치 단계' })
+    await expect(stepper.locator('[aria-current="step"] [data-step-indicator] > span:last-child')).toHaveText(locale === 'en-US' ? 'Administrator' : '관리자')
+    await expect(stepper.locator('li[data-step-state="complete"]')).toHaveCount(1)
+    await expect(stepper.locator('[data-step-connector="true"]')).toHaveCount(4)
+
+    for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }, { name: 'compact-mobile', width: 320, height: 720 }]) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height })
+      const geometry = await stepper.locator('[data-step-indicator="true"]').evaluateAll(indicators => indicators.map(indicator => {
+        const rect = indicator.getBoundingClientRect()
+        return { centerX: rect.left + rect.width / 2, top: rect.top }
+      }))
+      expect(geometry).toHaveLength(5)
+      expect(geometry.every((item, index) => index === 0 || item.centerX > geometry[index - 1].centerX)).toBe(true)
+      expect(geometry.every(item => Math.abs(item.top - geometry[0].top) < 1)).toBe(true)
+      const dimensions = await page.evaluate(() => ({ body: document.body.scrollWidth, viewport: window.innerWidth }))
+      expect(dimensions.body).toBeLessThanOrEqual(dimensions.viewport)
+      await page.screenshot({ path: testInfo.outputPath(`setup-owner-${locale}-${viewport.name}.png`), fullPage: true })
     }
     await context.close()
   }

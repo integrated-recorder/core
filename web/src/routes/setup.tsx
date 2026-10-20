@@ -228,7 +228,30 @@ export function SetupPage() {
   const adapterWarnings = adapters.filter(adapter => !['ready', 'running'].includes(adapter.status.state))
 
   return <SetupFrame>
-    <div className="mx-auto grid w-full max-w-5xl gap-5 lg:grid-cols-[minmax(0,1fr)_260px]">
+    <div className="mx-auto flex w-full max-w-5xl flex-col gap-4">
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">{t('setup.progressTitle')}</CardTitle>
+          <CardDescription>{t('setup.progressDescription')}</CardDescription>
+        </CardHeader>
+        <CardContent className="pt-1">
+          <nav aria-label={t('setup.progressAria')}>
+            <ol className="flex w-full items-start">
+              {stepList.map((item, index) => {
+                const current = item.id === visibleStep
+                const complete = index < activeIndex
+                return <li key={item.id} aria-current={current ? 'step' : undefined} data-step-state={current ? 'current' : complete ? 'complete' : 'upcoming'} className="relative min-w-0 flex-1">
+                  {index < stepList.length - 1 && <span aria-hidden="true" data-step-connector="true" className={`absolute left-1/2 top-3 h-px w-full ${index < activeIndex ? 'bg-emerald-600' : 'bg-border'}`} />}
+                  <span data-step-indicator="true" className="relative z-10 flex min-w-0 flex-col items-center text-center">
+                    <span aria-hidden="true" className={`grid h-6 w-6 shrink-0 place-items-center rounded-full border text-xs ${complete ? 'border-emerald-600 bg-emerald-600 text-white' : current ? 'border-primary bg-primary/10 font-semibold text-primary' : 'border-border bg-card text-muted-foreground'}`}>{complete ? <Check className="h-3.5 w-3.5" /> : index + 1}</span>
+                    <span className={`mt-2 max-w-full break-words text-[10px] leading-tight sm:text-xs ${current ? 'font-semibold text-primary' : complete ? 'text-foreground' : 'text-muted-foreground'}`}>{t(item.label)}</span>
+                  </span>
+                </li>
+              })}
+            </ol>
+          </nav>
+        </CardContent>
+      </Card>
       <section className="min-w-0">
         <Card className="overflow-hidden">
           <CardHeader className="border-b border-border bg-muted/20"><CardTitle className="text-lg">{t(stepHeadingKeys[visibleStep])}</CardTitle>{visibleStep !== 'welcome' && <p className="text-sm text-muted-foreground">{t(stepDescriptionKeys[visibleStep])}</p>}</CardHeader>
@@ -237,7 +260,7 @@ export function SetupPage() {
               <div className="flex justify-end"><Button onClick={() => status.state === 'uninitialized' && !status.auth_disabled ? setStep('administrator') : begin.mutate()} disabled={begin.isPending}>{begin.isPending ? t('setup.welcome.starting') : t('setup.welcome.start')}<ArrowRight className="h-4 w-4" /></Button></div>
             </div>}
 
-            {visibleStep === 'administrator' && <form ref={administratorForm} className="max-w-xl space-y-5" onSubmit={submitAdministrator}>
+            {visibleStep === 'administrator' && <form ref={administratorForm} className="w-full max-w-3xl space-y-5" onSubmit={submitAdministrator}>
               <div>
                 <p className="text-sm leading-6 text-muted-foreground">{t('setup.owner.description')}</p>
               </div>
@@ -303,15 +326,6 @@ export function SetupPage() {
           </CardContent>
         </Card>
       </section>
-      <aside className="space-y-4 lg:pt-[3.4rem]">
-        <Card><CardHeader className="pb-3"><CardTitle>{t('setup.progressTitle')}</CardTitle><CardDescription>{t('setup.progressDescription')}</CardDescription></CardHeader><CardContent>
-          <ol aria-label={t('setup.progressAria')} className="space-y-1">{stepList.map((item, index) => {
-            const current = item.id === visibleStep
-            const complete = index < activeIndex
-            return <li key={item.id}><div aria-current={current ? 'step' : undefined} className={`flex items-center gap-3 rounded-md px-2.5 py-2 text-sm ${current ? 'bg-primary/10 font-medium text-primary' : 'text-muted-foreground'}`}><span className={`grid h-6 w-6 shrink-0 place-items-center rounded-full border text-xs ${complete ? 'border-emerald-600 bg-emerald-600 text-white' : current ? 'border-primary' : 'border-border'}`}>{complete ? <Check className="h-3.5 w-3.5" /> : index + 1}</span>{t(item.label)}</div></li>
-          })}</ol>
-        </CardContent></Card>
-      </aside>
     </div>
   </SetupFrame>
 }

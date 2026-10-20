@@ -79,6 +79,26 @@ describe('first-run setup flow', () => {
     await waitFor(() => expect(document.documentElement.lang).toBe('ko-KR'))
   })
 
+  it('renders the setup progress as an accessible horizontal stepper above the form', async () => {
+    renderSetup()
+    fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
+
+    const navigation = screen.getByRole('navigation', { name: '설치 단계' })
+    const steps = Array.from(navigation.querySelectorAll('li'))
+    expect(steps).toHaveLength(5)
+    expect(steps.map(step => step.querySelector('[data-step-indicator] > span:last-child')?.textContent)).toEqual(['시작', '관리자', '저장소', '어댑터', '완료 확인'])
+    expect(steps[0]).toHaveAttribute('data-step-state', 'complete')
+    expect(steps[1]).toHaveAttribute('aria-current', 'step')
+    expect(steps[1]).toHaveAttribute('data-step-state', 'current')
+    expect(steps[4]).toHaveAttribute('data-step-state', 'upcoming')
+    expect(navigation.querySelectorAll('[data-step-connector="true"]')).toHaveLength(4)
+    expect(navigation.querySelector('ol')).toHaveClass('flex')
+
+    const form = screen.getByLabelText('계정').closest('form')!
+    expect(navigation.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(form).toHaveClass('w-full', 'max-w-3xl')
+  })
+
   it('keeps setup UI text in translation keys', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/routes/setup.tsx'), 'utf8')
     const file = ts.createSourceFile('setup.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)

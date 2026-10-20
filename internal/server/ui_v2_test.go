@@ -38,7 +38,7 @@ func TestEmbeddedSPAHasLocalProductionAssets(t *testing.T) {
 func TestSPARoutesAreRestrictedAndDirectLoadsWork(t *testing.T) {
 	handler := New(nil, nil, nil)
 	for _, path := range []string{
-		"/", "/login", "/recordings", "/recordings/abc123", "/adapters/example", "/sources", "/sources/example",
+		"/", "/setup", "/login", "/recordings", "/recordings/abc123", "/adapters/example", "/sources", "/sources/example",
 		"/plugins", "/workflows/id", "/settings", "/account/preferences", "/account/security", "/account/sessions",
 		"/system", "/system/users", "/system/updates", "/system/diagnostics", "/system/audit",
 		"/storage", "/storage/locations", "/storage/retention", "/storage/advanced", "/storage/local-primary",
@@ -63,18 +63,20 @@ func TestSPARoutesAreRestrictedAndDirectLoadsWork(t *testing.T) {
 			t.Errorf("unexpected SPA route match for %s", path)
 		}
 	}
-	nonHTML := httptest.NewRecorder()
-	nonHTMLRequest := httptest.NewRequest(http.MethodGet, "/system", nil)
-	nonHTMLRequest.Header.Set("Accept", "application/json")
-	handler.ServeHTTP(nonHTML, nonHTMLRequest)
-	if nonHTML.Code != http.StatusNotFound {
-		t.Fatalf("non-browser route received SPA: status=%d", nonHTML.Code)
+	for _, path := range []string{"/system", "/setup"} {
+		nonHTML := httptest.NewRecorder()
+		nonHTMLRequest := httptest.NewRequest(http.MethodGet, path, nil)
+		nonHTMLRequest.Header.Set("Accept", "application/json")
+		handler.ServeHTTP(nonHTML, nonHTMLRequest)
+		if nonHTML.Code != http.StatusNotFound {
+			t.Errorf("non-HTML request to %s received SPA: status=%d", path, nonHTML.Code)
+		}
 	}
 }
 
 func TestAuthPublicRoutesExposeOnlySPAAndStaticGetRequests(t *testing.T) {
 	for _, path := range []string{
-		"/", "/login", "/recordings", "/recordings/id", "/adapters/id", "/sources", "/sources/id", "/plugins",
+		"/", "/setup", "/login", "/recordings", "/recordings/id", "/adapters/id", "/sources", "/sources/id", "/plugins",
 		"/workflows/id", "/settings", "/account/preferences", "/account/security", "/account/sessions",
 		"/system", "/system/users", "/system/updates", "/system/diagnostics", "/system/audit",
 		"/storage", "/storage/locations", "/storage/retention", "/storage/advanced", "/storage/local-primary", "/static/ui/assets/app.js",

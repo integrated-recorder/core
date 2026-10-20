@@ -138,8 +138,15 @@ def pinned_release_decision(
     return "select-fresh", None
 
 
-def choose_port(requested: int | None, existing: int | None = None, available: Callable[[int], bool] | None = None, default_port: int = 8080, option: str = "--port") -> int:
-    available = available or local_port_available
+def choose_port(
+    requested: int | None,
+    existing: int | None = None,
+    available: Callable[[int], bool] | None = None,
+    default_port: int = 8080,
+    option: str = "--port",
+    bind: str = "127.0.0.1",
+) -> int:
+    available = available or (lambda port: bind_port_available(bind, port))
     if requested is not None:
         if not 1 <= requested <= 65535:
             raise InstallError("Host port must be between 1 and 65535.")
@@ -151,29 +158,31 @@ def choose_port(requested: int | None, existing: int | None = None, available: C
     if available(default_port):
         return default_port
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
+        family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.bind(socket_bind_address(bind, 0))
             return int(probe.getsockname()[1])
     except OSError:
-        raise InstallError(f"No available host port could be selected; specify {option} explicitly.") from None
+        raise InstallError(
+            f"No available host port could be selected on bind address {bind}; "
+            f"confirm the address is assigned locally or specify {option} explicitly."
+        ) from None
 
 
 def local_port_available(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        try:
-            probe.bind(("127.0.0.1", port))
-            return True
-        except OSError as exc:
-            if exc.errno in (1, 13):
-                raise InstallError(f"Cannot verify host port {port}; check it from an environment with local socket access.") from None
-            return False
+    return bind_port_available("127.0.0.1", port)
+
+
+def socket_bind_address(bind: str, port: int) -> tuple[Any, ...]:
+    family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    return (bind, port, 0, 0) if family == socket.AF_INET6 else (bind, port)
 
 
 def bind_port_available(bind: str, port: int) -> bool:
     family = socket.AF_INET6 if ":" in bind else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as probe:
         try:
-            probe.bind((bind, port, 0, 0) if family == socket.AF_INET6 else (bind, port))
+            probe.bind(socket_bind_address(bind, port))
             return True
         except OSError as exc:
             if exc.errno in (1, 13):
@@ -186,6 +195,29 @@ def normalize_bind(value: str) -> str:
         return ipaddress.ip_address(value).compressed
     except ValueError:
         raise InstallError("--bind must be an IPv4 or IPv6 interface address such as 127.0.0.1 or 0.0.0.0.") from None
+
+
+def runtime_probe_host(bind: str) -> str:
+    """Return a connectable address for a listener bound to ``bind``.
+
+    Wildcard addresses are listen-only addresses, so probe the matching
+    loopback family. Specific IPv4/IPv6 binds must be checked through that
+    same interface; using 127.0.0.1 would not reach a Tailscale/LAN-only bind.
+    """
+    address = ipaddress.ip_address(bind)
+    if address.is_unspecified:
+        return "::1" if address.version == 6 else "127.0.0.1"
+    return address.compressed
+
+
+def runtime_probe_url(bind: str, port: int, path: str) -> str:
+    host = runtime_probe_host(bind)
+    if ":" in host:
+        # RFC 6874 requires the percent sign in an IPv6 zone identifier to be
+        # escaped when it appears in a URL authority.
+        host = host.replace("%", "%25")
+        host = f"[{host}]"
+    return f"http://{host}:{port}{path}"
 
 
 def docker_architecture(value: str) -> str:
@@ -780,8 +812,8 @@ def write_metadata(path: Path, metadata: dict[str, Any]) -> None:
     atomic_write(path, (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("utf-8"), 0o600)
 
 
-def get_setup_status(port: int) -> dict[str, Any]:
-    url = f"http://127.0.0.1:{port}/api/setup/status"
+def get_setup_status(port: int, bind: str = "127.0.0.1") -> dict[str, Any]:
+    url = runtime_probe_url(bind, port, "/api/setup/status")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(url, timeout=5) as response:
@@ -795,9 +827,9 @@ def get_setup_status(port: int) -> dict[str, Any]:
     return value
 
 
-def verify_browser_ui(port: int) -> None:
+def verify_browser_ui(port: int, bind: str = "127.0.0.1") -> None:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    request = urllib.request.Request(f"http://127.0.0.1:{port}/setup", headers={"Accept": "text/html"})
+    request = urllib.request.Request(runtime_probe_url(bind, port, "/setup"), headers={"Accept": "text/html"})
     try:
         with opener.open(request, timeout=5) as response:
             body = response.read(256 * 1024)
@@ -807,28 +839,36 @@ def verify_browser_ui(port: int) -> None:
     except urllib.error.HTTPError as exc:
         raise InstallError(f"Runtime Host setup page returned HTTP {exc.code}.") from None
     except (urllib.error.URLError, TimeoutError, OSError):
-        raise InstallError("Runtime Host setup page is not reachable on its loopback port.") from None
+        raise InstallError(f"Runtime Host setup page is not reachable on bind address {bind}.") from None
 
 
-def wait_for_runtime(port: int, release: dict[str, Any], timeout: int = 180) -> dict[str, Any]:
+def wait_for_runtime(
+    port: int,
+    release: dict[str, Any],
+    timeout: int = 180,
+    bind: str = "127.0.0.1",
+) -> dict[str, Any]:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     deadline = time.monotonic() + timeout
     last_error = "not ready"
     while time.monotonic() < deadline:
         try:
-            with opener.open(f"http://127.0.0.1:{port}/healthz", timeout=3) as response:
+            with opener.open(runtime_probe_url(bind, port, "/healthz"), timeout=3) as response:
                 health = json.loads(response.read(8192).decode("utf-8"))
             if isinstance(health, dict) and health.get("status") == "ok":
-                status = get_setup_status(port)
+                status = get_setup_status(port, bind)
                 validate_setup_status(status, release)
-                verify_browser_ui(port)
+                verify_browser_ui(port, bind)
                 return status
         except InstallError as exc:
             last_error = str(exc)
         except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             last_error = type(exc).__name__
         time.sleep(2)
-    raise InstallError(f"Runtime Host did not become healthy within {timeout} seconds ({last_error}). Check local container logs.")
+    raise InstallError(
+        f"Runtime Host did not become healthy on bind address {bind} within {timeout} seconds "
+        f"({last_error}). Check local container logs."
+    )
 
 
 def network_settings(args: argparse.Namespace, existing: dict[str, Any] | None, install_dir: Path) -> tuple[str, int]:
@@ -838,8 +878,17 @@ def network_settings(args: argparse.Namespace, existing: dict[str, Any] | None, 
         bind = normalize_bind(existing["bind"])
     else:
         bind = "127.0.0.1"
+    previous_bind = normalize_bind(existing.get("bind", "127.0.0.1")) if existing else None
     previous_port = (existing or {}).get("https_port")
-    port = choose_port(args.https_port, int(previous_port) if previous_port else None, lambda value: bind_port_available(bind, value), CONTAINER_HTTPS_PORT, "--https-port")
+    reusable_port = int(previous_port) if previous_port and previous_bind == bind else None
+    port = choose_port(
+        args.https_port,
+        reusable_port,
+        lambda value: bind_port_available(bind, value),
+        CONTAINER_HTTPS_PORT,
+        "--https-port",
+        bind,
+    )
     return bind, port
 
 
@@ -978,12 +1027,21 @@ def install(args: argparse.Namespace) -> None:
         if channel == "prerelease":
             print(f"Notice: selected official prerelease {tag}.", file=sys.stderr)
 
-    if policy == "preserve-current" and current:
-        selected_port = choose_port(args.port, int(current["port"]))
-    elif policy == "resume-pending" and pending:
-        selected_port = choose_port(args.port, int(pending["port"]))
-    else:
-        selected_port = choose_port(args.port)
+    previous_bind = normalize_bind(prior_deployment.get("bind", "127.0.0.1")) if prior_deployment else None
+    previous_http_port = None
+    if prior_deployment and previous_bind == selected_bind:
+        try:
+            previous_http_port = int(prior_deployment["port"])
+        except (KeyError, TypeError, ValueError):
+            previous_http_port = None
+    selected_port = choose_port(
+        args.port,
+        previous_http_port,
+        lambda value: bind_port_available(selected_bind, value),
+        8080,
+        "--port",
+        selected_bind,
+    )
 
     archive_created = ensure_archive_dir(archive)
     source_dir, local_build_time = prepare_source(install_dir, {"tag": tag}, commit, api)
@@ -1035,7 +1093,7 @@ def install(args: argparse.Namespace) -> None:
         candidate["compose_started"] = True
         write_metadata(pending_path, candidate)
         run(compose_command(candidate_compose, "up", "-d", "--no-build", "--wait", "--wait-timeout", "180", "--remove-orphans", "archiver"), capture=False)
-        setup_status = wait_for_runtime(selected_port, release_data)
+        setup_status = wait_for_runtime(selected_port, release_data, bind=selected_bind)
     except InstallError:
         if old_compose.is_file() and current is not None:
             try:

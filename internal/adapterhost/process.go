@@ -232,6 +232,11 @@ func (p *process) call(ctx context.Context, method string, params any) (json.Raw
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	select {
+	case <-p.done:
+		return nil, errors.New("adapter process exited")
+	default:
+	}
 	id := fmt.Sprintf("%d", p.sequence.Add(1))
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
@@ -255,31 +260,44 @@ func (p *process) call(ctx context.Context, method string, params any) (json.Raw
 		return nil, fmt.Errorf("adapter request timed out or was canceled")
 	case <-p.done:
 		p.kill()
-		<-writeResult
-		return nil, errors.New("adapter process exited")
+		// The child can consume the complete request, write its response, and
+		// exit before the writer goroutine is scheduled to publish its result.
+		// Join the writer first, then prefer a response already drained from
+		// stdout. Otherwise this exit notification races a valid response.
+		if err := <-writeResult; err != nil {
+			return nil, errors.New("adapter request failed")
+		}
+		return p.responseAfterExit(ctx, id)
 	}
 	select {
 	case <-ctx.Done():
-		select {
-		case result := <-p.responses:
-			return p.consumeResponse(result, id)
-		default:
-		}
 		p.kill()
 		return nil, fmt.Errorf("adapter request timed out or was canceled")
 	case <-p.done:
-		// The process can write a complete response and exit immediately. The
-		// read goroutine may have queued that frame just before Wait closed done;
-		// prefer the complete frame over the process-exit notification.
-		select {
-		case result := <-p.responses:
-			return p.consumeResponse(result, id)
-		default:
-			return nil, errors.New("adapter process exited")
-		}
+		return p.responseAfterExit(ctx, id)
 	case result := <-p.responses:
-		return p.consumeResponse(result, id)
+		return p.consumeResponseUnlessCanceled(ctx, result, id)
 	}
+}
+
+func (p *process) responseAfterExit(ctx context.Context, id string) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("adapter request timed out or was canceled")
+	}
+	select {
+	case result := <-p.responses:
+		return p.consumeResponseUnlessCanceled(ctx, result, id)
+	default:
+		return nil, errors.New("adapter process exited")
+	}
+}
+
+func (p *process) consumeResponseUnlessCanceled(ctx context.Context, result readResult, id string) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		p.kill()
+		return nil, fmt.Errorf("adapter request timed out or was canceled")
+	}
+	return p.consumeResponse(result, id)
 }
 
 func (p *process) consumeResponse(result readResult, id string) (json.RawMessage, error) {

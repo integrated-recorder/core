@@ -13,8 +13,10 @@ import (
 	"image/png"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -755,6 +757,155 @@ func TestProcessDrainsResponseBeforeReapingAdapter(t *testing.T) {
 			p.kill()
 			t.Fatal("adapter process was not reaped")
 		}
+	}
+}
+
+type delayedWriteCloser struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	bytes   []byte
+}
+
+func (w *delayedWriteCloser) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	w.bytes = append(w.bytes, data...)
+	w.mu.Unlock()
+	close(w.started)
+	<-w.release
+	return len(data), nil
+}
+
+func (w *delayedWriteCloser) Close() error {
+	w.once.Do(func() { close(w.release) })
+	return nil
+}
+
+func (w *delayedWriteCloser) requestBytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.bytes...)
+}
+
+type callbackWriteCloser struct {
+	write func()
+}
+
+func (w *callbackWriteCloser) Write(data []byte) (int, error) {
+	w.write()
+	return len(data), nil
+}
+
+func (w *callbackWriteCloser) Close() error { return nil }
+
+func TestCallPrefersDrainedResponseWhenExitWinsRequestWriteRace(t *testing.T) {
+	success, err := adapterproto.Success("1", map[string]bool{"ok": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongID := success
+	wrongID.ID = "other"
+	wrongVersion := success
+	wrongVersion.ProtocolVersion++
+
+	tests := []struct {
+		name        string
+		response    *readResult
+		wantResult  string
+		wantErrPart string
+	}{
+		{name: "complete response", response: &readResult{response: success}, wantResult: `{"ok":true}`},
+		{name: "no response", wantErrPart: "adapter process exited"},
+		{name: "clean EOF", response: &readResult{err: io.EOF}, wantErrPart: "adapter closed protocol output"},
+		{name: "malformed response", response: &readResult{err: errors.New("invalid frame")}, wantErrPart: "adapter returned malformed protocol output"},
+		{name: "wrong response ID", response: &readResult{response: wrongID}, wantErrPart: "adapter response id mismatch"},
+		{name: "unsupported response protocol", response: &readResult{response: wrongVersion}, wantErrPart: adapterproto.ErrUnsupportedProtocolVersion.Error()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &delayedWriteCloser{started: make(chan struct{}), release: make(chan struct{})}
+			p := &process{
+				cmd:       &exec.Cmd{},
+				stdin:     writer,
+				requests:  make(chan struct{}, 1),
+				responses: make(chan readResult, 1),
+				done:      make(chan struct{}),
+			}
+			p.requests <- struct{}{}
+			resultCh := make(chan struct {
+				result json.RawMessage
+				err    error
+			}, 1)
+			go func() {
+				result, err := p.call(context.Background(), "describe", map[string]any{})
+				resultCh <- struct {
+					result json.RawMessage
+					err    error
+				}{result: result, err: err}
+			}()
+
+			// The writer has accepted the request bytes but has not yet returned
+			// to call(). Closing done now deterministically makes process exit
+			// ready while the write-result channel is still pending.
+			select {
+			case <-writer.started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("request writer did not start")
+			}
+			request, err := adapterproto.ReadRequest(bufio.NewReader(bytes.NewReader(writer.requestBytes())))
+			if err != nil || request.ID != "1" || request.Method != "describe" {
+				t.Fatalf("written request=%+v err=%v", request, err)
+			}
+			if test.response != nil {
+				p.responses <- *test.response
+			}
+			close(p.done)
+			defer writer.Close()
+
+			var got struct {
+				result json.RawMessage
+				err    error
+			}
+			select {
+			case got = <-resultCh:
+			case <-time.After(5 * time.Second):
+				t.Fatal("call did not finish after process exit")
+			}
+			if test.wantErrPart != "" {
+				if got.err == nil || !strings.Contains(got.err.Error(), test.wantErrPart) {
+					t.Fatalf("call result=%s err=%v, want error containing %q", got.result, got.err, test.wantErrPart)
+				}
+				return
+			}
+			if got.err != nil || string(got.result) != test.wantResult {
+				t.Fatalf("call result=%s err=%v, want %s", got.result, got.err, test.wantResult)
+			}
+		})
+	}
+}
+
+func TestCallDoesNotAcceptResponseAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	success, err := adapterproto.Success("1", map[string]bool{"ok": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &process{
+		cmd:       &exec.Cmd{},
+		requests:  make(chan struct{}, 1),
+		responses: make(chan readResult, 1),
+		done:      make(chan struct{}),
+	}
+	p.requests <- struct{}{}
+	p.stdin = &callbackWriteCloser{write: func() {
+		p.responses <- readResult{response: success}
+		cancel()
+	}}
+	result, err := p.call(ctx, "describe", map[string]any{})
+	if err == nil || !strings.Contains(err.Error(), "timed out or was canceled") {
+		t.Fatalf("canceled call result=%s err=%v, want cancellation error", result, err)
 	}
 }
 

@@ -650,9 +650,21 @@ func Run(ctx context.Context, config Config) error {
 	if err := reconcileColdGenerationState(registry, engineRecoveryMode, generationID, true); err != nil {
 		return errors.New("recording generation leases could not be reconciled after cold recovery")
 	}
-	if allowsUnleasedBundleSourceDetach(installState.Snapshot().State) && selected.imageBundleUpgradeSourceGenerationID != "" {
-		if err := reconcileImageBundleUpgradeSource(registry, selected.imageBundleUpgradeSourceGenerationID); err != nil {
-			return fmt.Errorf("reconcile prior image-bundled generation: %w", err)
+	if allowsUnleasedBundleSourceDetach(installState.Snapshot().State) {
+		// A fresh/setup Host has only attached the startup generation above. A
+		// prior cold-start activation may have committed its replacement before
+		// the old generation could be marked dormant (for example, when the
+		// bundled storage pin changed on the first restart). Reconcile the exact
+		// durable rollback predecessor, but never clear its leases. A leased
+		// predecessor remains authoritative and will fail closed if its Engine
+		// cannot be inventoried.
+		if err := reconcileUnleasedPreviousGeneration(registry); err != nil {
+			return fmt.Errorf("reconcile previous generation attachment: %w", err)
+		}
+		if selected.imageBundleUpgradeSourceGenerationID != "" {
+			if err := reconcileImageBundleUpgradeSource(registry, selected.imageBundleUpgradeSourceGenerationID); err != nil {
+				return fmt.Errorf("reconcile prior image-bundled generation: %w", err)
+			}
 		}
 	}
 	if err := sup.ActivateControl(startCtx, generationID); err != nil {
@@ -863,6 +875,37 @@ func reconcileImageBundleUpgradeSource(registry *generation.Registry, sourceID s
 	// MarkEngineDormant repeats the lease check atomically under the registry
 	// lock, so a concurrent lease cannot be lost between the snapshot and write.
 	return registry.MarkEngineDormant(sourceID)
+}
+
+// reconcileUnleasedPreviousGeneration handles a predecessor retained by the
+// generation rollback pointer after a cold start. The current Host has not
+// attached that Engine; mark it dormant only when the durable lease projection
+// confirms there are no recordings pinned to it. Do not infer that a leased
+// Engine is stopped or discard its lease.
+func reconcileUnleasedPreviousGeneration(registry *generation.Registry) error {
+	if registry == nil {
+		return errors.New("generation registry is unavailable")
+	}
+	snapshot := registry.Snapshot()
+	previousID := snapshot.PreviousGenerationID
+	if previousID == "" {
+		return nil
+	}
+	previous, exists := snapshot.Generations[previousID]
+	if !exists || previous.State != generation.StateDraining || previousID == snapshot.ActiveGenerationID {
+		return errors.New("previous generation is inconsistent")
+	}
+	if previous.EngineDormant {
+		return nil
+	}
+	for _, lease := range snapshot.Leases {
+		if lease.EngineGeneration == previousID {
+			return nil
+		}
+	}
+	// Registry.MarkEngineDormant repeats the lease check under its mutation
+	// lock, preventing a snapshot-to-write race from discarding a new lease.
+	return registry.MarkEngineDormant(previousID)
 }
 
 func resourceIPCPaths(ipcDir, hostBootID string) (socketPath, tokenPath string, err error) {

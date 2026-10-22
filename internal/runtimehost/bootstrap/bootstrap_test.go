@@ -538,6 +538,84 @@ func TestImageBundleUpgradeDormantsOnlyUnleasedSourceGeneration(t *testing.T) {
 	}
 }
 
+func TestColdSetupRestartDormantsOnlyUnleasedPreviousGeneration(t *testing.T) {
+	for _, withLease := range []bool{false, true} {
+		name := "unleased predecessor is dormant after restart"
+		if withLease {
+			name = "leased predecessor remains authoritative after restart"
+		}
+		t.Run(name, func(t *testing.T) {
+			registry, err := generation.Open(filepath.Join(t.TempDir(), "generations.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldID, candidateID, restartedID := strings.Repeat("a", 32), strings.Repeat("b", 32), strings.Repeat("c", 32)
+			oldBuild := buildinfo.Info{Version: "0.1.0-rc.9", Commit: strings.Repeat("9", 40)}
+			candidateBuild := buildinfo.Info{Version: "0.1.0-rc.10-diagnostic", Commit: strings.Repeat("a", 40)}
+			stageBootstrapGeneration(t, registry, runtimeGeneration(oldID, oldBuild))
+			if err := registry.Activate(oldID); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.FinalizeActivation(oldID); err != nil {
+				t.Fatal(err)
+			}
+			stageBootstrapGeneration(t, registry, runtimeGeneration(candidateID, candidateBuild))
+			if err := registry.Activate(candidateID); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.FinalizeActivation(candidateID); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.MarkEngineDormant(oldID); err != nil {
+				t.Fatalf("mark original image generation dormant: %v", err)
+			}
+			if withLease {
+				now := time.Now().UTC()
+				if err := registry.ReconcileInventory(generation.EngineInventory{
+					Confirmed: true, EngineGeneration: candidateID, WorkerInstance: strings.Repeat("d", 32), ObservedAt: now,
+					Recordings: []generation.InventoryRecording{{RecordingID: strings.Repeat("e", 32), StartedAt: now}},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// A restart may create a same-version generation to adopt a changed
+			// bundled provider pin. Its predecessor is not necessarily the
+			// original image generation and must be reconciled independently.
+			stageBootstrapGeneration(t, registry, runtimeGeneration(restartedID, candidateBuild))
+			if err := registry.Activate(restartedID); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.FinalizeActivation(restartedID); err != nil {
+				t.Fatal(err)
+			}
+			before := registry.Snapshot()
+			if before.PreviousGenerationID != candidateID || before.Generations[candidateID].Version != candidateBuild.Version {
+				t.Fatalf("precondition does not represent the restart transition: %+v", before)
+			}
+
+			if err := reconcileUnleasedPreviousGeneration(registry); err != nil {
+				t.Fatalf("reconcile previous generation: %v", err)
+			}
+			after := registry.Snapshot()
+			previous := after.Generations[candidateID]
+			if withLease {
+				if previous.EngineDormant || len(after.Leases) != 1 || after.Leases[strings.Repeat("e", 32)].EngineGeneration != candidateID {
+					t.Fatalf("leased predecessor was changed: before=%+v after=%+v", before, after)
+				}
+			} else if !previous.EngineDormant || len(after.Leases) != 0 {
+				t.Fatalf("unleased predecessor was not marked dormant: %+v", after)
+			}
+			if after.ActiveGenerationID != restartedID || after.PreviousGenerationID != candidateID || previous.State != generation.StateDraining {
+				t.Fatalf("restart reconciliation changed generation identity or rollback pointers: %+v", after)
+			}
+			if after.Generations[oldID] != before.Generations[oldID] {
+				t.Fatalf("reconciliation changed a non-predecessor generation: before=%+v after=%+v", before.Generations[oldID], after.Generations[oldID])
+			}
+		})
+	}
+}
+
 func stageBootstrapGeneration(t *testing.T, registry *generation.Registry, item generation.Generation) {
 	t.Helper()
 	if err := registry.Stage(item); err != nil {

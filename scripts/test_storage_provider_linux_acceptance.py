@@ -198,15 +198,39 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                             return original_run(command, *args, **kwargs)
                         except install.InstallError:
                             if is_candidate_up:
+                                candidate_compose = install_dir / "compose.pending.yaml"
                                 logs = original_run(install.compose_command(
-                                    install_dir / "compose.pending.yaml", "logs", "--no-color", "--tail", "100", "archiver",
+                                    candidate_compose, "logs", "--no-color", "--tail", "100", "archiver",
                                 ), check=False)
-                                combined = (logs.stdout or "") + (logs.stderr or "")
+                                ps = original_run(install.compose_command(candidate_compose, "ps", "-q", "archiver"), check=False)
+                                container_id = (ps.stdout or "").strip()
+                                runtime_state = "unknown"
+                                health_state = "unknown"
+                                health_exit = "unknown"
+                                container_logs = ""
+                                if container_id:
+                                    inspected = original_run(["docker", "inspect", container_id], check=False)
+                                    try:
+                                        details = json.loads(inspected.stdout)[0]
+                                        runtime_state = str(details.get("State", {}).get("Status", "unknown"))
+                                        health = details.get("State", {}).get("Health") or {}
+                                        health_state = str(health.get("Status", "unknown"))
+                                        health_log = health.get("Log") or []
+                                        if health_log:
+                                            health_exit = str(health_log[-1].get("ExitCode", "unknown"))
+                                    except (json.JSONDecodeError, IndexError, TypeError):
+                                        pass
+                                    app_logs = original_run(["docker", "logs", "--tail", "100", container_id], check=False)
+                                    container_logs = (app_logs.stdout or "") + (app_logs.stderr or "")
+                                combined = (logs.stdout or "") + (logs.stderr or "") + container_logs
                                 matches = re.findall(r"stage=([a-z][a-z0-9_]{0,63}) code=([a-z][a-z0-9_]{0,63})", combined)
                                 if matches:
                                     stage, code = matches[-1]
                                     candidate_startup_diagnostic = f"stage={stage} code={code}"
-                                print(f"RC10 candidate Compose startup failed; {candidate_startup_diagnostic}")
+                                print(
+                                    f"RC10 candidate Compose startup failed; container={runtime_state} "
+                                    f"health={health_state} health_exit={health_exit} {candidate_startup_diagnostic}"
+                                )
                             raise
 
                     candidate_error = None

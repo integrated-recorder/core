@@ -617,12 +617,12 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                         if is_candidate_start and not preactivation_injected:
                             preactivation_injected = True
                             compose_text = (install_dir / "compose.pending.yaml").read_text(encoding="utf-8")
-                            compose_text, replacements = re.subn(
-                                r'(IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT:\s*)[0-9a-f]{40}',
-                                r'\g<1>' + ("0" * 40), compose_text,
-                            )
+                            marker = f"IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT: {json.dumps(RC9_COMMIT)}"
+                            replacement = f"IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT: {json.dumps('0' * 40)}"
+                            replacements = compose_text.count(marker)
                             if replacements != 1:
                                 raise AssertionError("candidate Compose did not contain one exact prior-image commit marker")
+                            compose_text = compose_text.replace(marker, replacement, 1)
                             (install_dir / "compose.pending.yaml").write_text(compose_text, encoding="utf-8")
                             for index, value in enumerate(argv[:-1]):
                                 if value == "--wait-timeout":

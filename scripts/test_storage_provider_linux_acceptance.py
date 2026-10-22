@@ -712,13 +712,61 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                         raise
                     restarted = compose_container(install_dir)
                     restarted_status = assert_running_identity(self, restarted, tag, candidate_commit)
-                    self.assertEqual(restarted_status["registry"]["active_generation_id"], final["registry"]["active_generation_id"])
-                    assert_storage_pin(self, restarted, new_tuple[1])
+                    restarted_registry = restarted_status["registry"]
+                    restarted_generation_id = restarted_registry["active_generation_id"]
+                    self.assertEqual(restarted_registry.get("staged_generation_id", ""), "")
+                    self.assertEqual(restarted_registry.get("activation_previous_generation_id", ""), "")
+                    self.assertEqual(restarted_status["generation"].get("adapter_set_id"), new_tuple[0])
+                    self.assertEqual(restarted_status["generation"].get("storage_instance_id"), new_tuple[2])
+                    if restarted_generation_id != final["registry"]["active_generation_id"]:
+                        # The image's storage.local import can update the
+                        # selected instance's desired provider set while the
+                        # application upgrade itself deliberately retains the
+                        # old immutable set. On the first cold restart, that
+                        # desired set is adopted by a new generation rather
+                        # than rewriting either generation's pin in place.
+                        predecessor_id = final["registry"]["active_generation_id"]
+                        predecessor = restarted_registry.get("generations", {}).get(predecessor_id)
+                        self.assertIsInstance(predecessor, dict)
+                        self.assertEqual(predecessor.get("state"), "draining")
+                        self.assertTrue(predecessor.get("engine_dormant"))
+                        self.assertEqual(predecessor.get("version"), version)
+                        self.assertEqual(predecessor.get("commit"), candidate_commit)
+                        self.assertEqual(
+                            (
+                                predecessor.get("adapter_set_id"),
+                                predecessor.get("storage_provider_set_id"),
+                                predecessor.get("storage_instance_id"),
+                            ),
+                            new_tuple,
+                            "restart rewrote the previous generation's immutable provider pins",
+                        )
+                        self.assertFalse(
+                            any(lease.get("engine_generation") == predecessor_id for lease in restarted_registry.get("leases", {}).values()),
+                            "lease-free cold-start predecessor unexpectedly retained an Engine lease",
+                        )
+                    # Verify the provider set actually selected by the active
+                    # generation, including a one-time desired-set adoption.
+                    assert_storage_pin(self, restarted, restarted_status["generation"]["storage_provider_set_id"])
                     self.assertEqual(install.wait_for_runtime(final_metadata["port"], final_metadata["release"], timeout=30, bind=final_metadata["bind"])["version"], version)
+
+                    # A second recreation must reuse the now-reconciled active
+                    # generation and provider pin rather than stage repeatedly.
+                    install.run(install.compose_command(install_dir / "compose.yaml", "up", "-d", "--no-build", "--force-recreate", "--wait", "--wait-timeout", "180", "archiver"))
+                    stable_container = compose_container(install_dir)
+                    stable_status = assert_running_identity(self, stable_container, tag, candidate_commit)
+                    self.assertEqual(stable_status["registry"]["active_generation_id"], restarted_generation_id)
+                    self.assertEqual(stable_status["generation"]["storage_provider_set_id"], restarted_status["generation"]["storage_provider_set_id"])
+                    self.assertEqual(stable_status["generation"]["storage_instance_id"], new_tuple[2])
+                    assert_storage_pin(self, stable_container, stable_status["generation"]["storage_provider_set_id"])
+                    self.assertEqual(docker([
+                        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", stable_container,
+                        "/bin/sh", "-ec", f"test \"$(cat /data/{state_marker})\" = state-preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
+                    ]).returncode, 0)
                     print(
                         "Candidate Docker image upgrade PASS: "
-                        f"runtime-host={version}/{candidate_commit}; active-generation={restarted_status['registry']['active_generation_id']}; "
-                        f"RC9-generation-retained={old_generation_id}; adapter/storage pins preserved"
+                        f"runtime-host={version}/{candidate_commit}; active-generation={stable_status['registry']['active_generation_id']}; "
+                        f"RC9-generation-retained={old_generation_id}; predecessor dormant; provider reconciliation stable"
                     )
                 finally:
                     for compose_path in (install_dir / "compose.yaml", install_dir / "compose.pending.yaml"):

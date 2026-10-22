@@ -84,7 +84,7 @@ jobs:
           IR_EXPECTED_RELEASE_COMMIT: 131b0271cfce081a3bd5957a8c90b0376a145c57
           IR_REQUIRE_ARCHIVE_FIXTURE: '1'
           IR_DOCKER_ARCHIVE_FIXTURE_BINARY: ${{ runner.temp }}/storageprocess-upgrade-fixture.test
-        run: python3 scripts/test_storage_provider_linux_acceptance.py OfficialRC9OfficialReleaseDockerUpgradeTests.test_official_rc9_install_target_upgrade_and_pending_rollback_retry -v
+        run: python3 scripts/test_storage_provider_linux_acceptance.py OfficialRC9OfficialReleaseDockerUpgradeTests.test_official_rc9_install_target_and_pending_retry -v
 
   candidate-image-bundle-upgrade:
     name: RC9 install and candidate image-bundle upgrade

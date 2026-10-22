@@ -703,6 +703,9 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Provider-only adoption is a separate reconciliation decision. The default
+	// same-image restart keeps the active generation's durable pins.
+	selected.preserveActivePins = false
 	prepared, candidate, needsStage, err := prepareStartupGeneration(selected, registryState, newSetID, storageSetID, storageInstanceID)
 	if err != nil {
 		t.Fatal(err)

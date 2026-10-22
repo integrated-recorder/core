@@ -49,9 +49,19 @@ jobs:
           docker version
           docker compose version
           docker info --format '{{.OSType}}/{{.Architecture}}'
+      - name: Install Go and compile archive fixture verifier
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Compile Linux archive fixture test binary
+        env:
+          CGO_ENABLED: '0'
+        run: go test -c -o "${RUNNER_TEMP}/storageprocess-upgrade-fixture.test" ./internal/storageprocess
       - name: Install official RC9 and upgrade to exact diagnostic image candidate
         env:
           IR_RUN_BUNDLE_UPGRADE_DOCKER_E2E: '1'
+          IR_DOCKER_ARCHIVE_FIXTURE_BINARY: ${{ runner.temp }}/storageprocess-upgrade-fixture.test
         run: python3 scripts/test_storage_provider_linux_acceptance.py CandidateImageBundleUpgradeDockerTests.test_rc9_image_bundle_migrates_to_candidate_and_resumes_after_verification_retry -v
 
   diagnostic-image:
@@ -71,10 +81,12 @@ jobs:
           cache: true
       - name: Python installer tests
         run: python3 -m unittest discover -s scripts -p 'test_install.py'
-      - name: Storage diagnostics unit and race tests
+      - name: Full short Go and race suites
         run: |
-          go test -short -count=1 ./internal/storageproto ./internal/runtimehost/storagecatalog ./internal/storageprocess ./internal/runtimehost/bootstrap ./internal/storage ./internal/storagelocal
-          go test -race -short -count=1 ./internal/storageproto ./internal/runtimehost/storagecatalog ./internal/storageprocess ./internal/runtimehost/bootstrap ./internal/storage ./internal/storagelocal
+          go test -short -count=1 -timeout=30m ./...
+          go test -race -short -count=1 -timeout=30m ./...
+          go vet ./...
+          go build ./...
       - name: Build and probe diagnostic Docker image
         env:
           IR_RUN_STORAGE_DIAGNOSTIC_DOCKER_E2E: '1'

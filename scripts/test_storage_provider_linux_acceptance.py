@@ -119,6 +119,24 @@ def release_directories(container_id: str) -> set[str]:
     return set(output.splitlines())
 
 
+def run_upgrade_archive_fixture(test: unittest.TestCase, container_id: str, action: str, set_id: str) -> None:
+    """Exercise a real v2 archive through the container's pinned provider."""
+    binary = os.environ.get("IR_DOCKER_ARCHIVE_FIXTURE_BINARY", "")
+    if not binary or not Path(binary).is_file():
+        test.fail("Linux acceptance did not provide the compiled storageprocess archive fixture test binary")
+    container_binary = "/tmp/ir-storage-upgrade-archive-fixture.test"
+    docker(["cp", binary, f"{container_id}:{container_binary}"])
+    result = docker([
+        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}",
+        "--env", f"IR_DOCKER_ARCHIVE_FIXTURE_ACTION={action}",
+        "--env", f"IR_DOCKER_ARCHIVE_FIXTURE_DATA_DIR=/data",
+        "--env", f"IR_DOCKER_ARCHIVE_FIXTURE_SET_ID={set_id}",
+        container_id, container_binary, "-test.run", "^TestDockerImageUpgradeArchiveFixture$", "-test.v",
+    ])
+    test.assertIn("PASS", result.stdout)
+    test.assertNotIn("FAIL", result.stdout)
+
+
 def build_diagnostic_image() -> tuple[str, str, str]:
     commit = subprocess.run(["git", "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
     created = subprocess.run(["git", "show", "-s", "--format=%cI", commit], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
@@ -580,6 +598,124 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                     ])
                     old_release_dirs = release_directories(rc9_container)
 
+                    # Seed and verify a format-v2 archive through the real
+                    # RC9 storage.local executable. The same immutable set is
+                    # then used after the candidate image transition.
+                    run_upgrade_archive_fixture(self, rc9_container, "create", old_tuple[1])
+
+                    # Inject a Host startup/provenance failure before candidate
+                    # activation. It must restore the known-good RC9 Compose
+                    # while retaining the pending candidate for an exact retry.
+                    original_run = install.run
+                    preactivation_injected = False
+
+                    def reject_before_activation(command, *args, **kwargs):
+                        nonlocal preactivation_injected
+                        argv = [str(item) for item in command]
+                        pending_file = str(install_dir / "compose.pending.yaml")
+                        is_candidate_start = pending_file in argv and "up" in argv and "archiver" in argv
+                        if is_candidate_start and not preactivation_injected:
+                            preactivation_injected = True
+                            compose_text = (install_dir / "compose.pending.yaml").read_text(encoding="utf-8")
+                            compose_text, replacements = re.subn(
+                                r'(IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT:\s*)[0-9a-f]{40}',
+                                r'\g<1>' + ("0" * 40), compose_text,
+                            )
+                            if replacements != 1:
+                                raise AssertionError("candidate Compose did not contain one exact prior-image commit marker")
+                            (install_dir / "compose.pending.yaml").write_text(compose_text, encoding="utf-8")
+                            for index, value in enumerate(argv[:-1]):
+                                if value == "--wait-timeout":
+                                    argv[index + 1] = "20"
+                                    break
+                            return original_run(argv, *args, **kwargs)
+                        return original_run(command, *args, **kwargs)
+
+                    preactivation_error = None
+                    with mock.patch.object(install, "run", side_effect=reject_before_activation):
+                        try:
+                            install_candidate()
+                        except install.InstallError as exc:
+                            preactivation_error = exc
+                    self.assertTrue(preactivation_injected, "pre-activation failure injection was not reached")
+                    self.assertIsNotNone(preactivation_error, "invalid prior-image provenance unexpectedly started candidate")
+                    preactivation_pending = install.read_pending(install_dir / "deployment.pending.json")
+                    self.assertIsNotNone(preactivation_pending)
+                    self.assertEqual(preactivation_pending["release"]["commit"], candidate_commit)
+                    rolled_back_container = compose_container(install_dir)
+                    rolled_back = assert_running_identity(self, rolled_back_container, RC9_TAG, RC9_COMMIT)
+                    self.assertEqual(rolled_back["registry"]["active_generation_id"], old_generation_id)
+                    self.assertEqual(rolled_back["generation"]["storage_provider_set_id"], old_tuple[1])
+                    self.assertTrue(old_release_dirs.issubset(release_directories(rolled_back_container)))
+
+                    # The pre-activation rollback preserved canonical archive
+                    # content and the pending retry will upgrade the same bytes.
+                    run_upgrade_archive_fixture(self, rolled_back_container, "verify", old_tuple[1])
+
+                    # Exercise a later pre-activation boundary as well: let the
+                    # candidate Host verify provenance, persist its staged
+                    # generation, and then make only the candidate Engine
+                    # executable exit before readiness. The installer may
+                    # restore RC9 because the durable active pointer is still
+                    # the prior generation; the failed candidate must not be
+                    # mistaken for an activation or lose the pending retry.
+                    original_run = install.run
+                    staged_failure_injected = False
+
+                    def fail_candidate_engine_before_activation(command, *args, **kwargs):
+                        nonlocal staged_failure_injected
+                        argv = [str(item) for item in command]
+                        pending_file = str(install_dir / "compose.pending.yaml")
+                        is_candidate_start = pending_file in argv and "up" in argv and "archiver" in argv
+                        if is_candidate_start and not staged_failure_injected:
+                            staged_failure_injected = True
+                            original_run(install.compose_command(
+                                install_dir / "compose.pending.yaml", "create", "--force-recreate", "archiver",
+                            ), check=False)
+                            container = original_run(install.compose_command(
+                                install_dir / "compose.pending.yaml", "ps", "-aq", "archiver",
+                            ), check=False).stdout.strip()
+                            if not container:
+                                raise AssertionError("candidate container was not created for staged failure injection")
+                            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as engine:
+                                engine.write("#!/bin/sh\nexit 42\n")
+                                engine_path = Path(engine.name)
+                            engine_path.chmod(0o755)
+                            try:
+                                docker(["cp", str(engine_path), f"{container}:/opt/integrated-recorder/initial/recorder-engine"])
+                            finally:
+                                engine_path.unlink(missing_ok=True)
+                            for index, value in enumerate(argv[:-1]):
+                                if value == "--wait-timeout":
+                                    argv[index + 1] = "30"
+                                    break
+                            return original_run(argv, *args, **kwargs)
+                        return original_run(command, *args, **kwargs)
+
+                    staged_failure = None
+                    with mock.patch.object(install, "run", side_effect=fail_candidate_engine_before_activation):
+                        try:
+                            install_candidate()
+                        except install.InstallError as exc:
+                            staged_failure = exc
+                    self.assertTrue(staged_failure_injected, "staged Engine failure injection was not reached")
+                    self.assertIsNotNone(staged_failure, "candidate Engine failure unexpectedly passed readiness")
+                    staged_pending = install.read_pending(install_dir / "deployment.pending.json")
+                    self.assertIsNotNone(staged_pending)
+                    self.assertEqual(staged_pending["release"]["commit"], candidate_commit)
+                    staged_rollback_container = compose_container(install_dir)
+                    staged_rollback = assert_running_identity(self, staged_rollback_container, RC9_TAG, RC9_COMMIT)
+                    self.assertEqual(staged_rollback["registry"]["active_generation_id"], old_generation_id)
+                    self.assertEqual(staged_rollback["registry"].get("staged_generation_id", ""), "")
+                    failed_candidates = [
+                        generation for generation in staged_rollback["registry"]["generations"].values()
+                        if generation.get("version") == version and generation.get("commit", "").lower() == candidate_commit.lower()
+                    ]
+                    self.assertTrue(failed_candidates, "the failed candidate generation was not retained for forensic state")
+                    self.assertTrue(all(generation.get("state") == "failed" for generation in failed_candidates))
+                    self.assertEqual(staged_rollback["generation"]["storage_provider_set_id"], old_tuple[1])
+                    run_upgrade_archive_fixture(self, staged_rollback_container, "verify", old_tuple[1])
+
                     # Fail installer-level acceptance only after the candidate
                     # Host has made its generation activation durable. The
                     # installer must not start RC9 against RC10 registry state.
@@ -626,6 +762,7 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
 
                     candidate_container = compose_container(install_dir)
                     upgraded = assert_running_identity(self, candidate_container, tag, candidate_commit)
+                    run_upgrade_archive_fixture(self, candidate_container, "verify", old_tuple[1])
                     self.assertNotEqual(upgraded["registry"]["active_generation_id"], old_generation_id)
                     old = upgraded["registry"]["generations"].get(old_generation_id)
                     self.assertIsNotNone(old)
@@ -734,6 +871,7 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                     install.run(install.compose_command(install_dir / "compose.yaml", "up", "-d", "--no-build", "--force-recreate", "--wait", "--wait-timeout", "180", "archiver"))
                     stable_container = compose_container(install_dir)
                     stable_status = assert_running_identity(self, stable_container, tag, candidate_commit)
+                    run_upgrade_archive_fixture(self, stable_container, "verify", old_tuple[1])
                     self.assertEqual(stable_status["registry"]["active_generation_id"], restarted_generation_id)
                     self.assertEqual(stable_status["generation"]["storage_provider_set_id"], restarted_status["generation"]["storage_provider_set_id"])
                     self.assertEqual(stable_status["generation"]["storage_instance_id"], new_tuple[2])

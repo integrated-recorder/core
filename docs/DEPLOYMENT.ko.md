@@ -98,7 +98,11 @@ curl -fsS http://127.0.0.1:<선택한-port>/api/setup/status
 ./scripts/install.sh --upgrade --recordings-dir /same/absolute/recordings/path
 ```
 
-Upgrade version 고정은 `--version vX.Y.Z`를 추가합니다. Installer는 선택한 exact tag를 build하고 새 container가 health/setup 검사를 통과한 뒤에만 pinned metadata를 갱신합니다. 기존 `/data` volume과 archive bind mount를 재사용합니다. 새 container가 준비되지 않으면 기존 Compose 정의를 다시 올리려고 시도합니다. Host/container 교체는 유지보수 작업이며 Runtime Host의 restartless application-generation handover와 다릅니다. Live recording이 없을 때 upgrade하세요. Application data schema가 이전 버전과 호환된다는 보장은 없습니다. Upgrade 전에 검증된 backup을 준비하고 release note를 확인하세요.
+Upgrade version 고정은 `--version vX.Y.Z`를 추가합니다. Installer는 선택한 exact tag를 build하고 기존 `/data` volume과 archive bind mount를 재사용합니다. Runtime Host는 기존 generation을 변경하지 않고 후보 이미지의 정확한 version/commit을 가진 별도 generation을 stage합니다. 기존 adapter 및 storage provider pin은 유지됩니다. 이미 설치된 signed release가 있으면 그 release를 우선 사용하고 signature, digest, compatibility를 다시 검증합니다. 디렉터리는 있으나 손상된 release는 즉시 실패하며 image-bundled release로 재해석하지 않습니다. 서명 release 디렉터리가 없는 과거 image-bundled generation은 명시적 upgrade 중 Installer가 전달한 이전 이미지의 정확한 pin으로만 식별합니다.
+
+실패 처리는 durable generation registry를 기준으로 합니다. 후보 activation이 commit되기 전이고 기존 generation이 여전히 active라면 이전 Compose 정의를 복원할 수 있습니다. 이때 pending 후보 metadata와 source는 보존되므로 동일한 `--upgrade` 명령과 지정했던 `--version`으로 재시도합니다. 후보 generation이 이미 active이거나 registry 상태를 확실하게 읽지 못하면 이전 Host를 새 durable 상태 위에 기동하지 않도록 후보 Compose와 pending metadata를 유지합니다. 같은 upgrade를 재시도해 forward recovery를 진행하세요. 강제 rollback을 위해 image를 수동 교체하거나 generation metadata를 편집하지 마세요. Docker image rollback은 application-generation rollback과 같지 않으며 application data schema의 역호환성도 보장되지 않습니다.
+
+Host/container 교체는 Runtime Host의 restartless application-generation handover와 다른 유지보수 작업입니다. Live recording이 없을 때 upgrade하세요. 업그레이드 전 `/data` 전체 named volume과 recordings bind를 함께 백업하세요. generation이 참조하는 기존 signed `runtime/releases` 디렉터리를 보존해야 서명 검증 및 복구가 가능합니다. 재시도나 rollback 과정에서 state volume, archive 또는 release directory를 삭제하지 마세요. release note를 확인하고 이전·후보 image identity를 검증한 뒤 재시도하세요.
 
 기존 수동 Compose 배포나 감지된 `recording-data`/application-state volume은 자동 채택하지 않습니다. Installer는 기존 layout, mount 경로, 소유권을 추측하지 않고 설치를 거부합니다. 이를 보존한 채 별도 검증 migration을 계획하세요. 기존 archive layout을 확인하지 않고 신규 설치에 연결하지 마세요.
 

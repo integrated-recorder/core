@@ -644,6 +644,77 @@ func TestInvalidInstalledReleaseNeverFallsBackToBundleTransition(t *testing.T) {
 	}
 }
 
+func TestDamagedSignedInstalledReleaseNeverFallsBackToImageBundle(t *testing.T) {
+	for _, damage := range []string{"signature", "missing artifact"} {
+		t.Run(damage, func(t *testing.T) {
+			public, private, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, manifestBytes, signature, payloads := signedTestRelease(t, private)
+			runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+			t.Cleanup(func() {
+				if err := filepath.Walk(runtimeRoot, func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return nil
+					}
+					mode := os.FileMode(0600)
+					if info.IsDir() {
+						mode = 0700
+					}
+					_ = os.Chmod(path, mode)
+					return nil
+				}); err != nil {
+					t.Errorf("restore signed fixture permissions: %v", err)
+				}
+			})
+			installer, err := install.NewInstaller(runtimeRoot, map[string]ed25519.PublicKey{"test-key": public}, currentHostCompatibility())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := installer.Stage(context.Background(), &controllerSource{manifest: manifestBytes, signature: signature, payloads: payloads}); err != nil {
+				t.Fatalf("stage valid signed release fixture: %v", err)
+			}
+			releaseDir := filepath.Join(runtimeRoot, "releases", install.ReleaseDirectoryID(manifest.ReleaseVersion, manifest.Commit))
+			if err := os.Chmod(releaseDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if damage == "signature" {
+				path := filepath.Join(releaseDir, "release.json.sig")
+				if err := os.Chmod(path, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("tampered-signature"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0400); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				path := filepath.Join(releaseDir, manifest.Artifacts[1].Filename)
+				if err := os.Chmod(path, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			activeID := strings.Repeat("b", 32)
+			activeBuild := buildinfo.Info{Version: manifest.ReleaseVersion, Commit: manifest.Commit}
+			snapshot := generationSnapshotForTest(activeID, activeBuild)
+			bundleBuild := buildinfo.Info{Version: "0.1.0-rc.10-diagnostic", Commit: strings.Repeat("a", 40)}
+			selected, err := selectRuntimeRelease(snapshot, bundleBuild, t.TempDir(), runtimeRoot, map[string]ed25519.PublicKey{"test-key": public}, activeBuild)
+			if err == nil || !strings.Contains(err.Error(), "active installed release failed verification") {
+				t.Fatalf("damaged signed installation was accepted or replaced by bundle: selected=%+v err=%v", selected, err)
+			}
+			if selected.needsStage || selected.appBuild.Version != "" {
+				t.Fatalf("failed verification produced an image-bundle candidate: %+v", selected)
+			}
+		})
+	}
+}
+
 func TestSignedActiveReleaseIsPreservedAcrossImageUpgrade(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

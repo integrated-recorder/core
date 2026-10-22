@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/archiveindex"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/runtimehost/storagecatalog"
 	"github.com/integrated-recorder/core/internal/storage"
@@ -33,6 +35,232 @@ func TestOpenStoreRejectsGenerationWithoutProviderSetInsteadOfUsingDirectLocalSt
 	}
 	if _, err := os.Lstat(filepath.Join(dataDir, "recordings")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("rejected unpinned startup mutated/created the legacy archive root: %v", err)
+	}
+}
+
+// TestDockerImageUpgradeArchiveFixture is compiled on the Linux acceptance
+// runner and copied into both the RC9 and candidate containers. It writes and
+// reads a real format-v2 archive through the generation-pinned storage.local
+// process, so image replacement exercises canonical metadata, media/init
+// payloads, sidecars, manifest snapshots, and the VOD timeline projection.
+// The test is opt-in because the regular package suite has no Docker data
+// volume or active Runtime Host provider set to attach to.
+func TestDockerImageUpgradeArchiveFixture(t *testing.T) {
+	action := os.Getenv("IR_DOCKER_ARCHIVE_FIXTURE_ACTION")
+	if action == "" {
+		t.Skip("requires the isolated RC9/candidate Docker acceptance volume")
+	}
+	if action != "create" && action != "verify" {
+		t.Fatalf("unsupported archive fixture action %q", action)
+	}
+	dataDir := os.Getenv("IR_DOCKER_ARCHIVE_FIXTURE_DATA_DIR")
+	setID := os.Getenv("IR_DOCKER_ARCHIVE_FIXTURE_SET_ID")
+	if dataDir != "/data" || setID == "" {
+		t.Fatal("archive fixture requires /data and the active generation's storage provider set ID")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	store, provider, err := OpenStore(ctx, dataDir, filepath.Join(dataDir, "runtime", "storage-providers"), setID)
+	if err != nil {
+		t.Fatalf("open the pinned storage.local process: %v", err)
+	}
+	defer func() {
+		if err := provider.Close(); err != nil {
+			t.Errorf("close pinned storage.local process: %v", err)
+		}
+	}()
+	exerciseUpgradeArchiveFixture(t, ctx, store, action)
+}
+
+func exerciseUpgradeArchiveFixture(t *testing.T, ctx context.Context, store *storage.Store, action string) {
+	t.Helper()
+	const recordingID = "8a6c9c2e9d5140a8b7f00ce67a00c001"
+	const sessionID = "session-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const initPath = "tracks/main/objects/upgrade-fixture-init.mp4"
+	const mediaPath1 = "tracks/main/objects/upgrade-fixture-000001.m4s"
+	const mediaPath2 = "tracks/main/objects/upgrade-fixture-000002.m4s"
+	const manifestPath = "manifests/main/upgrade-fixture.m3u8"
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	initPayload := []byte("upgrade-fixture-init-segment")
+	mediaPayloads := [][]byte{
+		[]byte("upgrade-fixture-media-segment-one"),
+		[]byte("upgrade-fixture-media-segment-two"),
+	}
+	manifestPayload := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXTINF:2.0,\nsegment-1.m4s\n#EXTINF:2.0,\nsegment-2.m4s\n#EXT-X-ENDLIST\n")
+
+	if action == "create" {
+		header := &domain.Recording{
+			FormatVersion:  storage.ShardedArchiveFormatVersion,
+			ShardedArchive: &domain.ShardedArchiveSummary{},
+			ID:             recordingID, SourceSessionID: sessionID,
+			Title: "Image upgrade archive fixture", AdapterID: "fixture",
+			State: domain.StateStopped, CreatedAt: now, StartedAt: now,
+			Tracks: map[string]*domain.Track{"main": {ID: "main", NextArchiveOrdinal: 1}},
+		}
+		if err := store.CreateShardedRecordingWithSidecar(header, "archive/acquisition/context", map[string]string{"fixture": "image-upgrade"}); err != nil {
+			t.Fatalf("create canonical v2 Recording root and acquisition sidecar: %v", err)
+		}
+		initStored, err := store.SavePayloadExact(recordingID, initPath, bytes.NewReader(initPayload), int64(len(initPayload)), int64(len(initPayload)))
+		if err != nil {
+			t.Fatalf("store init payload: %v", err)
+		}
+		initCoordinate := archiveindex.Coordinate{SessionID: sessionID, TrackID: "main", Sequence: 0, Kind: archiveindex.ObjectInit}
+		initRecord := storage.V2MediaRecord{Coordinate: initCoordinate, Segment: domain.Segment{
+			ID: "init-upgrade-fixture", TrackID: "main", Sequence: 0, IsInit: true,
+			SourceURI: "fixture://image-upgrade/init", StoragePath: initPath,
+			PayloadSize: initStored.Size, SHA256: initStored.SHA256,
+		}}
+		if err := store.AppendShardedMedia(ctx, recordingID, initRecord); err != nil {
+			t.Fatalf("publish canonical init record: %v", err)
+		}
+		if err := store.SaveSidecar(recordingID, initPath, initRecord.Segment); err != nil {
+			t.Fatalf("save init segment sidecar: %v", err)
+		}
+
+		for i, payload := range mediaPayloads {
+			ordinal := uint64(i + 1)
+			mediaPath := []string{mediaPath1, mediaPath2}[i]
+			stored, err := store.SavePayloadExact(recordingID, mediaPath, bytes.NewReader(payload), int64(len(payload)), int64(len(payload)))
+			if err != nil {
+				t.Fatalf("store media payload %d: %v", ordinal, err)
+			}
+			coordinate := archiveindex.Coordinate{SessionID: sessionID, TrackID: "main", Sequence: ordinal, Kind: archiveindex.ObjectMedia}
+			segment := domain.Segment{
+				ID: fmt.Sprintf("seg-%020d", ordinal), TrackID: "main", Sequence: ordinal, ArchiveOrdinal: ordinal,
+				SourceURI: fmt.Sprintf("fixture://image-upgrade/media/%d", ordinal), Duration: 2,
+				InitSegmentID: initRecord.Segment.ID, StoragePath: mediaPath,
+				PayloadSize: stored.Size, SHA256: stored.SHA256,
+			}
+			if err := store.AppendShardedMedia(ctx, recordingID, storage.V2MediaRecord{Coordinate: coordinate, Segment: segment}); err != nil {
+				t.Fatalf("publish canonical media record %d: %v", ordinal, err)
+			}
+			if err := store.SaveSidecar(recordingID, mediaPath, segment); err != nil {
+				t.Fatalf("save media sidecar %d: %v", ordinal, err)
+			}
+		}
+
+		title, description := "Image upgrade archive fixture", "Metadata preserved across bundled generation migration"
+		if err := store.AppendShardedMetadata(ctx, recordingID, domain.MetadataRevision{ObservedAt: now, Title: &title, Description: &description}); err != nil {
+			t.Fatalf("append canonical metadata revision: %v", err)
+		}
+		// Keep the fixture's manifest key stable across Docker invocation and
+		// prove that the sharded manifest index, not only the payload, survives.
+		manifest := domain.ManifestSnapshot{
+			TrackID: "main", SourceURI: "fixture://image-upgrade/playlist", StoragePath: manifestPath,
+			FetchedAt: now, SHA256: payloadSHA256(manifestPayload), Size: int64(len(manifestPayload)),
+		}
+		if _, err := store.SavePayloadExact(recordingID, manifestPath, bytes.NewReader(manifestPayload), int64(len(manifestPayload)), int64(len(manifestPayload))); err != nil {
+			t.Fatalf("publish stable manifest payload path: %v", err)
+		}
+		if err := store.SaveSidecar(recordingID, manifestPath, manifest); err != nil {
+			t.Fatalf("save stable manifest sidecar: %v", err)
+		}
+		if err := store.AppendShardedManifest(ctx, recordingID, manifest); err != nil {
+			t.Fatalf("append canonical manifest snapshot: %v", err)
+		}
+	}
+
+	header, err := store.LoadRecordingHeader(ctx, recordingID)
+	if err != nil {
+		t.Fatalf("load canonical Recording header: %v", err)
+	}
+	if header.FormatVersion != storage.ShardedArchiveFormatVersion || header.Title != "Image upgrade archive fixture" || header.ShardedArchive.MediaCount != 2 || header.ShardedArchive.InitCount != 1 || header.ShardedArchive.ManifestSnapshotCount != 1 || header.ShardedArchive.MetadataRevisionCount != 1 {
+		t.Fatalf("archive root summary changed: %+v", header)
+	}
+	var initRecords, mediaRecords, timelineRecords int
+	if err := store.IterateShardedInitSegments(ctx, recordingID, "main", func(record storage.V2MediaRecord) error {
+		initRecords++
+		if record.Segment.ID != "init-upgrade-fixture" || record.Segment.SHA256 != payloadSHA256(initPayload) {
+			return errors.New("canonical init metadata changed")
+		}
+		return nil
+	}); err != nil || initRecords != 1 {
+		t.Fatalf("init archive iteration count=%d err=%v", initRecords, err)
+	}
+	wantMedia := []string{mediaPath1, mediaPath2}
+	if err := store.IterateShardedMedia(ctx, recordingID, "main", func(record storage.V2MediaRecord) error {
+		if mediaRecords >= len(wantMedia) || record.Segment.StoragePath != wantMedia[mediaRecords] || record.Segment.ArchiveOrdinal != uint64(mediaRecords+1) {
+			return errors.New("canonical media order or identity changed")
+		}
+		mediaRecords++
+		return nil
+	}); err != nil || mediaRecords != 2 {
+		t.Fatalf("media archive iteration count=%d err=%v", mediaRecords, err)
+	}
+	if err := store.IterateShardedTimelineProjection(ctx, recordingID, "main", func(record storage.V2MediaRecord) error {
+		wantOrdinal := uint64(timelineRecords + 1)
+		if record.Segment.TimelineOrdinal != wantOrdinal || record.Segment.ArchiveOrdinal != wantOrdinal || record.Segment.Sequence != wantOrdinal {
+			return fmt.Errorf("VOD playback timeline projection changed: timeline=%d archive=%d sequence=%d index=%d", record.Segment.TimelineOrdinal, record.Segment.ArchiveOrdinal, record.Segment.Sequence, timelineRecords)
+		}
+		timelineRecords++
+		return nil
+	}); err != nil || timelineRecords != 2 {
+		t.Fatalf("VOD timeline projection count=%d err=%v", timelineRecords, err)
+	}
+	var playbackRecords int
+	if err := store.IterateShardedTimeline(ctx, recordingID, "main", func(record storage.V2MediaRecord) error {
+		if playbackRecords >= len(wantMedia) || record.Segment.TimelineOrdinal != uint64(playbackRecords+1) || record.Segment.StoragePath != wantMedia[playbackRecords] {
+			return errors.New("VOD playback media resolution changed")
+		}
+		playbackRecords++
+		return nil
+	}); err != nil || playbackRecords != 2 {
+		t.Fatalf("VOD playback media count=%d err=%v", playbackRecords, err)
+	}
+	var metadataCount, manifestCount int
+	if err := store.IterateShardedMetadata(ctx, recordingID, func(revision domain.MetadataRevision) error {
+		metadataCount++
+		if revision.Title == nil || *revision.Title != "Image upgrade archive fixture" {
+			return errors.New("metadata revision changed")
+		}
+		return nil
+	}); err != nil || metadataCount != 1 {
+		t.Fatalf("metadata revision count=%d err=%v", metadataCount, err)
+	}
+	if err := store.IterateShardedManifests(ctx, recordingID, func(snapshot domain.ManifestSnapshot) error {
+		manifestCount++
+		if snapshot.StoragePath != manifestPath || snapshot.SHA256 != payloadSHA256(manifestPayload) || snapshot.Size != int64(len(manifestPayload)) {
+			return errors.New("manifest snapshot identity changed")
+		}
+		return nil
+	}); err != nil || manifestCount != 1 {
+		t.Fatalf("manifest snapshot count=%d err=%v", manifestCount, err)
+	}
+	var acquisition struct {
+		Fixture string `json:"fixture"`
+	}
+	if err := store.LoadSidecar(recordingID, "archive/acquisition/context", 1024, &acquisition); err != nil || acquisition.Fixture != "image-upgrade" {
+		t.Fatalf("acquisition sidecar=%+v err=%v", acquisition, err)
+	}
+	for i, payload := range mediaPayloads {
+		reader, err := store.OpenPayloadReader(recordingID, wantMedia[i])
+		if err != nil {
+			t.Fatalf("open media payload %d: %v", i+1, err)
+		}
+		actual, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil || !bytes.Equal(actual, payload) || payloadSHA256(actual) != payloadSHA256(payload) {
+			t.Fatalf("media payload %d integrity mismatch: read=%v close=%v", i+1, readErr, closeErr)
+		}
+	}
+	manifestReader, err := store.OpenPayloadReader(recordingID, manifestPath)
+	if err != nil {
+		t.Fatalf("open manifest payload: %v", err)
+	}
+	manifestBytes, readErr := io.ReadAll(manifestReader)
+	closeErr := manifestReader.Close()
+	if readErr != nil || closeErr != nil || !bytes.Equal(manifestBytes, manifestPayload) {
+		t.Fatalf("manifest payload integrity mismatch: read=%v close=%v", readErr, closeErr)
+	}
+	rangeReader, err := store.OpenPayloadRangeReaderContext(ctx, recordingID, mediaPath2, 5, 12)
+	if err != nil {
+		t.Fatalf("open VOD byte-range media reader after image transition: %v", err)
+	}
+	rangeBytes, rangeReadErr := io.ReadAll(rangeReader)
+	rangeCloseErr := rangeReader.Close()
+	if rangeReadErr != nil || rangeCloseErr != nil || !bytes.Equal(rangeBytes, mediaPayloads[1][5:17]) {
+		t.Fatalf("VOD byte-range media mismatch: read=%v close=%v", rangeReadErr, rangeCloseErr)
 	}
 }
 
@@ -403,6 +631,18 @@ func TestBundledLocalProviderArchiveRoundTrip(t *testing.T) {
 	closeErr := reader.Close()
 	if readErr != nil || closeErr != nil || !bytes.Equal(ranged, payload[1024:1024+4096]) {
 		t.Fatalf("local provider range mismatch: read=%v close=%v size=%d", readErr, closeErr, len(ranged))
+	}
+	// The same format-v2 archive fixture used by the Linux Docker migration
+	// acceptance must round-trip through the real bundled storage.local process
+	// before it is copied across image generations.
+	exerciseUpgradeArchiveFixture(t, ctx, store, "create")
+	if err := provider.Close(); err != nil {
+		t.Fatalf("close provider before archive fixture restart: %v", err)
+	}
+	store, provider = openStore()
+	exerciseUpgradeArchiveFixture(t, ctx, store, "verify")
+	if err := store.DeleteRecordingData("8a6c9c2e9d5140a8b7f00ce67a00c001"); err != nil {
+		t.Fatalf("remove local-provider upgrade fixture: %v", err)
 	}
 	if err := store.DeleteRecordingData(recordingID); err != nil {
 		t.Fatalf("delete canonical recording through provider protocol: %v", err)

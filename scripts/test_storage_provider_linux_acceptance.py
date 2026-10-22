@@ -432,8 +432,7 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                                 candidate_error = exc
                     if candidate_error is None:
                         self.fail("acceptance readiness rejection was not reached")
-                    if "acceptance injected readiness rejection" not in str(candidate_error):
-                        self.fail(f"RC10 candidate failed before readiness acceptance: {candidate_error}; {candidate_startup_diagnostic}")
+                    candidate_failed_before_readiness = "acceptance injected readiness rejection" not in str(candidate_error)
                     pending_path = install_dir / "deployment.pending.json"
                     pending = install.read_pending(pending_path)
                     self.assertIsNotNone(pending)
@@ -449,6 +448,15 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                         "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", rollback_container,
                         "/bin/sh", "-ec", f"test \"$(cat /data/{data_marker})\" = preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
                     ]).returncode, 0)
+                    rollback_release_dirs = release_directories(rollback_container)
+                    self.assertTrue(release_dirs_before.issubset(rollback_release_dirs))
+
+                    if candidate_failed_before_readiness:
+                        self.fail(
+                            "RC10 candidate failed before injected readiness rejection; "
+                            "automatic RC9 rollback was healthy and preserved generation, state, "
+                            f"archive, and release directories; {candidate_startup_diagnostic}"
+                        )
 
                     # Official retry resumes the exact pending RC10 identity;
                     # it neither changes nor replaces the application data.

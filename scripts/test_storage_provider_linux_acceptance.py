@@ -156,6 +156,8 @@ def build_diagnostic_image() -> tuple[str, str, str]:
 def safe_startup_failure_class(output: str) -> str:
     """Map known startup messages to fixed codes without returning raw logs."""
     classifications = (
+        ("confirm initial Recorder Engine inventory", "initial_engine_inventory_unavailable"),
+        ("engine inventory endpoint is unavailable", "initial_engine_inventory_unavailable"),
         ("active runtime generation is inconsistent", "active_generation_inconsistent"),
         ("active installed release failed verification", "active_installed_release_verification"),
         ("active runtime registry does not match its signed release", "active_registry_release_mismatch"),
@@ -630,6 +632,11 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                     self.assertEqual(old["version"], RC9_TAG[1:])
                     self.assertEqual(old["commit"], RC9_COMMIT)
                     self.assertEqual(old["state"], "draining")
+                    self.assertTrue(old.get("engine_dormant"), "lease-free RC9 source Engine was not marked dormant")
+                    self.assertFalse(
+                        any(lease.get("engine_generation") == old_generation_id for lease in upgraded["registry"].get("leases", {}).values()),
+                        "RC9 source unexpectedly retains a Recording lease",
+                    )
                     new_tuple = (
                         upgraded["generation"].get("adapter_set_id"),
                         upgraded["generation"].get("storage_provider_set_id"),
@@ -659,7 +666,39 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                         "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", final_container,
                         "/bin/sh", "-ec", f"printf restart-probe > /data/restart-probe && test \"$(cat /data/{state_marker})\" = state-preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
                     ]).returncode, 0)
-                    install.run(install.compose_command(install_dir / "compose.yaml", "up", "-d", "--no-build", "--force-recreate", "--wait", "--wait-timeout", "180", "archiver"))
+                    try:
+                        install.run(install.compose_command(install_dir / "compose.yaml", "up", "-d", "--no-build", "--force-recreate", "--wait", "--wait-timeout", "180", "archiver"))
+                    except install.InstallError:
+                        failed_container = compose_container(install_dir)
+                        inspect = docker(["inspect", failed_container]).stdout
+                        try:
+                            container_state = json.loads(inspect)[0].get("State", {})
+                        except (json.JSONDecodeError, IndexError, TypeError):
+                            container_state = {}
+                        failed_registry = generation_snapshot(failed_container)
+                        generation_summary = {
+                            key: {
+                                "version": value.get("version"),
+                                "state": value.get("state"),
+                                "engine_dormant": value.get("engine_dormant", False),
+                            }
+                            for key, value in failed_registry.get("generations", {}).items()
+                        }
+                        failure_logs = docker(["logs", "--tail", "120", failed_container], check=False)
+                        combined_logs = (failure_logs.stdout or "") + (failure_logs.stderr or "")
+                        matches = re.findall(r"stage=([a-z][a-z0-9_]{0,63}) code=([a-z][a-z0-9_]{0,63})", combined_logs)
+                        stage, code = matches[-1] if matches else ("not_reported", "not_reported")
+                        print(
+                            "Candidate restart failed: "
+                            f"container={container_state.get('Status', 'unknown')} "
+                            f"health={(container_state.get('Health') or {}).get('Status', 'unknown')} "
+                            f"startup_class={safe_startup_failure_class(combined_logs)} "
+                            f"stage={stage} code={code} "
+                            f"active_generation={failed_registry.get('active_generation_id', 'unknown')} "
+                            f"generations={json.dumps(generation_summary, sort_keys=True)} "
+                            f"lease_count={len(failed_registry.get('leases', {}))}"
+                        )
+                        raise
                     restarted = compose_container(install_dir)
                     restarted_status = assert_running_identity(self, restarted, tag, candidate_commit)
                     self.assertEqual(restarted_status["registry"]["active_generation_id"], final["registry"]["active_generation_id"])

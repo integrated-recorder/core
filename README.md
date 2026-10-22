@@ -5,7 +5,7 @@
 Integrated Recorder Core는 라이브 스트림의 원본 미디어 세그먼트와 방송 메타데이터를 보존하고 브라우저 재생을 제공하는 실행 본체입니다.
 
 > [!NOTE]
-> 현재 공개 버전은 `v0.1.0-rc.8` prerelease입니다. 설치 스크립트는 공개 stable release가 있으면 stable을 선택하고, 없을 때만 가장 최신 prerelease를 선택합니다.
+> 현재 공개 버전은 `v0.1.0-rc.11` prerelease입니다. 설치 스크립트는 공개 stable release가 있으면 stable을 선택하고, 없을 때만 가장 최신 prerelease를 선택합니다.
 
 ## 빠른 설치
 
@@ -17,7 +17,7 @@ cd core
 ./scripts/install.sh --recordings-dir /absolute/path/to/recordings
 ```
 
-스크립트는 공식 GitHub release를 선택하고 공개 release tag를 정확한 commit SHA로 확인한 뒤, 그 tag의 source로 이미지를 빌드합니다. Stable release가 없을 경우 prerelease를 선택했다는 알림을 출력합니다. 특정 버전을 고정하려면 `--version v0.1.0-rc.8`을 추가하세요. 기존 설치는 명시적으로 `--upgrade`를 지정하지 않는 한 기록된 버전을 유지합니다.
+스크립트는 공식 GitHub release를 선택하고 공개 release tag를 정확한 commit SHA로 확인한 뒤, 그 tag의 source로 이미지를 빌드합니다. Stable release가 없을 경우 prerelease를 선택했다는 알림을 출력합니다. 특정 버전을 고정하려면 `--version v0.1.0-rc.11`을 추가하세요. 기존 설치는 명시적으로 `--upgrade`를 지정하지 않는 한 기록된 버전을 유지합니다.
 
 Application state, 인증 정보, Runtime Host 및 plugin/generation state는 전용 Docker volume의 `/data`에 저장됩니다. Recording archive만 지정한 host directory를 `/data/recordings`에 bind mount합니다. 앱은 container UID:GID `10001:10001`로 실행되며 installer는 그 identity로 파일 생성·읽기·rename·삭제를 검사합니다. 기본 host port `8080`이 사용 중이면 다른 loopback port를 선택합니다. 기본 network는 `127.0.0.1`이며 LAN 접근은 `--bind 0.0.0.0` 또는 특정 interface 주소를 명시해야 합니다.
 

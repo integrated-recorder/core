@@ -5,7 +5,7 @@
 Integrated Recorder Core is the runtime that preserves original live-stream media segments and broadcast metadata, then serves browser playback.
 
 > [!NOTE]
-> The current public version is the `v0.1.0-rc.8` prerelease. The installer selects a published stable release when one exists, and otherwise selects the newest published prerelease.
+> The current public version is the `v0.1.0-rc.11` prerelease. The installer selects a published stable release when one exists, and otherwise selects the newest published prerelease.
 
 ## Quick install
 
@@ -17,7 +17,7 @@ cd core
 ./scripts/install.sh --recordings-dir /absolute/path/to/recordings
 ```
 
-The installer selects an official GitHub release, resolves its published tag to an exact commit SHA, and builds the image from that tag's source. It prints a notice when it selects a prerelease because no stable release is available. Pin a version with `--version v0.1.0-rc.8`. An existing install keeps its recorded version unless you explicitly pass `--upgrade`.
+The installer selects an official GitHub release, resolves its published tag to an exact commit SHA, and builds the image from that tag's source. It prints a notice when it selects a prerelease because no stable release is available. Pin a version with `--version v0.1.0-rc.11`. An existing install keeps its recorded version unless you explicitly pass `--upgrade`.
 
 Application state, credentials, Runtime Host state, and plugin/generation metadata live in a dedicated Docker volume mounted at `/data`. Only the recording archive is bind-mounted from the requested host directory to `/data/recordings`. The application runs as container UID:GID `10001:10001`; the installer checks real file creation, read, rename, and deletion as that identity. It uses host port `8080` when free, otherwise selects and reports another loopback port. The default bind is `127.0.0.1`; LAN access requires an explicit `--bind 0.0.0.0` or a specific host interface address.
 

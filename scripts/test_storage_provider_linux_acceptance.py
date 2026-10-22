@@ -652,13 +652,13 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                     # content and the pending retry will upgrade the same bytes.
                     run_upgrade_archive_fixture(self, rolled_back_container, "verify", old_tuple[1])
 
-                    # Exercise a later pre-activation boundary as well: let the
-                    # candidate Host verify provenance, persist its staged
-                    # generation, and then make only the candidate Engine
-                    # executable exit before readiness. The installer may
-                    # restore RC9 because the durable active pointer is still
-                    # the prior generation; the failed candidate must not be
-                    # mistaken for an activation or lose the pending retry.
+                    # Exercise a later pre-activation boundary as well: let
+                    # the candidate Host verify provenance, then make its
+                    # bundled Engine exit before readiness. Startup may fail
+                    # before a staged generation is durably published. If a
+                    # failed candidate is recorded, the restored Host may
+                    # retire it when it has no leases; the durable active
+                    # pointer and its provider pins must remain unchanged.
                     original_run = install.run
                     staged_failure_injected = False
 
@@ -707,12 +707,22 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                     staged_rollback = assert_running_identity(self, staged_rollback_container, RC9_TAG, RC9_COMMIT)
                     self.assertEqual(staged_rollback["registry"]["active_generation_id"], old_generation_id)
                     self.assertEqual(staged_rollback["registry"].get("staged_generation_id", ""), "")
-                    failed_candidates = [
+                    candidate_generations = [
                         generation for generation in staged_rollback["registry"]["generations"].values()
                         if generation.get("version") == version and generation.get("commit", "").lower() == candidate_commit.lower()
                     ]
-                    self.assertTrue(failed_candidates, "the failed candidate generation was not retained for forensic state")
-                    self.assertTrue(all(generation.get("state") == "failed" for generation in failed_candidates))
+                    self.assertTrue(
+                        all(generation.get("state") in ("failed", "retired") for generation in candidate_generations),
+                        "pre-activation candidate unexpectedly became active or remained staged",
+                    )
+                    candidate_ids = {generation.get("id") for generation in candidate_generations}
+                    self.assertFalse(
+                        any(
+                            lease.get("engine_generation") in candidate_ids
+                            for lease in staged_rollback["registry"].get("leases", {}).values()
+                        ),
+                        "failed pre-activation candidate unexpectedly owns a Recording lease",
+                    )
                     self.assertEqual(staged_rollback["generation"]["storage_provider_set_id"], old_tuple[1])
                     run_upgrade_archive_fixture(self, staged_rollback_container, "verify", old_tuple[1])
 

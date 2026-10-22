@@ -128,7 +128,11 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           if [[ "${TAG#v}" == *-* ]]; then
-            gh release create "${TAG}" dist/* --title "${TAG}" --generate-notes --prerelease
+            if [[ "${TAG}" == "v0.1.0-rc.11" ]]; then
+              gh release create "${TAG}" dist/* --title "${TAG}" --notes-file docs/RELEASE_NOTES_v0.1.0-rc.11.md --prerelease
+            else
+              gh release create "${TAG}" dist/* --title "${TAG}" --generate-notes --prerelease
+            fi
           else
             gh release create "${TAG}" dist/* --title "${TAG}" --generate-notes
           fi

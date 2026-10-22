@@ -313,14 +313,14 @@ def diagnose_rc9_state_with_diagnostic_image(
             ], check=False)
 
 
-class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
-    """Exercise installer build, pending retry, rollback, and successful upgrade."""
+class OfficialRC9OfficialReleaseDockerUpgradeTests(unittest.TestCase):
+    """Exercise official installer rollback/retry and release upgrades."""
 
     @unittest.skipUnless(
         os.environ.get("IR_RUN_STORAGE_UPGRADE_DOCKER_E2E") == "1",
         "requires a fresh Linux Docker runner; set IR_RUN_STORAGE_UPGRADE_DOCKER_E2E=1",
     )
-    def test_official_rc9_install_rc10_upgrade_and_pending_rollback_retry(self):
+    def test_official_rc9_install_target_upgrade_and_pending_rollback_retry(self):
         if shutil.which("docker") is None:
             self.fail("Docker acceptance was requested but Docker is unavailable")
         project = f"ir-storage-upgrade-{uuid.uuid4().hex[:12]}"
@@ -331,11 +331,24 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
             archive = root / "recordings with spaces"
             archive_marker = "linux-upgrade-archive-marker"
             data_marker = "linux-upgrade-state-marker"
+            target_tag = os.environ.get("IR_OFFICIAL_UPGRADE_TARGET_TAG", RC10_TAG)
+            target_commit = os.environ.get("IR_EXPECTED_RELEASE_COMMIT", RC10_COMMIT)
+            require_archive_fixture = os.environ.get("IR_REQUIRE_ARCHIVE_FIXTURE") == "1"
+            if target_tag not in (RC10_TAG, "v0.1.0-rc.11"):
+                self.fail("official upgrade acceptance only supports the RC10 baseline or the published RC11 tag")
+            if target_tag == "v0.1.0-rc.11":
+                checked_out_commit = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE,
+                ).stdout.strip()
+                if not re.fullmatch(r"[0-9a-f]{40}", target_commit) or target_commit != checked_out_commit:
+                    self.fail("RC11 acceptance commit must match the exact checked-out release source")
+                if not require_archive_fixture:
+                    self.fail("RC11 acceptance must verify a real V2 archive fixture")
             args_rc9 = install.cli_parser().parse_args([
                 "--install-dir", str(install_dir), "--recordings-dir", str(archive), "--version", RC9_TAG,
             ])
-            args_rc10 = install.cli_parser().parse_args([
-                "--install-dir", str(install_dir), "--upgrade", "--version", RC10_TAG,
+            args_target = install.cli_parser().parse_args([
+                "--install-dir", str(install_dir), "--upgrade", "--version", target_tag,
             ])
             with mock.patch.object(install, "COMPOSE_PROJECT", project), mock.patch.object(install, "STATE_VOLUME", volume):
                 try:
@@ -366,6 +379,14 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                     # immutable RC9 source image has been verified by install.py.
                     storage_set = rc9["generation"]["storage_provider_set_id"]
                     assert_storage_pin(self, container, storage_set)
+                    old_tuple = (
+                        rc9["generation"].get("adapter_set_id"),
+                        rc9["generation"].get("storage_provider_set_id"),
+                        rc9["generation"].get("storage_instance_id"),
+                    )
+                    self.assertTrue(all(old_tuple))
+                    if require_archive_fixture:
+                        run_upgrade_archive_fixture(self, container, "create", storage_set)
                     release_dirs_before = release_directories(container)
                     print(f"RC9 baseline healthy: generation={rc9['registry']['active_generation_id']} storage_set={storage_set}")
 
@@ -438,7 +459,7 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                                         # leak paths or raw process diagnostics.
                                         candidate_startup_diagnostic += "; cloned_state_probe=failed"
                                 print(
-                                    f"RC10 candidate Compose startup failed; container={runtime_state} "
+                                    f"{target_tag} candidate Compose startup failed; container={runtime_state} "
                                     f"health={health_state} health_exit={health_exit} {candidate_startup_diagnostic}"
                                 )
                             raise
@@ -447,7 +468,7 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                     with mock.patch.object(install, "run", side_effect=capture_candidate_startup_failure):
                         with mock.patch.object(install, "wait_for_runtime", side_effect=reject_candidate_once):
                             try:
-                                install.install(args_rc10)
+                                install.install(args_target)
                             except install.InstallError as exc:
                                 candidate_error = exc
                     if candidate_error is None:
@@ -456,7 +477,7 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                     pending_path = install_dir / "deployment.pending.json"
                     pending = install.read_pending(pending_path)
                     self.assertIsNotNone(pending)
-                    self.assertEqual(pending["release"]["tag"], RC10_TAG)
+                    self.assertEqual(pending["release"]["tag"], target_tag)
                     self.assertTrue(pending.get("compose_started"))
                     self.assertTrue((install_dir / "compose.pending.yaml").is_file())
 
@@ -470,36 +491,87 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                     ]).returncode, 0)
                     rollback_release_dirs = release_directories(rollback_container)
                     self.assertTrue(release_dirs_before.issubset(rollback_release_dirs))
+                    if require_archive_fixture:
+                        run_upgrade_archive_fixture(self, rollback_container, "verify", storage_set)
 
                     if candidate_failed_before_readiness:
                         self.fail(
-                            "RC10 candidate failed before injected readiness rejection; "
+                            f"{target_tag} candidate failed before injected readiness rejection; "
                             "automatic RC9 rollback was healthy and preserved generation, state, "
                             f"archive, and release directories; {candidate_startup_diagnostic}"
                         )
 
-                    # Official retry resumes the exact pending RC10 identity;
+                    # Official retry resumes the exact pending release identity;
                     # it neither changes nor replaces the application data.
-                    install.install(args_rc10)
+                    install.install(args_target)
                     final_metadata = install.load_metadata(install_dir / "deployment.json")
                     self.assertIsNone(install.read_pending(pending_path))
-                    self.assertEqual(final_metadata["release"]["tag"], RC10_TAG)
-                    self.assertEqual(final_metadata["release"]["commit"], RC10_COMMIT)
+                    self.assertEqual(final_metadata["release"]["tag"], target_tag)
+                    self.assertEqual(final_metadata["release"]["commit"], target_commit)
+                    self.assertEqual(final_metadata["release"]["channel"], "prerelease")
+                    self.assertTrue(final_metadata["release"].get("manifest_identity_checked"))
                     final_container = compose_container(install_dir)
-                    rc10 = assert_running_identity(self, final_container, RC10_TAG, RC10_COMMIT)
-                    self.assertEqual(install.wait_for_runtime(final_metadata["port"], final_metadata["release"], timeout=30, bind=final_metadata["bind"])["version"], RC10_TAG[1:])
+                    upgraded = assert_running_identity(self, final_container, target_tag, target_commit)
+                    self.assertNotEqual(
+                        upgraded["registry"]["active_generation_id"],
+                        rc9["registry"]["active_generation_id"],
+                        "image upgrade did not activate a generation with the target application identity",
+                    )
+                    target_status = install.wait_for_runtime(
+                        final_metadata["port"], final_metadata["release"], timeout=30, bind=final_metadata["bind"],
+                    )
+                    self.assertEqual(target_status["version"], target_tag[1:])
+                    self.assertFalse(target_status["auth_disabled"])
                     self.assertEqual(docker([
                         "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", final_container,
                         "/bin/sh", "-ec", f"test \"$(cat /data/{data_marker})\" = preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
                     ]).returncode, 0)
-                    old_generation = rc10["registry"]["generations"].get(rc9["registry"]["active_generation_id"])
+                    old_generation = upgraded["registry"]["generations"].get(rc9["registry"]["active_generation_id"])
                     if old_generation is not None:
                         self.assertEqual(old_generation["commit"], RC9_COMMIT)
-                    active_set = rc10["generation"]["storage_provider_set_id"]
+                    active_tuple = (
+                        upgraded["generation"].get("adapter_set_id"),
+                        upgraded["generation"].get("storage_provider_set_id"),
+                        upgraded["generation"].get("storage_instance_id"),
+                    )
+                    self.assertEqual(active_tuple, old_tuple, "application image upgrade changed immutable adapter/storage pins")
+                    active_set = upgraded["generation"]["storage_provider_set_id"]
                     assert_storage_pin(self, final_container, active_set)
                     release_dirs_after = release_directories(final_container)
                     self.assertTrue(release_dirs_before.issubset(release_dirs_after))
-                    print(f"RC10 upgrade healthy: generation={rc10['registry']['active_generation_id']} storage_set={active_set}")
+                    if require_archive_fixture:
+                        run_upgrade_archive_fixture(self, final_container, "verify", active_set)
+
+                    # Container replacement must not stage another generation
+                    # or alter provider pins; archive objects remain readable.
+                    install.run(install.compose_command(
+                        install_dir / "compose.yaml", "up", "-d", "--no-build", "--force-recreate",
+                        "--wait", "--wait-timeout", "180", "archiver",
+                    ))
+                    restarted_container = compose_container(install_dir)
+                    restarted = assert_running_identity(self, restarted_container, target_tag, target_commit)
+                    self.assertEqual(
+                        restarted["registry"]["active_generation_id"],
+                        upgraded["registry"]["active_generation_id"],
+                        "container recreation unexpectedly created another application generation",
+                    )
+                    self.assertEqual(
+                        (
+                            restarted["generation"].get("adapter_set_id"),
+                            restarted["generation"].get("storage_provider_set_id"),
+                            restarted["generation"].get("storage_instance_id"),
+                        ),
+                        old_tuple,
+                        "container recreation changed immutable provider pins",
+                    )
+                    assert_storage_pin(self, restarted_container, active_set)
+                    if require_archive_fixture:
+                        run_upgrade_archive_fixture(self, restarted_container, "verify", active_set)
+                    print(
+                        f"{target_tag} upgrade healthy: runtime-host={target_tag[1:]}/{target_commit}; "
+                        f"generation={restarted['registry']['active_generation_id']} storage_set={active_set}; "
+                        f"archive_fixture={require_archive_fixture}"
+                    )
                 finally:
                     for compose_path in (install_dir / "compose.yaml", install_dir / "compose.pending.yaml"):
                         if compose_path.exists():

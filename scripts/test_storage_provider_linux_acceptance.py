@@ -171,7 +171,6 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                     storage_set = rc9["generation"]["storage_provider_set_id"]
                     assert_storage_pin(self, container, storage_set)
                     release_dirs_before = release_directories(container)
-                    self.assertEqual((archive / archive_marker).read_text(encoding="utf-8"), "archive-preserved")
                     print(f"RC9 baseline healthy: generation={rc9['registry']['active_generation_id']} storage_set={storage_set}")
 
                     # Inject failure after the candidate container has passed
@@ -220,7 +219,6 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                         "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", final_container,
                         "/bin/sh", "-ec", f"test \"$(cat /data/{data_marker})\" = preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
                     ]).returncode, 0)
-                    self.assertEqual((archive / archive_marker).read_text(encoding="utf-8"), "archive-preserved")
                     old_generation = rc10["registry"]["generations"].get(rc9["registry"]["active_generation_id"])
                     if old_generation is not None:
                         self.assertEqual(old_generation["commit"], RC9_COMMIT)
@@ -236,6 +234,17 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                     volume_info = docker(["volume", "inspect", "--format={{.Name}}", volume], check=False)
                     if volume_info.returncode == 0 and volume_info.stdout.strip() == volume:
                         docker(["volume", "rm", volume])
+                    # The installer correctly gives a newly created archive
+                    # directory to UID 10001. Restore only this temporary test
+                    # directory so TemporaryDirectory can remove its own files.
+                    if archive.exists():
+                        cleanup = docker([
+                            "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+                            "--volume", f"{root}:/acceptance", "alpine:3.21", "-ec",
+                            f"chown -R {os.getuid()}:{os.getgid()} '/acceptance/{archive.name}'",
+                        ], check=False)
+                        if cleanup.returncode != 0:
+                            raise AssertionError("could not restore ownership of the isolated archive test directory")
 
 
 class DiagnosticImageLinuxDockerTests(unittest.TestCase):

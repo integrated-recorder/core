@@ -675,7 +675,18 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                             container_state = json.loads(inspect)[0].get("State", {})
                         except (json.JSONDecodeError, IndexError, TypeError):
                             container_state = {}
-                        failed_registry = generation_snapshot(failed_container)
+                        # The Host may be in Docker's restart loop, so do not
+                        # depend on docker exec into the failing container.
+                        # Read only the isolated named volume from a helper
+                        # container and capture Host logs directly.
+                        registry_probe = docker([
+                            "run", "--rm", "--volume", f"{volume}:/data:ro", "alpine:3.21",
+                            "cat", "/data/runtime/state/generations.json",
+                        ], check=False)
+                        try:
+                            failed_registry = json.loads(registry_probe.stdout) if registry_probe.returncode == 0 else {}
+                        except json.JSONDecodeError:
+                            failed_registry = {}
                         generation_summary = {
                             key: {
                                 "version": value.get("version"),

@@ -241,7 +241,7 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                         cleanup = docker([
                             "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
                             "--volume", f"{root}:/acceptance", "alpine:3.21", "-ec",
-                            f"chown -R {os.getuid()}:{os.getgid()} '/acceptance/{archive.name}'",
+                            f"chown -R {os.getuid()}:{os.getgid()} '/acceptance/{archive.name}' && chmod -R u+rwX '/acceptance/{archive.name}'",
                         ], check=False)
                         if cleanup.returncode != 0:
                             raise AssertionError("could not restore ownership of the isolated archive test directory")
@@ -290,7 +290,7 @@ class DiagnosticImageLinuxDockerTests(unittest.TestCase):
         image_digest = docker(["image", "inspect", "--format={{index .RepoDigests 0}}", image], check=False).stdout.strip()
         print(f"Diagnostic image identity: version={diagnostic_version} commit={commit} digest={image_digest or 'local image ID only'}")
 
-        with tempfile.TemporaryDirectory(prefix="ir storage diagnostic ") as temp:
+        with tempfile.TemporaryDirectory(prefix="ir storage diagnostic ", ignore_cleanup_errors=True) as temp:
             root = Path(temp)
             normal_data, normal_archive = root / "normal-data", root / "normal-archive"
             normal_data.mkdir()
@@ -303,20 +303,31 @@ class DiagnosticImageLinuxDockerTests(unittest.TestCase):
             try:
                 health_deadline = time.monotonic() + 240
                 while time.monotonic() < health_deadline:
-                    state = docker(["inspect", "--format={{.State.Health.Status}}", normal], check=False).stdout.strip()
-                    if state == "healthy":
-                        break
-                    if state in ("unhealthy", "exited"):
-                        self.fail("diagnostic Runtime Host failed its Docker health check")
+                    state = docker(["inspect", "--format={{.State.Status}}", normal], check=False).stdout.strip()
+                    if state != "running":
+                        self.fail("diagnostic Runtime Host container stopped before readiness")
+                    response = docker([
+                        "exec", normal, "/bin/sh", "-ec", "wget -q -O- http://127.0.0.1:8080/healthz",
+                    ], check=False)
+                    if response.returncode == 0:
+                        try:
+                            health = json.loads(response.stdout)
+                        except json.JSONDecodeError:
+                            health = None
+                        if isinstance(health, dict) and health.get("status") == "ok":
+                            break
                     time.sleep(2)
-                self.assertEqual(state, "healthy", "diagnostic Runtime Host did not become healthy")
+                else:
+                    self.fail("diagnostic Runtime Host did not pass /healthz readiness")
+                if not isinstance(health, dict) or health.get("status") != "ok":
+                    self.fail("diagnostic Runtime Host returned an invalid health response")
                 _, generation = active_generation(normal)
                 self.assertEqual(generation["version"], diagnostic_version)
                 self.assertEqual(generation["commit"], commit)
                 self.assertTrue(generation.get("storage_provider_set_id"))
                 catalog = json.loads(docker(["exec", normal, "cat", "/data/runtime/storage-providers/state.json"]).stdout)
                 self.assertTrue(catalog.get("installed"))
-                print("Diagnostic normal startup: healthy; bundled import, staged probe, catalog publication, provider startup and physical probe completed")
+                print("Diagnostic normal startup: /healthz ok; bundled import, staged probe, catalog publication, provider startup and physical probe completed")
             finally:
                 docker(["rm", "--force", normal], check=False)
 
@@ -383,6 +394,15 @@ class DiagnosticImageLinuxDockerTests(unittest.TestCase):
             if str(physical_archive) in combined:
                 self.fail("physical probe diagnostic exposed the archive path")
             print("Diagnostic physical probe failure: stage=physical_storage_probe code=write; archive path withheld")
+
+            # Restore the host user's ownership and write permissions only
+            # within this one temporary root; the image correctly owns its
+            # dedicated bind mounts as UID 10001 while the tests run.
+            docker([
+                "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+                "--volume", f"{root}:/acceptance", image, "-ec",
+                f"chown -R {os.getuid()}:{os.getgid()} /acceptance && chmod -R u+rwX /acceptance",
+            ])
 
 
 if __name__ == "__main__":

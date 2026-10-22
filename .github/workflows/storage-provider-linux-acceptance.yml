@@ -1,28 +1,15 @@
 name: Storage Provider Linux Docker Acceptance
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - '.github/workflows/storage-provider-linux-acceptance.yml'
-      - 'scripts/install.py'
-      - 'scripts/test_install.py'
-      - 'scripts/test_storage_provider_linux_acceptance.py'
-      - 'Dockerfile'
-      - 'go.mod'
-      - 'go.sum'
-      - 'cmd/storage-local/**'
-      - 'internal/runtimehost/bootstrap/**'
-      - 'internal/runtimehost/storagecatalog/**'
-      - 'internal/storage/**'
-      - 'internal/storageprocess/**'
-      - 'internal/storageproto/**'
+  push:
+    branches:
+      - diagnostic/storage-provider-linux-acceptance
 
 permissions:
   contents: read
 
 concurrency:
-  group: storage-provider-linux-acceptance-${{ github.event.pull_request.number }}
+  group: storage-provider-linux-acceptance-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -34,7 +21,7 @@ jobs:
       - name: Check out diagnostic branch commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
       - name: Record runner Docker environment
         run: |
           docker version
@@ -53,7 +40,7 @@ jobs:
       - name: Check out diagnostic branch commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
       - name: Install Go
         uses: actions/setup-go@v5
         with:

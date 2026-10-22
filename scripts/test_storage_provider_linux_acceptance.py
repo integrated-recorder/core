@@ -598,7 +598,22 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                         except install.InstallError as exc:
                             candidate_error = exc
                     self.assertIsNotNone(candidate_error)
-                    self.assertIn("post-activation verification rejection", str(candidate_error))
+                    if "post-activation verification rejection" not in str(candidate_error):
+                        # Compose's --wait can fail before the installer's HTTP
+                        # readiness probe runs. Preserve sanitized container
+                        # evidence before the isolated project is torn down so
+                        # a startup/health regression is distinguishable from
+                        # the deliberate post-activation retry injection.
+                        container = install.run(
+                            install.compose_command(install_dir / "compose.pending.yaml", "ps", "-q", "archiver"),
+                            check=False,
+                        ).stdout.strip()
+                        if container:
+                            inspect = docker(["inspect", "--format={{json .State}}", container], check=False)
+                            logs = docker(["logs", "--tail", "120", container], check=False)
+                            print("Candidate container state before retry:", (inspect.stdout or inspect.stderr or "unavailable")[:12000])
+                            print("Candidate Runtime Host logs before retry:", ((logs.stdout or "") + (logs.stderr or ""))[-20000:])
+                        self.fail(f"candidate did not reach the intended post-activation verification hook: {candidate_error}")
                     pending_path = install_dir / "deployment.pending.json"
                     pending = install.read_pending(pending_path)
                     self.assertIsNotNone(pending)

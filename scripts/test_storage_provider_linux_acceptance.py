@@ -12,6 +12,7 @@ IR_RUN_STORAGE_DIAGNOSTIC_DOCKER_E2E=1.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -152,6 +153,39 @@ def build_diagnostic_image() -> tuple[str, str, str]:
     return image, version, commit
 
 
+def safe_startup_failure_class(output: str) -> str:
+    """Map known startup messages to fixed codes without returning raw logs."""
+    classifications = (
+        ("active runtime generation is inconsistent", "active_generation_inconsistent"),
+        ("active installed release failed verification", "active_installed_release_verification"),
+        ("active runtime registry does not match its signed release", "active_registry_release_mismatch"),
+        ("Runtime Host storage provider catalog is unavailable", "storage_catalog_open_failed"),
+        ("initialize bundled storage.local provider", "bundled_storage_initialization_failed"),
+        ("active Runtime Host storage provider set is unavailable", "active_storage_provider_set_unavailable"),
+        ("active Runtime Host storage provider is unavailable", "active_storage_provider_probe_failed"),
+        ("Runtime Host adapter catalog is unavailable", "adapter_catalog_open_failed"),
+        ("Runtime Host plugin registry state is unavailable", "plugin_registry_state_unavailable"),
+        ("Runtime Host plugin source state is unavailable", "plugin_source_state_unavailable"),
+    )
+    for marker, classification in classifications:
+        if marker in output:
+            return classification
+    return "not_reported"
+
+
+class DiagnosticStartupClassificationTests(unittest.TestCase):
+    def test_known_bootstrap_failures_map_to_bounded_classes(self):
+        cases = {
+            "active installed release failed verification: /private/path": "active_installed_release_verification",
+            "initialize bundled storage.local provider: storage provider initialization failed": "bundled_storage_initialization_failed",
+            "Runtime Host storage provider catalog is unavailable": "storage_catalog_open_failed",
+            "unclassified failure /private/path": "not_reported",
+        }
+        for output, expected in cases.items():
+            with self.subTest(expected=expected):
+                self.assertEqual(safe_startup_failure_class(output), expected)
+
+
 def diagnose_rc9_state_with_diagnostic_image(
     root: Path,
     state_volume: str,
@@ -180,6 +214,24 @@ def diagnose_rc9_state_with_diagnostic_image(
             "uid=$(stat -c %u /source); gid=$(stat -c %g /source); mode=$(stat -c %a /source); "
             "cp -a /source/. /dest/; chown \"$uid:$gid\" /dest; chmod \"$mode\" /dest",
         ])
+        snapshot_output = docker([
+            "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+            "--volume", f"{clone_volume}:/data:ro", "alpine:3.21", "-ec",
+            "cat /data/runtime/state/generations.json; printf '\\n__RELEASE_DIRS__\\n'; "
+            "for d in /data/runtime/releases/release-*; do if [ -d \"$d\" ]; then basename \"$d\"; fi; done; exit 0",
+        ]).stdout
+        marker = "\n__RELEASE_DIRS__\n"
+        snapshot_text, separator, release_text = snapshot_output.partition(marker)
+        generation_state = json.loads(snapshot_text) if separator else {}
+        active_id = generation_state.get("active_generation_id", "")
+        active = generation_state.get("generations", {}).get(active_id, {})
+        active_version = str(active.get("version", "unknown"))
+        active_commit = str(active.get("commit", "unknown"))
+        expected_release = "release-" + hashlib.sha256(
+            (active_version + "\x00" + active_commit.lower()).encode("utf-8")
+        ).hexdigest()
+        release_dirs = set(release_text.splitlines())
+        active_release_dir = "present" if expected_release in release_dirs else "missing"
         docker([
             "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
             "--volume", f"{archive}:/source:ro", "--volume", f"{clone_archive}:/dest", "alpine:3.21", "-ec",
@@ -220,9 +272,12 @@ def diagnose_rc9_state_with_diagnostic_image(
         combined = (app_logs.stdout or "") + (app_logs.stderr or "")
         matches = re.findall(r"stage=([a-z][a-z0-9_]{0,63}) code=([a-z][a-z0-9_]{0,63})", combined)
         stage, code = matches[-1] if matches else ("not_reported", "not_reported")
+        startup_class = safe_startup_failure_class(combined)
         result = (
             f"container={state} health={'ok' if healthy else 'failed'} exit_code={exit_code} "
-            f"stage={stage} code={code} image={diagnostic_version} commit={diagnostic_commit}"
+            f"stage={stage} code={code} startup_class={startup_class} "
+            f"active_version={active_version} active_commit={active_commit} active_release_dir={active_release_dir} "
+            f"image={diagnostic_version} commit={diagnostic_commit}"
         )
         return result
     finally:
@@ -347,6 +402,11 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                                 if matches:
                                     stage, code = matches[-1]
                                     candidate_startup_diagnostic = f"stage={stage} code={code}"
+                                else:
+                                    candidate_startup_diagnostic = (
+                                        "stage=not_reported code=not_reported startup_class="
+                                        + safe_startup_failure_class(combined)
+                                    )
                                 if container_id:
                                     try:
                                         cloned = diagnose_rc9_state_with_diagnostic_image(

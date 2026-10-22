@@ -650,6 +650,11 @@ func Run(ctx context.Context, config Config) error {
 	if err := reconcileColdGenerationState(registry, engineRecoveryMode, generationID, true); err != nil {
 		return errors.New("recording generation leases could not be reconciled after cold recovery")
 	}
+	if allowsUnleasedBundleSourceDetach(installState.Snapshot().State) && selected.imageBundleUpgradeSourceGenerationID != "" {
+		if err := reconcileImageBundleUpgradeSource(registry, selected.imageBundleUpgradeSourceGenerationID); err != nil {
+			return fmt.Errorf("reconcile prior image-bundled generation: %w", err)
+		}
+	}
 	if err := sup.ActivateControl(startCtx, generationID); err != nil {
 		return fmt.Errorf("activate bundled Control Plane: %w", err)
 	}
@@ -802,6 +807,13 @@ func initialEngineRecoveryMode(state installation.State) string {
 	return "fresh"
 }
 
+// allowsUnleasedBundleSourceDetach is deliberately narrower than the Engine's
+// "fresh" recovery mode: a corrupted/recovery-required installation must not
+// have its durable generation registry changed as a side effect of startup.
+func allowsUnleasedBundleSourceDetach(state installation.State) bool {
+	return state == installation.StateUninitialized || state == installation.StateSetupInProgress
+}
+
 type coldGenerationReconciler interface {
 	ReconcileColdStart(activeGenerationID string) error
 }
@@ -820,6 +832,37 @@ func reconcileColdGenerationState(registry coldGenerationReconciler, recoveryMod
 		return errors.New("cold recovery has not completed")
 	}
 	return registry.ReconcileColdStart(activeGenerationID)
+}
+
+// reconcileImageBundleUpgradeSource detaches only the exact prior image
+// generation named by the installer during an image replacement. A first-run
+// or recovery-required installation cannot perform cold archive recovery, so
+// it must not clear any lease. The old container's Engine is not attached to
+// this Host; mark it dormant only when the durable registry confirms that it
+// owns no Recording lease. A leased generation remains untouched and the
+// normal complete inventory pass will fail closed if that Engine is absent.
+func reconcileImageBundleUpgradeSource(registry *generation.Registry, sourceID string) error {
+	if registry == nil || !generationPattern.MatchString(sourceID) {
+		return errors.New("image-bundle upgrade source identity is invalid")
+	}
+	snapshot := registry.Snapshot()
+	source, exists := snapshot.Generations[sourceID]
+	if !exists || source.State != generation.StateDraining || sourceID == snapshot.ActiveGenerationID {
+		return errors.New("image-bundle upgrade source generation is inconsistent")
+	}
+	if source.EngineDormant {
+		return nil
+	}
+	for _, lease := range snapshot.Leases {
+		if lease.EngineGeneration == sourceID {
+			// Preserve the authoritative lease. In particular, do not interpret a
+			// fresh setup state as proof that archive recovery is safe.
+			return nil
+		}
+	}
+	// MarkEngineDormant repeats the lease check atomically under the registry
+	// lock, so a concurrent lease cannot be lost between the snapshot and write.
+	return registry.MarkEngineDormant(sourceID)
 }
 
 func resourceIPCPaths(ipcDir, hostBootID string) (socketPath, tokenPath string, err error) {

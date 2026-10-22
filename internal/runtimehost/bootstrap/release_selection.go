@@ -26,14 +26,15 @@ var (
 )
 
 type runtimeRelease struct {
-	generationID       string
-	needsStage         bool
-	preserveActivePins bool
-	directory          string
-	controlPath        string
-	enginePath         string
-	appBuild           buildinfo.Info
-	manifest           *release.Manifest
+	generationID                         string
+	needsStage                           bool
+	preserveActivePins                   bool
+	imageBundleUpgradeSourceGenerationID string
+	directory                            string
+	controlPath                          string
+	enginePath                           string
+	appBuild                             buildinfo.Info
+	manifest                             *release.Manifest
 }
 
 // selectRuntimeRelease chooses the durable active application generation on
@@ -56,8 +57,20 @@ func selectRuntimeRelease(snapshot generation.Snapshot, bundleBuild buildinfo.In
 			return selectInstalledRuntimeRelease(active, runtimeRoot, trustedKeys)
 		}
 		if active.Version == bundleBuild.Version && strings.EqualFold(active.Commit, bundleBuild.Commit) {
+			// If the installer is retrying a transition that already persisted the
+			// candidate generation, retain the same explicit provenance until the
+			// installer commits its metadata. The previous generation remains the
+			// exact source of the transition and may still need cold-start cleanup.
+			upgradeSourceID := ""
+			if bundleUpgradeFrom.Version != "" && snapshot.PreviousGenerationID != "" {
+				previous, exists := snapshot.Generations[snapshot.PreviousGenerationID]
+				if exists && previous.State == generation.StateDraining && previous.Version == bundleUpgradeFrom.Version && strings.EqualFold(previous.Commit, bundleUpgradeFrom.Commit) {
+					upgradeSourceID = previous.ID
+				}
+			}
 			return runtimeRelease{
 				generationID: activeID, directory: bundleDir,
+				preserveActivePins: upgradeSourceID != "", imageBundleUpgradeSourceGenerationID: upgradeSourceID,
 				controlPath: filepath.Join(bundleDir, "control-plane"), enginePath: filepath.Join(bundleDir, "recorder-engine"), appBuild: bundleBuild,
 			}, nil
 		}
@@ -73,7 +86,8 @@ func selectRuntimeRelease(snapshot generation.Snapshot, bundleBuild buildinfo.In
 			}
 			return runtimeRelease{
 				generationID: id, needsStage: true, preserveActivePins: true,
-				directory: bundleDir, controlPath: filepath.Join(bundleDir, "control-plane"),
+				imageBundleUpgradeSourceGenerationID: active.ID,
+				directory:                            bundleDir, controlPath: filepath.Join(bundleDir, "control-plane"),
 				enginePath: filepath.Join(bundleDir, "recorder-engine"), appBuild: bundleBuild,
 			}, nil
 		}

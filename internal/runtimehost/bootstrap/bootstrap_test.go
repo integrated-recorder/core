@@ -262,11 +262,12 @@ func attestationPointer(value plugintrust.Attestation) *plugintrust.Attestation 
 
 func TestInitialEngineRecoveryIsGatedByInstallationReadiness(t *testing.T) {
 	tests := []struct {
-		state installation.State
-		want  string
+		state       installation.State
+		want        string
+		allowDetach bool
 	}{
-		{state: installation.StateUninitialized, want: "fresh"},
-		{state: installation.StateSetupInProgress, want: "fresh"},
+		{state: installation.StateUninitialized, want: "fresh", allowDetach: true},
+		{state: installation.StateSetupInProgress, want: "fresh", allowDetach: true},
 		{state: installation.StateRecoveryRequired, want: "fresh"},
 		{state: installation.StateReady, want: "recover"},
 	}
@@ -274,6 +275,9 @@ func TestInitialEngineRecoveryIsGatedByInstallationReadiness(t *testing.T) {
 		t.Run(string(test.state), func(t *testing.T) {
 			if got := initialEngineRecoveryMode(test.state); got != test.want {
 				t.Fatalf("initialEngineRecoveryMode(%q)=%q, want %q", test.state, got, test.want)
+			}
+			if got := allowsUnleasedBundleSourceDetach(test.state); got != test.allowDetach {
+				t.Fatalf("allowsUnleasedBundleSourceDetach(%q)=%t, want %t", test.state, got, test.allowDetach)
 			}
 		})
 	}
@@ -440,6 +444,110 @@ func TestLegacyImageBundleUpgradeStagesExactNewGenerationAndPreservesPins(t *tes
 	}
 	if state.Generations[oldID] != old || state.ActiveGenerationID != oldID {
 		t.Fatalf("selection mutated old active generation: %+v", state.Generations[oldID])
+	}
+	if selected.imageBundleUpgradeSourceGenerationID != oldID {
+		t.Fatalf("transition source generation=%q, want %q", selected.imageBundleUpgradeSourceGenerationID, oldID)
+	}
+}
+
+func TestImageBundleUpgradeRetryRecognizesAlreadyActiveCandidate(t *testing.T) {
+	oldBuild := buildinfo.Info{Version: "0.1.0-rc.9", Commit: strings.Repeat("9", 40), ReleaseChannel: "prerelease"}
+	newBuild := buildinfo.Info{Version: "0.1.0-rc.10-diagnostic", Commit: strings.Repeat("a", 40), ReleaseChannel: "prerelease"}
+	oldID, activeID := strings.Repeat("b", 32), strings.Repeat("c", 32)
+	old := runtimeGeneration(oldID, oldBuild)
+	old.State = generation.StateDraining
+	active := runtimeGeneration(activeID, newBuild)
+	active.State = generation.StateActive
+	snapshot := generation.Snapshot{
+		SchemaVersion: generation.SchemaVersion, ActiveGenerationID: activeID, PreviousGenerationID: oldID,
+		Generations: map[string]generation.Generation{oldID: old, activeID: active},
+		Leases:      map[string]generation.Lease{},
+	}
+	selected, err := selectRuntimeRelease(snapshot, newBuild, t.TempDir(), filepath.Join(t.TempDir(), "runtime"), nil, oldBuild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.generationID != activeID || selected.needsStage || !selected.preserveActivePins || selected.imageBundleUpgradeSourceGenerationID != oldID {
+		t.Fatalf("retry selection lost transition provenance: %+v", selected)
+	}
+
+	// A stale or unrelated installer marker must not turn an ordinary matching
+	// bundle startup into an image-transition recovery path.
+	selected, err = selectRuntimeRelease(snapshot, newBuild, t.TempDir(), filepath.Join(t.TempDir(), "runtime"), nil,
+		buildinfo.Info{Version: "0.1.0-rc.8", Commit: strings.Repeat("8", 40)})
+	if err != nil || selected.preserveActivePins || selected.imageBundleUpgradeSourceGenerationID != "" {
+		t.Fatalf("unrelated installer marker authorized transition recovery: %+v, %v", selected, err)
+	}
+}
+
+func TestImageBundleUpgradeDormantsOnlyUnleasedSourceGeneration(t *testing.T) {
+	for _, withLease := range []bool{false, true} {
+		name := "unleased source becomes dormant"
+		if withLease {
+			name = "leased source remains authoritative"
+		}
+		t.Run(name, func(t *testing.T) {
+			registry, err := generation.Open(filepath.Join(t.TempDir(), "generations.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldID, newID := strings.Repeat("b", 32), strings.Repeat("c", 32)
+			oldBuild := buildinfo.Info{Version: "0.1.0-rc.9", Commit: strings.Repeat("9", 40)}
+			newBuild := buildinfo.Info{Version: "0.1.0-rc.10-diagnostic", Commit: strings.Repeat("a", 40)}
+			stageBootstrapGeneration(t, registry, runtimeGeneration(oldID, oldBuild))
+			if err := registry.Activate(oldID); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.FinalizeActivation(oldID); err != nil {
+				t.Fatal(err)
+			}
+			if withLease {
+				now := time.Now().UTC()
+				if err := registry.ReconcileInventory(generation.EngineInventory{
+					Confirmed: true, EngineGeneration: oldID, WorkerInstance: strings.Repeat("d", 32), ObservedAt: now,
+					Recordings: []generation.InventoryRecording{{RecordingID: strings.Repeat("e", 32), StartedAt: now}},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stageBootstrapGeneration(t, registry, runtimeGeneration(newID, newBuild))
+			if err := registry.Activate(newID); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.FinalizeActivation(newID); err != nil {
+				t.Fatal(err)
+			}
+
+			before := registry.Snapshot()
+			if err := reconcileImageBundleUpgradeSource(registry, oldID); err != nil {
+				t.Fatalf("reconcile source generation: %v", err)
+			}
+			after := registry.Snapshot()
+			oldAfter := after.Generations[oldID]
+			if withLease {
+				if oldAfter.EngineDormant || len(after.Leases) != 1 || after.Leases[strings.Repeat("e", 32)].EngineGeneration != oldID {
+					t.Fatalf("leased source was changed: before=%+v after=%+v", before, after)
+				}
+			} else if !oldAfter.EngineDormant || len(after.Leases) != 0 {
+				t.Fatalf("unleased source was not marked dormant: %+v", after)
+			}
+			if after.ActiveGenerationID != newID || after.PreviousGenerationID != oldID || oldAfter.State != generation.StateDraining {
+				t.Fatalf("image transition changed immutable generation lifecycle pointers: %+v", after)
+			}
+		})
+	}
+}
+
+func stageBootstrapGeneration(t *testing.T, registry *generation.Registry, item generation.Generation) {
+	t.Helper()
+	if err := registry.Stage(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.MarkVerified(item.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.MarkReady(item.ID); err != nil {
+		t.Fatal(err)
 	}
 }
 

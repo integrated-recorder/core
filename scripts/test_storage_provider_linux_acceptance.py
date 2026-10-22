@@ -118,6 +118,126 @@ def release_directories(container_id: str) -> set[str]:
     return set(output.splitlines())
 
 
+def build_diagnostic_image() -> tuple[str, str, str]:
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+    created = subprocess.run(["git", "show", "-s", "--format=%cI", commit], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+    timestamp = dt.datetime.fromisoformat(created.replace("Z", "+00:00"))
+    if not commit or len(commit) != 40 or timestamp.tzinfo is None:
+        raise AssertionError("diagnostic build identity is incomplete")
+    version = "0.1.0-rc.10-diagnostic." + commit[:12]
+    image = f"localhost/integrated-recorder-storage-diagnostic:{commit[:12]}"
+    release_identity = {
+        "tag": "diagnostic-" + commit[:12],
+        "version": version,
+        "commit": commit,
+        "build_time": created,
+        "channel": "prerelease",
+        "source": install.REPOSITORY_SOURCE,
+    }
+    docker([
+        "build", "--file", "Dockerfile", "--tag", image,
+        "--label", f"org.opencontainers.image.source={install.REPOSITORY_SOURCE}",
+        "--label", f"org.opencontainers.image.version={version}",
+        "--label", f"org.opencontainers.image.revision={commit}",
+        "--label", f"org.opencontainers.image.created={created}",
+        "--label", "com.integrated-recorder.release-channel=prerelease",
+        "--label", f"com.integrated-recorder.release-tag=diagnostic-{commit[:12]}",
+        "--build-arg", f"VERSION={version}",
+        "--build-arg", f"COMMIT={commit}",
+        "--build-arg", f"BUILD_TIME={created}",
+        "--build-arg", "RELEASE_CHANNEL=prerelease", ".",
+    ])
+    install.verify_image_labels(image, release_identity)
+    install.verify_image_binaries(image, release_identity)
+    return image, version, commit
+
+
+def diagnose_rc9_state_with_diagnostic_image(
+    root: Path,
+    state_volume: str,
+    archive: Path,
+    candidate_container_id: str,
+) -> str:
+    """Probe an isolated clone of the restored RC9 state with instrumented code."""
+    image, diagnostic_version, diagnostic_commit = build_diagnostic_image()
+    clone_volume = f"{install.COMPOSE_PROJECT}-diagnostic-state-{uuid.uuid4().hex[:8]}"
+    clone_archive = root / "diagnostic-cloned-recordings"
+    clone_archive.mkdir()
+    container_name = "ir-storage-rc9-state-diagnostic-" + uuid.uuid4().hex[:8]
+    container_id = ""
+    volume_created = False
+    result = "container=not_started health=not_checked stage=not_reported code=not_reported"
+    try:
+        # Stop only the failed candidate container so the isolated acceptance
+        # volume is quiescent. The enclosing installer then performs its normal
+        # RC9 rollback after this diagnostic clone is removed.
+        docker(["stop", "--time", "10", candidate_container_id], check=False)
+        docker(["volume", "create", clone_volume])
+        volume_created = True
+        docker([
+            "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+            "--volume", f"{state_volume}:/source:ro", "--volume", f"{clone_volume}:/dest", "alpine:3.21", "-ec",
+            "uid=$(stat -c %u /source); gid=$(stat -c %g /source); mode=$(stat -c %a /source); "
+            "cp -a /source/. /dest/; chown \"$uid:$gid\" /dest; chmod \"$mode\" /dest",
+        ])
+        docker([
+            "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+            "--volume", f"{archive}:/source:ro", "--volume", f"{clone_archive}:/dest", "alpine:3.21", "-ec",
+            "cp -a /source/. /dest/; chown -R 10001:10001 /dest",
+        ])
+        container_id = docker([
+            "run", "-d", "--name", container_name,
+            "--volume", f"{clone_volume}:/data", "--volume", f"{clone_archive}:/data/recordings", image,
+        ]).stdout.strip()
+        deadline = time.monotonic() + 90
+        healthy = False
+        state = "unknown"
+        while time.monotonic() < deadline:
+            state = docker(["inspect", "--format={{.State.Status}}", container_id], check=False).stdout.strip() or "unknown"
+            if state != "running":
+                break
+            response = docker([
+                "exec", container_id, "/bin/sh", "-ec", "wget -q -O- http://127.0.0.1:8080/healthz",
+            ], check=False)
+            if response.returncode == 0:
+                try:
+                    payload = json.loads(response.stdout)
+                except json.JSONDecodeError:
+                    payload = None
+                healthy = isinstance(payload, dict) and payload.get("status") == "ok"
+                if healthy:
+                    break
+            time.sleep(2)
+
+        inspect_result = docker(["inspect", container_id], check=False)
+        exit_code = "unknown"
+        if inspect_result.returncode == 0:
+            try:
+                exit_code = str(json.loads(inspect_result.stdout)[0].get("State", {}).get("ExitCode", "unknown"))
+            except (json.JSONDecodeError, IndexError, TypeError):
+                pass
+        app_logs = docker(["logs", "--tail", "100", container_id], check=False)
+        combined = (app_logs.stdout or "") + (app_logs.stderr or "")
+        matches = re.findall(r"stage=([a-z][a-z0-9_]{0,63}) code=([a-z][a-z0-9_]{0,63})", combined)
+        stage, code = matches[-1] if matches else ("not_reported", "not_reported")
+        result = (
+            f"container={state} health={'ok' if healthy else 'failed'} exit_code={exit_code} "
+            f"stage={stage} code={code} image={diagnostic_version} commit={diagnostic_commit}"
+        )
+        return result
+    finally:
+        if container_id:
+            docker(["rm", "--force", container_id], check=False)
+        if volume_created:
+            docker(["volume", "rm", clone_volume], check=False)
+        if clone_archive.exists():
+            docker([
+                "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+                "--volume", f"{root}:/acceptance", "alpine:3.21", "-ec",
+                f"chown -R {os.getuid()}:{os.getgid()} /acceptance/diagnostic-cloned-recordings && chmod -R u+rwX /acceptance/diagnostic-cloned-recordings",
+            ], check=False)
+
+
 class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
     """Exercise installer build, pending retry, rollback, and successful upgrade."""
 
@@ -227,6 +347,16 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                                 if matches:
                                     stage, code = matches[-1]
                                     candidate_startup_diagnostic = f"stage={stage} code={code}"
+                                if container_id:
+                                    try:
+                                        cloned = diagnose_rc9_state_with_diagnostic_image(
+                                            root, volume, archive, container_id,
+                                        )
+                                        candidate_startup_diagnostic += f"; cloned_state_probe={cloned}"
+                                    except Exception:
+                                        # Keep failure output bounded and do not
+                                        # leak paths or raw process diagnostics.
+                                        candidate_startup_diagnostic += "; cloned_state_probe=failed"
                                 print(
                                     f"RC10 candidate Compose startup failed; container={runtime_state} "
                                     f"health={health_state} health_exit={health_exit} {candidate_startup_diagnostic}"

@@ -567,14 +567,16 @@ func TestImportRejectsExpectedIdentityHashAndSizeMismatches(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = removeTreeOwned(catalog.root) })
 	cases := []struct {
-		name    string
-		mutate  func(*Expected)
-		wantErr error
+		name      string
+		mutate    func(*Expected)
+		wantErr   error
+		wantStage string
+		wantCode  string
 	}{
-		{name: "wrong hash", mutate: func(value *Expected) { value.SHA256 = strings.Repeat("0", 64) }, wantErr: ErrInvalidArtifact},
-		{name: "wrong size", mutate: func(value *Expected) { value.Size++ }, wantErr: ErrInvalidArtifact},
-		{name: "wrong id", mutate: func(value *Expected) { value.ID = "different-provider" }, wantErr: ErrInvalidArtifact},
-		{name: "wrong version", mutate: func(value *Expected) { value.Version = "2.0.0" }, wantErr: ErrInvalidArtifact},
+		{name: "wrong hash", mutate: func(value *Expected) { value.SHA256 = strings.Repeat("0", 64) }, wantErr: ErrInvalidArtifact, wantStage: "artifact_checksum", wantCode: "checksum_mismatch"},
+		{name: "wrong size", mutate: func(value *Expected) { value.Size++ }, wantErr: ErrInvalidArtifact, wantStage: "artifact_source_validation", wantCode: "executable_invalid"},
+		{name: "wrong id", mutate: func(value *Expected) { value.ID = "different-provider" }, wantErr: ErrInvalidArtifact, wantStage: "staged_descriptor_validation", wantCode: "descriptor_mismatch"},
+		{name: "wrong version", mutate: func(value *Expected) { value.Version = "2.0.0" }, wantErr: ErrInvalidArtifact, wantStage: "staged_descriptor_validation", wantCode: "descriptor_mismatch"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -582,11 +584,63 @@ func TestImportRejectsExpectedIdentityHashAndSizeMismatches(t *testing.T) {
 			tc.mutate(&expected)
 			if _, err := catalog.Import(context.Background(), binary, expected); !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Import() error = %v, want %v", err, tc.wantErr)
+			} else if stage, code, ok := storageproto.DiagnosticCode(err); !ok || stage != tc.wantStage || code != tc.wantCode {
+				t.Fatalf("Import() diagnostic = %s/%s (%t), want %s/%s", stage, code, ok, tc.wantStage, tc.wantCode)
 			}
 		})
 	}
 	if entries, err := os.ReadDir(filepath.Join(catalog.root, "artifacts")); err != nil || len(entries) != 0 {
 		t.Fatalf("mismatched artifacts were published: %+v, %v", entries, err)
+	}
+}
+
+func TestImportDiagnosticsIdentifyStagingAndPublicationFailures(t *testing.T) {
+	binary := buildFixtureProvider(t)
+	data, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	expected := Expected{ID: "fixture-storage", Version: "1.0.0", ProtocolVersion: storageproto.Version, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	root := filepath.Join(t.TempDir(), "catalog")
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removeTreeOwned(root) })
+
+	stagingRoot := filepath.Join(root, "staging")
+	if err := os.Chmod(stagingRoot, 0500); err != nil {
+		t.Fatal(err)
+	}
+	_, err = catalog.Import(context.Background(), binary, expected)
+	if err == nil || !errors.Is(err, ErrUnsafeStore) {
+		t.Fatalf("Import() with unsafe staging directory error = %v", err)
+	}
+	if stage, code, ok := storageproto.DiagnosticCode(err); !ok || stage != "catalog_staging_directory" || code != "directory_invalid" {
+		t.Fatalf("staging diagnostic = %s/%s (%t), want catalog_staging_directory/directory_invalid", stage, code, ok)
+	}
+	if err := os.Chmod(stagingRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	artifactTarget := filepath.Join(root, "artifacts", expected.SHA256)
+	if err := os.Mkdir(artifactTarget, 0700); err != nil {
+		t.Fatal(err)
+	}
+	poison := filepath.Join(artifactTarget, "preserve-me")
+	if err := os.WriteFile(poison, []byte("do not replace"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = catalog.Import(context.Background(), binary, expected)
+	if err == nil || !errors.Is(err, ErrUnsafeStore) {
+		t.Fatalf("Import() with invalid existing publication target error = %v", err)
+	}
+	if stage, code, ok := storageproto.DiagnosticCode(err); !ok || stage != "artifact_publication_collision" || code != "existing_artifact_invalid" {
+		t.Fatalf("publication diagnostic = %s/%s (%t), want artifact_publication_collision/existing_artifact_invalid", stage, code, ok)
+	}
+	if got, err := os.ReadFile(poison); err != nil || string(got) != "do not replace" {
+		t.Fatalf("failed publication altered existing artifact data: bytes=%q err=%v", got, err)
 	}
 }
 
@@ -619,6 +673,13 @@ func TestImportRejectsUnsafeSources(t *testing.T) {
 	}
 	if _, err := catalog.Import(context.Background(), nonExecutable, expected); !errors.Is(err, ErrInvalidArtifact) {
 		t.Fatalf("non-executable source accepted: %v", err)
+	}
+	if _, err := catalog.ImportBundled(context.Background(), nonExecutable, "fixture-storage"); !errors.Is(err, ErrInvalidArtifact) {
+		t.Fatalf("non-executable bundled source error = %v, want ErrInvalidArtifact", err)
+	} else if stage, code, ok := storageproto.DiagnosticCode(err); !ok || stage != "bundled_executable_probe" || code != "executable_invalid" {
+		t.Fatalf("bundled probe diagnostic = %s/%s (%t), want bundled_executable_probe/executable_invalid", stage, code, ok)
+	} else if strings.Contains(err.Error(), nonExecutable) {
+		t.Fatalf("bundled probe diagnostic exposed executable path: %v", err)
 	}
 	oversized := filepath.Join(t.TempDir(), "oversized")
 	file, err := os.OpenFile(oversized, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)

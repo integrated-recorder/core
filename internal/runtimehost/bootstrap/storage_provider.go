@@ -24,40 +24,55 @@ var _ httpapi.StorageController = (*updateController)(nil)
 var _ httpapi.StorageInstanceController = (*updateController)(nil)
 
 func ensureBundledLocalStorage(ctx context.Context, catalog *storagecatalog.Catalog, binary, archiveRoot string) (storagecatalog.Set, error) {
-	if ctx == nil || ctx.Err() != nil || catalog == nil || !filepath.IsAbs(binary) || filepath.Clean(binary) != binary ||
+	if ctx == nil {
+		return storagecatalog.Set{}, storageproto.NewDiagnosticError("bundled_storage_configuration", "context_unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return storagecatalog.Set{}, err
+	}
+	if catalog == nil || !filepath.IsAbs(binary) || filepath.Clean(binary) != binary ||
 		!filepath.IsAbs(archiveRoot) || filepath.Clean(archiveRoot) != archiveRoot {
-		return storagecatalog.Set{}, errors.New("bundled local storage configuration is invalid")
+		return storagecatalog.Set{}, storageproto.NewDiagnosticError("bundled_storage_configuration", "invalid_configuration")
 	}
 	artifact, err := catalog.ImportBundled(ctx, binary, "local")
 	if err != nil {
-		return storagecatalog.Set{}, errors.New("bundled storage.local artifact failed validation")
+		// ImportBundled returns a safe, stage-specific diagnostic while retaining
+		// ErrInvalidArtifact compatibility. Do not replace it with a generic
+		// message: the startup log is the operator's only source for this stage.
+		return storagecatalog.Set{}, err
 	}
 	rootValue, err := json.Marshal(archiveRoot)
 	if err != nil {
-		return storagecatalog.Set{}, errors.New("bundled storage.local configuration is invalid")
+		return storagecatalog.Set{}, storageproto.NewDiagnosticError("bundled_storage_configuration", "archive_root_encoding_failed", err)
 	}
 	if err := catalog.InstallWithAttestation(artifact, plugintrust.NewBundled()); err != nil {
-		return storagecatalog.Set{}, errors.New("bundled storage.local artifact could not be installed")
+		return storagecatalog.Set{}, storageproto.NewDiagnosticError("bundled_storage_install", "artifact_install_failed", err)
 	}
 	set, err := catalog.CreateInstalledSet("local", storagecatalog.SetConfig{
 		Values: map[string]json.RawMessage{"root": rootValue},
 	})
 	if err != nil {
-		return storagecatalog.Set{}, errors.New("bundled storage.local set could not be created")
+		return storagecatalog.Set{}, storageproto.NewDiagnosticError("bundled_storage_set_create", "storage_set_create_failed", err)
 	}
 	if err := catalog.SelectDesiredSet("local", set.ID); err != nil {
-		return storagecatalog.Set{}, errors.New("bundled storage.local set could not be selected")
+		return storagecatalog.Set{}, storageproto.NewDiagnosticError("bundled_storage_set_select", "storage_set_select_failed", err)
 	}
 	return set, nil
 }
 
 func probeStorageProviderSet(ctx context.Context, catalogRoot, setID string) error {
-	if ctx == nil || ctx.Err() != nil || setID == "" {
-		return errors.New("storage provider probe could not start")
+	if ctx == nil {
+		return storageproto.NewDiagnosticError("storage_provider_set_probe", "context_unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if setID == "" {
+		return storageproto.NewDiagnosticError("storage_provider_set_probe", "invalid_probe_input")
 	}
 	provider, err := storageprocess.StartSet(ctx, catalogRoot, setID)
 	if err != nil {
-		return errors.New("storage provider process probe failed")
+		return err
 	}
 	closed := false
 	defer func() {
@@ -66,10 +81,15 @@ func probeStorageProviderSet(ctx context.Context, catalogRoot, setID string) err
 		}
 	}()
 	if err := storage.ProbePhysicalObjectStore(ctx, provider.ObjectStore()); err != nil {
-		return errors.New("storage provider object probe failed")
+		code := "provider_probe_failed"
+		var probeErr *storage.ProbeError
+		if errors.As(err, &probeErr) && probeErr != nil {
+			code = probeErr.OperationCode()
+		}
+		return storageproto.NewDiagnosticError("physical_storage_probe", code, err)
 	}
 	if err := provider.Close(); err != nil {
-		return errors.New("storage provider process cleanup failed")
+		return storageproto.NewDiagnosticError("storage_provider_process_cleanup", "process_cleanup_failed", err)
 	}
 	closed = true
 	return nil

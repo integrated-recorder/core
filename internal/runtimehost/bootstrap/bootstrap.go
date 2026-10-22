@@ -42,6 +42,7 @@ import (
 	"github.com/integrated-recorder/core/internal/runtimehost/supervisor"
 	"github.com/integrated-recorder/core/internal/runtimehost/tlsserver"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
+	"github.com/integrated-recorder/core/internal/storageproto"
 	"github.com/integrated-recorder/core/internal/systemsettings"
 )
 
@@ -396,7 +397,14 @@ func Run(ctx context.Context, config Config) error {
 	}
 	storageCatalog, err := storagecatalog.Open(filepath.Join(config.DataDir, "runtime", "storage-providers"))
 	if err != nil {
-		return errors.New("Runtime Host storage provider catalog is unavailable")
+		if _, _, ok := storageproto.DiagnosticCode(err); !ok {
+			code := storageproto.SafeErrorCode(err)
+			if code == "operation_failed" || code == "none" {
+				code = "catalog_unavailable"
+			}
+			err = storageproto.NewDiagnosticError("storage_catalog_open", code, err)
+		}
+		return fmt.Errorf("Runtime Host storage provider catalog is unavailable: %w", err)
 	}
 	localStorageSet, err := ensureBundledLocalStorage(ctx, storageCatalog, config.StorageLocalBinary, filepath.Join(config.DataDir, "recordings"))
 	if err != nil {
@@ -450,10 +458,10 @@ func Run(ctx context.Context, config Config) error {
 		return errors.New("active Runtime Host storage provider set is unavailable")
 	}
 	if _, err := storageCatalog.LoadSet(startupGeneration.StorageProviderSetID); err != nil {
-		return errors.New("active Runtime Host storage provider set is unavailable")
+		return fmt.Errorf("active Runtime Host storage provider set is unavailable: %w", storageproto.NewDiagnosticError("active_provider_set_load", "set_unavailable", err))
 	}
 	if err := probeStorageProviderSet(ctx, filepath.Join(config.DataDir, "runtime", "storage-providers"), startupGeneration.StorageProviderSetID); err != nil {
-		return errors.New("active Runtime Host storage provider is unavailable")
+		return fmt.Errorf("active Runtime Host storage provider is unavailable: %w", err)
 	}
 	generationID := selected.generationID
 	engineToken, err := randomSecret()

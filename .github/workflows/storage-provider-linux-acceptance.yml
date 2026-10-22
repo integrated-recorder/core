@@ -1,0 +1,71 @@
+name: Storage Provider Linux Docker Acceptance
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/storage-provider-linux-acceptance.yml'
+      - 'scripts/install.py'
+      - 'scripts/test_install.py'
+      - 'scripts/test_storage_provider_linux_acceptance.py'
+      - 'Dockerfile'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/storage-local/**'
+      - 'internal/runtimehost/bootstrap/**'
+      - 'internal/runtimehost/storagecatalog/**'
+      - 'internal/storage/**'
+      - 'internal/storageprocess/**'
+      - 'internal/storageproto/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-provider-linux-acceptance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  official-rc9-to-rc10-upgrade:
+    name: Official RC9 install and RC10 upgrade
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out diagnostic branch commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Record runner Docker environment
+        run: |
+          docker version
+          docker compose version
+          docker info --format '{{.OSType}}/{{.Architecture}}'
+      - name: Install official RC9, exercise rollback, retry official RC10
+        env:
+          IR_RUN_STORAGE_UPGRADE_DOCKER_E2E: '1'
+        run: python3 scripts/test_storage_provider_linux_acceptance.py OfficialRC9RC10DockerUpgradeTests.test_official_rc9_install_rc10_upgrade_and_pending_rollback_retry -v
+
+  diagnostic-image:
+    name: Diagnostic image and safe failure stages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out diagnostic branch commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Python installer tests
+        run: python3 -m unittest discover -s scripts -p 'test_install.py'
+      - name: Storage diagnostics unit and race tests
+        run: |
+          go test -short -count=1 ./internal/storageproto ./internal/runtimehost/storagecatalog ./internal/storageprocess ./internal/runtimehost/bootstrap ./internal/storage ./internal/storagelocal
+          go test -race -short -count=1 ./internal/storageproto ./internal/runtimehost/storagecatalog ./internal/storageprocess ./internal/runtimehost/bootstrap ./internal/storage ./internal/storagelocal
+      - name: Build and probe diagnostic Docker image
+        env:
+          IR_RUN_STORAGE_DIAGNOSTIC_DOCKER_E2E: '1'
+        run: python3 scripts/test_storage_provider_linux_acceptance.py DiagnosticImageLinuxDockerTests.test_diagnostic_image_normal_provider_and_safe_failure_codes -v

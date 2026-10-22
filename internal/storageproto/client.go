@@ -38,6 +38,8 @@ type Client struct {
 	cmd        *exec.Cmd
 	parentPipe io.WriteCloser
 	done       chan struct{}
+	processMu  sync.Mutex
+	processErr error
 	closeOnce  sync.Once
 	closeErr   error
 }
@@ -51,26 +53,38 @@ func (e *RemoteError) Error() string { return "storage provider request failed: 
 // it for EOF through Serve's default ParentLiveness behavior.
 func Start(ctx context.Context, options StartOptions) (*Client, error) {
 	if ctx == nil || !filepath.IsAbs(options.Binary) || !filepath.IsAbs(options.SocketPath) || !filepath.IsAbs(options.TokenFile) {
-		return nil, errors.New("storage provider launch configuration is invalid")
+		return nil, NewDiagnosticError("provider_process_start", "invalid_launch_configuration", ErrProtocol)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	info, err := os.Lstat(options.Binary)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0111 == 0 {
-		return nil, errors.New("storage provider executable is invalid")
+	if err != nil {
+		code := SafeErrorCode(err)
+		if code != "permission_denied" && code != "not_found" {
+			code = "executable_unavailable"
+		}
+		return nil, NewDiagnosticError("provider_executable_validation", code, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0111 == 0 {
+		return nil, NewDiagnosticError("provider_executable_validation", "executable_invalid")
 	}
 	token, err := readToken(options.TokenFile)
 	if err != nil {
-		return nil, err
+		return nil, NewDiagnosticError("provider_token_validation", "token_file_invalid", err)
 	}
 	cmd := exec.Command(options.Binary, "--socket", options.SocketPath, "--token-file", options.TokenFile)
 	cmd.Env = []string{}
 	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	childDiagnostics := newBoundedDiagnosticCapture()
+	defer childDiagnostics.clear()
+	cmd.Stderr = childDiagnostics
 	parentPipe, err := cmd.StdinPipe()
 	if err != nil {
 		for i := range token {
 			token[i] = 0
 		}
-		return nil, errors.New("storage provider process could not start")
+		return nil, NewDiagnosticError("provider_process_start", "process_pipe_setup_failed", err)
 	}
 	configureParentDeathSignal(cmd)
 	if err = cmd.Start(); err != nil {
@@ -78,7 +92,13 @@ func Start(ctx context.Context, options StartOptions) (*Client, error) {
 		for i := range token {
 			token[i] = 0
 		}
-		return nil, errors.New("storage provider process could not start")
+		code := "process_start_failed"
+		if errors.Is(err, os.ErrPermission) {
+			code = "permission_denied"
+		} else if errors.Is(err, os.ErrNotExist) {
+			code = "executable_not_found"
+		}
+		return nil, NewDiagnosticError("provider_process_start", code, err)
 	}
 	c := newClient(options.SocketPath, token)
 	for i := range token {
@@ -87,7 +107,13 @@ func Start(ctx context.Context, options StartOptions) (*Client, error) {
 	c.cmd = cmd
 	c.parentPipe = parentPipe
 	c.done = make(chan struct{})
-	go func() { _ = cmd.Wait(); close(c.done) }()
+	go func() {
+		waitErr := cmd.Wait()
+		c.processMu.Lock()
+		c.processErr = waitErr
+		c.processMu.Unlock()
+		close(c.done)
+	}()
 	startup := options.StartupTimeout
 	if startup <= 0 {
 		startup = defaultStartupTimeout
@@ -96,23 +122,50 @@ func Start(ctx context.Context, options StartOptions) (*Client, error) {
 	defer deadline.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
+	var lastDescribeErr error
 	for {
 		probeCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 		_, describeErr := c.Describe(probeCtx)
 		cancel()
 		if describeErr == nil {
+			childDiagnostics.disable()
 			return c, nil
+		}
+		lastDescribeErr = describeErr
+		if !isTransportFailure(describeErr) && errors.Is(describeErr, ErrProtocol) {
+			childDiagnostics.disable()
+			_ = c.Close()
+			return nil, NewDiagnosticError("provider_protocol_validation", "protocol_invalid", ErrProtocol, describeErr)
+		}
+		var remote *RemoteError
+		if errors.As(describeErr, &remote) {
+			childDiagnostics.disable()
+			_ = c.Close()
+			return nil, NewDiagnosticError("provider_protocol_validation", "provider_rejected_request", ErrProtocol, describeErr)
 		}
 		select {
 		case <-ctx.Done():
+			childDiagnostics.disable()
 			_ = c.Close()
 			return nil, ctx.Err()
 		case <-deadline.C:
+			childDiagnostics.disable()
 			_ = c.Close()
-			return nil, errors.New("storage provider did not become ready")
+			code := "readiness_timeout"
+			causes := []error{context.DeadlineExceeded}
+			if lastDescribeErr != nil {
+				causes = append(causes, lastDescribeErr)
+				if isTransportFailure(lastDescribeErr) {
+					code = "socket_connect_timeout"
+				}
+			}
+			return nil, NewDiagnosticError("provider_readiness", code, causes...)
 		case <-c.done:
+			waitErr := c.processWaitError()
+			code := childDiagnostics.failureCode()
+			childDiagnostics.disable()
 			_ = c.Close()
-			return nil, errors.New("storage provider exited before becoming ready")
+			return nil, NewDiagnosticError("provider_process_start", code, ErrProcessExited, waitErr)
 		case <-ticker.C:
 		}
 	}
@@ -403,9 +456,28 @@ func normalizeTransportError(ctx context.Context, err error) error {
 		return ctx.Err()
 	}
 	if err != nil {
-		return fmt.Errorf("%w: transport failed", ErrProtocol)
+		return transportFailure{}
 	}
 	return nil
+}
+
+type transportFailure struct{}
+
+func (transportFailure) Error() string { return "storage provider transport failed" }
+func (transportFailure) Unwrap() error { return ErrProtocol }
+
+func isTransportFailure(err error) bool {
+	var failure transportFailure
+	return errors.As(err, &failure)
+}
+
+func (c *Client) processWaitError() error {
+	if c == nil {
+		return nil
+	}
+	c.processMu.Lock()
+	defer c.processMu.Unlock()
+	return c.processErr
 }
 
 func parseContentRange(value string, offset, length int64) (int64, bool) {

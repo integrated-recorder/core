@@ -30,6 +30,28 @@ const (
 	maxConcurrentReadStreams = storageproto.MaxConcurrentReadStreams
 )
 
+func diagnosticCode(err error, fallback string) string {
+	if _, code, ok := storageproto.DiagnosticCode(err); ok {
+		return code
+	}
+	var remote *storageproto.RemoteError
+	if errors.As(err, &remote) && remote != nil && remote.Code != "" {
+		return "provider_" + remote.Code
+	}
+	if code := storageproto.SafeErrorCode(err); code != "operation_failed" && code != "none" {
+		return code
+	}
+	return fallback
+}
+
+func providerFailure(stage, fallback string, base, cause error) error {
+	if _, _, ok := storageproto.DiagnosticCode(cause); ok {
+		return cause
+	}
+	code := diagnosticCode(cause, fallback)
+	return storageproto.NewDiagnosticError(stage, code, base, cause)
+}
+
 // Runtime owns one generation-pinned provider child and the private IPC
 // material used to reach it. When a child exits, Runtime may restart only the
 // same immutable executable with the same descriptor and configuration.
@@ -64,17 +86,17 @@ type Runtime struct {
 // and requires its physical backend probe to pass before returning it for use.
 func Start(ctx context.Context, binary string, expected storageproto.Descriptor, config storageproto.Config) (*Runtime, error) {
 	if ctx == nil || !filepath.IsAbs(binary) || filepath.Clean(binary) != binary {
-		return nil, errors.New("storage provider launch input is invalid")
+		return nil, storageproto.NewDiagnosticError("provider_runtime_input", "invalid_launch_input")
 	}
 	if err := storageproto.ValidateDescriptor(expected); err != nil {
-		return nil, errors.New("pinned storage provider descriptor is invalid")
+		return nil, storageproto.NewDiagnosticError("provider_runtime_descriptor", "protocol_invalid", storageproto.ErrProtocol, err)
 	}
 	if err := storageproto.ValidateConfigForSchema(expected.ConfigurationSchema, config); err != nil {
-		return nil, errors.New("pinned storage provider configuration is invalid")
+		return nil, storageproto.NewDiagnosticError("provider_runtime_configuration", "protocol_invalid", storageproto.ErrProtocol, err)
 	}
 	wantFingerprint, err := storageproto.Fingerprint(expected)
 	if err != nil {
-		return nil, errors.New("pinned storage provider descriptor is invalid")
+		return nil, storageproto.NewDiagnosticError("provider_runtime_descriptor", "protocol_invalid", storageproto.ErrProtocol, err)
 	}
 	child, actual, err := startChild(ctx, binary, expected, wantFingerprint, config)
 	if err != nil {
@@ -105,18 +127,18 @@ type providerChild struct {
 // or reuses that path.
 func startChild(ctx context.Context, binary string, expected storageproto.Descriptor, expectedFingerprint string, config storageproto.Config) (_ providerChild, _ storageproto.Descriptor, resultErr error) {
 	if ctx == nil {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("storage provider launch context is unavailable")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_runtime_context", "context_unavailable")
 	}
 	if err := ctx.Err(); err != nil {
 		return providerChild{}, storageproto.Descriptor{}, err
 	}
 	directory, err := os.MkdirTemp("/tmp", "irsp-")
 	if err != nil {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("private storage provider IPC directory is unavailable")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_ipc_workspace", storageproto.SafeErrorCode(err), err)
 	}
 	if err := os.Chmod(directory, 0700); err != nil {
 		_ = removeOwnedDirectory(directory)
-		return providerChild{}, storageproto.Descriptor{}, errors.New("private storage provider IPC directory is unavailable")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_ipc_permissions", storageproto.SafeErrorCode(err), err)
 	}
 	keepDirectory := false
 	defer func() {
@@ -128,38 +150,38 @@ func startChild(ctx context.Context, binary string, expected storageproto.Descri
 	}()
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("storage provider IPC identity could not be created")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_ipc_identity", "random_source_failed", err)
 	}
 	suffix := hex.EncodeToString(nonce[:])
 	socketPath := filepath.Join(directory, "p.sock")
 	tokenPath := filepath.Join(directory, "t-"+suffix)
 	var token [32]byte
 	if _, err := rand.Read(token[:]); err != nil {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("storage provider IPC credential could not be created")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_ipc_credential", "random_source_failed", err)
 	}
 	tokenText := []byte(hex.EncodeToString(token[:]))
 	file, err := os.OpenFile(tokenPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		zeroBytes(tokenText)
 		zeroBytes(token[:])
-		return providerChild{}, storageproto.Descriptor{}, errors.New("storage provider IPC credential could not be secured")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_ipc_credential", storageproto.SafeErrorCode(err), err)
 	}
 	if _, err := file.Write(tokenText); err != nil {
 		_ = file.Close()
 		zeroBytes(tokenText)
 		zeroBytes(token[:])
-		return providerChild{}, storageproto.Descriptor{}, errors.New("storage provider IPC credential could not be secured")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_ipc_credential", storageproto.SafeErrorCode(err), err)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
 		zeroBytes(tokenText)
 		zeroBytes(token[:])
-		return providerChild{}, storageproto.Descriptor{}, errors.New("storage provider IPC credential could not be secured")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_ipc_credential", storageproto.SafeErrorCode(err), err)
 	}
 	if err := file.Close(); err != nil {
 		zeroBytes(tokenText)
 		zeroBytes(token[:])
-		return providerChild{}, storageproto.Descriptor{}, errors.New("storage provider IPC credential could not be secured")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_ipc_credential", storageproto.SafeErrorCode(err), err)
 	}
 	zeroBytes(tokenText)
 	zeroBytes(token[:])
@@ -167,7 +189,7 @@ func startChild(ctx context.Context, binary string, expected storageproto.Descri
 		Binary: binary, SocketPath: socketPath, TokenFile: tokenPath, StartupTimeout: 8 * time.Second,
 	})
 	if err != nil {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("pinned storage provider process could not start")
+		return providerChild{}, storageproto.Descriptor{}, err
 	}
 	keepClient := false
 	defer func() {
@@ -179,11 +201,11 @@ func startChild(ctx context.Context, binary string, expected storageproto.Descri
 	actual, err := client.Describe(probeCtx)
 	cancel()
 	if err != nil {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("pinned storage provider descriptor is unavailable")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_runtime_descriptor", diagnosticCode(err, "descriptor_unavailable"), storageproto.ErrProtocol, err)
 	}
 	gotFingerprint, err := storageproto.Fingerprint(actual)
 	if err != nil || expectedFingerprint == "" || gotFingerprint != expectedFingerprint {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("pinned storage provider identity changed")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_runtime_identity", "descriptor_fingerprint_mismatch", storageproto.ErrProtocol, err)
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	configured := cloneConfig(config)
@@ -191,13 +213,13 @@ func startChild(ctx context.Context, binary string, expected storageproto.Descri
 	zeroConfig(&configured)
 	cancel()
 	if err != nil {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("pinned storage provider configuration failed")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_runtime_configuration", diagnosticCode(err, "provider_rejected_configuration"), err)
 	}
 	callCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
 	err = client.Probe(callCtx)
 	cancel()
 	if err != nil {
-		return providerChild{}, storageproto.Descriptor{}, errors.New("pinned storage provider probe failed")
+		return providerChild{}, storageproto.Descriptor{}, storageproto.NewDiagnosticError("provider_runtime_probe", diagnosticCode(err, "provider_probe_failed"), err)
 	}
 	if err := ctx.Err(); err != nil {
 		return providerChild{}, storageproto.Descriptor{}, err
@@ -215,19 +237,22 @@ func StartSet(ctx context.Context, catalogRoot, setID string) (*Runtime, error) 
 	}
 	catalog, err := storagecatalog.OpenReadOnly(catalogRoot)
 	if err != nil {
-		return nil, errors.New("pinned storage provider catalog is unavailable")
+		return nil, providerFailure("pinned_provider_catalog", "catalog_unavailable", storagecatalog.ErrUnsafeStore, err)
 	}
 	set, err := catalog.LoadSet(setID)
 	if err != nil {
-		return nil, errors.New("pinned storage provider set is unavailable")
+		return nil, providerFailure("pinned_provider_set", "set_unavailable", storagecatalog.ErrInvalidSet, err)
 	}
 	binary, err := catalog.ArtifactPath(set.Artifact.Digest)
 	if err != nil {
-		return nil, errors.New("pinned storage provider artifact is unavailable")
+		return nil, providerFailure("pinned_provider_artifact", "artifact_unavailable", storagecatalog.ErrArtifactMissing, err)
 	}
 	artifact, descriptor, err := catalog.DescribeArtifact(set.Artifact.Digest)
-	if err != nil || artifact.ID != set.Artifact.ID || artifact.Version != set.Artifact.Version || artifact.ProtocolVersion != set.Artifact.ProtocolVersion || artifact.Digest != set.Artifact.Digest {
-		return nil, errors.New("pinned storage provider identity is unavailable")
+	if err != nil {
+		return nil, providerFailure("pinned_provider_identity", "artifact_unavailable", storagecatalog.ErrInvalidArtifact, err)
+	}
+	if artifact.ID != set.Artifact.ID || artifact.Version != set.Artifact.Version || artifact.ProtocolVersion != set.Artifact.ProtocolVersion || artifact.Digest != set.Artifact.Digest {
+		return nil, storageproto.NewDiagnosticError("pinned_provider_identity", "artifact_descriptor_mismatch", storagecatalog.ErrInvalidArtifact, storageproto.ErrProtocol)
 	}
 	return Start(ctx, binary, descriptor, storageproto.Config{Values: set.Config.Values, Secrets: set.Config.Secrets})
 }

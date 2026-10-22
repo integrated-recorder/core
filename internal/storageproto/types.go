@@ -27,12 +27,13 @@ const (
 )
 
 var (
-	ErrUnsupported  = errors.New("storage provider operation is unsupported")
-	ErrNotFound     = errors.New("storage object not found")
-	ErrInvalidKey   = errors.New("storage object key is invalid")
-	ErrInvalidRange = errors.New("storage object range is invalid")
-	ErrProtocol     = errors.New("storage provider protocol error")
-	ErrClosed       = errors.New("storage provider process is closed")
+	ErrUnsupported   = errors.New("storage provider operation is unsupported")
+	ErrNotFound      = errors.New("storage object not found")
+	ErrInvalidKey    = errors.New("storage object key is invalid")
+	ErrInvalidRange  = errors.New("storage object range is invalid")
+	ErrProtocol      = errors.New("storage provider protocol error")
+	ErrClosed        = errors.New("storage provider process is closed")
+	ErrProcessExited = errors.New("storage provider exited before becoming ready")
 	// ErrUnframedResponse identifies a legacy provider's plain-text 502 response.
 	// LIST callers may retry it with a smaller page while still validating every
 	// returned key and cursor.

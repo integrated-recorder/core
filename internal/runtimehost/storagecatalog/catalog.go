@@ -213,32 +213,36 @@ func (c *Catalog) Import(ctx context.Context, sourcePath string, expected Expect
 	}
 
 	before, err := os.Lstat(sourcePath)
-	if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Mode().Perm()&0111 == 0 || before.Size() != expected.Size {
-		return Artifact{}, ErrInvalidArtifact
+	if err != nil {
+		return Artifact{}, catalogDiagnostic("artifact_source_validation", storageproto.SafeErrorCode(err), ErrInvalidArtifact, err)
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Mode().Perm()&0111 == 0 || before.Size() != expected.Size {
+		return Artifact{}, catalogDiagnostic("artifact_source_validation", "executable_invalid", ErrInvalidArtifact)
 	}
 	input, err := openSourceNoFollow(sourcePath)
 	if err != nil {
-		return Artifact{}, ErrInvalidArtifact
+		return Artifact{}, catalogDiagnostic("artifact_source_open", storageproto.SafeErrorCode(err), ErrInvalidArtifact, err)
 	}
 	defer input.Close()
 	opened, err := input.Stat()
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) || opened.Size() != expected.Size || !opened.ModTime().Equal(before.ModTime()) {
-		return Artifact{}, ErrInvalidArtifact
+		return Artifact{}, catalogDiagnostic("artifact_source_revalidation", "source_changed", ErrInvalidArtifact, err)
 	}
 
 	stageDir, err := os.MkdirTemp(filepath.Join(c.root, "staging"), "import-")
 	if err != nil {
-		return Artifact{}, ErrUnsafeStore
+		return Artifact{}, catalogDiagnostic("artifact_staging_create", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	defer func() { _ = removeTreeOwned(stageDir) }()
 	stageBinary := filepath.Join(stageDir, "provider")
 	output, err := os.OpenFile(stageBinary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
-		return Artifact{}, ErrUnsafeStore
+		return Artifact{}, catalogDiagnostic("artifact_staging_create", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	h := sha256.New()
 	written, copyErr := copyContext(ctx, io.MultiWriter(output, h), input, make([]byte, copyBufferSize), MaxArtifactBytes)
-	if copyErr == nil && written != expected.Size {
+	sizeMismatch := copyErr == nil && written != expected.Size
+	if sizeMismatch {
 		copyErr = errors.New("source size changed")
 	}
 	if copyErr == nil {
@@ -252,36 +256,43 @@ func (c *Catalog) Import(ctx context.Context, sourcePath string, expected Expect
 		if ctx.Err() != nil {
 			return Artifact{}, ctx.Err()
 		}
-		return Artifact{}, ErrInvalidArtifact
+		code := storageproto.SafeErrorCode(copyErr)
+		if sizeMismatch {
+			code = "source_size_mismatch"
+		}
+		return Artifact{}, catalogDiagnostic("artifact_staging_copy", code, ErrInvalidArtifact, copyErr)
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
 	if digest != expected.SHA256 {
-		return Artifact{}, ErrInvalidArtifact
+		return Artifact{}, catalogDiagnostic("artifact_checksum", "checksum_mismatch", ErrInvalidArtifact)
 	}
 	afterPath, pathErr := os.Lstat(sourcePath)
 	afterFD, fdErr := input.Stat()
 	if pathErr != nil || fdErr != nil || afterPath.Mode()&os.ModeSymlink != 0 || !afterPath.Mode().IsRegular() ||
 		!os.SameFile(before, afterPath) || !os.SameFile(opened, afterFD) || afterPath.Size() != expected.Size || afterFD.Size() != expected.Size ||
 		!afterPath.ModTime().Equal(before.ModTime()) || !afterFD.ModTime().Equal(opened.ModTime()) || afterPath.Mode().Perm()&0111 == 0 || afterFD.Mode().Perm()&0111 == 0 {
-		return Artifact{}, ErrInvalidArtifact
+		return Artifact{}, catalogDiagnostic("artifact_source_revalidation", "source_changed", ErrInvalidArtifact, pathErr, fdErr)
 	}
 	if err := ctx.Err(); err != nil {
 		return Artifact{}, err
 	}
 	if err := os.Chmod(stageBinary, 0500); err != nil {
-		return Artifact{}, ErrUnsafeStore
+		return Artifact{}, catalogDiagnostic("artifact_staging_permissions", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 
 	descriptor, probeErr := probeExecutable(ctx, stageBinary)
-	if probeErr != nil || descriptor.ID != expected.ID || descriptor.Version != expected.Version || descriptor.ProtocolVersion != expected.ProtocolVersion {
+	if probeErr != nil {
 		if ctx.Err() != nil {
 			return Artifact{}, ctx.Err()
 		}
-		return Artifact{}, fmt.Errorf("%w: descriptor probe rejected (probe=%v id=%q version=%q protocol=%d)", ErrInvalidArtifact, probeErr, descriptor.ID, descriptor.Version, descriptor.ProtocolVersion)
+		return Artifact{}, catalogDiagnostic("staged_executable_probe", diagnosticCode(probeErr, "probe_failed"), ErrInvalidArtifact, probeErr)
+	}
+	if descriptor.ID != expected.ID || descriptor.Version != expected.Version || descriptor.ProtocolVersion != expected.ProtocolVersion {
+		return Artifact{}, catalogDiagnostic("staged_descriptor_validation", "descriptor_mismatch", ErrInvalidArtifact, storageproto.ErrProtocol)
 	}
 	fingerprint, err := storageproto.Fingerprint(descriptor)
 	if err != nil {
-		return Artifact{}, ErrInvalidArtifact
+		return Artifact{}, catalogDiagnostic("staged_descriptor_validation", "protocol_invalid", ErrInvalidArtifact, storageproto.ErrProtocol, err)
 	}
 	artifact := Artifact{Digest: digest, ID: descriptor.ID, Version: descriptor.Version, ProtocolVersion: descriptor.ProtocolVersion, DescriptorFingerprint: fingerprint, Size: written}
 	if err := c.publishArtifact(stageDir, artifact, descriptor); err != nil {
@@ -299,12 +310,21 @@ func (c *Catalog) ImportBundled(ctx context.Context, sourcePath, expectedID stri
 		return Artifact{}, ErrInvalidConfig
 	}
 	descriptor, err := probeExecutable(ctx, sourcePath)
-	if err != nil || descriptor.ID != expectedID || descriptor.ProtocolVersion != storageproto.Version {
-		return Artifact{}, ErrInvalidArtifact
+	if err != nil {
+		if ctx.Err() != nil {
+			return Artifact{}, ctx.Err()
+		}
+		return Artifact{}, catalogDiagnostic("bundled_executable_probe", diagnosticCode(err, "probe_failed"), ErrInvalidArtifact, err)
+	}
+	if descriptor.ID != expectedID || descriptor.ProtocolVersion != storageproto.Version {
+		return Artifact{}, catalogDiagnostic("bundled_descriptor_validation", "descriptor_mismatch", ErrInvalidArtifact, storageproto.ErrProtocol)
 	}
 	size, digest, err := stableExecutableDigest(ctx, sourcePath)
 	if err != nil {
-		return Artifact{}, ErrInvalidArtifact
+		if ctx.Err() != nil {
+			return Artifact{}, ctx.Err()
+		}
+		return Artifact{}, catalogDiagnostic("bundled_executable_digest", diagnosticCode(err, "executable_invalid"), ErrInvalidArtifact, err)
 	}
 	return c.Import(ctx, sourcePath, Expected{
 		ID: expectedID, Version: descriptor.Version, ProtocolVersion: storageproto.Version,
@@ -314,16 +334,16 @@ func (c *Catalog) ImportBundled(ctx context.Context, sourcePath, expectedID stri
 
 func probeExecutable(ctx context.Context, binary string) (storageproto.Descriptor, error) {
 	if ctx == nil || !filepath.IsAbs(binary) || filepath.Clean(binary) != binary {
-		return storageproto.Descriptor{}, ErrInvalidArtifact
+		return storageproto.Descriptor{}, catalogDiagnostic("executable_probe_input", "invalid_executable", ErrInvalidArtifact)
 	}
 	probeDir, err := os.MkdirTemp("", "ir-storage-probe-")
 	if err != nil {
-		return storageproto.Descriptor{}, ErrUnsafeStore
+		return storageproto.Descriptor{}, catalogDiagnostic("executable_probe_workspace", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	defer func() { _ = removeTreeOwned(probeDir) }()
 	socketPath, tokenPath, err := createProbeCredentials(probeDir)
 	if err != nil {
-		return storageproto.Descriptor{}, ErrUnsafeStore
+		return storageproto.Descriptor{}, catalogDiagnostic("executable_probe_credentials", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
@@ -334,44 +354,60 @@ func probeExecutable(ctx context.Context, binary string) (storageproto.Descripto
 		if ctx.Err() != nil {
 			return storageproto.Descriptor{}, ctx.Err()
 		}
-		return storageproto.Descriptor{}, ErrInvalidArtifact
+		return storageproto.Descriptor{}, catalogDiagnostic("executable_probe_process", diagnosticCode(err, "process_start_failed"), ErrInvalidArtifact, err)
 	}
 	descriptor, describeErr := client.Describe(probeCtx)
 	closeErr := client.Close()
-	if describeErr != nil || closeErr != nil || storageproto.ValidateDescriptor(descriptor) != nil {
-		return storageproto.Descriptor{}, ErrInvalidArtifact
+	if describeErr != nil {
+		return storageproto.Descriptor{}, catalogDiagnostic("executable_probe_descriptor", diagnosticCode(describeErr, "protocol_invalid"), ErrInvalidArtifact, storageproto.ErrProtocol, describeErr)
+	}
+	if closeErr != nil {
+		return storageproto.Descriptor{}, catalogDiagnostic("executable_probe_cleanup", "process_cleanup_failed", ErrInvalidArtifact, closeErr)
+	}
+	if err := storageproto.ValidateDescriptor(descriptor); err != nil {
+		return storageproto.Descriptor{}, catalogDiagnostic("executable_probe_descriptor", "protocol_invalid", ErrInvalidArtifact, storageproto.ErrProtocol, err)
 	}
 	return descriptor, nil
 }
 
 func stableExecutableDigest(ctx context.Context, sourcePath string) (int64, string, error) {
 	if ctx == nil || !filepath.IsAbs(sourcePath) || filepath.Clean(sourcePath) != sourcePath {
-		return 0, "", ErrInvalidArtifact
+		return 0, "", catalogDiagnostic("executable_digest_input", "invalid_executable", ErrInvalidArtifact)
 	}
 	before, err := os.Lstat(sourcePath)
-	if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Mode().Perm()&0111 == 0 || before.Size() <= 0 || before.Size() > MaxArtifactBytes {
-		return 0, "", ErrInvalidArtifact
+	if err != nil {
+		return 0, "", catalogDiagnostic("executable_digest_source", storageproto.SafeErrorCode(err), ErrInvalidArtifact, err)
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Mode().Perm()&0111 == 0 || before.Size() <= 0 || before.Size() > MaxArtifactBytes {
+		return 0, "", catalogDiagnostic("executable_digest_source", "executable_invalid", ErrInvalidArtifact)
 	}
 	input, err := openSourceNoFollow(sourcePath)
 	if err != nil {
-		return 0, "", ErrInvalidArtifact
+		return 0, "", catalogDiagnostic("executable_digest_source", storageproto.SafeErrorCode(err), ErrInvalidArtifact, err)
 	}
 	defer input.Close()
 	opened, err := input.Stat()
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) || opened.Size() != before.Size() {
-		return 0, "", ErrInvalidArtifact
+		return 0, "", catalogDiagnostic("executable_digest_revalidation", "source_changed", ErrInvalidArtifact, err)
 	}
 	h := sha256.New()
 	written, err := copyContext(ctx, h, input, make([]byte, copyBufferSize), MaxArtifactBytes)
 	if err != nil || written != before.Size() {
-		return 0, "", ErrInvalidArtifact
+		if ctx.Err() != nil {
+			return 0, "", ctx.Err()
+		}
+		code := storageproto.SafeErrorCode(err)
+		if err == nil {
+			code = "source_size_mismatch"
+		}
+		return 0, "", catalogDiagnostic("executable_digest_read", code, ErrInvalidArtifact, err)
 	}
 	afterPath, pathErr := os.Lstat(sourcePath)
 	afterFD, fdErr := input.Stat()
 	if pathErr != nil || fdErr != nil || !afterPath.Mode().IsRegular() || afterPath.Mode()&os.ModeSymlink != 0 ||
 		!os.SameFile(before, afterPath) || !os.SameFile(opened, afterFD) || afterPath.Size() != before.Size() || afterFD.Size() != opened.Size() ||
 		!afterPath.ModTime().Equal(before.ModTime()) || !afterFD.ModTime().Equal(opened.ModTime()) {
-		return 0, "", ErrInvalidArtifact
+		return 0, "", catalogDiagnostic("executable_digest_revalidation", "source_changed", ErrInvalidArtifact, pathErr, fdErr)
 	}
 	return written, hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -992,7 +1028,7 @@ func (c *Catalog) StartProvider(ctx context.Context, setID, socketPath, tokenPat
 	defer c.mu.Unlock()
 	set, err := c.loadSet(setID)
 	if err != nil {
-		return nil, err
+		return nil, catalogDiagnostic("installed_provider_set_load", diagnosticCode(err, "set_unavailable"), ErrInvalidSet, err)
 	}
 	binaryPath := filepath.Join(c.root, "artifacts", set.Artifact.Digest, "provider")
 	startCtx, cancel := context.WithTimeout(ctx, probeTimeout)
@@ -1005,15 +1041,23 @@ func (c *Catalog) StartProvider(ctx context.Context, setID, socketPath, tokenPat
 	if err == nil {
 		var fingerprint string
 		fingerprint, err = storageproto.Fingerprint(descriptor)
-		if err == nil && (descriptor.ID != set.Artifact.ID || descriptor.Version != set.Artifact.Version || descriptor.ProtocolVersion != set.Artifact.ProtocolVersion || fingerprint != set.Artifact.DescriptorFingerprint) {
-			err = ErrInvalidArtifact
+		if err != nil {
+			err = catalogDiagnostic("installed_descriptor_validation", "protocol_invalid", ErrInvalidArtifact, storageproto.ErrProtocol, err)
+		} else if descriptor.ID != set.Artifact.ID || descriptor.Version != set.Artifact.Version || descriptor.ProtocolVersion != set.Artifact.ProtocolVersion || fingerprint != set.Artifact.DescriptorFingerprint {
+			err = catalogDiagnostic("installed_descriptor_validation", "descriptor_fingerprint_mismatch", ErrInvalidArtifact, storageproto.ErrProtocol)
+		}
+	} else {
+		err = catalogDiagnostic("installed_descriptor_read", diagnosticCode(err, "protocol_invalid"), ErrInvalidArtifact, err, storageproto.ErrProtocol)
+	}
+	if err == nil {
+		if configureErr := client.Configure(startCtx, toProtocolConfig(set.Config)); configureErr != nil {
+			err = catalogDiagnostic("installed_provider_configuration", diagnosticCode(configureErr, "provider_configuration_failed"), ErrInvalidArtifact, configureErr)
 		}
 	}
 	if err == nil {
-		err = client.Configure(startCtx, toProtocolConfig(set.Config))
-	}
-	if err == nil {
-		err = client.Probe(startCtx)
+		if probeErr := client.Probe(startCtx); probeErr != nil {
+			err = catalogDiagnostic("installed_provider_probe", diagnosticCode(probeErr, "provider_probe_failed"), ErrInvalidArtifact, probeErr)
+		}
 	}
 	cancel()
 	if err != nil {
@@ -1125,41 +1169,62 @@ func (c *Catalog) loadArtifact(digest string) (Artifact, storageproto.Descriptor
 
 func (c *Catalog) publishArtifact(stageDir string, artifact Artifact, descriptor storageproto.Descriptor) error {
 	if err := writePrivateFile(filepath.Join(stageDir, "descriptor.json"), mustJSON(descriptor), 0400); err != nil {
-		return fmt.Errorf("%w: write artifact descriptor: %v", ErrUnsafeStore, err)
+		return catalogDiagnostic("artifact_publication_metadata", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	// Keep the staging directory writable until it has been renamed: some
 	// filesystems reject renaming a read-only source directory. The published
 	// name is locked down immediately after the atomic rename.
 	if err := os.Chmod(stageDir, 0700); err != nil {
-		return fmt.Errorf("%w: secure artifact stage: %v", ErrUnsafeStore, err)
+		return catalogDiagnostic("artifact_publication_permissions", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	if err := syncDirectory(stageDir); err != nil {
-		return fmt.Errorf("%w: sync artifact stage: %v", ErrUnsafeStore, err)
+		return catalogDiagnostic("artifact_publication_sync", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	artifactRoot := filepath.Join(c.root, "artifacts")
 	target := filepath.Join(artifactRoot, artifact.Digest)
 	if _, err := os.Lstat(target); err == nil {
 		stored, _, loadErr := c.loadArtifact(artifact.Digest)
 		if loadErr != nil || stored != artifact {
-			return ErrUnsafeStore
+			return catalogDiagnostic("artifact_publication_collision", "existing_artifact_invalid", ErrUnsafeStore, loadErr)
 		}
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return ErrUnsafeStore
+		return catalogDiagnostic("artifact_publication_target", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	if err := os.Rename(stageDir, target); err != nil {
 		if stored, _, loadErr := c.loadArtifact(artifact.Digest); loadErr == nil && stored == artifact {
 			return nil
 		}
-		return fmt.Errorf("%w: publish artifact directory: %v", ErrUnsafeStore, err)
+		return catalogDiagnostic("artifact_publication_rename", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	if err := os.Chmod(target, 0500); err != nil {
-		return fmt.Errorf("%w: secure published artifact: %v", ErrUnsafeStore, err)
+		return catalogDiagnostic("artifact_publication_permissions", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	if err := syncDirectory(artifactRoot); err != nil {
-		return fmt.Errorf("%w: sync artifact catalog: %v", ErrUnsafeStore, err)
+		return catalogDiagnostic("artifact_publication_sync", storageproto.SafeErrorCode(err), ErrUnsafeStore, err)
 	}
 	return nil
+}
+
+func catalogDiagnostic(stage, code string, base error, causes ...error) error {
+	all := make([]error, 0, len(causes)+1)
+	if base != nil {
+		all = append(all, base)
+	}
+	all = append(all, causes...)
+	return storageproto.NewDiagnosticError(stage, code, all...)
+}
+
+func diagnosticCode(err error, fallback string) string {
+	if _, code, ok := storageproto.DiagnosticCode(err); ok {
+		return code
+	}
+	if err != nil {
+		if code := storageproto.SafeErrorCode(err); code != "operation_failed" {
+			return code
+		}
+	}
+	return fallback
 }
 
 func (c *Catalog) ensureLayout() error {
@@ -1175,9 +1240,18 @@ func (c *Catalog) ensureLayout() error {
 }
 
 func (c *Catalog) checkLayout() error {
-	for _, path := range []string{c.root, filepath.Join(c.root, "artifacts"), filepath.Join(c.root, "sets"), filepath.Join(c.root, "staging")} {
-		if err := requireDirectory(path, 0700); err != nil {
-			return ErrUnsafeStore
+	for _, item := range []struct{ stage, path string }{
+		{stage: "catalog_root_directory", path: c.root},
+		{stage: "catalog_artifacts_directory", path: filepath.Join(c.root, "artifacts")},
+		{stage: "catalog_sets_directory", path: filepath.Join(c.root, "sets")},
+		{stage: "catalog_staging_directory", path: filepath.Join(c.root, "staging")},
+	} {
+		if err := requireDirectory(item.path, 0700); err != nil {
+			code := storageproto.SafeErrorCode(err)
+			if code == "operation_failed" {
+				code = "directory_invalid"
+			}
+			return storageproto.NewDiagnosticError(item.stage, code, ErrUnsafeStore, err)
 		}
 	}
 	return nil

@@ -28,18 +28,24 @@ func TestProbePhysicalObjectStoreExercisesAndCleansReservedNamespace(t *testing.
 
 func TestProbePhysicalObjectStoreFailsClosedOnIncompleteOperations(t *testing.T) {
 	tests := []struct {
-		name  string
-		setup func(*memoryPhysicalObjects)
+		name          string
+		setup         func(*memoryPhysicalObjects)
+		wantOperation string
 	}{
-		{name: "write before publish", setup: func(m *memoryPhysicalObjects) { m.failPutBefore = true }},
-		{name: "reported digest mismatch", setup: func(m *memoryPhysicalObjects) { m.wrongPutHash = true }},
+		{name: "write before publish", setup: func(m *memoryPhysicalObjects) { m.failPutBefore = true }, wantOperation: "write"},
+		{name: "reported digest mismatch", setup: func(m *memoryPhysicalObjects) { m.wrongPutHash = true }, wantOperation: "write"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			objects := newMemoryPhysicalObjects()
 			test.setup(objects)
-			if err := ProbePhysicalObjectStore(context.Background(), objects); err == nil {
+			err := ProbePhysicalObjectStore(context.Background(), objects)
+			if err == nil {
 				t.Fatal("incomplete provider operation was accepted")
+			}
+			var probeErr *ProbeError
+			if !errors.As(err, &probeErr) || probeErr.OperationCode() != test.wantOperation {
+				t.Fatalf("probe failure=%v probe error=%#v, want operation %q", err, probeErr, test.wantOperation)
 			}
 			objects.mu.Lock()
 			defer objects.mu.Unlock()

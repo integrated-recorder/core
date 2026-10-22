@@ -23,6 +23,7 @@ import (
 	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/runtimehost/adaptercatalog"
 	"github.com/integrated-recorder/core/internal/runtimehost/generation"
+	"github.com/integrated-recorder/core/internal/runtimehost/install"
 	"github.com/integrated-recorder/core/internal/runtimehost/installation"
 	"github.com/integrated-recorder/core/internal/runtimehost/pluginregistry"
 	"github.com/integrated-recorder/core/internal/runtimehost/resources"
@@ -77,6 +78,28 @@ func TestConfigFromEnvOperatorPluginOptIn(t *testing.T) {
 			}
 			if config.AllowOperatorPlugins && config.PluginRegistryURL != pluginregistry.OfficialCatalogV3URL {
 				t.Fatalf("operator opt-in changed registry default: %q", config.PluginRegistryURL)
+			}
+		})
+	}
+}
+
+func TestConfigFromEnvValidatesExplicitImageBundleTransitionIdentity(t *testing.T) {
+	values := map[string]string{
+		"IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION": "0.1.0-rc.9",
+		"IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT":  strings.Repeat("a", 40),
+	}
+	config, err := ConfigFromEnv(func(key string) string { return values[key] })
+	if err != nil || config.BundleUpgradeFrom.Version != values["IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION"] || config.BundleUpgradeFrom.Commit != values["IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT"] {
+		t.Fatalf("valid transition identity = %+v, %v", config.BundleUpgradeFrom, err)
+	}
+	for name, invalid := range map[string]map[string]string{
+		"missing commit": {"IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION": "0.1.0-rc.9"},
+		"unsafe version": {"IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION": "../rc9", "IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT": strings.Repeat("a", 40)},
+		"invalid commit": {"IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION": "0.1.0-rc.9", "IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT": "unknown"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ConfigFromEnv(func(key string) string { return invalid[key] }); err == nil {
+				t.Fatal("invalid image transition identity was accepted")
 			}
 		})
 	}
@@ -367,21 +390,111 @@ func TestSelectRuntimeReleaseUsesDurableActiveIdentity(t *testing.T) {
 	bundle := t.TempDir()
 	build := buildinfoForTest()
 	id := strings.Repeat("a", 32)
-	selected, err := selectRuntimeRelease(generationSnapshotForTest(id, build), build, bundle, filepath.Join(t.TempDir(), "runtime"), nil)
+	selected, err := selectRuntimeRelease(generationSnapshotForTest(id, build), build, bundle, filepath.Join(t.TempDir(), "runtime"), nil, buildinfo.Info{})
 	if err != nil || selected.generationID != id || selected.needsStage || selected.controlPath != filepath.Join(bundle, "control-plane") || selected.enginePath != filepath.Join(bundle, "recorder-engine") {
 		t.Fatalf("matching bundled generation selection = %+v, %v", selected, err)
 	}
 
 	other := build
 	other.Commit = strings.Repeat("f", 40)
-	if _, err := selectRuntimeRelease(generationSnapshotForTest(id, other), build, bundle, filepath.Join(t.TempDir(), "runtime"), nil); err == nil {
+	if _, err := selectRuntimeRelease(generationSnapshotForTest(id, other), build, bundle, filepath.Join(t.TempDir(), "runtime"), nil, buildinfo.Info{}); err == nil {
 		t.Fatal("missing signed installation for the active generation silently fell back to the image bundle")
 	}
 
 	empty := generation.Snapshot{Generations: map[string]generation.Generation{}, Leases: map[string]generation.Lease{}}
-	selected, err = selectRuntimeRelease(empty, build, bundle, filepath.Join(t.TempDir(), "runtime"), nil)
+	selected, err = selectRuntimeRelease(empty, build, bundle, filepath.Join(t.TempDir(), "runtime"), nil, buildinfo.Info{})
 	if err != nil || !selected.needsStage || !generationPattern.MatchString(selected.generationID) {
 		t.Fatalf("fresh bundle selection = %+v, %v", selected, err)
+	}
+}
+
+func TestLegacyImageBundleUpgradeStagesExactNewGenerationAndPreservesPins(t *testing.T) {
+	oldBuild := buildinfo.Info{Version: "0.1.0-rc.9", Commit: strings.Repeat("9", 40), ReleaseChannel: "prerelease"}
+	newBuild := buildinfo.Info{Version: "0.1.0-rc.10-diagnostic", Commit: strings.Repeat("a", 40), ReleaseChannel: "prerelease"}
+	oldID := strings.Repeat("b", 32)
+	state := generationSnapshotForTest(oldID, oldBuild) // Legacy records have no image-source field.
+	old := state.Generations[oldID]
+	old.AdapterSetID = strings.Repeat("c", 64)
+	old.StorageProviderSetID = strings.Repeat("d", 64)
+	old.StorageInstanceID = "si_" + strings.Repeat("e", 32)
+	state.Generations[oldID] = old
+	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	bundle := filepath.Join(t.TempDir(), "bundle")
+
+	if _, err := selectRuntimeRelease(state, newBuild, bundle, runtimeRoot, nil, buildinfo.Info{}); err == nil {
+		t.Fatal("legacy active identity changed without explicit installer provenance")
+	}
+	selected, err := selectRuntimeRelease(state, newBuild, bundle, runtimeRoot, nil, oldBuild)
+	if err != nil || !selected.needsStage || !selected.preserveActivePins || selected.generationID == oldID || selected.appBuild != newBuild {
+		t.Fatalf("explicit image transition selection=%+v err=%v", selected, err)
+	}
+	prepared, candidate, stage, err := prepareStartupGeneration(selected, state, strings.Repeat("f", 64), strings.Repeat("1", 64), "si_"+strings.Repeat("2", 32))
+	if err != nil || !stage || candidate.ID != prepared.generationID || candidate.ID == oldID {
+		t.Fatalf("transition candidate=%+v selected=%+v stage=%t err=%v", candidate, prepared, stage, err)
+	}
+	if candidate.Version != newBuild.Version || candidate.Commit != newBuild.Commit {
+		t.Fatalf("new generation identity=%s/%s, want exact new image %s/%s", candidate.Version, candidate.Commit, newBuild.Version, newBuild.Commit)
+	}
+	if candidate.AdapterSetID != old.AdapterSetID || candidate.StorageProviderSetID != old.StorageProviderSetID || candidate.StorageInstanceID != old.StorageInstanceID {
+		t.Fatalf("image upgrade changed pinned provider tuple: old=%+v new=%+v", old, candidate)
+	}
+	if state.Generations[oldID] != old || state.ActiveGenerationID != oldID {
+		t.Fatalf("selection mutated old active generation: %+v", state.Generations[oldID])
+	}
+}
+
+func TestInvalidInstalledReleaseNeverFallsBackToBundleTransition(t *testing.T) {
+	oldBuild := buildinfo.Info{Version: "0.1.0-rc.9", Commit: strings.Repeat("9", 40)}
+	newBuild := buildinfo.Info{Version: "0.1.0-rc.10-diagnostic", Commit: strings.Repeat("a", 40)}
+	id := strings.Repeat("b", 32)
+	state := generationSnapshotForTest(id, oldBuild)
+	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	releaseDir := filepath.Join(runtimeRoot, "releases", install.ReleaseDirectoryID(oldBuild.Version, oldBuild.Commit))
+	if err := os.MkdirAll(releaseDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := selectRuntimeRelease(state, newBuild, t.TempDir(), runtimeRoot, nil, oldBuild); err == nil || !strings.Contains(err.Error(), "active installed release failed verification") {
+		t.Fatalf("invalid signed-release directory fell back to bundle: %v", err)
+	}
+}
+
+func TestSignedActiveReleaseIsPreservedAcrossImageUpgrade(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, manifestBytes, signature, payloads := signedTestRelease(t, private)
+	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	t.Cleanup(func() {
+		_ = filepath.Walk(runtimeRoot, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			mode := os.FileMode(0600)
+			if info.IsDir() {
+				mode = 0700
+			}
+			_ = os.Chmod(path, mode)
+			return nil
+		})
+	})
+	installer, err := install.NewInstaller(runtimeRoot, map[string]ed25519.PublicKey{"test-key": public}, currentHostCompatibility())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.Stage(context.Background(), &controllerSource{manifest: manifestBytes, signature: signature, payloads: payloads}); err != nil {
+		t.Fatalf("stage signed fixture: %v", err)
+	}
+	activeID := strings.Repeat("b", 32)
+	activeBuild := buildinfo.Info{Version: manifest.ReleaseVersion, Commit: manifest.Commit}
+	state := generationSnapshotForTest(activeID, activeBuild)
+	bundleBuild := buildinfo.Info{Version: "0.1.0-rc.10-diagnostic", Commit: strings.Repeat("a", 40)}
+	selected, err := selectRuntimeRelease(state, bundleBuild, t.TempDir(), runtimeRoot, map[string]ed25519.PublicKey{"test-key": public}, activeBuild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.generationID != activeID || selected.needsStage || selected.preserveActivePins || selected.manifest == nil || selected.appBuild.Version != manifest.ReleaseVersion || selected.appBuild.Commit != manifest.Commit {
+		t.Fatalf("explicitly installed signed release was displaced by image bundle: %+v", selected)
 	}
 }
 
@@ -400,7 +513,7 @@ func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGenera
 	old.ArchiveReadCompatibility = generation.CompatibilityRange{Minimum: 2, Maximum: 2}
 	old.ArchiveWriteFormat = 2
 	registryState.Generations[id] = old
-	selected, err := selectRuntimeRelease(registryState, build, bundle, filepath.Join(t.TempDir(), "runtime"), nil)
+	selected, err := selectRuntimeRelease(registryState, build, bundle, filepath.Join(t.TempDir(), "runtime"), nil, buildinfo.Info{})
 	if err != nil {
 		t.Fatal(err)
 	}

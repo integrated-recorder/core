@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - diagnostic/storage-provider-linux-acceptance
+      - fix/docker-bundled-generation-migration
 
 permissions:
   contents: read
@@ -15,6 +16,7 @@ concurrency:
 jobs:
   official-rc9-to-rc10-upgrade:
     name: Official RC9 install and RC10 upgrade
+    if: github.ref == 'refs/heads/diagnostic/storage-provider-linux-acceptance'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -32,8 +34,29 @@ jobs:
           IR_RUN_STORAGE_UPGRADE_DOCKER_E2E: '1'
         run: python3 scripts/test_storage_provider_linux_acceptance.py OfficialRC9RC10DockerUpgradeTests.test_official_rc9_install_rc10_upgrade_and_pending_rollback_retry -v
 
+  candidate-image-bundle-upgrade:
+    name: RC9 install and candidate image-bundle upgrade
+    if: github.ref == 'refs/heads/fix/docker-bundled-generation-migration'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out candidate commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Record runner Docker environment
+        run: |
+          docker version
+          docker compose version
+          docker info --format '{{.OSType}}/{{.Architecture}}'
+      - name: Install official RC9 and upgrade to exact diagnostic image candidate
+        env:
+          IR_RUN_BUNDLE_UPGRADE_DOCKER_E2E: '1'
+        run: python3 scripts/test_storage_provider_linux_acceptance.py CandidateImageBundleUpgradeDockerTests.test_rc9_image_bundle_migrates_to_candidate_and_resumes_after_verification_retry -v
+
   diagnostic-image:
     name: Diagnostic image and safe failure stages
+    if: github.ref == 'refs/heads/diagnostic/storage-provider-linux-acceptance' || github.ref == 'refs/heads/fix/docker-bundled-generation-migration'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

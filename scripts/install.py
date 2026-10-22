@@ -303,6 +303,16 @@ def render_compose(config: dict[str, Any]) -> str:
     https_port = str(config.get("https_port", CONTAINER_HTTPS_PORT))
     bind = config.get("bind", "127.0.0.1")
     bind_yaml = quote_yaml(bind)
+    bundle_upgrade_from = config.get("bundle_upgrade_from")
+    transition_env = ""
+    if isinstance(bundle_upgrade_from, dict):
+        transition_version = bundle_upgrade_from.get("version")
+        transition_commit = bundle_upgrade_from.get("commit")
+        if isinstance(transition_version, str) and isinstance(transition_commit, str):
+            transition_env = (
+                f'      IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION: {quote_yaml(transition_version)}\n'
+                f'      IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT: {quote_yaml(transition_commit)}\n'
+            )
     return f'''name: {COMPOSE_PROJECT}
 services:
   archiver:
@@ -347,6 +357,7 @@ services:
       IR_ALLOW_OPERATOR_PLUGINS: "0"
       IR_PLUGIN_REGISTRY_URL: https://integrated-recorder.github.io/plugin-registry/catalog-v3.json
       IR_RELEASE_TRUSTED_KEYS_JSON: ""
+{transition_env.rstrip()}
     volumes:
       - type: volume
         source: application-state
@@ -383,6 +394,65 @@ def validate_setup_status(status: dict[str, Any], release: dict[str, Any]) -> No
         raise InstallError("Runtime Host is not ready for setup or normal use; inspect its local container logs.")
     if status.get("state") == "uninitialized" and status.get("administrator_configured"):
         raise InstallError("Runtime Host setup state is inconsistent; the installation was not accepted.")
+
+
+def classify_active_generation(snapshot: Any, release: dict[str, Any]) -> str:
+    """Classify whether candidate app state durably activated before rollback.
+
+    Unknown or malformed state is not safe evidence for restoring an older
+    image. The caller keeps the pending candidate so the operator can retry or
+    inspect it without pairing an old Host binary with a new active generation.
+    """
+    if not isinstance(snapshot, dict):
+        return "unknown"
+    active_id = snapshot.get("active_generation_id")
+    generations = snapshot.get("generations")
+    if not isinstance(active_id, str) or not isinstance(generations, dict):
+        return "unknown"
+    active = generations.get(active_id)
+    if not isinstance(active, dict) or active.get("state") != "active":
+        return "unknown"
+    if active.get("version") == release.get("version") and str(active.get("commit", "")).lower() == str(release.get("commit", "")).lower():
+        return "committed"
+    return "uncommitted"
+
+
+def candidate_generation_state(compose_file: Path, release: dict[str, Any]) -> str:
+    """Read the candidate's durable generation registry without changing it."""
+    try:
+        result = run(compose_command(
+            compose_file, "run", "--rm", "--no-deps", "--entrypoint", "/bin/cat",
+            "archiver", "/data/runtime/state/generations.json",
+        ), check=False)
+    except InstallError:
+        return "unknown"
+    raw = result.stdout or ""
+    if result.returncode != 0 or len(raw.encode("utf-8", errors="replace")) > (1 << 20):
+        return "unknown"
+    try:
+        snapshot = json.loads(raw)
+    except json.JSONDecodeError:
+        return "unknown"
+    return classify_active_generation(snapshot, release)
+
+
+def previous_image_bundle_identity(deployment: dict[str, Any] | None) -> dict[str, str] | None:
+    """Return the exact previous installer-built image identity, if provable."""
+    if not isinstance(deployment, dict) or deployment.get("repository") != REPOSITORY:
+        return None
+    release = deployment.get("release")
+    if not isinstance(release, dict):
+        return None
+    version, commit = release.get("version"), release.get("commit")
+    image = deployment.get("image")
+    if (
+        not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", version)
+        or not isinstance(commit, str) or not COMMIT_SHA.fullmatch(commit)
+        or image != f"localhost/integrated-recorder-core:{commit}"
+        or not isinstance(deployment.get("source_dir"), str) or not deployment.get("source_dir")
+    ):
+        return None
+    return {"version": version, "commit": commit.lower()}
 
 
 def permission_failure_message(path: Path) -> str:
@@ -1062,6 +1132,20 @@ def install(args: argparse.Namespace) -> None:
         "manifest_identity_checked": bool(release_identity.get("manifest_identity_checked")),
         "manifest_signature_independently_verified": False,
     }
+    bundle_upgrade_from = None
+    if policy in ("resume-pending", "select-upgrade"):
+        if pending and isinstance(pending.get("bundle_upgrade_from"), dict):
+            bundle_upgrade_from = pending["bundle_upgrade_from"]
+        current_release = current.get("release") if current else None
+        target_differs = isinstance(current_release, dict) and (
+            current_release.get("version") != release_data["version"]
+            or str(current_release.get("commit", "")).lower() != release_data["commit"].lower()
+        )
+        if bundle_upgrade_from is None and current and target_differs:
+            # Older installers did not write this transition identity. Derive
+            # it only from a complete official installer deployment record so
+            # the RC9 -> fixed-image retry remains resumable.
+            bundle_upgrade_from = previous_image_bundle_identity(current)
     candidate = {
         "schema_version": 1,
         "repository": REPOSITORY,
@@ -1079,6 +1163,8 @@ def install(args: argparse.Namespace) -> None:
         "container_uid": CONTAINER_UID,
         "container_gid": CONTAINER_GID,
     }
+    if bundle_upgrade_from is not None:
+        candidate["bundle_upgrade_from"] = bundle_upgrade_from
     old_compose = install_dir / "compose.yaml"
     candidate_compose = install_dir / "compose.pending.yaml"
     write_compose(candidate_compose, candidate)
@@ -1095,13 +1181,30 @@ def install(args: argparse.Namespace) -> None:
         run(compose_command(candidate_compose, "up", "-d", "--no-build", "--wait", "--wait-timeout", "180", "--remove-orphans", "archiver"), capture=False)
         setup_status = wait_for_runtime(selected_port, release_data, bind=selected_bind)
     except InstallError:
-        if old_compose.is_file() and current is not None:
+        generation_state = candidate_generation_state(candidate_compose, release_data) if current is not None else "unknown"
+        if generation_state == "committed":
+            print(
+                "The candidate application generation is already active; the installer kept the candidate image and pending metadata. "
+                "Retry the same installation to resume verification. The previous image was not restored over newer durable generation state.",
+                file=sys.stderr,
+            )
+        elif generation_state == "unknown":
+            print(
+                "The candidate generation state could not be confirmed; the installer kept the candidate image and pending metadata rather than risk restoring an incompatible previous image.",
+                file=sys.stderr,
+            )
+        elif old_compose.is_file() and current is not None:
             try:
                 run(compose_command(old_compose, "up", "-d", "--no-build", "--wait", "--wait-timeout", "180", "archiver"), capture=False)
             except InstallError:
                 print("The previous Compose definition could not be restored automatically; its data volume was not removed.", file=sys.stderr)
         raise
 
+    # The durable active generation now carries the exact image build
+    # identity. The one-shot legacy transition hint is no longer needed for
+    # subsequent restarts or Compose recreations.
+    candidate.pop("bundle_upgrade_from", None)
+    write_compose(candidate_compose, candidate)
     os.replace(candidate_compose, old_compose)
     candidate.pop("compose_started", None)
     candidate["installed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()

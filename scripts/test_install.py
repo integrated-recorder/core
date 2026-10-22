@@ -149,6 +149,50 @@ class ReleaseSelectionTests(unittest.TestCase):
         for argument in ("VERSION", "COMMIT", "BUILD_TIME", "RELEASE_CHANNEL"):
             self.assertIn(f"        {argument}:", rendered)
 
+    def test_compose_passes_exact_prior_bundle_identity_only_when_upgrade_is_explicit(self):
+        config = deployment_config(version="0.1.0-rc.10-diagnostic", channel="prerelease")
+        prior_commit = "9" * 40
+        config["bundle_upgrade_from"] = {"version": "0.1.0-rc.9", "commit": prior_commit}
+        rendered = install.render_compose(config)
+        self.assertIn('IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION: "0.1.0-rc.9"', rendered)
+        self.assertIn(f'IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT: "{prior_commit}"', rendered)
+        self.assertIn('VERSION: "0.1.0-rc.10-diagnostic"', rendered)
+
+        config.pop("bundle_upgrade_from")
+        self.assertNotIn("IR_IMAGE_BUNDLE_UPGRADE_FROM_", install.render_compose(config))
+
+    def test_installer_bundle_provenance_requires_complete_official_image_metadata(self):
+        metadata = deployment_config()
+        metadata["repository"] = install.REPOSITORY
+        metadata["source_dir"] = "/tmp/pinned-source"
+        self.assertEqual(install.previous_image_bundle_identity(metadata), {"version": "1.2.3", "commit": COMMIT})
+        for field, value in (
+            ("repository", "somewhere-else/core"),
+            ("image", "untrusted/image:tag"),
+            ("source_dir", ""),
+        ):
+            altered = dict(metadata)
+            altered[field] = value
+            with self.subTest(field=field):
+                self.assertIsNone(install.previous_image_bundle_identity(altered))
+
+    def test_candidate_generation_classification_prevents_unsafe_image_rollback(self):
+        release_data = {"version": "0.1.0-rc.10", "commit": "a" * 40}
+        active = {"version": "0.1.0-rc.10", "commit": "A" * 40, "state": "active"}
+        self.assertEqual(install.classify_active_generation({"active_generation_id": "g", "generations": {"g": active}}, release_data), "committed")
+        previous = {"version": "0.1.0-rc.9", "commit": "9" * 40, "state": "active"}
+        self.assertEqual(install.classify_active_generation({"active_generation_id": "g", "generations": {"g": previous}}, release_data), "uncommitted")
+        self.assertEqual(install.classify_active_generation({"generations": {}}, release_data), "unknown")
+
+    def test_candidate_generation_state_reads_only_the_generation_registry(self):
+        release_data = {"version": "0.1.0-rc.10", "commit": "a" * 40}
+        snapshot = {"active_generation_id": "g", "generations": {"g": dict(release_data, state="active")}}
+        result = subprocess.CompletedProcess([], 0, json.dumps(snapshot), "")
+        with mock.patch.object(install, "run", return_value=result) as run_command:
+            state = install.candidate_generation_state(Path("compose.pending.yaml"), release_data)
+        self.assertEqual(state, "committed")
+        self.assertEqual(run_command.call_args.args[0][-2:], ["archiver", "/data/runtime/state/generations.json"])
+
     def test_direct_tls_ports_are_mapped_to_runtime_host_without_proxy_container(self):
         config = deployment_config()
         config.update(bind="0.0.0.0", https_port=18443)
@@ -467,6 +511,7 @@ class ComposeAndInstallSafetyTests(unittest.TestCase):
                  mock.patch.object(install, "verify_image_labels"), \
                  mock.patch.object(install, "verify_image_binaries"), \
                  mock.patch.object(install, "probe_archive_permissions"), \
+                 mock.patch.object(install, "candidate_generation_state", return_value="uncommitted"), \
                  mock.patch.object(install, "wait_for_runtime", readiness) as wait_runtime, \
                  mock.patch.object(install, "bind_port_available", return_value=True), \
                  mock.patch.object(install, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):

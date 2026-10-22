@@ -81,8 +81,13 @@ var generationPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // not read from the environment: production executables come from the image's
 // immutable initial-release directory.
 type Config struct {
-	DataDir              string
-	BundleDir            string
+	DataDir   string
+	BundleDir string
+	// BundleUpgradeFrom is set only by the official installer while replacing
+	// one image-bundled release with another. It lets cold startup distinguish
+	// a legacy image-bundled generation from a signed release without changing
+	// or reinterpreting the immutable generation record.
+	BundleUpgradeFrom    buildinfo.Info
 	StorageLocalBinary   string
 	BundledHLSBinary     string
 	ListenAddr           string
@@ -168,6 +173,14 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	c.AuthDisabled = getenv("AUTH_DISABLED") == "1"
 	c.ForceSecureCookies = getenv("COOKIE_SECURE") == "1"
 	c.ReleaseBundleDir = strings.TrimSpace(getenv("IR_RELEASE_BUNDLE_DIR"))
+	fromVersion := strings.TrimSpace(getenv("IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION"))
+	fromCommit := strings.ToLower(strings.TrimSpace(getenv("IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT")))
+	if fromVersion != "" || fromCommit != "" {
+		if !imageBundleUpgradeIdentityPattern.MatchString(fromVersion) || !imageBundleUpgradeCommitPattern.MatchString(fromCommit) {
+			return Config{}, errors.New("image-bundle upgrade source identity is invalid")
+		}
+		c.BundleUpgradeFrom = buildinfo.Info{Version: fromVersion, Commit: fromCommit}
+	}
 	if value := strings.TrimSpace(getenv("IR_PLUGIN_REGISTRY_URL")); value != "" {
 		c.PluginRegistryURL = value
 	}
@@ -203,6 +216,10 @@ func (c Config) Validate() error {
 	}
 	if c.ReleaseBundleDir != "" && (!filepath.IsAbs(c.ReleaseBundleDir) || filepath.Clean(c.ReleaseBundleDir) != c.ReleaseBundleDir || strings.ContainsRune(c.ReleaseBundleDir, 0)) {
 		return errors.New("IR_RELEASE_BUNDLE_DIR must be an absolute clean path")
+	}
+	if (c.BundleUpgradeFrom.Version == "") != (c.BundleUpgradeFrom.Commit == "") ||
+		(c.BundleUpgradeFrom.Version != "" && (!imageBundleUpgradeIdentityPattern.MatchString(c.BundleUpgradeFrom.Version) || !imageBundleUpgradeCommitPattern.MatchString(c.BundleUpgradeFrom.Commit))) {
+		return errors.New("image-bundle upgrade source identity is invalid")
 	}
 	if strings.ContainsRune(c.FFmpegPath, 0) {
 		return errors.New("FFMPEG_PATH is invalid")
@@ -385,7 +402,7 @@ func Run(ctx context.Context, config Config) error {
 		}
 		registrySnapshot = registry.Snapshot()
 	}
-	selected, err := selectRuntimeRelease(registrySnapshot, build, config.BundleDir, filepath.Join(config.DataDir, "runtime"), config.TrustedReleaseKeys)
+	selected, err := selectRuntimeRelease(registrySnapshot, build, config.BundleDir, filepath.Join(config.DataDir, "runtime"), config.TrustedReleaseKeys, config.BundleUpgradeFrom)
 	if err != nil {
 		return err
 	}
@@ -446,9 +463,27 @@ func Run(ctx context.Context, config Config) error {
 			return errors.New("active Runtime Host adapter set is unavailable")
 		}
 	}
+	if selected.preserveActivePins && activeExists && activeGeneration.AdapterSetID != "" && adapterSet.ID != activeGeneration.AdapterSetID {
+		// An image-bundle application upgrade does not implicitly accept plugin
+		// source changes. The new application generation inherits the exact
+		// adapter set pinned by the active generation; normal reconciliation can
+		// adopt desired changes after startup.
+		adapterSet, err = adapterCatalog.Load(activeGeneration.AdapterSetID)
+		if err != nil {
+			return errors.New("active Runtime Host adapter set is unavailable")
+		}
+	}
 	storageSetID, storageInstanceID, err := resolveStartupStoragePin(storageCatalog, registrySnapshot, localStorageSet.ID)
 	if err != nil {
 		return err
+	}
+	if selected.preserveActivePins && activeExists {
+		if activeGeneration.StorageProviderSetID != "" {
+			storageSetID = activeGeneration.StorageProviderSetID
+		}
+		if activeGeneration.StorageInstanceID != "" {
+			storageInstanceID = activeGeneration.StorageInstanceID
+		}
 	}
 	selected, startupGeneration, needsRegistryStage, err := prepareStartupGeneration(selected, registrySnapshot, adapterSet.ID, storageSetID, storageInstanceID)
 	if err != nil {
@@ -1105,24 +1140,65 @@ func prepareStartupGeneration(selected runtimeRelease, registryState generation.
 		if !ok || active.State != generation.StateActive {
 			return runtimeRelease{}, generation.Generation{}, false, errors.New("active application generation is inconsistent")
 		}
-		if active.AdapterSetID != adapterSetID || active.StorageProviderSetID != storageProviderSetID || active.StorageInstanceID != storageInstanceID {
-			id, err := newGenerationID()
-			if err != nil {
-				return runtimeRelease{}, generation.Generation{}, false, err
+		applicationChanged := active.Version != selected.appBuild.Version || !strings.EqualFold(active.Commit, selected.appBuild.Commit)
+		pinsChanged := active.AdapterSetID != adapterSetID || active.StorageProviderSetID != storageProviderSetID || active.StorageInstanceID != storageInstanceID
+		if !applicationChanged && !pinsChanged {
+			return selected, active, false, nil
+		}
+		id, err := newGenerationID()
+		if err != nil {
+			return runtimeRelease{}, generation.Generation{}, false, err
+		}
+		candidate := active
+		candidate.ID = id
+		candidate.InstalledAt = time.Now().UTC()
+		candidate.State = generation.StateStaging
+		candidate.EngineDormant = false
+		if applicationChanged {
+			candidate.Version = selected.appBuild.Version
+			candidate.Commit = selected.appBuild.Commit
+			if selected.manifest != nil {
+				candidate.ControlProtocol = selected.manifest.ControlProtocolVersion
+				candidate.EngineProtocol = selected.manifest.EngineProtocolVersion
+				candidate.ArchiveReadCompatibility = generation.CompatibilityRange{
+					Minimum: selected.manifest.ArchiveReadMinimum, Maximum: selected.manifest.ArchiveReadMaximum,
+				}
+				candidate.ArchiveWriteFormat = selected.manifest.ArchiveWriteFormat
+			} else {
+				candidate.ControlProtocol = runtimeipc.ProtocolVersion
+				candidate.EngineProtocol = runtimeipc.ProtocolVersion
+				candidate.ArchiveReadCompatibility = generation.CompatibilityRange{
+					Minimum: generation.CurrentArchiveFormatVersion, Maximum: generation.CurrentArchiveFormatVersion,
+				}
+				candidate.ArchiveWriteFormat = generation.CurrentArchiveFormatVersion
 			}
-			candidate := active
-			candidate.ID = id
+		}
+		if selected.preserveActivePins {
+			// The image transition changes only application binaries. Keep the
+			// exact immutable adapter/storage tuple used by the prior generation.
+			candidate.AdapterSetID = active.AdapterSetID
+			if candidate.AdapterSetID == "" {
+				// Older registry entries did not pin adapters. Bind that legacy
+				// generation to the already-confirmed startup set once.
+				candidate.AdapterSetID = adapterSetID
+			}
+			candidate.StorageProviderSetID = active.StorageProviderSetID
+			if candidate.StorageProviderSetID == "" {
+				candidate.StorageProviderSetID = storageProviderSetID
+			}
+			if active.StorageInstanceID != "" {
+				candidate.StorageInstanceID = active.StorageInstanceID
+			} else {
+				candidate.StorageInstanceID = storageInstanceID
+			}
+		} else {
 			candidate.AdapterSetID = adapterSetID
 			candidate.StorageProviderSetID = storageProviderSetID
 			candidate.StorageInstanceID = storageInstanceID
-			candidate.InstalledAt = time.Now().UTC()
-			candidate.State = generation.StateStaging
-			candidate.EngineDormant = false
-			selected.generationID = id
-			selected.needsStage = true
-			return selected, candidate, true, nil
 		}
-		return selected, active, false, nil
+		selected.generationID = id
+		selected.needsStage = true
+		return selected, candidate, true, nil
 	}
 	if !selected.needsStage || !generationPattern.MatchString(selected.generationID) {
 		return runtimeRelease{}, generation.Generation{}, false, errors.New("initial application generation is inconsistent")

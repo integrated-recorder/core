@@ -500,6 +500,178 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                             raise AssertionError("could not restore ownership of the isolated archive test directory")
 
 
+class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
+    """Exercise RC9 -> source-built diagnostic image with the real installer."""
+
+    @unittest.skipUnless(
+        os.environ.get("IR_RUN_BUNDLE_UPGRADE_DOCKER_E2E") == "1",
+        "requires an isolated Linux Docker runner; set IR_RUN_BUNDLE_UPGRADE_DOCKER_E2E=1",
+    )
+    def test_rc9_image_bundle_migrates_to_candidate_and_resumes_after_verification_retry(self):
+        if shutil.which("docker") is None:
+            self.fail("Docker candidate upgrade acceptance was requested but Docker is unavailable")
+        candidate_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+        candidate_time = subprocess.run(
+            ["git", "show", "-s", "--format=%cI", candidate_commit], check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", candidate_commit):
+            self.fail("candidate image commit identity is invalid")
+        version = "0.1.0-rc.10-diagnostic." + candidate_commit[:12]
+        tag = "v" + version
+        selected = {"tag_name": tag, "prerelease": True, "draft": False}
+        identity = {
+            "channel": "prerelease",
+            "manifest_identity_checked": False,
+            "manifest_signature_independently_verified": False,
+        }
+        release_identity = {
+            "tag": tag,
+            "source": install.REPOSITORY_SOURCE,
+            "version": version,
+            "commit": candidate_commit,
+            "build_time": candidate_time,
+            "channel": "prerelease",
+            "architecture_manifest": "amd64",
+            "manifest_identity_checked": False,
+            "manifest_signature_independently_verified": False,
+        }
+        project = "ir-bundle-upgrade-" + uuid.uuid4().hex[:12]
+        volume = project + "-state"
+        with tempfile.TemporaryDirectory(prefix="ir bundle upgrade acceptance ") as temp:
+            root = Path(temp)
+            install_dir = root / "deployment with spaces"
+            archive = root / "recordings with spaces"
+            archive_marker = "candidate-archive-marker"
+            state_marker = "candidate-state-marker"
+            args_rc9 = install.cli_parser().parse_args([
+                "--install-dir", str(install_dir), "--recordings-dir", str(archive), "--version", RC9_TAG,
+            ])
+            args_candidate = install.cli_parser().parse_args([
+                "--install-dir", str(install_dir), "--upgrade", "--version", tag,
+            ])
+
+            def install_candidate():
+                with mock.patch.object(install, "prepare_release", return_value=(selected, candidate_commit, candidate_time, identity)), \
+                     mock.patch.object(install, "prepare_source", return_value=(Path.cwd().resolve(), candidate_time)):
+                    install.install(args_candidate)
+
+            with mock.patch.object(install, "COMPOSE_PROJECT", project), mock.patch.object(install, "STATE_VOLUME", volume):
+                try:
+                    # RC9 is installed from the exact published tag via the
+                    # unmodified official release selection and source path.
+                    install.install(args_rc9)
+                    rc9_metadata = install.load_metadata(install_dir / "deployment.json")
+                    rc9_container = compose_container(install_dir)
+                    rc9 = assert_running_identity(self, rc9_container, RC9_TAG, RC9_COMMIT)
+                    old_generation_id = rc9["registry"]["active_generation_id"]
+                    old_tuple = (
+                        rc9["generation"].get("adapter_set_id"),
+                        rc9["generation"].get("storage_provider_set_id"),
+                        rc9["generation"].get("storage_instance_id"),
+                    )
+                    self.assertTrue(all(old_tuple))
+                    docker([
+                        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", rc9_container,
+                        "/bin/sh", "-ec", f"printf state-preserved > /data/{state_marker}; printf archive-preserved > /data/recordings/{archive_marker}",
+                    ])
+                    old_release_dirs = release_directories(rc9_container)
+
+                    # Fail installer-level acceptance only after the candidate
+                    # Host has made its generation activation durable. The
+                    # installer must not start RC9 against RC10 registry state.
+                    original_wait = install.wait_for_runtime
+                    rejected_once = False
+
+                    def reject_once(*args, **kwargs):
+                        nonlocal rejected_once
+                        if not rejected_once:
+                            rejected_once = True
+                            raise install.InstallError("acceptance injected post-activation verification rejection")
+                        return original_wait(*args, **kwargs)
+
+                    candidate_error = None
+                    with mock.patch.object(install, "wait_for_runtime", side_effect=reject_once):
+                        try:
+                            install_candidate()
+                        except install.InstallError as exc:
+                            candidate_error = exc
+                    self.assertIsNotNone(candidate_error)
+                    self.assertIn("post-activation verification rejection", str(candidate_error))
+                    pending_path = install_dir / "deployment.pending.json"
+                    pending = install.read_pending(pending_path)
+                    self.assertIsNotNone(pending)
+                    self.assertEqual(pending["release"]["commit"], candidate_commit)
+                    self.assertEqual(pending["bundle_upgrade_from"], {"version": RC9_TAG[1:], "commit": RC9_COMMIT})
+                    pending_compose = install_dir / "compose.pending.yaml"
+                    self.assertIn("IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION", pending_compose.read_text(encoding="utf-8"))
+
+                    candidate_container = compose_container(install_dir)
+                    upgraded = assert_running_identity(self, candidate_container, tag, candidate_commit)
+                    self.assertNotEqual(upgraded["registry"]["active_generation_id"], old_generation_id)
+                    old = upgraded["registry"]["generations"].get(old_generation_id)
+                    self.assertIsNotNone(old)
+                    self.assertEqual(old["version"], RC9_TAG[1:])
+                    self.assertEqual(old["commit"], RC9_COMMIT)
+                    self.assertEqual(old["state"], "draining")
+                    new_tuple = (
+                        upgraded["generation"].get("adapter_set_id"),
+                        upgraded["generation"].get("storage_provider_set_id"),
+                        upgraded["generation"].get("storage_instance_id"),
+                    )
+                    self.assertEqual(new_tuple, old_tuple)
+                    self.assertTrue(old_release_dirs.issubset(release_directories(candidate_container)))
+                    self.assertEqual(docker([
+                        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", candidate_container,
+                        "/bin/sh", "-ec", f"test \"$(cat /data/{state_marker})\" = state-preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
+                    ]).returncode, 0)
+
+                    # Retrying the same pending candidate verifies forward
+                    # recovery: it reuses the activated generation, removes the
+                    # one-shot legacy hint, and preserves both mounted stores.
+                    install_candidate()
+                    final_metadata = install.load_metadata(install_dir / "deployment.json")
+                    self.assertIsNone(install.read_pending(pending_path))
+                    self.assertEqual(final_metadata["release"]["version"], version)
+                    final_compose = (install_dir / "compose.yaml").read_text(encoding="utf-8")
+                    self.assertNotIn("IR_IMAGE_BUNDLE_UPGRADE_FROM_", final_compose)
+                    final_container = compose_container(install_dir)
+                    final = assert_running_identity(self, final_container, tag, candidate_commit)
+                    self.assertEqual(final["registry"]["active_generation_id"], upgraded["registry"]["active_generation_id"])
+                    self.assertEqual(install.wait_for_runtime(final_metadata["port"], final_metadata["release"], timeout=30, bind=final_metadata["bind"])["version"], version)
+                    self.assertEqual(docker([
+                        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", final_container,
+                        "/bin/sh", "-ec", f"printf restart-probe > /data/restart-probe && test \"$(cat /data/{state_marker})\" = state-preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
+                    ]).returncode, 0)
+                    install.run(install.compose_command(install_dir / "compose.yaml", "up", "-d", "--no-build", "--force-recreate", "--wait", "--wait-timeout", "180", "archiver"))
+                    restarted = compose_container(install_dir)
+                    restarted_status = assert_running_identity(self, restarted, tag, candidate_commit)
+                    self.assertEqual(restarted_status["registry"]["active_generation_id"], final["registry"]["active_generation_id"])
+                    assert_storage_pin(self, restarted, new_tuple[1])
+                    self.assertEqual(install.wait_for_runtime(final_metadata["port"], final_metadata["release"], timeout=30, bind=final_metadata["bind"])["version"], version)
+                    print(
+                        "Candidate Docker image upgrade PASS: "
+                        f"runtime-host={version}/{candidate_commit}; active-generation={restarted_status['registry']['active_generation_id']}; "
+                        f"RC9-generation-retained={old_generation_id}; adapter/storage pins preserved"
+                    )
+                finally:
+                    for compose_path in (install_dir / "compose.yaml", install_dir / "compose.pending.yaml"):
+                        if compose_path.exists():
+                            install.run(install.compose_command(compose_path, "down", "--remove-orphans"), check=False)
+                    volume_info = docker(["volume", "inspect", "--format={{.Name}}", volume], check=False)
+                    if volume_info.returncode == 0 and volume_info.stdout.strip() == volume:
+                        docker(["volume", "rm", volume])
+                    if archive.exists():
+                        cleanup = docker([
+                            "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+                            "--volume", f"{root}:/acceptance", "alpine:3.21", "-ec",
+                            f"chown -R {os.getuid()}:{os.getgid()} '/acceptance/{archive.name}' && chmod -R u+rwX '/acceptance/{archive.name}'",
+                        ], check=False)
+                        if cleanup.returncode != 0:
+                            raise AssertionError("could not restore ownership of the isolated candidate archive")
+
+
 class DiagnosticImageLinuxDockerTests(unittest.TestCase):
     """Run normal and deliberately failing provider startup in a Docker image."""
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -178,6 +179,7 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                     # This exercises the real installer rollback/pending path.
                     original_wait_for_runtime = install.wait_for_runtime
                     rejected_candidate_readiness = False
+                    candidate_startup_diagnostic = "stage=not_reported code=not_reported"
 
                     def reject_candidate_once(*args, **kwargs):
                         nonlocal rejected_candidate_readiness
@@ -186,9 +188,38 @@ class OfficialRC9RC10DockerUpgradeTests(unittest.TestCase):
                             raise install.InstallError("acceptance injected readiness rejection")
                         return original_wait_for_runtime(*args, **kwargs)
 
-                    with mock.patch.object(install, "wait_for_runtime", side_effect=reject_candidate_once):
-                        with self.assertRaisesRegex(install.InstallError, "acceptance injected"):
-                            install.install(args_rc10)
+                    original_run = install.run
+
+                    def capture_candidate_startup_failure(command, *args, **kwargs):
+                        nonlocal candidate_startup_diagnostic
+                        argv = [str(item) for item in command]
+                        is_candidate_up = str(install_dir / "compose.pending.yaml") in argv and "up" in argv
+                        try:
+                            return original_run(command, *args, **kwargs)
+                        except install.InstallError:
+                            if is_candidate_up:
+                                logs = original_run(install.compose_command(
+                                    install_dir / "compose.pending.yaml", "logs", "--no-color", "--tail", "100", "archiver",
+                                ), check=False)
+                                combined = (logs.stdout or "") + (logs.stderr or "")
+                                matches = re.findall(r"stage=([a-z][a-z0-9_]{0,63}) code=([a-z][a-z0-9_]{0,63})", combined)
+                                if matches:
+                                    stage, code = matches[-1]
+                                    candidate_startup_diagnostic = f"stage={stage} code={code}"
+                                print(f"RC10 candidate Compose startup failed; {candidate_startup_diagnostic}")
+                            raise
+
+                    candidate_error = None
+                    with mock.patch.object(install, "run", side_effect=capture_candidate_startup_failure):
+                        with mock.patch.object(install, "wait_for_runtime", side_effect=reject_candidate_once):
+                            try:
+                                install.install(args_rc10)
+                            except install.InstallError as exc:
+                                candidate_error = exc
+                    if candidate_error is None:
+                        self.fail("acceptance readiness rejection was not reached")
+                    if "acceptance injected readiness rejection" not in str(candidate_error):
+                        self.fail(f"RC10 candidate failed before readiness acceptance: {candidate_error}; {candidate_startup_diagnostic}")
                     pending_path = install_dir / "deployment.pending.json"
                     pending = install.read_pending(pending_path)
                     self.assertIsNotNone(pending)

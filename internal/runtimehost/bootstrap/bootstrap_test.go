@@ -395,7 +395,7 @@ func TestSelectRuntimeReleaseUsesDurableActiveIdentity(t *testing.T) {
 	build := buildinfoForTest()
 	id := strings.Repeat("a", 32)
 	selected, err := selectRuntimeRelease(generationSnapshotForTest(id, build), build, bundle, filepath.Join(t.TempDir(), "runtime"), nil, buildinfo.Info{})
-	if err != nil || selected.generationID != id || selected.needsStage || selected.controlPath != filepath.Join(bundle, "control-plane") || selected.enginePath != filepath.Join(bundle, "recorder-engine") {
+	if err != nil || selected.generationID != id || selected.needsStage || !selected.preserveActivePins || selected.controlPath != filepath.Join(bundle, "control-plane") || selected.enginePath != filepath.Join(bundle, "recorder-engine") {
 		t.Fatalf("matching bundled generation selection = %+v, %v", selected, err)
 	}
 
@@ -471,11 +471,11 @@ func TestImageBundleUpgradeRetryRecognizesAlreadyActiveCandidate(t *testing.T) {
 		t.Fatalf("retry selection lost transition provenance: %+v", selected)
 	}
 
-	// A stale or unrelated installer marker must not turn an ordinary matching
-	// bundle startup into an image-transition recovery path.
+	// A stale or unrelated marker must not authorize source-generation cleanup.
+	// The active image-bundled generation still retains its own provider pins.
 	selected, err = selectRuntimeRelease(snapshot, newBuild, t.TempDir(), filepath.Join(t.TempDir(), "runtime"), nil,
 		buildinfo.Info{Version: "0.1.0-rc.8", Commit: strings.Repeat("8", 40)})
-	if err != nil || selected.preserveActivePins || selected.imageBundleUpgradeSourceGenerationID != "" {
+	if err != nil || !selected.preserveActivePins || selected.imageBundleUpgradeSourceGenerationID != "" {
 		t.Fatalf("unrelated installer marker authorized transition recovery: %+v, %v", selected, err)
 	}
 }

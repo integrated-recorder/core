@@ -58,9 +58,12 @@ func selectRuntimeRelease(snapshot generation.Snapshot, bundleBuild buildinfo.In
 		}
 		if active.Version == bundleBuild.Version && strings.EqualFold(active.Commit, bundleBuild.Commit) {
 			// If the installer is retrying a transition that already persisted the
-			// candidate generation, retain the same explicit provenance until the
-			// installer commits its metadata. The previous generation remains the
-			// exact source of the transition and may still need cold-start cleanup.
+			// candidate generation, retain its explicit source provenance until the
+			// installer commits its metadata. The active image-bundled generation's
+			// immutable adapter/storage pins also remain authoritative on ordinary
+			// restarts of the same image. A changed bundled provider is reconciled
+			// through a separate generation transition, never as a side effect of
+			// selecting the current application image.
 			upgradeSourceID := ""
 			if bundleUpgradeFrom.Version != "" && snapshot.PreviousGenerationID != "" {
 				previous, exists := snapshot.Generations[snapshot.PreviousGenerationID]
@@ -70,7 +73,7 @@ func selectRuntimeRelease(snapshot generation.Snapshot, bundleBuild buildinfo.In
 			}
 			return runtimeRelease{
 				generationID: activeID, directory: bundleDir,
-				preserveActivePins: upgradeSourceID != "", imageBundleUpgradeSourceGenerationID: upgradeSourceID,
+				preserveActivePins: true, imageBundleUpgradeSourceGenerationID: upgradeSourceID,
 				controlPath: filepath.Join(bundleDir, "control-plane"), enginePath: filepath.Join(bundleDir, "recorder-engine"), appBuild: bundleBuild,
 			}, nil
 		}

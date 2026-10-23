@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const selectedOwnerLogin = 'rc8-owner-test'
-const initialPassword = 'first-run-product-e2e-password-2026'
+const initialPassword = 'A7bc-defghijk-lmnopq'
 const dataDir = process.env.IR_SETUP_E2E_DATA_DIR
 const restartFile = process.env.IR_SETUP_E2E_RESTART_FILE
 
@@ -36,49 +36,77 @@ async function requestHostRestart() {
   }, { timeout: 30_000 }).toBe(true)
 }
 
-test('fresh setup resolves browser locale before authentication', async ({ browser }, testInfo) => {
+test('setup stepper geometry adapts to locale, color scheme, and viewport', async ({ browser }, testInfo) => {
+  const viewports = [
+    { name: 'desktop', width: 1440, height: 900 },
+    { name: 'mobile', width: 390, height: 844 },
+    { name: 'compact-mobile', width: 320, height: 720 },
+  ]
+
   for (const locale of ['en-US', 'ko-KR'] as const) {
-    const context = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale })
-    const page = await context.newPage()
-    await page.goto('/')
-    await expect(page).toHaveURL(/\/setup$/)
-    await expect(page.locator('html')).toHaveAttribute('lang', locale)
-    if (locale === 'en-US') {
-      await expect(page.getByRole('heading', { name: 'Get started with Integrated Recorder' })).toBeVisible()
-      await expect(page.getByText('Complete a few checks before starting archive operations.')).toHaveCount(0)
-      expect(await page.locator('body').innerText()).not.toMatch(/[\uac00-\ud7a3]/)
-    } else {
-      await expect(page.getByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeVisible()
-      await expect(page.getByText('몇 가지 확인을 마치면 보관 작업을 시작할 수 있습니다.')).toHaveCount(0)
-      expect(await page.locator('body').innerText()).toMatch(/[\uac00-\ud7a3]/)
-    }
-    for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }, { name: 'compact-mobile', width: 320, height: 720 }]) {
-      await page.setViewportSize({ width: viewport.width, height: viewport.height })
-      const dimensions = await page.evaluate(() => ({ body: document.body.scrollWidth, viewport: window.innerWidth }))
-      expect(dimensions.body).toBeLessThanOrEqual(dimensions.viewport)
-      await page.screenshot({ path: testInfo.outputPath(`setup-${locale}-${viewport.name}.png`), fullPage: true })
-    }
+    for (const colorScheme of ['light', 'dark'] as const) {
+      const context = await browser.newContext({ baseURL: 'http://127.0.0.1:4173', locale, colorScheme })
+      const page = await context.newPage()
+      await page.goto('/')
+      await expect(page).toHaveURL(/\/setup$/)
+      await expect(page.locator('html')).toHaveAttribute('lang', locale)
+      await expect.poll(() => page.locator('html').evaluate(element => element.classList.contains('dark'))).toBe(colorScheme === 'dark')
+      if (locale === 'en-US') {
+        await expect(page.getByRole('heading', { name: 'Get started with Integrated Recorder' })).toBeVisible()
+        await expect(page.getByText('Complete a few checks before starting archive operations.')).toHaveCount(0)
+        expect(await page.locator('body').innerText()).not.toMatch(/[\uac00-\ud7a3]/)
+      } else {
+        await expect(page.getByRole('heading', { name: 'Integrated Recorder 시작하기' })).toBeVisible()
+        await expect(page.getByText('몇 가지 확인을 마치면 보관 작업을 시작할 수 있습니다.')).toHaveCount(0)
+        expect(await page.locator('body').innerText()).toMatch(/[\uac00-\ud7a3]/)
+      }
 
-    await page.getByRole('button', { name: locale === 'en-US' ? 'Get started' : '시작하기' }).click()
-    const stepper = page.getByRole('navigation', { name: locale === 'en-US' ? 'Setup steps' : '설치 단계' })
-    await expect(stepper.locator('[aria-current="step"] [data-step-indicator] > span:last-child')).toHaveText(locale === 'en-US' ? 'Administrator' : '관리자')
-    await expect(stepper.locator('li[data-step-state="complete"]')).toHaveCount(1)
-    await expect(stepper.locator('[data-step-connector="true"]')).toHaveCount(4)
+      await page.getByRole('button', { name: locale === 'en-US' ? 'Get started' : '시작하기' }).click()
+      const stepper = page.getByRole('navigation', { name: locale === 'en-US' ? 'Setup steps' : '설치 단계' })
+      await expect(stepper.locator('[aria-current="step"] [data-step-indicator] > span:last-child')).toHaveText(locale === 'en-US' ? 'Administrator' : '관리자')
+      await expect(stepper.locator('li[data-step-state="complete"]')).toHaveCount(1)
+      await expect(stepper.locator('[data-step-connector="true"]')).toHaveCount(4)
 
-    for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }, { name: 'compact-mobile', width: 320, height: 720 }]) {
-      await page.setViewportSize({ width: viewport.width, height: viewport.height })
-      const geometry = await stepper.locator('[data-step-indicator="true"]').evaluateAll(indicators => indicators.map(indicator => {
-        const rect = indicator.getBoundingClientRect()
-        return { centerX: rect.left + rect.width / 2, top: rect.top }
-      }))
-      expect(geometry).toHaveLength(5)
-      expect(geometry.every((item, index) => index === 0 || item.centerX > geometry[index - 1].centerX)).toBe(true)
-      expect(geometry.every(item => Math.abs(item.top - geometry[0].top) < 1)).toBe(true)
-      const dimensions = await page.evaluate(() => ({ body: document.body.scrollWidth, viewport: window.innerWidth }))
-      expect(dimensions.body).toBeLessThanOrEqual(dimensions.viewport)
-      await page.screenshot({ path: testInfo.outputPath(`setup-owner-${locale}-${viewport.name}.png`), fullPage: true })
+      for (const viewport of viewports) {
+        await page.setViewportSize({ width: viewport.width, height: viewport.height })
+        const geometry = await stepper.evaluate(element => {
+          const markers = Array.from(element.querySelectorAll<HTMLElement>('[data-step-marker="true"]'))
+          const connectors = Array.from(element.querySelectorAll<HTMLElement>('[data-step-connector="true"]'))
+          return {
+            nav: element.getBoundingClientRect().toJSON(),
+            markers: markers.map(marker => {
+              const rect = marker.getBoundingClientRect()
+              return { left: rect.left, right: rect.right, centerY: rect.top + rect.height / 2, zIndex: getComputedStyle(marker).zIndex, background: getComputedStyle(marker).backgroundColor }
+            }),
+            connectors: connectors.map(connector => {
+              const rect = connector.getBoundingClientRect()
+              return { left: rect.left, right: rect.right, centerY: rect.top + rect.height / 2, height: rect.height, zIndex: getComputedStyle(connector).zIndex }
+            }),
+          }
+        })
+        expect(geometry.markers).toHaveLength(5)
+        expect(geometry.connectors).toHaveLength(4)
+        expect(geometry.nav.left).toBeGreaterThanOrEqual(0)
+        expect(geometry.nav.right).toBeLessThanOrEqual(viewport.width)
+        for (let index = 0; index < geometry.connectors.length; index += 1) {
+          const marker = geometry.markers[index]
+          const nextMarker = geometry.markers[index + 1]
+          const connector = geometry.connectors[index]
+          expect(connector.left).toBeCloseTo(marker.right, 0)
+          expect(connector.right).toBeCloseTo(nextMarker.left, 0)
+          expect(Math.abs(connector.centerY - marker.centerY)).toBeLessThanOrEqual(0.5)
+          expect(connector.height).toBe(1)
+          expect(Number(connector.zIndex)).toBeLessThan(Number(marker.zIndex))
+          expect(marker.background).not.toBe('rgba(0, 0, 0, 0)')
+          expect(marker.background).not.toBe('transparent')
+        }
+        expect(geometry.markers.every((marker, index) => index === 0 || marker.left > geometry.markers[index - 1].left)).toBe(true)
+        const dimensions = await page.evaluate(() => ({ body: document.body.scrollWidth, viewport: window.innerWidth }))
+        expect(dimensions.body).toBeLessThanOrEqual(dimensions.viewport)
+        await page.screenshot({ path: testInfo.outputPath(`setup-${locale}-${colorScheme}-${viewport.name}.png`) })
+      }
+      await context.close()
     }
-    await context.close()
   }
 })
 
@@ -136,12 +164,35 @@ test('fresh installation completes through product APIs and remains ready after 
 
   await page.getByRole('button', { name: '시작하기' }).click()
   const setupUsername = page.getByLabel('계정')
+  const setupPassword = page.getByLabel('관리자 비밀번호')
+  const setupConfirmation = page.getByLabel('비밀번호 확인')
+  const ownerForm = setupUsername.locator('xpath=ancestor::form')
+  await expect(ownerForm).toHaveAttribute('id', 'owner-bootstrap-form')
+  await expect(ownerForm).toHaveAttribute('name', 'owner-bootstrap')
+  await expect(ownerForm).toHaveAttribute('method', 'post')
+  await expect(ownerForm).toHaveAttribute('autocomplete', 'on')
   await expect(setupUsername).toHaveAttribute('name', 'username')
+  await expect(setupUsername).toHaveAttribute('id', 'setup-username')
   await expect(setupUsername).toHaveAttribute('autocomplete', 'username')
   await expect(setupUsername).not.toHaveAttribute('readonly')
-  await setupUsername.fill(selectedOwnerLogin)
-  await page.getByLabel('관리자 비밀번호').fill(initialPassword)
-  await page.getByLabel('비밀번호 확인').fill(initialPassword)
+  await expect(setupPassword).toHaveAttribute('name', 'password')
+  await expect(setupPassword).toHaveAttribute('id', 'setup-password')
+  await expect(setupPassword).toHaveAttribute('autocomplete', 'new-password')
+  await expect(setupConfirmation).toHaveAttribute('name', 'password_confirmation')
+  await expect(setupConfirmation).toHaveAttribute('id', 'setup-password-confirm')
+  await expect(setupConfirmation).toHaveAttribute('autocomplete', 'new-password')
+  for (const [field, value] of [[setupUsername, selectedOwnerLogin], [setupPassword, initialPassword], [setupConfirmation, initialPassword]] as const) {
+    await field.evaluate((element, nativeValue) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      if (!setter) throw new Error('native input value setter is unavailable')
+      setter.call(element as HTMLInputElement, nativeValue)
+    }, value)
+  }
+  const submittedFormValues = await ownerForm.evaluate(form => {
+    const data = new FormData(form as HTMLFormElement)
+    return ['username', 'password', 'password_confirmation'].map(name => data.get(name))
+  })
+  expect(submittedFormValues).toEqual([selectedOwnerLogin, initialPassword, initialPassword])
   await page.getByRole('button', { name: '관리자 계정 만들기' }).click()
 
   await expect.poll(() => bootstrapResponseStatus).not.toBe(0)

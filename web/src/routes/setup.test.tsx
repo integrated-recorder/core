@@ -128,18 +128,62 @@ describe('first-run setup flow', () => {
     expect(password).toHaveAttribute('autocomplete', 'new-password')
     expect(confirmation).toHaveAttribute('name', 'password_confirmation')
     expect(confirmation).toHaveAttribute('autocomplete', 'new-password')
+    expect(username).toHaveAttribute('id', 'setup-username')
+    expect(password).toHaveAttribute('id', 'setup-password')
+    expect(confirmation).toHaveAttribute('id', 'setup-password-confirm')
+    expect(username.labels?.[0]).toHaveAttribute('for', 'setup-username')
+    expect(password.labels?.[0]).toHaveAttribute('for', 'setup-password')
+    expect(confirmation.labels?.[0]).toHaveAttribute('for', 'setup-password-confirm')
     expect(username.compareDocumentPosition(password) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     const form = username.closest('form')!
+    expect(form).toHaveAttribute('id', 'owner-bootstrap-form')
+    expect(form).toHaveAttribute('name', 'owner-bootstrap')
+    expect(form).toHaveAttribute('method', 'post')
+    expect(form).toHaveAttribute('autocomplete', 'on')
     expect(password.closest('form')).toBe(form)
     expect(form).toContainElement(screen.getByRole('button', { name: '관리자 계정 만들기' }))
+    expect(password).not.toHaveAttribute('minlength')
+    expect(password).not.toHaveAttribute('maxlength')
+    expect(password).not.toHaveAttribute('passwordrules')
 
     setNativeInputValue(username, 'sangwook')
-    setNativeInputValue(password, 'a-strong-passphrase')
-    setNativeInputValue(confirmation, 'a-strong-passphrase')
+    // Mirrors a currently documented Apple generated password: printable ASCII,
+    // 20 characters, and within the server's 12–72 UTF-8 byte contract.
+    const generatedPassword = 'A7bc-defghijk-lmnopq'
+    setNativeInputValue(password, generatedPassword)
+    setNativeInputValue(confirmation, generatedPassword)
+    expect(new FormData(form).get('username')).toBe('sangwook')
+    expect(new FormData(form).get('password')).toBe(generatedPassword)
+    expect(new FormData(form).get('password_confirmation')).toBe(generatedPassword)
     fireEvent.submit(form)
-    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledWith('sangwook', 'a-strong-passphrase'))
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledWith('sangwook', generatedPassword))
     await waitFor(() => expect(mocks.begin).toHaveBeenCalledTimes(1))
     expect(await screen.findByRole('heading', { name: '저장소 확인' })).toBeInTheDocument()
+  })
+
+  it('keeps native AutoFill values mounted until the bootstrap and setup transition succeeds', async () => {
+    let finishBegin: (() => void) | undefined
+    mocks.begin.mockReturnValueOnce(new Promise(resolve => { finishBegin = () => resolve(status('setup_in_progress')) }))
+    renderSetup()
+    fireEvent.click(await screen.findByRole('button', { name: '시작하기' }))
+    const username = screen.getByLabelText('계정') as HTMLInputElement
+    const password = screen.getByLabelText('관리자 비밀번호') as HTMLInputElement
+    const confirmation = screen.getByLabelText('비밀번호 확인') as HTMLInputElement
+    const form = username.closest('form')!
+    setNativeInputValue(username, 'autofill-owner')
+    setNativeInputValue(password, 'A7bc-defghijk-lmnopq')
+    setNativeInputValue(confirmation, 'A7bc-defghijk-lmnopq')
+
+    fireEvent.submit(form)
+    await waitFor(() => expect(mocks.begin).toHaveBeenCalledTimes(1))
+    expect(form.isConnected).toBe(true)
+    expect(username).toHaveValue('autofill-owner')
+    expect(password).toHaveValue('A7bc-defghijk-lmnopq')
+    expect(confirmation).toHaveValue('A7bc-defghijk-lmnopq')
+
+    finishBegin?.()
+    expect(await screen.findByRole('heading', { name: '저장소 확인' })).toBeInTheDocument()
+    expect(form.isConnected).toBe(false)
   })
 
   it('rejects password mismatch before submitting the bootstrap request', async () => {

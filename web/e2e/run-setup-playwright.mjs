@@ -244,10 +244,13 @@ async function main() {
 
   const playwrightCLI = join(webDir, 'node_modules', '@playwright', 'test', 'cli.js')
   if (!existsSync(playwrightCLI)) throw new Error('Playwright is not installed. Run npm ci in web/.')
-  playwright = spawn(process.execPath, [playwrightCLI, 'test', '--config', 'playwright.setup.config.ts', ...process.argv.slice(2)], {
+  const useWebKit = process.argv.includes('--webkit')
+  const playwrightArgs = process.argv.slice(2).filter(argument => argument !== '--webkit')
+  playwright = spawn(process.execPath, [playwrightCLI, 'test', '--config', 'playwright.setup.config.ts', ...playwrightArgs], {
     cwd: webDir,
     env: {
       ...process.env,
+      IR_SETUP_E2E_BROWSER: useWebKit ? 'webkit' : 'chromium',
       IR_SETUP_E2E_DATA_DIR: dataDir,
       IR_SETUP_E2E_RESTART_FILE: controlFile,
     },

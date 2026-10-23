@@ -241,9 +241,9 @@ export function SetupPage() {
                 const current = item.id === visibleStep
                 const complete = index < activeIndex
                 return <li key={item.id} aria-current={current ? 'step' : undefined} data-step-state={current ? 'current' : complete ? 'complete' : 'upcoming'} className="relative min-w-0 flex-1">
-                  {index < stepList.length - 1 && <span aria-hidden="true" data-step-connector="true" className={`absolute left-1/2 top-3 h-px w-full ${index < activeIndex ? 'bg-emerald-600' : 'bg-border'}`} />}
+                  {index < stepList.length - 1 && <span aria-hidden="true" data-step-connector="true" className={`pointer-events-none absolute left-[calc(50%_+_12px)] top-3 z-0 h-px w-[calc(100%_-_24px)] ${index < activeIndex ? 'bg-emerald-600' : 'bg-border'}`} />}
                   <span data-step-indicator="true" className="relative z-10 flex min-w-0 flex-col items-center text-center">
-                    <span aria-hidden="true" className={`grid h-6 w-6 shrink-0 place-items-center rounded-full border text-xs ${complete ? 'border-emerald-600 bg-emerald-600 text-white' : current ? 'border-primary bg-primary/10 font-semibold text-primary' : 'border-border bg-card text-muted-foreground'}`}>{complete ? <Check className="h-3.5 w-3.5" /> : index + 1}</span>
+                    <span data-step-marker="true" aria-hidden="true" className={`relative z-10 grid h-6 w-6 shrink-0 place-items-center rounded-full border text-xs ${complete ? 'border-emerald-600 bg-emerald-600 text-white' : current ? 'border-primary bg-card font-semibold text-primary' : 'border-border bg-card text-muted-foreground'}`}>{complete ? <Check className="h-3.5 w-3.5" /> : index + 1}</span>
                     <span className={`mt-2 max-w-full break-words text-[10px] leading-tight sm:text-xs ${current ? 'font-semibold text-primary' : complete ? 'text-foreground' : 'text-muted-foreground'}`}>{t(item.label)}</span>
                   </span>
                 </li>
@@ -260,7 +260,7 @@ export function SetupPage() {
               <div className="flex justify-end"><Button onClick={() => status.state === 'uninitialized' && !status.auth_disabled ? setStep('administrator') : begin.mutate()} disabled={begin.isPending}>{begin.isPending ? t('setup.welcome.starting') : t('setup.welcome.start')}<ArrowRight className="h-4 w-4" /></Button></div>
             </div>}
 
-            {visibleStep === 'administrator' && <form ref={administratorForm} className="w-full max-w-3xl space-y-5" onSubmit={submitAdministrator}>
+            {visibleStep === 'administrator' && <form ref={administratorForm} id="owner-bootstrap-form" name="owner-bootstrap" method="post" autoComplete="on" className="w-full max-w-3xl space-y-5" onSubmit={submitAdministrator}>
               <div>
                 <p className="text-sm leading-6 text-muted-foreground">{t('setup.owner.description')}</p>
               </div>

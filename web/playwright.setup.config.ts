@@ -2,6 +2,7 @@ import { defineConfig, devices } from '@playwright/test'
 
 const dataDir = process.env.IR_SETUP_E2E_DATA_DIR
 const restartFile = process.env.IR_SETUP_E2E_RESTART_FILE
+const webkit = process.env.IR_SETUP_E2E_BROWSER === 'webkit'
 if (!dataDir || !restartFile) {
   throw new Error('Run the real-product first-run E2E through `npm run test:e2e:setup`.')
 }
@@ -19,7 +20,6 @@ export default defineConfig({
     baseURL: 'http://127.0.0.1:4173',
     // Credential form traces stay disabled to avoid retaining password values.
     trace: 'off',
-    ...devices['Desktop Chrome'],
-    channel: 'chrome',
+    ...(webkit ? { browserName: 'webkit' as const, viewport: { width: 1280, height: 720 } } : { ...devices['Desktop Chrome'], channel: 'chrome' }),
   },
 })

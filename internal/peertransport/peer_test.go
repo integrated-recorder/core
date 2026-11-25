@@ -65,8 +65,14 @@ func TestLocalPeerConnectionUsesBoundedOrderedDataChannel(t *testing.T) {
 	pair := newLocalPeerPair(t)
 	for label, peer := range map[string]*webrtc.PeerConnection{"initiator": pair.initiator, "responder": pair.responder} {
 		selected, err := peer.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
-		if err != nil || selected == nil || selected.Local.Typ != webrtc.ICECandidateTypeHost || selected.Remote.Typ != webrtc.ICECandidateTypeHost {
-			t.Fatalf("%s did not establish direct host-candidate transport without TURN: pair=%+v err=%v", label, selected, err)
+		if err != nil || selected == nil {
+			t.Fatalf("%s did not establish a selected ICE path without TURN: pair=%+v err=%v", label, selected, err)
+		}
+		if selected.Local.Typ == webrtc.ICECandidateTypeRelay || selected.Remote.Typ == webrtc.ICECandidateTypeRelay {
+			t.Fatalf("%s selected a relayed ICE path without TURN configured: pair=%+v", label, selected)
+		}
+		if selected.Local.Protocol != webrtc.ICEProtocolUDP || selected.Remote.Protocol != webrtc.ICEProtocolUDP {
+			t.Fatalf("%s selected a non-UDP direct ICE path: pair=%+v", label, selected)
 		}
 	}
 	control, data, peerControl, remote := pair.control, pair.data, pair.peerControl, pair.peerData

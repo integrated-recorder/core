@@ -46,7 +46,61 @@ func TestStartFailureDiagnosticsAreSafeAndDistinguishFailureClasses(t *testing.T
 	}
 
 	assertDiagnostic("not-executable", "exit 0", 0600, time.Second, "executable_invalid", nil)
-	assertDiagnostic("permission-exit", `echo "$2 DO_NOT_LOG_THIS: operation not permitted" >&2; exit 9`, 0700, time.Second, "child_exit_permission_denied", ErrProcessExited)
+	permissionBinary := filepath.Join(dir, "permission-exit")
+	permissionMarker := filepath.Join(dir, "permission-exit.started")
+	permissionScript := `: > "` + permissionMarker + `"; echo "$2 DO_NOT_LOG_THIS: operation not permitted" >&2; exit 9`
+	if err := os.WriteFile(permissionBinary, []byte("#!/bin/sh\n"+permissionScript+"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	permissionResult := make(chan error, 1)
+	go func() {
+		_, err := Start(context.Background(), StartOptions{
+			Binary: permissionBinary, SocketPath: filepath.Join(dir, "permission-exit.sock"), TokenFile: tokenPath,
+			StartupTimeout: 5 * time.Second,
+		})
+		permissionResult <- err
+	}()
+	startDeadline := time.NewTimer(5 * time.Second)
+	tick := time.NewTicker(5 * time.Millisecond)
+	started := false
+	permissionErr := error(nil)
+	resultReceived := false
+	for !started {
+		select {
+		case err := <-permissionResult:
+			if _, statErr := os.Stat(permissionMarker); statErr != nil {
+				startDeadline.Stop()
+				t.Fatalf("permission-exit completed before its script-start marker: %v", err)
+			}
+			permissionErr = err
+			resultReceived = true
+			started = true
+		case <-tick.C:
+			if _, err := os.Stat(permissionMarker); err == nil {
+				started = true
+			}
+		case <-startDeadline.C:
+			t.Fatal("permission-exit script was not scheduled before its bounded test deadline")
+		}
+	}
+	tick.Stop()
+	startDeadline.Stop()
+	if !resultReceived {
+		select {
+		case permissionErr = <-permissionResult:
+		case <-time.After(5 * time.Second):
+			t.Fatal("permission-exit did not finish after writing its start marker")
+		}
+	}
+	var permissionDiagnostic *DiagnosticError
+	if permissionErr == nil || !errors.As(permissionErr, &permissionDiagnostic) || permissionDiagnostic.Code() != "child_exit_permission_denied" || !errors.Is(permissionErr, ErrProcessExited) {
+		t.Fatalf("permission-exit diagnostic = %#v (%v), want child_exit_permission_denied", permissionDiagnostic, permissionErr)
+	}
+	for _, secret := range []string{dir, tokenPath, "DO_NOT_LOG_THIS"} {
+		if strings.Contains(permissionErr.Error(), secret) {
+			t.Fatalf("permission-exit diagnostic exposed sensitive value %q: %v", secret, permissionErr)
+		}
+	}
 	assertDiagnostic("socket-timeout", "exec /bin/sleep 10", 0700, 75*time.Millisecond, "socket_connect_timeout", context.DeadlineExceeded)
 	missingInterpreter := filepath.Join(dir, "missing-interpreter")
 	if err := os.WriteFile(missingInterpreter, []byte("#!/path/that/does/not/exist\n"), 0700); err != nil {

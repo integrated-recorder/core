@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net"
 	"strings"
@@ -240,6 +241,59 @@ func TestLocalPeerConnectionUsesBoundedOrderedDataChannel(t *testing.T) {
 		nodeidentity.PeerCommandReplayConsumer{NodeStore: remoteNode},
 		identityID, remoteInfo.NodeID); !errors.Is(err, peerprotocol.ErrReplay) {
 		t.Fatalf("duplicate command was accepted: %v", err)
+	}
+}
+
+func TestApplicationReadinessPreservesCancellationAfterLocalReady(t *testing.T) {
+	pair := newLocalPeerPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	inbox := make(chan []byte, 1)
+	if err := SetBoundedMessageHandler(pair.control, MaxControlFrame, func(message []byte) error {
+		select {
+		case inbox <- message:
+			return nil
+		default:
+			return ErrMessageRejected
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sender, err := NewSender(pair.control, MaxControlFrame)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readyObserved := make(chan struct{})
+	pair.peerControl.OnMessage(func(message webrtc.DataChannelMessage) {
+		var frame handshakeFrame
+		if json.Unmarshal(message.Data, &frame) == nil && frame.Type == "ready" {
+			close(readyObserved)
+			cancel()
+		}
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		result <- completeApplicationReadiness(ctx, pair.control, inbox, sender, "session-ready")
+	}()
+
+	select {
+	case <-readyObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote did not observe the local readiness frame")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("readiness error=%v, want context.Canceled", err)
+		}
+		if errors.Is(err, ErrMessageRejected) {
+			t.Fatalf("readiness cancellation was converted to ErrMessageRejected: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("readiness did not return after cancellation")
 	}
 }
 

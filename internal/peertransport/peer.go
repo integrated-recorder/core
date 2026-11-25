@@ -398,7 +398,10 @@ func completeApplicationReadiness(ctx context.Context, control *webrtc.DataChann
 		return err
 	}
 	frame, err := receiveHandshakeFrame(ctx, inbox)
-	if err != nil || frame.Type != "ready" || frame.SessionID != sessionID {
+	if err != nil {
+		return err
+	}
+	if frame.Type != "ready" || frame.SessionID != sessionID {
 		return ErrMessageRejected
 	}
 	return nil
@@ -648,7 +651,10 @@ func authenticateWithInbox(ctx context.Context, role HandshakeRole, control *web
 			return authority.Principal{}, "", err
 		}
 		frame, err := receiveHandshakeFrame(ctx, inbound)
-		if err != nil || frame.Type != "hello" || frame.Hello == nil {
+		if err != nil {
+			return authority.Principal{}, "", err
+		}
+		if frame.Type != "hello" || frame.Hello == nil {
 			return authority.Principal{}, "", ErrMessageRejected
 		}
 		remote = *frame.Hello
@@ -665,13 +671,19 @@ func authenticateWithInbox(ctx context.Context, role HandshakeRole, control *web
 			return authority.Principal{}, "", err
 		}
 		frame, err = receiveHandshakeFrame(ctx, inbound)
-		if err != nil || frame.Type != "proof" || frame.Proof == "" {
+		if err != nil {
+			return authority.Principal{}, "", err
+		}
+		if frame.Type != "proof" || frame.Proof == "" {
 			return authority.Principal{}, "", ErrMessageRejected
 		}
 		transcript.ResponderProof = frame.Proof
 	} else {
 		frame, err := receiveHandshakeFrame(ctx, inbound)
-		if err != nil || frame.Type != "hello" || frame.Hello == nil {
+		if err != nil {
+			return authority.Principal{}, "", err
+		}
+		if frame.Type != "hello" || frame.Hello == nil {
 			return authority.Principal{}, "", ErrMessageRejected
 		}
 		remote = *frame.Hello
@@ -686,7 +698,10 @@ func authenticateWithInbox(ctx context.Context, role HandshakeRole, control *web
 			return authority.Principal{}, "", err
 		}
 		frame, err = receiveHandshakeFrame(ctx, inbound)
-		if err != nil || frame.Type != "proof" || frame.Proof == "" {
+		if err != nil {
+			return authority.Principal{}, "", err
+		}
+		if frame.Type != "proof" || frame.Proof == "" {
 			return authority.Principal{}, "", ErrMessageRejected
 		}
 		transcript = peerprotocol.Transcript{Version: peerprotocol.HandshakeVersion, Initiator: remote, Responder: local, InitiatorProof: frame.Proof}

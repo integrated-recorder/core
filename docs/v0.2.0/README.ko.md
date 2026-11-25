@@ -1,5 +1,7 @@
 # Integrated Recorder v0.2.0 구현 상태
 
+요구사항별 실제 구현 위치, 실행된 검증, 미해결 조건은 [Requirement-to-Evidence Matrix](REQUIREMENT_EVIDENCE.ko.md)에 추적한다. 마일스톤 표의 상태는 해당 acceptance gate가 모두 완료됐다는 뜻이 아니다.
+
 기준 소스는 `v0.1.0-rc.12`의 commit `d4a14d4fab908a0cb415dacd47e7f0d9bc63be8d`입니다. 이 문서는 구현 완료를 선언하지 않고, 단계별 증거와 미완료 gate를 기록합니다.
 
 | 단계 | 목표 | 상태 | 완료 증거 |

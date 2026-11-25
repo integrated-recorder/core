@@ -40,14 +40,15 @@ type peerConnectionManager interface {
 // OwnerSubject capability. Reconciliation is bounded so a large identity or
 // an offline peer cannot block Control lifecycle work indefinitely.
 type peerConnectionReconciler struct {
-	identity identitySnapshotReader
-	node     nodeInfoReader
-	peers    peerConnectionManager
-	resolve  authority.AuthorityIdentityResolver
-	owners   *authority.Store
+	identity    identitySnapshotReader
+	node        nodeInfoReader
+	peers       peerConnectionManager
+	resolve     authority.AuthorityIdentityResolver
+	owners      *authority.Store
+	cursorStore peerConnectionCursorStore
 
 	mu     sync.Mutex
-	cursor int
+	cursor int // in-memory fallback for unit fixtures without a durable cursor store
 }
 
 func (r *peerConnectionReconciler) Reconcile(ctx context.Context) error {
@@ -129,12 +130,34 @@ func (r *peerConnectionReconciler) Reconcile(ctx context.Context) error {
 	if len(targets) == 0 {
 		return joinedErrors()
 	}
-	start := r.nextCursor(len(targets))
-	if len(targets) > peerConnectionBatch {
-		rotated := append(append([]string(nil), targets[start:]...), targets[:start]...)
-		targets = rotated[:peerConnectionBatch]
-	} else if start > 0 {
-		targets = append(append([]string(nil), targets[start:]...), targets[:start]...)
+	if r.cursorStore != nil {
+		desiredSetHash := peerConnectionDesiredSetHash(local.NodeID, desired)
+		lastPlanned, err := r.cursorStore.LastPlanned(snapshot.IdentityID, desiredSetHash)
+		if err != nil {
+			return errors.New("peer connection scheduler state is unavailable")
+		}
+		start := peerConnectionCursorStart(targets, lastPlanned)
+		end := start + peerConnectionBatch
+		if end > len(targets) {
+			end = len(targets)
+		}
+		planned := append([]string(nil), targets[start:end]...)
+		// Persist every nonempty planned batch endpoint before any network
+		// attempt, including a short tail. Otherwise the cursor can stall on
+		// that tail forever. The cursor is scheduling metadata only; every
+		// Connect still performs its normal authorization.
+		if err := r.cursorStore.SaveLastPlanned(snapshot.IdentityID, desiredSetHash, planned[len(planned)-1]); err != nil {
+			return errors.New("peer connection scheduler state could not be persisted")
+		}
+		targets = planned
+	} else {
+		start := r.nextCursor(len(targets))
+		if len(targets) > peerConnectionBatch {
+			rotated := append(append([]string(nil), targets[start:]...), targets[:start]...)
+			targets = rotated[:peerConnectionBatch]
+		} else if start > 0 {
+			targets = append(append([]string(nil), targets[start:]...), targets[:start]...)
+		}
 	}
 
 	var wait sync.WaitGroup
@@ -194,4 +217,18 @@ func containsNodeID(nodeIDs []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func peerConnectionCursorStart(targets []string, lastPlanned string) int {
+	if len(targets) == 0 || lastPlanned == "" {
+		return 0
+	}
+	start := sort.SearchStrings(targets, lastPlanned)
+	if start < len(targets) && targets[start] <= lastPlanned {
+		start++
+	}
+	if start == len(targets) {
+		return 0
+	}
+	return start
 }

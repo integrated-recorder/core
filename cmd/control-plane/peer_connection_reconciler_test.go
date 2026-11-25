@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"sync"
@@ -115,6 +118,110 @@ func TestPeerConnectionReconcilerDialsOnlyDelegatedRemoteNodesAndRotatesBatch(t 
 		if containsString(firstIDs, id) {
 			t.Fatalf("batch cursor retried %q before visiting remaining peers; first=%v second=%v", id, firstIDs, secondIDs)
 		}
+	}
+}
+
+func TestPeerConnectionReconcilerResumesFairBatchAfterRestart(t *testing.T) {
+	identityID := "gi_AAAAAAAAAAAAAAAAAAAAAA"
+	localNodeID := "nd_0000000000000000000000"
+	nodes := []string{localNodeID}
+	connectErr := make(map[string]error)
+	for i := 1; i <= 9; i++ {
+		nodeID := fmt.Sprintf("nd_%022d", i)
+		nodes = append(nodes, nodeID)
+		connectErr[nodeID] = errors.New("simulated unavailable peer")
+	}
+	cursorRoot := filepath.Join(t.TempDir(), "peer-connection")
+	store, err := openPeerConnectionCursorStore(cursorRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := fakeIdentitySnapshotReader{snapshot: globalidentity.Snapshot{IdentityID: identityID, NodeIDs: nodes}, found: true}
+	localNode := fakeNodeInfoReader{info: nodeidentity.Info{NodeID: localNodeID}}
+
+	// A new reconciler and reopened store model a process restart on every pass.
+	// The first eight peers fail, the one-peer tail is planned, then wraparound
+	// must resume at Node 1 rather than retrying Node 9 forever.
+	windows := [][2]int{{1, 5}, {5, 9}, {9, 10}, {1, 5}, {5, 9}}
+	for pass, window := range windows {
+		store, err = openPeerConnectionCursorStore(cursorRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peers := &fakePeerConnectionManager{connectErr: connectErr}
+		reconciler := &peerConnectionReconciler{identity: identity, node: localNode, peers: peers, cursorStore: store}
+		if err := reconciler.Reconcile(context.Background()); err == nil {
+			t.Fatalf("pass %d: unavailable peers were not reported", pass+1)
+		}
+		calls, _ := peers.results()
+		if len(calls) != window[1]-window[0] {
+			t.Fatalf("pass %d planned %d peers, want %d", pass+1, len(calls), window[1]-window[0])
+		}
+		got := make(map[string]struct{}, len(calls))
+		for _, call := range calls {
+			got[call.NodeID] = struct{}{}
+		}
+		for expected := window[0]; expected < window[1]; expected++ {
+			want := fmt.Sprintf("nd_%022d", expected)
+			if _, ok := got[want]; !ok {
+				t.Fatalf("pass %d did not plan Node %s; got %v", pass+1, want, got)
+			}
+		}
+	}
+}
+
+func TestPeerConnectionCursorStoreReopensAndScopesProgress(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "peer-connection")
+	store, err := openPeerConnectionCursorStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityID := "gi_AAAAAAAAAAAAAAAAAAAAAA"
+	desiredSet := peerConnectionDesiredSetHash("nd_0000000000000000000000", map[string]struct{}{
+		"nd_1111111111111111111111": {},
+		"nd_2222222222222222222222": {},
+	})
+	last := "nd_2222222222222222222222"
+	if err := store.SaveLastPlanned(identityID, desiredSet, last); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openPeerConnectionCursorStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reopened.LastPlanned(identityID, desiredSet)
+	if err != nil || got != last {
+		t.Fatalf("reopened cursor=%q, err=%v; want %q", got, err, last)
+	}
+	if got, err := reopened.LastPlanned("gi_BBBBBBBBBBBBBBBBBBBBBB", desiredSet); err != nil || got != "" {
+		t.Fatalf("different identity inherited cursor=%q, err=%v", got, err)
+	}
+	if got, err := reopened.LastPlanned(identityID, peerConnectionDesiredSetHash("nd_0000000000000000000000", map[string]struct{}{"nd_3333333333333333333333": {}})); err != nil || got != "" {
+		t.Fatalf("different delegated set inherited cursor=%q, err=%v", got, err)
+	}
+}
+
+func TestPeerConnectionCursorStoreFailsClosedOnMalformedState(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "peer-connection")
+	store, err := openPeerConnectionCursorStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityID := "gi_AAAAAAAAAAAAAAAAAAAAAA"
+	desiredSet := peerConnectionDesiredSetHash("nd_0000000000000000000000", map[string]struct{}{"nd_1111111111111111111111": {}})
+	if err := store.SaveLastPlanned(identityID, desiredSet, "nd_1111111111111111111111"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, peerConnectionCursorName)
+	malformed := []byte(`{"state_version":"1","state_version":"1","identity_id":"gi_AAAAAAAAAAAAAAAAAAAAAA","desired_set_hash":"` + desiredSet + `","last_planned_node_id":"nd_1111111111111111111111"}` + "\n")
+	if err := os.WriteFile(path, malformed, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LastPlanned(identityID, desiredSet); err == nil {
+		t.Fatal("duplicate-field cursor state was accepted")
+	}
+	if _, err := openPeerConnectionCursorStore(root); err == nil {
+		t.Fatal("store open accepted malformed durable state")
 	}
 }
 

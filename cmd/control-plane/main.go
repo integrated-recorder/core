@@ -754,15 +754,23 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 	if peerSessions != nil && globalIdentityStore != nil && globalIdentityRegistry != nil &&
 		identityFederation != nil && ownerAuthorityStore != nil && archiveCatalogStore != nil &&
 		nodeIdentityStore != nil && replicaLeaseStore != nil && replicaCiphertexts != nil {
-		identityResolver := authority.IdentityStateResolverFromFederated(
-			globalIdentityStore,
-			authority.NewFederatedIdentityResolver(globalIdentityRegistry, identityFederation),
-		)
-		peerReconciler := &peerConnectionReconciler{
-			identity: globalIdentityStore, node: nodeIdentityStore, peers: peerSessions,
-			resolve: identityResolver, owners: ownerAuthorityStore,
+		cursorStore, cursorErr := openPeerConnectionCursorStore(filepath.Join(config.dataDir, "peer-connection"))
+		if cursorErr != nil {
+			// Invalid or unavailable scheduler state disables automatic peer
+			// dialing only. Existing peer commands retain their normal authority
+			// checks, and local recording remains independent of peer networking.
+			log.Printf("peer connection scheduler unavailable: durable state invalid")
+		} else {
+			identityResolver := authority.IdentityStateResolverFromFederated(
+				globalIdentityStore,
+				authority.NewFederatedIdentityResolver(globalIdentityRegistry, identityFederation),
+			)
+			peerReconciler := &peerConnectionReconciler{
+				identity: globalIdentityStore, node: nodeIdentityStore, peers: peerSessions,
+				resolve: identityResolver, owners: ownerAuthorityStore, cursorStore: cursorStore,
+			}
+			peerConnectionPass = peerReconciler.Reconcile
 		}
-		peerConnectionPass = peerReconciler.Reconcile
 	}
 	replicaImportGate := replication.NewImportGate()
 	var replicaTransferPass func(context.Context, time.Time) error

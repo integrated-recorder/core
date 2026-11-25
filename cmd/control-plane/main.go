@@ -724,7 +724,13 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 	}
 	var replicaLeaseStore *lease.Store
 	if globalIdentityStore != nil && ownerAuthorityStore != nil {
-		replicaLeaseStore, err = openReplicaLeaseStore(config.dataDir, globalIdentityStore, globalIdentityRegistry, identityFederation, ownerAuthorityStore)
+		localNodeID := ""
+		if nodeIdentityStore != nil {
+			if info, infoErr := nodeIdentityStore.Info(); infoErr == nil {
+				localNodeID = info.NodeID
+			}
+		}
+		replicaLeaseStore, err = openReplicaLeaseStore(config.dataDir, globalIdentityStore, globalIdentityRegistry, identityFederation, ownerAuthorityStore, settings.Current().Replication.ProviderCapacityBytes, localNodeID)
 		if err != nil {
 			// Invalid replica-retention state disables only the distributed
 			// lease surface; local acquisition and archive access remain usable.

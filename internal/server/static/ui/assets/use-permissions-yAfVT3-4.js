@@ -1,1 +1,0 @@
-import{d as u,Y as r,b8 as c}from"./index-D6Vq8_cc.js";function b(){var e;const s=u(c),a=u({...r,enabled:((e=s.data)==null?void 0:e.auth_enabled)!==!1});return{can:i=>{var n,t,o;return((n=s.data)==null?void 0:n.auth_enabled)===!1||((o=(t=a.data)==null?void 0:t.permissions)==null?void 0:o.includes(i))===!0},authorization:a,session:s}}export{b as u};

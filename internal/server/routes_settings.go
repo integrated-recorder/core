@@ -9,10 +9,11 @@ import (
 )
 
 type settingsPutRequest struct {
-	UI        *settingsUIRequest              `json:"ui,omitempty"`
-	Integrity *settingsIntegrityRequest       `json:"integrity,omitempty"`
-	Retention *settingsRetentionRequest       `json:"retention,omitempty"`
-	Storage   *systemsettings.StorageSettings `json:"storage,omitempty"`
+	UI          *settingsUIRequest              `json:"ui,omitempty"`
+	Integrity   *settingsIntegrityRequest       `json:"integrity,omitempty"`
+	Retention   *settingsRetentionRequest       `json:"retention,omitempty"`
+	Storage     *systemsettings.StorageSettings `json:"storage,omitempty"`
+	Replication *settingsReplicationRequest     `json:"replication,omitempty"`
 }
 
 type settingsUIRequest struct {
@@ -26,6 +27,10 @@ type settingsIntegrityRequest struct {
 type settingsRetentionRequest struct {
 	Enabled            *bool `json:"enabled,omitempty"`
 	CompletedAfterDays *int  `json:"completed_after_days,omitempty"`
+}
+
+type settingsReplicationRequest struct {
+	ProviderCapacityBytes *string `json:"provider_capacity_bytes,omitempty"`
 }
 
 func (s *Server) registerSettingsRoutes() {
@@ -59,7 +64,8 @@ func (s *Server) settingsPut(w http.ResponseWriter, r *http.Request) {
 	if request.UI != nil && request.UI.Theme == nil ||
 		request.Integrity != nil && request.Integrity.Concurrency == nil ||
 		request.Retention != nil && request.Retention.Enabled == nil && request.Retention.CompletedAfterDays == nil ||
-		request.UI == nil && request.Integrity == nil && request.Retention == nil && request.Storage == nil {
+		request.Replication != nil && request.Replication.ProviderCapacityBytes == nil ||
+		request.UI == nil && request.Integrity == nil && request.Retention == nil && request.Storage == nil && request.Replication == nil {
 		writeError(w, http.StatusBadRequest, "settings request contains no values")
 		return
 	}
@@ -73,6 +79,9 @@ func (s *Server) settingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	if request.Storage != nil {
 		patch.Storage = request.Storage
+	}
+	if request.Replication != nil {
+		patch.ReplicationProviderCapacityBytes = request.Replication.ProviderCapacityBytes
 	}
 	settings, err := s.settings.Update(patch)
 	if err != nil {
@@ -92,6 +101,9 @@ func (s *Server) writeSettings(w http.ResponseWriter, status int, settings syste
 		restartRequired = append(restartRequired, "integrity.concurrency")
 	}
 	restartRequired = append(restartRequired, changedStorageSettings(s.effectiveStorage, settings.Storage)...)
+	if s.settings != nil && settings.Replication.ProviderCapacityBytes != s.settings.InitialProviderCapacityBytes() {
+		restartRequired = append(restartRequired, "replication.provider_capacity_bytes")
+	}
 	sort.Strings(restartRequired)
 	writeJSON(w, status, map[string]any{
 		"settings":          settings,

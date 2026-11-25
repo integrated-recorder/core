@@ -233,12 +233,14 @@ export type StorageSettings = {
   failure_handling: { persist_attempts: number; retry_initial_backoff_ms: number; retry_max_backoff_ms: number }
   observability: { sampling_interval_ms: number; metrics_retention_ms: number }
 }
+export type ProviderReplicationSettings = { provider_capacity_bytes: string }
 export type SystemSettings = {
   settings: {
     ui: { theme: 'system' | 'light' | 'dark' }
     integrity: { concurrency: number }
     retention: { enabled: boolean; completed_after_days: number }
     storage: StorageSettings
+    replication: ProviderReplicationSettings
   }
   effective_storage: StorageSettings
   restart_required: string[]

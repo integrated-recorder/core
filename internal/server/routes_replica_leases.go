@@ -345,6 +345,10 @@ func (s *Server) replicaImport(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 			writeCodedError(w, http.StatusGatewayTimeout, "replica_import_interrupted", "Replica import did not finish; retry the same lease to resume from durable progress.")
+		case errors.Is(err, lease.ErrCapacityExceeded):
+			writeCodedError(w, http.StatusInsufficientStorage, "replica_provider_capacity_exceeded", "This Node's configured replica storage capacity does not have room for this offer.")
+		case errors.Is(err, lease.ErrProviderIdentity):
+			writeCodedError(w, http.StatusServiceUnavailable, "replica_provider_identity_unavailable", "This Node cannot safely reserve replica capacity until its Node identity is available.")
 		case errors.Is(err, lease.ErrDenied), errors.Is(err, lease.ErrFrozen), errors.Is(err, peerprotocol.ErrCommandDenied):
 			writeCodedError(w, http.StatusForbidden, "replica_import_denied", "Current archive authority does not authorize this import.")
 		case errors.Is(err, lease.ErrConflict), errors.Is(err, lease.ErrTransition), errors.Is(err, replication.ErrUnauthorized):

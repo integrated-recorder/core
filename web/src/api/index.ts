@@ -195,7 +195,7 @@ export const productAPI = {
   audit: () => api<{ items: AuditEvent[] }>('/api/audit'),
   logs: (query: { level?: string; component?: string; q?: string; limit?: number; cursor?: string }) => api<{ items: LogEntry[]; next_cursor?: string }>(`/api/logs${queryString(query)}`),
   settings: () => api<SystemSettings>('/api/settings'),
-  saveSettings: (body: { ui?: { theme: 'system' | 'light' | 'dark' }; integrity?: { concurrency: number }; retention?: { enabled?: boolean; completed_after_days?: number }; storage?: StorageSettings }) => api<SystemSettings>('/api/settings', { method: 'PUT', body }),
+  saveSettings: (body: { ui?: { theme: 'system' | 'light' | 'dark' }; integrity?: { concurrency: number }; retention?: { enabled?: boolean; completed_after_days?: number }; storage?: StorageSettings; replication?: { provider_capacity_bytes: string } }) => api<SystemSettings>('/api/settings', { method: 'PUT', body }),
   retentionCandidates: () => api<{ enabled: boolean; candidate_count: number; candidates: { id: string; stopped_at: string }[] }>('/api/retention/candidates'),
   runRetention: () => api<{ candidate_count: number; deleted_count: number; deleted_ids: string[] }>('/api/retention/run', { method: 'POST', body: {} }),
 }

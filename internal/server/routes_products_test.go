@@ -832,6 +832,35 @@ func TestSystemSettingsAPIReportsRestartRequiredAndValidatesStrictly(t *testing.
 	}
 }
 
+func TestSystemSettingsProviderCapacityRequiresRestartAndValidatesCanonicalBytes(t *testing.T) {
+	settings, err := systemsettings.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(nil, nil, nil, Options{Settings: settings})
+
+	update := httptest.NewRecorder()
+	handler.ServeHTTP(update, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"replication":{"provider_capacity_bytes":"1048576"}}`)))
+	if update.Code != http.StatusOK || !strings.Contains(update.Body.String(), `"provider_capacity_bytes":"1048576"`) || !strings.Contains(update.Body.String(), `"restart_required":["replication.provider_capacity_bytes"]`) {
+		t.Fatalf("capacity update=%d %s", update.Code, update.Body.String())
+	}
+
+	for _, capacity := range []string{"01", "1.0", "1125899906842625"} {
+		body, _ := json.Marshal(map[string]any{"replication": map[string]string{"provider_capacity_bytes": capacity}})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(body)))
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "replication provider capacity") {
+			t.Fatalf("invalid capacity %q response=%d %s", capacity, response.Code, response.Body.String())
+		}
+	}
+
+	revert := httptest.NewRecorder()
+	handler.ServeHTTP(revert, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"replication":{"provider_capacity_bytes":"0"}}`)))
+	if revert.Code != http.StatusOK || strings.Contains(revert.Body.String(), "replication.provider_capacity_bytes") {
+		t.Fatalf("capacity revert=%d %s", revert.Code, revert.Body.String())
+	}
+}
+
 func TestUnavailableExportIsAdvertisedAndNotImplemented(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.New(root)

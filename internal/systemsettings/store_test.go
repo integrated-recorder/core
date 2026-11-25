@@ -23,6 +23,9 @@ func TestOpenDefaultsAndPermissions(t *testing.T) {
 	if got := store.IntegrityConcurrency(); got != 2 {
 		t.Fatalf("IntegrityConcurrency() = %d, want 2", got)
 	}
+	if got := store.Current().Replication.ProviderCapacityBytes; got != "0" {
+		t.Fatalf("provider capacity default = %q, want unlimited (0)", got)
+	}
 	if mode := modeOf(t, filepath.Join(root, "management")); mode.Perm() != 0700 {
 		t.Fatalf("management mode = %04o, want 0700", mode.Perm())
 	}
@@ -109,6 +112,9 @@ func TestOpenBackfillsRetentionDefaultsForExistingSettings(t *testing.T) {
 	if got := store.Current().Storage; got != defaultStorageSettings() {
 		t.Fatalf("existing settings storage defaults = %#v", got)
 	}
+	if got := store.Current().Replication.ProviderCapacityBytes; got != "0" {
+		t.Fatalf("existing settings provider capacity default = %q, want 0", got)
+	}
 	if _, err := store.Update(Patch{RetentionEnabled: ptr(true)}); err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +124,81 @@ func TestOpenBackfillsRetentionDefaultsForExistingSettings(t *testing.T) {
 	}
 	if got := reloaded.Current().Retention; got != (RetentionSettings{Enabled: true, CompletedAfterDays: 30}) {
 		t.Fatalf("retention after partial update/reload = %#v", got)
+	}
+}
+
+func TestReplicationProviderCapacityPersistsAndRequiresRestart(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.InitialProviderCapacityBytes() != "0" {
+		t.Fatal("unexpected startup provider capacity")
+	}
+	capacity := "1048576"
+	updated, err := store.Update(Patch{ReplicationProviderCapacityBytes: &capacity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Replication.ProviderCapacityBytes != capacity || store.InitialProviderCapacityBytes() != "0" {
+		t.Fatalf("updated capacity=%q startup capacity=%q", updated.Replication.ProviderCapacityBytes, store.InitialProviderCapacityBytes())
+	}
+	reloaded, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Current().Replication.ProviderCapacityBytes; got != capacity {
+		t.Fatalf("reloaded provider capacity=%q, want %q", got, capacity)
+	}
+	if reloaded.InitialProviderCapacityBytes() != capacity {
+		t.Fatal("reloaded startup capacity does not match persisted capacity")
+	}
+}
+
+func TestReplicationSettingsRejectsNullAndUnknownFields(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "management"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "management", settingsFilename)
+	for _, raw := range []string{
+		`{"ui":{"theme":"system"},"replication":{"provider_capacity_bytes":null}}`,
+		`{"ui":{"theme":"system"},"replication":null}`,
+		`{"ui":{"theme":"system"},"replication":{"provider_capacity_bytes":"0","unexpected":true}}`,
+	} {
+		if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(root); !errors.Is(err, ErrInvalidSettings) {
+			t.Fatalf("Open(%s) error = %v, want invalid settings", raw, err)
+		}
+	}
+}
+
+func TestReplicationProviderCapacityRejectsNonCanonicalAndOutOfRangeValues(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"", "00", "01", "+1", "-1", " 1", "1 ", "1.0", "1e3", "18446744073709551616", "1125899906842625"} {
+		t.Run(value, func(t *testing.T) {
+			before := store.Current()
+			_, updateErr := store.Update(Patch{ReplicationProviderCapacityBytes: &value})
+			if !errors.Is(updateErr, ErrInvalidSettings) {
+				t.Fatalf("Update(%q) error = %v, want ErrInvalidSettings", value, updateErr)
+			}
+			if strings.Contains(updateErr.Error(), value) && value != "" {
+				t.Fatalf("validation error echoed input: %v", updateErr)
+			}
+			if got := store.Current(); got != before {
+				t.Fatal("invalid capacity update changed settings")
+			}
+		})
+	}
+	maximum := "1125899906842624"
+	if _, err := store.Update(Patch{ReplicationProviderCapacityBytes: &maximum}); err != nil {
+		t.Fatalf("protocol maximum rejected: %v", err)
 	}
 }
 

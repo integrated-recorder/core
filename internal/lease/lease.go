@@ -50,6 +50,9 @@ var (
 	ErrNotFound         = errors.New("replica lease not found")
 	ErrTransition       = errors.New("replica lease transition is not allowed")
 	ErrFrozen           = errors.New("archive replication is frozen by conflicting tombstones")
+	ErrCapacityExceeded = errors.New("replica provider capacity exceeded")
+	ErrCapacityOverflow = errors.New("replica provider capacity accounting overflow")
+	ErrProviderIdentity = errors.New("local replica provider identity is unavailable")
 	archiveIDPattern    = regexp.MustCompile(`^arc_[A-Za-z0-9_-]{22}$`)
 	snapshotIDPattern   = regexp.MustCompile(`^snap_[a-f0-9]{64}$`)
 	leaseIDPattern      = regexp.MustCompile(`^rl_[A-Za-z0-9_-]{22}$`)
@@ -279,10 +282,12 @@ type ObjectReader interface {
 }
 
 type Options struct {
-	Root       string
-	Authorizer Authorizer
-	Keys       KeyResolver
-	Now        func() time.Time
+	Root                  string
+	Authorizer            Authorizer
+	Keys                  KeyResolver
+	Now                   func() time.Time
+	ProviderCapacityBytes uint64
+	LocalProviderNodeID   string
 }
 
 type snapshot struct {

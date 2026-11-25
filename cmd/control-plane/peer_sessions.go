@@ -215,16 +215,22 @@ func readPrivatePeerTURNSecret(path string) ([]byte, error) {
 	return append([]byte(nil), secret...), nil
 }
 
-func openReplicaLeaseStore(dataDir string, identity *globalidentity.Store, registry *globalidentity.HistoryRegistry, federation *discovery.FederationClient, authorities *authority.Store) (*lease.Store, error) {
+func openReplicaLeaseStore(dataDir string, identity *globalidentity.Store, registry *globalidentity.HistoryRegistry, federation *discovery.FederationClient, authorities *authority.Store, providerCapacity, localProviderNodeID string) (*lease.Store, error) {
 	if dataDir == "" || identity == nil || authorities == nil {
 		return nil, errors.New("replica lease prerequisites are unavailable")
+	}
+	capacityBytes, err := strconv.ParseUint(providerCapacity, 10, 64)
+	if err != nil || strconv.FormatUint(capacityBytes, 10) != providerCapacity || capacityBytes > lease.MaxReservedBytes {
+		return nil, errors.New("replica provider capacity configuration is invalid")
 	}
 	remote := authority.NewFederatedIdentityResolver(registry, federation)
 	resolve := authority.IdentityStateResolverFromFederated(identity, remote)
 	return lease.Open(lease.Options{
-		Root:       filepath.Join(dataDir, "replication", "leases"),
-		Authorizer: lease.FederatedAuthority{Store: authorities, Federation: federation, Resolve: resolve},
-		Keys:       localLeaseKeyResolver{identity: identity, registry: registry},
+		Root:                  filepath.Join(dataDir, "replication", "leases"),
+		Authorizer:            lease.FederatedAuthority{Store: authorities, Federation: federation, Resolve: resolve},
+		Keys:                  localLeaseKeyResolver{identity: identity, registry: registry},
+		ProviderCapacityBytes: capacityBytes,
+		LocalProviderNodeID:   localProviderNodeID,
 	})
 }
 

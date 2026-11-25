@@ -93,8 +93,19 @@ function RetentionPage({ settings, loading, error, retry, canConfigure, canRun }
 
 function AdvancedStoragePage({ settings, loading, error, retry }: { settings?: SystemSettings; loading: boolean; error: unknown; retry: () => void }) {
   const client = useQueryClient(); const { toast } = useToast(); const { t } = useI18n()
+  const [providerCapacity, setProviderCapacity] = useState('0')
+  const configuredProviderCapacity = settings?.settings.replication.provider_capacity_bytes
+  useEffect(() => { if (configuredProviderCapacity !== undefined) setProviderCapacity(configuredProviderCapacity) }, [configuredProviderCapacity])
   const save = useMutation({ mutationFn: (storage: StorageSettings) => productAPI.saveSettings({ storage }), onSuccess: result => { client.setQueryData(qk.settings, result); toast(t('settings.saved')) }, onError: err => toast(t('settings.saveStorageFailed'), errorMessage(err), 'error') })
-  return <StorageSettingsForm data={settings} loading={loading} error={error} retry={retry} saving={save.isPending} saveError={save.error} saveResult={save.data} onSave={value => save.mutate(value)} />
+  const saveProviderCapacity = useMutation({ mutationFn: (provider_capacity_bytes: string) => productAPI.saveSettings({ replication: { provider_capacity_bytes } }), onSuccess: result => { client.setQueryData(qk.settings, result); toast(t('settings.providerCapacitySaved')) }, onError: err => toast(t('settings.saveStorageFailed'), errorMessage(err), 'error') })
+  return <div className="space-y-4"><StorageSettingsForm data={settings} loading={loading} error={error} retry={retry} saving={save.isPending} saveError={save.error} saveResult={save.data} onSave={value => save.mutate(value)} />
+    <Card><CardHeader><CardTitle>{t('settings.providerCapacityTitle')}</CardTitle></CardHeader><CardContent>{loading ? <LoadingState /> : error ? <ErrorState message={errorMessage(error)} retry={retry} /> : settings ? <form className="space-y-4" onSubmit={event => { event.preventDefault(); saveProviderCapacity.mutate(providerCapacity) }}>
+      <p className="text-sm text-muted-foreground">{t('settings.providerCapacityHelp')}</p>
+      <div className="space-y-1.5"><label htmlFor="provider-replica-capacity" className="block text-sm font-medium">{t('settings.providerCapacityLabel')}</label><div className="flex items-center gap-2"><Input id="provider-replica-capacity" name="provider_capacity_bytes" type="text" inputMode="numeric" pattern="[0-9]+" required value={providerCapacity} onChange={event => setProviderCapacity(event.target.value)} aria-describedby="provider-replica-capacity-help" /><span className="shrink-0 text-xs text-muted-foreground">{t('settings.bytes')}</span></div><p id="provider-replica-capacity-help" className="text-xs text-muted-foreground">{t('settings.providerCapacityInputHelp')}</p></div>
+      {settings.restart_required.includes('replication.provider_capacity_bytes') && <p role="status" className="flex items-center gap-1 text-xs text-amber-700"><CircleAlert className="h-3.5 w-3.5" />{t('settings.providerCapacityRestart')}</p>}
+      <Button type="submit" disabled={saveProviderCapacity.isPending}><Check className="h-4 w-4" />{saveProviderCapacity.isPending ? t('settings.saving') : t('settings.providerCapacitySave')}</Button>
+    </form> : null}</CardContent></Card>
+  </div>
 }
 
 function DiagnosticsPage({ query, level, setLevel, component, setComponent, search, setSearch, onSearch }: {

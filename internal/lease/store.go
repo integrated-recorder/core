@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/integrated-recorder/core/internal/authority"
+	"github.com/integrated-recorder/core/internal/identityprotocol"
 )
 
 const (
@@ -32,14 +33,17 @@ const (
 // A nil authorizer is allowed for read-only recovery, but all mutations fail
 // closed. Key resolution must use verified identity history, not Discovery.
 type Store struct {
-	root       string
-	authorizer Authorizer
-	keys       KeyResolver
-	now        func() time.Time
+	root                  string
+	authorizer            Authorizer
+	keys                  KeyResolver
+	now                   func() time.Time
+	providerCapacityBytes uint64
+	localProviderNodeID   string
 }
 
 func Open(options Options) (*Store, error) {
-	if !filepath.IsAbs(options.Root) || filepath.Clean(options.Root) != options.Root || options.Keys == nil {
+	if !filepath.IsAbs(options.Root) || filepath.Clean(options.Root) != options.Root || options.Keys == nil ||
+		options.ProviderCapacityBytes > MaxReservedBytes {
 		return nil, ErrInvalid
 	}
 	if options.Now == nil {
@@ -48,7 +52,11 @@ func Open(options Options) (*Store, error) {
 	if err := ensurePrivateDirectory(options.Root); err != nil {
 		return nil, err
 	}
-	store := &Store{root: options.Root, authorizer: options.Authorizer, keys: options.Keys, now: options.Now}
+	store := &Store{
+		root: options.Root, authorizer: options.Authorizer, keys: options.Keys, now: options.Now,
+		providerCapacityBytes: options.ProviderCapacityBytes,
+		localProviderNodeID:   options.LocalProviderNodeID,
+	}
 	if err := store.withLocked(context.Background(), func(state *snapshot) (bool, error) { return false, nil }); err != nil {
 		return nil, err
 	}
@@ -255,6 +263,19 @@ func (s *Store) IssueOffer(ctx context.Context, signed SignedOffer) (Lease, erro
 }
 
 func (s *Store) Accept(ctx context.Context, signed SignedAcceptance) (Lease, error) {
+	return s.accept(ctx, signed, false)
+}
+
+// AcceptProvider is used only at the explicit local-provider consent boundary.
+// Its capacity reservation and status transition share one durable mutation,
+// so concurrent provider accepts cannot both consume the same remaining space.
+// Source-side receipt processing must continue to use Accept, which does not
+// apply this local provider's capacity configuration.
+func (s *Store) AcceptProvider(ctx context.Context, signed SignedAcceptance) (Lease, error) {
+	return s.accept(ctx, signed, true)
+}
+
+func (s *Store) accept(ctx context.Context, signed SignedAcceptance, enforceProviderCapacity bool) (Lease, error) {
 	a := signed.Acceptance
 	canonical, err := CanonicalAcceptance(a)
 	if err != nil {
@@ -287,6 +308,22 @@ func (s *Store) Accept(ctx context.Context, signed SignedAcceptance) (Lease, err
 		if lease.Status != StatusOffered || a.OfferHash != lease.OfferHash || a.ProviderNodeID != lease.Offer.Offer.ProviderNodeID || a.ReservedBytes != lease.Offer.Offer.ReservedBytes {
 			return false, ErrTransition
 		}
+		if enforceProviderCapacity && s.providerCapacityBytes != 0 {
+			if !identityprotocol.IsNodeID(s.localProviderNodeID) {
+				return false, ErrProviderIdentity
+			}
+			used, capacityErr := providerReservedBytes(state.Leases, s.localProviderNodeID)
+			if capacityErr != nil {
+				return false, capacityErr
+			}
+			requested, parseErr := strconv.ParseUint(lease.Offer.Offer.ReservedBytes, 10, 64)
+			if parseErr != nil {
+				return false, ErrInvalid
+			}
+			if used > s.providerCapacityBytes || requested > s.providerCapacityBytes-used {
+				return false, ErrCapacityExceeded
+			}
+		}
 		acceptedAt := parseTime(a.AcceptedAt)
 		if acceptedAt.Before(parseTime(lease.Offer.Offer.IssuedAt)) || acceptedAt.After(s.now().UTC().Add(2*time.Minute)) || !acceptedAt.Before(parseTime(lease.Offer.Offer.ExpiresAt)) {
 			return false, ErrDenied
@@ -301,6 +338,41 @@ func (s *Store) Accept(ctx context.Context, signed SignedAcceptance) (Lease, err
 		return true, nil
 	})
 	return result, err
+}
+
+// providerReservedBytes conservatively counts every lease that might still
+// occupy this Node's provider storage. Outbound leases belong to the remote
+// provider and must not consume local capacity. Only an unaccepted offered
+// lease and a locally deleted lease with a durable report release capacity.
+func providerReservedBytes(leases []Lease, localProviderNodeID string) (uint64, error) {
+	if !identityprotocol.IsNodeID(localProviderNodeID) {
+		return 0, ErrProviderIdentity
+	}
+	var used uint64
+	for _, current := range leases {
+		if current.Offer.Offer.ProviderNodeID != localProviderNodeID {
+			continue
+		}
+		if current.Status == StatusOffered && current.Acceptance.Signature == "" && current.Acceptance.Acceptance == (Acceptance{}) {
+			continue
+		}
+		if current.Status == StatusDeleted && current.DeletionReport != nil &&
+			current.DeletionReport.Report.Status == string(StatusDeleted) &&
+			current.DeletionReport.Report.LeaseID == current.Offer.Offer.LeaseID &&
+			current.DeletionReport.Report.OfferHash == current.OfferHash &&
+			current.DeletionReport.Report.ProviderNodeID == current.Offer.Offer.ProviderNodeID {
+			continue
+		}
+		reserved, err := strconv.ParseUint(current.Offer.Offer.ReservedBytes, 10, 64)
+		if err != nil {
+			return 0, ErrInvalid
+		}
+		if reserved > ^uint64(0)-used {
+			return 0, ErrCapacityOverflow
+		}
+		used += reserved
+	}
+	return used, nil
 }
 
 // acceptanceCanBeConfirmed reports the nonterminal states in which an exact,

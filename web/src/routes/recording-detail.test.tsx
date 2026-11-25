@@ -1,7 +1,7 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { Events, ExportRow, MetadataTimeline, Timeline } from './recording-detail'
+import { ArchiveSnapshotRetryAction, Events, ExportRow, MetadataTimeline, Timeline } from './recording-detail'
 import { archiveIndexNextPageParam, orderRecordingEvents, recordingHasCommittedMedia, timelineProjectionOmitted } from './recording-detail-utils'
 import { authAPI, userPreferencesAPI } from '@/api'
 import { I18nProvider } from '@/i18n/provider'
@@ -9,6 +9,16 @@ import { I18nProvider } from '@/i18n/provider'
 afterEach(() => { vi.restoreAllMocks(); document.documentElement.lang = 'ko-KR' })
 
 describe('bounded V2 detail projection', () => {
+  it('offers snapshot publication retry only when the sealed archive snapshot is pending', () => {
+    const retry = vi.fn()
+    const { rerender } = render(<ArchiveSnapshotRetryAction visible label="Retry snapshot publication" pending={false} onRetry={retry} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry snapshot publication' }))
+    expect(retry).toHaveBeenCalledOnce()
+
+    rerender(<ArchiveSnapshotRetryAction visible={false} label="Retry snapshot publication" pending={false} onRetry={retry} />)
+    expect(screen.queryByRole('button', { name: 'Retry snapshot publication' })).not.toBeInTheDocument()
+  })
+
   it('stops archive pagination when the API returns an empty terminal cursor', () => {
     expect(archiveIndexNextPageParam({ next_cursor: 'next-page' })).toBe('next-page')
     expect(archiveIndexNextPageParam({ next_cursor: '' })).toBeUndefined()

@@ -10,10 +10,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/lease"
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
@@ -33,10 +35,38 @@ var (
 
 // Settings is the public, self-describing system settings document.
 type Settings struct {
-	UI        UISettings        `json:"ui"`
-	Integrity IntegritySettings `json:"integrity"`
-	Retention RetentionSettings `json:"retention"`
-	Storage   StorageSettings   `json:"storage"`
+	UI          UISettings          `json:"ui"`
+	Integrity   IntegritySettings   `json:"integrity"`
+	Retention   RetentionSettings   `json:"retention"`
+	Storage     StorageSettings     `json:"storage"`
+	Replication ReplicationSettings `json:"replication"`
+}
+
+// ReplicationSettings contains local provider policy. Capacity is a canonical
+// unsigned decimal string to retain the full protocol uint64 range in JSON.
+type ReplicationSettings struct {
+	ProviderCapacityBytes string `json:"provider_capacity_bytes"`
+}
+
+func (settings *ReplicationSettings) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+		return fmt.Errorf("invalid replication settings")
+	}
+	for key, raw := range fields {
+		if key != "provider_capacity_bytes" {
+			return fmt.Errorf("unknown replication setting")
+		}
+		if len(raw) == 0 || raw[0] != '"' {
+			return fmt.Errorf("provider capacity must be a string")
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return fmt.Errorf("provider capacity must be a string")
+		}
+		settings.ProviderCapacityBytes = value
+	}
+	return nil
 }
 
 // StorageSettings contains operational limits for volatile ingest and
@@ -88,20 +118,22 @@ type RetentionSettings struct {
 
 // Patch updates only the fields provided by the caller.
 type Patch struct {
-	UITheme              *string          `json:"ui_theme,omitempty"`
-	IntegrityConcurrency *int             `json:"integrity_concurrency,omitempty"`
-	RetentionEnabled     *bool            `json:"retention_enabled,omitempty"`
-	RetentionAfterDays   *int             `json:"retention_completed_after_days,omitempty"`
-	Storage              *StorageSettings `json:"storage,omitempty"`
+	UITheme                          *string          `json:"ui_theme,omitempty"`
+	IntegrityConcurrency             *int             `json:"integrity_concurrency,omitempty"`
+	RetentionEnabled                 *bool            `json:"retention_enabled,omitempty"`
+	RetentionAfterDays               *int             `json:"retention_completed_after_days,omitempty"`
+	Storage                          *StorageSettings `json:"storage,omitempty"`
+	ReplicationProviderCapacityBytes *string          `json:"replication_provider_capacity_bytes,omitempty"`
 }
 
 // Store serializes updates and publishes a new in-memory snapshot only after
 // the corresponding file has been durably replaced.
 type Store struct {
-	mu        sync.RWMutex
-	path      string
-	directory string
-	settings  Settings
+	mu                           sync.RWMutex
+	path                         string
+	directory                    string
+	settings                     Settings
+	initialProviderCapacityBytes string
 }
 
 // Open loads the system settings from <dataRoot>/management. Missing settings
@@ -122,7 +154,7 @@ func Open(dataRoot string) (*Store, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, settingsFilename)
-	store := &Store{path: path, directory: dir, settings: defaultSettings()}
+	store := &Store{path: path, directory: dir, settings: defaultSettings(), initialProviderCapacityBytes: "0"}
 
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -157,6 +189,7 @@ func Open(dataRoot string) (*Store, error) {
 		return nil, fmt.Errorf("secure system settings file: %w", err)
 	}
 	store.settings = loaded
+	store.initialProviderCapacityBytes = loaded.Replication.ProviderCapacityBytes
 	return store, nil
 }
 
@@ -172,6 +205,14 @@ func (s *Store) IntegrityConcurrency() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.settings.Integrity.Concurrency
+}
+
+// InitialProviderCapacityBytes returns the provider capacity loaded when this
+// process opened the store. Lease-store configuration is fixed for that life.
+func (s *Store) InitialProviderCapacityBytes() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.initialProviderCapacityBytes
 }
 
 // IngestOptions converts persisted storage settings into runtime configuration.
@@ -213,6 +254,9 @@ func (s *Store) Update(patch Patch) (Settings, error) {
 	if patch.Storage != nil {
 		candidate.Storage = *patch.Storage
 	}
+	if patch.ReplicationProviderCapacityBytes != nil {
+		candidate.Replication.ProviderCapacityBytes = *patch.ReplicationProviderCapacityBytes
+	}
 	if err := validate(candidate); err != nil {
 		return s.settings, err
 	}
@@ -234,6 +278,11 @@ func validate(settings Settings) error {
 	}
 	if settings.Retention.CompletedAfterDays < 1 || settings.Retention.CompletedAfterDays > 3650 {
 		return fmt.Errorf("%w: retention age is out of range", ErrInvalidSettings)
+	}
+	capacity := settings.Replication.ProviderCapacityBytes
+	parsedCapacity, err := strconv.ParseUint(capacity, 10, 64)
+	if err != nil || strconv.FormatUint(parsedCapacity, 10) != capacity || parsedCapacity > lease.MaxReservedBytes {
+		return fmt.Errorf("%w: replication provider capacity must be a canonical unsigned byte count no greater than the protocol maximum", ErrInvalidSettings)
 	}
 	// Validate persisted millisecond values before converting them to
 	// time.Duration; multiplication by time.Millisecond can overflow int64.
@@ -282,10 +331,11 @@ func defaultStorageSettings() StorageSettings {
 
 func defaultSettings() Settings {
 	return Settings{
-		UI:        UISettings{Theme: defaultTheme},
-		Integrity: IntegritySettings{Concurrency: defaultConcurrency},
-		Retention: RetentionSettings{Enabled: false, CompletedAfterDays: defaultRetentionDays},
-		Storage:   defaultStorageSettings(),
+		UI:          UISettings{Theme: defaultTheme},
+		Integrity:   IntegritySettings{Concurrency: defaultConcurrency},
+		Retention:   RetentionSettings{Enabled: false, CompletedAfterDays: defaultRetentionDays},
+		Storage:     defaultStorageSettings(),
+		Replication: ReplicationSettings{ProviderCapacityBytes: "0"},
 	}
 }
 

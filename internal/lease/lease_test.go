@@ -701,6 +701,313 @@ func TestAcceptanceRequiresCurrentOwnerAuthorization(t *testing.T) {
 	}
 }
 
+func TestProviderCapacityReservationAcceptsExactBoundaryAndReopensWithNewLimit(t *testing.T) {
+	f := newLeaseFixture(t)
+	ctx := context.Background()
+	reserved, err := strconv.ParseUint(f.offer.ReservedBytes, 10, 64)
+	if err != nil || reserved == 0 {
+		t.Fatalf("fixture reservation=%q err=%v", f.offer.ReservedBytes, err)
+	}
+	providerStore, err := Open(Options{
+		Root: f.root, Authorizer: allowAuthority{}, Keys: f.store.keys,
+		Now: f.store.now, ProviderCapacityBytes: reserved, LocalProviderNodeID: f.providerID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := f.signedOffer(t, f.offer.LeaseID)
+	if _, err := providerStore.IssueOffer(ctx, signed); err != nil {
+		t.Fatal(err)
+	}
+	acceptance := f.signedAcceptance(t, signed)
+	accepted, err := providerStore.AcceptProvider(ctx, acceptance)
+	if err != nil || accepted.Status != StatusAccepted {
+		t.Fatalf("exact-boundary provider acceptance=%+v err=%v", accepted, err)
+	}
+	if retry, retryErr := providerStore.AcceptProvider(ctx, acceptance); retryErr != nil || retry.Revision != accepted.Revision {
+		t.Fatalf("exact provider acceptance retry changed durable state: accepted=%+v retry=%+v err=%v", accepted, retry, retryErr)
+	}
+
+	second := f.signedOffer(t, "rl_bbbbbbbbbbbbbbbbbbbbbb")
+	if _, err := providerStore.IssueOffer(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	before, err := providerStore.Get(ctx, second.Offer.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tooSmall, err := Open(Options{
+		Root: f.root, Authorizer: allowAuthority{}, Keys: f.store.keys,
+		Now: f.store.now, ProviderCapacityBytes: reserved - 1, LocalProviderNodeID: f.providerID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAcceptance := f.signedAcceptance(t, second)
+	if _, err := tooSmall.AcceptProvider(ctx, secondAcceptance); !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("reconfigured over-capacity acceptance error=%v", err)
+	}
+	after, err := tooSmall.Get(ctx, second.Offer.LeaseID)
+	if err != nil || !reflect.DeepEqual(before, after) || after.Status != StatusOffered {
+		t.Fatalf("rejected provider acceptance changed lease state: before=%+v after=%+v err=%v", before, after, err)
+	}
+
+	raised, err := Open(Options{
+		Root: f.root, Authorizer: allowAuthority{}, Keys: f.store.keys,
+		Now: f.store.now, ProviderCapacityBytes: reserved * 2, LocalProviderNodeID: f.providerID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedSecond, err := raised.AcceptProvider(ctx, secondAcceptance)
+	if err != nil || acceptedSecond.Status != StatusAccepted {
+		t.Fatalf("raised-capacity provider acceptance=%+v err=%v", acceptedSecond, err)
+	}
+}
+
+func TestProviderCapacityReservationUnlimitedByDefault(t *testing.T) {
+	f := newLeaseFixture(t)
+	ctx := context.Background()
+	signed := f.signedOffer(t, f.offer.LeaseID)
+	if _, err := f.store.IssueOffer(ctx, signed); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := f.store.AcceptProvider(ctx, f.signedAcceptance(t, signed))
+	if err != nil || accepted.Status != StatusAccepted {
+		t.Fatalf("default unlimited provider acceptance=%+v err=%v", accepted, err)
+	}
+}
+
+func TestProviderCapacityOptionIsBoundedByProtocolMaximum(t *testing.T) {
+	keys := testKeys{}
+	for _, capacity := range []uint64{0, MaxReservedBytes} {
+		if _, err := Open(Options{
+			Root: filepath.Join(t.TempDir(), "valid-capacity"), Keys: keys, ProviderCapacityBytes: capacity,
+		}); err != nil {
+			t.Fatalf("valid provider capacity %d rejected: %v", capacity, err)
+		}
+	}
+	if _, err := Open(Options{
+		Root: filepath.Join(t.TempDir(), "invalid-capacity"), Keys: keys, ProviderCapacityBytes: MaxReservedBytes + 1,
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("provider capacity above protocol maximum accepted: %v", err)
+	}
+}
+
+func TestSourceAcceptanceDoesNotUseLocalProviderCapacity(t *testing.T) {
+	f := newLeaseFixture(t)
+	ctx := context.Background()
+	providerStore, err := Open(Options{
+		Root: f.root, Authorizer: allowAuthority{}, Keys: f.store.keys,
+		Now: f.store.now, ProviderCapacityBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := f.signedOffer(t, f.offer.LeaseID)
+	if _, err := providerStore.IssueOffer(ctx, signed); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := providerStore.Accept(ctx, f.signedAcceptance(t, signed))
+	if err != nil || accepted.Status != StatusAccepted {
+		t.Fatalf("source-side acceptance was incorrectly capacity-limited: lease=%+v err=%v", accepted, err)
+	}
+}
+
+func TestConcurrentProviderAcceptancesCannotExceedCapacity(t *testing.T) {
+	f := newLeaseFixture(t)
+	ctx := context.Background()
+	reserved, err := strconv.ParseUint(f.offer.ReservedBytes, 10, 64)
+	if err != nil || reserved == 0 {
+		t.Fatalf("fixture reservation=%q err=%v", f.offer.ReservedBytes, err)
+	}
+	providerStore, err := Open(Options{
+		Root: f.root, Authorizer: allowAuthority{}, Keys: f.store.keys,
+		Now: f.store.now, ProviderCapacityBytes: reserved, LocalProviderNodeID: f.providerID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := f.signedOffer(t, f.offer.LeaseID)
+	second := f.signedOffer(t, "rl_bbbbbbbbbbbbbbbbbbbbbb")
+	for _, signed := range []SignedOffer{first, second} {
+		if _, err := providerStore.IssueOffer(ctx, signed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	acceptances := []SignedAcceptance{f.signedAcceptance(t, first), f.signedAcceptance(t, second)}
+	start := make(chan struct{})
+	type result struct{ err error }
+	results := make(chan result, len(acceptances))
+	var workers sync.WaitGroup
+	for _, acceptance := range acceptances {
+		acceptance := acceptance
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			_, err := providerStore.AcceptProvider(ctx, acceptance)
+			results <- result{err: err}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	accepted, capacityRejected := 0, 0
+	for result := range results {
+		switch {
+		case result.err == nil:
+			accepted++
+		case errors.Is(result.err, ErrCapacityExceeded):
+			capacityRejected++
+		default:
+			t.Fatalf("unexpected concurrent provider acceptance error: %v", result.err)
+		}
+	}
+	if accepted != 1 || capacityRejected != 1 {
+		t.Fatalf("capacity race accepted=%d rejected=%d, want exactly one of each", accepted, capacityRejected)
+	}
+}
+
+func TestProviderCapacityCountsPossiblyRetainedLeaseStates(t *testing.T) {
+	for _, status := range []Status{
+		StatusAccepted, StatusTransferring, StatusVerifying, StatusActive, StatusRenewing,
+		StatusExpired, StatusFailed, StatusTerminating, StatusUnconfirmed,
+	} {
+		leases := []Lease{{Status: status, Offer: SignedOffer{Offer: Offer{ProviderNodeID: "nd_aaaaaaaaaaaaaaaaaaaaaa", ReservedBytes: "7"}}}}
+		used, err := providerReservedBytes(leases, "nd_aaaaaaaaaaaaaaaaaaaaaa")
+		if err != nil || used != 7 {
+			t.Errorf("status %q used=%d err=%v, want 7", status, used, err)
+		}
+	}
+	used, err := providerReservedBytes([]Lease{{Status: StatusOffered, Offer: SignedOffer{Offer: Offer{ProviderNodeID: "nd_aaaaaaaaaaaaaaaaaaaaaa", ReservedBytes: "7"}}}}, "nd_aaaaaaaaaaaaaaaaaaaaaa")
+	if err != nil || used != 0 {
+		t.Fatalf("never-accepted offered lease used=%d err=%v, want 0", used, err)
+	}
+	deleted := Lease{
+		Status: StatusDeleted, OfferHash: "sha256:" + strings.Repeat("a", 64),
+		Offer: SignedOffer{Offer: Offer{LeaseID: "rl_aaaaaaaaaaaaaaaaaaaaaa", ProviderNodeID: "nd_aaaaaaaaaaaaaaaaaaaaaa", ReservedBytes: "7"}},
+		DeletionReport: &SignedDeletionReport{Report: DeletionReport{
+			Status: string(StatusDeleted), LeaseID: "rl_aaaaaaaaaaaaaaaaaaaaaa",
+			OfferHash: "sha256:" + strings.Repeat("a", 64), ProviderNodeID: "nd_aaaaaaaaaaaaaaaaaaaaaa",
+		}},
+	}
+	if used, err := providerReservedBytes([]Lease{deleted}, "nd_aaaaaaaaaaaaaaaaaaaaaa"); err != nil || used != 0 {
+		t.Fatalf("confirmed deleted lease used=%d err=%v, want 0", used, err)
+	}
+	deleted.DeletionReport = nil
+	if used, err := providerReservedBytes([]Lease{deleted}, "nd_aaaaaaaaaaaaaaaaaaaaaa"); err != nil || used != 7 {
+		t.Fatalf("deleted lease without receipt used=%d err=%v, want 7", used, err)
+	}
+}
+
+func TestProviderCapacityAccountingRejectsOverflow(t *testing.T) {
+	leases := make([]Lease, 16385)
+	for i := range leases {
+		leases[i] = Lease{Status: StatusActive, Offer: SignedOffer{Offer: Offer{ProviderNodeID: "nd_aaaaaaaaaaaaaaaaaaaaaa", ReservedBytes: strconv.FormatUint(MaxReservedBytes, 10)}}}
+	}
+	if _, err := providerReservedBytes(leases, "nd_aaaaaaaaaaaaaaaaaaaaaa"); !errors.Is(err, ErrCapacityOverflow) {
+		t.Fatalf("overflowing provider capacity accounting error=%v", err)
+	}
+}
+
+func TestProviderCapacityIgnoresOutboundLeasesOnSameNode(t *testing.T) {
+	localNodeID := "nd_aaaaaaaaaaaaaaaaaaaaaa"
+	remoteProviderID := "nd_bbbbbbbbbbbbbbbbbbbbbb"
+	leases := []Lease{
+		{Status: StatusActive, Offer: SignedOffer{Offer: Offer{ProviderNodeID: remoteProviderID, ReservedBytes: "900"}}},
+		{Status: StatusTransferring, Offer: SignedOffer{Offer: Offer{ProviderNodeID: localNodeID, ReservedBytes: "40"}}},
+	}
+	used, err := providerReservedBytes(leases, localNodeID)
+	if err != nil || used != 40 {
+		t.Fatalf("provider capacity included nonlocal outbound lease: used=%d err=%v, want 40", used, err)
+	}
+}
+
+func TestProviderCapacityDoesNotChargeAcceptedOutboundLease(t *testing.T) {
+	f := newLeaseFixture(t)
+	ctx := context.Background()
+	_, remotePrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteNodeID, err := identityprotocol.NodeID(remotePrivate.Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := strconv.ParseUint(f.offer.ReservedBytes, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := testKeys{
+		f.owner.Kind + ":" + f.owner.ID:              f.ownerPrivate.Public().(ed25519.PublicKey),
+		authority.PrincipalNode + ":" + f.providerID: f.providerPrivate.Public().(ed25519.PublicKey),
+		authority.PrincipalNode + ":" + remoteNodeID: remotePrivate.Public().(ed25519.PublicKey),
+	}
+	store, err := Open(Options{
+		Root: f.root, Authorizer: allowAuthority{}, Keys: keys, Now: f.store.now,
+		ProviderCapacityBytes: reserved, LocalProviderNodeID: f.providerID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This is a source-side lease for bytes that belong on another Node.
+	outboundOffer := f.offer
+	outboundOffer.LeaseID = "rl_cccccccccccccccccccccc"
+	outboundOffer.ProviderNodeID = remoteNodeID
+	outbound, err := SignOffer(outboundOffer, f.owner, f.chain, f.ownerPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.IssueOffer(ctx, outbound); err != nil {
+		t.Fatal(err)
+	}
+	outboundHash, err := OfferHash(outbound.Offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboundReceipt, err := SignAcceptance(Acceptance{
+		Version: ProtocolVersion, LeaseID: outbound.Offer.LeaseID, OfferHash: outboundHash,
+		ProviderNodeID: remoteNodeID, ReservedBytes: outbound.Offer.ReservedBytes,
+		AcceptedAt: f.now.Add(time.Second).Format(time.RFC3339),
+	}, remotePrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Accept(ctx, outboundReceipt); err != nil {
+		t.Fatalf("outbound provider receipt failed: %v", err)
+	}
+
+	// A local incoming offer should still fit at its exact capacity because the
+	// outbound reservation above is charged to remoteNodeID, not this Node.
+	inbound := f.signedOffer(t, f.offer.LeaseID)
+	if _, err := store.IssueOffer(ctx, inbound); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcceptProvider(ctx, f.signedAcceptance(t, inbound)); err != nil {
+		t.Fatalf("outbound lease consumed local provider capacity: %v", err)
+	}
+}
+
+func TestProviderCapacityFailsClosedWithoutLocalNodeIdentity(t *testing.T) {
+	f := newLeaseFixture(t)
+	providerStore, err := Open(Options{
+		Root: f.root, Authorizer: allowAuthority{}, Keys: f.store.keys,
+		Now: f.store.now, ProviderCapacityBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := f.signedOffer(t, f.offer.LeaseID)
+	if _, err := providerStore.IssueOffer(context.Background(), signed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providerStore.AcceptProvider(context.Background(), f.signedAcceptance(t, signed)); !errors.Is(err, ErrProviderIdentity) {
+		t.Fatalf("provider acceptance without local Node identity error=%v", err)
+	}
+}
+
 func TestWrongTombstonePredecessorConflictsWithoutFreezing(t *testing.T) {
 	f := newLeaseFixture(t)
 	ctx := context.Background()

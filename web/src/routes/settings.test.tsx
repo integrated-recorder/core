@@ -18,7 +18,7 @@ const storageDefaults: StorageSettings = {
   observability: { sampling_interval_ms: 5000, metrics_retention_ms: 24 * 60 * 60 * 1000 },
 }
 const settingsDefaults: SystemSettings = {
-  settings: { ui: { theme: 'light' }, integrity: { concurrency: 1 }, retention: { enabled: false, completed_after_days: 30 }, storage: storageDefaults },
+  settings: { ui: { theme: 'light' }, integrity: { concurrency: 1 }, retention: { enabled: false, completed_after_days: 30 }, storage: storageDefaults, replication: { provider_capacity_bytes: '0' } },
   effective_storage: storageDefaults,
   restart_required: [],
 }
@@ -81,6 +81,25 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); document.documentElement.lang = 'ko-KR'; configureFormatPreferences('ko-KR', 'system') })
 
 describe('storage ingest settings UI', () => {
+  it('saves provider replica capacity as an exact decimal string and trusts restart status from the API', async () => {
+    const saved = structuredClone(settingsDefaults)
+    saved.settings.replication.provider_capacity_bytes = '900719925474099312345'
+    saved.restart_required = ['replication.provider_capacity_bytes']
+    vi.mocked(productAPI.saveSettings).mockResolvedValue(saved)
+    renderSettings('advanced-storage')
+
+    expect(await screen.findByRole('heading', { name: '이 노드의 복제 저장 용량' })).toBeInTheDocument()
+    expect(await screen.findByLabelText('복제 데이터 허용 용량')).toHaveValue('0')
+    expect(screen.getByText(/OwnerSubject의 복제 정책과 별개입니다/)).toBeInTheDocument()
+    expect(screen.getByText(/복제 Offer를 자동으로 수락하지 않습니다/)).toBeInTheDocument()
+    expect(screen.queryByText('서버가 API 응답에서 재시작 필요 상태를 보고했습니다.')).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('복제 데이터 허용 용량'), { target: { value: '900719925474099312345' } })
+    fireEvent.click(screen.getByRole('button', { name: '복제 용량 저장' }))
+    await waitFor(() => expect(productAPI.saveSettings).toHaveBeenCalledWith({ replication: { provider_capacity_bytes: '900719925474099312345' } }))
+    expect(await screen.findByRole('status')).toHaveTextContent('서버가 API 응답에서 재시작 필요 상태를 보고했습니다.')
+  })
+
   it('loads MiB/seconds values, shows effective values separately, and sends bytes/milliseconds to the API', async () => {
     const saved = structuredClone(settingsDefaults)
     saved.settings.storage.observability.sampling_interval_ms = 10_000

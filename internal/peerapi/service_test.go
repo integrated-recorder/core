@@ -194,17 +194,19 @@ func TestReplicaOfferPagingCrossesDurableReceiverValidation(t *testing.T) {
 		authority.PrincipalNode + ":" + serverNodeID:   serverPrivate.Public().(ed25519.PublicKey),
 		authority.PrincipalNode + ":" + providerNodeID: providerPrivate.Public().(ed25519.PublicKey),
 	}
-	openStore := func(name string) *lease.Store {
+	openStore := func(root string, capacity uint64) *lease.Store {
 		store, openErr := lease.Open(lease.Options{
-			Root: filepath.Join(t.TempDir(), name), Authorizer: peerOfferTestAuthorizer{}, Keys: keys,
-			Now: func() time.Time { return now },
+			Root: root, Authorizer: peerOfferTestAuthorizer{}, Keys: keys,
+			Now: func() time.Time { return now }, ProviderCapacityBytes: capacity, LocalProviderNodeID: providerNodeID,
 		})
 		if openErr != nil {
 			t.Fatal(openErr)
 		}
 		return store
 	}
-	sourceStore, destinationStore := openStore("source-leases"), openStore("provider-leases")
+	sourceRoot := filepath.Join(t.TempDir(), "source-leases")
+	providerRoot := filepath.Join(t.TempDir(), "provider-leases")
+	sourceStore, destinationStore := openStore(sourceRoot, 0), openStore(providerRoot, uint64(len(objects)-1))
 	if _, err := sourceStore.IssueOffer(ctx, signed); err != nil {
 		t.Fatalf("persist source offer before delivery: %v", err)
 	}
@@ -235,6 +237,22 @@ func TestReplicaOfferPagingCrossesDurableReceiverValidation(t *testing.T) {
 	}
 	signer := peerOfferAcceptanceSigner{privateKey: providerPrivate}
 	received, err := client.AcceptReplicaOffer(ctx, destinationStore, signer, archiveID, snapshotID, offer.LeaseID)
+	if !errors.Is(err, lease.ErrCapacityExceeded) || received.Status != lease.StatusOffered || len(received.Offer.Offer.EncryptedObjectSet) != len(objects) {
+		t.Fatalf("provider over-capacity acceptance should remain unaccepted: status=%q objects=%d err=%v", received.Status, len(received.Offer.Offer.EncryptedObjectSet), err)
+	}
+	providerUnaccepted, err := destinationStore.Get(ctx, offer.LeaseID)
+	if err != nil || providerUnaccepted.Status != lease.StatusOffered || providerUnaccepted.Acceptance.Signature != "" {
+		t.Fatalf("capacity rejection changed provider consent state: status=%q signature=%t err=%v", providerUnaccepted.Status, providerUnaccepted.Acceptance.Signature != "", err)
+	}
+	sourceUnaccepted, err := sourceStore.Get(ctx, offer.LeaseID)
+	if err != nil || sourceUnaccepted.Status != lease.StatusOffered || sourceUnaccepted.Acceptance.Signature != "" {
+		t.Fatalf("rejected provider consent reached source: status=%q signature=%t err=%v", sourceUnaccepted.Status, sourceUnaccepted.Acceptance.Signature != "", err)
+	}
+	destinationStore = openStore(providerRoot, uint64(len(objects)))
+	if persisted, err := destinationStore.Get(ctx, offer.LeaseID); err != nil || persisted.Status != lease.StatusOffered {
+		t.Fatalf("provider offer did not survive capacity reconfiguration: status=%q err=%v", persisted.Status, err)
+	}
+	received, err = client.AcceptReplicaOffer(ctx, destinationStore, signer, archiveID, snapshotID, offer.LeaseID)
 	if err == nil || received.Status != lease.StatusAccepted || len(received.Offer.Offer.EncryptedObjectSet) != len(objects) {
 		t.Fatalf("lost acceptance response should preserve local accepted lease: status=%q objects=%d err=%v", received.Status, len(received.Offer.Offer.EncryptedObjectSet), err)
 	}
@@ -313,7 +331,7 @@ func TestReplicaOfferPagingCrossesDurableReceiverValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tamperedClient.ReceiveReplicaOffer(ctx, openStore("tampered-provider"), archiveID, snapshotID, offer.LeaseID); !errors.Is(err, lease.ErrDenied) {
+	if _, err := tamperedClient.ReceiveReplicaOffer(ctx, openStore(filepath.Join(t.TempDir(), "tampered-provider"), 0), archiveID, snapshotID, offer.LeaseID); !errors.Is(err, lease.ErrDenied) {
 		t.Fatalf("tampered signed offer crossed receiving Store validation: %v", err)
 	}
 }

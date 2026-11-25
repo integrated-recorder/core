@@ -1611,8 +1611,10 @@ func (c *Client) AcceptReplicaOffer(ctx context.Context, destination *lease.Stor
 		if err != nil {
 			return current, err
 		}
-		current, err = destination.Accept(ctx, signed)
-		if err != nil {
+		// The destination is the receiving provider's local durable store. Its
+		// explicit consent must reserve capacity atomically with acceptance.
+		accepted, acceptErr := destination.AcceptProvider(ctx, signed)
+		if acceptErr != nil {
 			// Another caller may have durably accepted the same offer between
 			// our read and mutation. Reuse that exact signed receipt; never mint
 			// a second acceptance for the same local lease.
@@ -1622,14 +1624,16 @@ func (c *Client) AcceptReplicaOffer(ctx context.Context, destination *lease.Stor
 				latest.Acceptance.Acceptance.ProviderNodeID != c.scope.NodeID || latest.Offer.Offer.ArchiveID != archiveID ||
 				latest.Offer.Offer.SnapshotID != snapshotID || latest.Offer.Offer.OwnerSubjectID != c.scope.OwnerSubjectID ||
 				latest.Offer.Offer.ProviderNodeID != c.scope.NodeID {
-				return current, err
+				return current, acceptErr
 			}
 			switch latest.Status {
 			case lease.StatusAccepted, lease.StatusTransferring, lease.StatusVerifying, lease.StatusActive, lease.StatusRenewing:
 			default:
-				return current, err
+				return current, acceptErr
 			}
 			current, signed = latest, latest.Acceptance
+		} else {
+			current = accepted
 		}
 	} else {
 		current, err = destination.Get(ctx, leaseID)

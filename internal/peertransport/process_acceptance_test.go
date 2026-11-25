@@ -161,19 +161,40 @@ type peerTransportProcess struct {
 
 type synchronizedBuffer struct {
 	mu sync.Mutex
-	b  bytes.Buffer
+	b  []byte
+}
+
+func TestSynchronizedBufferBoundsDiagnosticOutput(t *testing.T) {
+	buffer := &synchronizedBuffer{}
+	input := bytes.Repeat([]byte("x"), 9<<10)
+	if n, err := buffer.Write(input); err != nil || n != len(input) {
+		t.Fatalf("write diagnostic output n=%d err=%v", n, err)
+	}
+	if got := buffer.String(); len(got) != 8<<10 || got != strings.Repeat("x", 8<<10) {
+		t.Fatalf("diagnostic output length=%d, want bounded 8192-byte suffix", len(got))
+	}
 }
 
 func (b *synchronizedBuffer) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.Write(data)
+	const maxBytes = 8 << 10
+	if len(data) >= maxBytes {
+		b.b = append(b.b[:0], data[len(data)-maxBytes:]...)
+		return len(data), nil
+	}
+	if overflow := len(b.b) + len(data) - maxBytes; overflow > 0 {
+		copy(b.b, b.b[overflow:])
+		b.b = b.b[:len(b.b)-overflow]
+	}
+	b.b = append(b.b, data...)
+	return len(data), nil
 }
 
 func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.String()
+	return string(append([]byte(nil), b.b...))
 }
 
 func startPeerTransportProcess(t *testing.T, nodeDir string) *peerTransportProcess {

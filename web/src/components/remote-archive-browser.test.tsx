@@ -1,7 +1,8 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { globalIdentityAPI, peerArchivesAPI } from '@/api'
+import { openArchiveDEK } from '@/identity/cryptoarchive'
 import { RemoteArchiveBrowser } from './remote-archive-browser'
 
 vi.mock('@/identity/recovery', () => ({
@@ -76,6 +77,7 @@ function head(nodeID: string, snapshotID = `snap_${'c'.repeat(64)}`, sequence = 
 function renderBrowser() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   render(<QueryClientProvider client={queryClient}><RemoteArchiveBrowser /></QueryClientProvider>)
+  return queryClient
 }
 
 describe('remote archive browser', () => {
@@ -106,6 +108,28 @@ describe('remote archive browser', () => {
       expect(request).toContain(`archive_id=${archiveID}`)
       expect(request).toContain(`grant_hash=${encodeURIComponent(grantHash)}`)
     }
+  })
+
+  it('fails closed when one Node ID is simultaneously attributed to multiple identities', async () => {
+    const state = capabilities()
+    state.sessions.push({ identity_id: `gi_${'J'.repeat(22)}`, node_id: nodeA, connected_at: new Date().toISOString() })
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      calls.push(path)
+      if (path === '/api/peer-archives/capabilities') {
+        return new Response(JSON.stringify(state), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const requestedNode = path.match(/^\/api\/peer-archives\/([^/]+)\/head/u)?.[1] ?? ''
+      return new Response(JSON.stringify(head(requestedNode)), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    renderBrowser()
+
+    fireEvent.click(await screen.findByRole('button', { name: '스냅샷 목록 불러오기' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('요청을 완료하지 못했습니다. 잠시 후 다시 시도하세요.')
+    expect(calls.some(path => path.includes('/head?'))).toBe(false)
+    expect(screen.queryByText('스냅샷 5 · 객체 1개')).not.toBeInTheDocument()
   })
 
   it('walks the immutable snapshot predecessor chain under the same archive capability', async () => {
@@ -218,10 +242,13 @@ describe('remote archive browser', () => {
     vi.stubGlobal('crypto', { subtle: {} })
     Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true })
     const NativeURL = URL
-    vi.stubGlobal('URL', Object.assign(class extends NativeURL {}, { createObjectURL: vi.fn(() => 'blob:peer-playback'), revokeObjectURL: vi.fn() }))
-    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
-    vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
-    renderBrowser()
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal('URL', Object.assign(class extends NativeURL {}, { createObjectURL: vi.fn(() => 'blob:peer-playback'), revokeObjectURL }))
+    const dek = new Uint8Array(32).fill(0x7b)
+    vi.mocked(openArchiveDEK).mockResolvedValue(dek)
+    const pause = vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const load = vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const queryClient = renderBrowser()
 
     fireEvent.click(await screen.findByRole('button', { name: '스냅샷 목록 불러오기' }))
     await screen.findByText('스냅샷 5 · 객체 1개')
@@ -233,6 +260,34 @@ describe('remote archive browser', () => {
     expect(calls.some(path => path.includes('/key-epochs?'))).toBe(true)
     expect(calls.some(path => path.includes('/manifest?') && path.includes('key_epoch=7'))).toBe(true)
     expect(calls.some(path => path.includes('/key-envelope?') && path.includes('key_epoch=7'))).toBe(true)
+
+    const differentIdentity = `gi_${'J'.repeat(22)}`
+    queryClient.setQueryData(['peerArchives', 'capabilities'], {
+      ...capabilities(),
+      sessions: [{ identity_id: differentIdentity, node_id: nodeA, connected_at: new Date().toISOString() }],
+    })
+
+    await waitFor(() => {
+      expect(pause).toHaveBeenCalled()
+      expect(load).toHaveBeenCalled()
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:peer-playback')
+      expect(dek.every(byte => byte === 0)).toBe(true)
+      expect(screen.getByRole('alert')).toHaveTextContent('아카이브 권한 또는 Node 연결이 만료되거나 변경되어 재생을 중지하고 복호화 키를 지웠습니다.')
+    })
+
+    const secondDEK = new Uint8Array(32).fill(0x5a)
+    vi.mocked(openArchiveDEK).mockResolvedValue(secondDEK)
+    queryClient.setQueryData(['peerArchives', 'capabilities'], capabilities())
+    fireEvent.change(screen.getByLabelText('Global Identity 복구 문구'), { target: { value: 'recovery phrase fixture' } })
+    fireEvent.click(screen.getByRole('button', { name: '복호화 재생' }))
+    expect(await screen.findByText('확인된 키 Epoch: 7')).toBeInTheDocument()
+
+    queryClient.setQueryData(['peerArchives', 'capabilities'], { ...capabilities(), capabilities: [] })
+    await waitFor(() => {
+      expect(revokeObjectURL).toHaveBeenCalledTimes(2)
+      expect(secondDEK.every(byte => byte === 0)).toBe(true)
+      expect(screen.getByRole('alert')).toHaveTextContent('아카이브 권한 또는 Node 연결이 만료되거나 변경되어 재생을 중지하고 복호화 키를 지웠습니다.')
+    })
   })
 
   it('uses Passkey-bound ephemeral key delivery without recovery input', async () => {

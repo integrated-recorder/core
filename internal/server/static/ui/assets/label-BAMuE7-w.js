@@ -1,0 +1,1 @@
+import{o as s,j as r,b4 as t}from"./index-D6Vq8_cc.js";const d=s.forwardRef(function({className:e,...a},o){return r.jsx("label",{ref:o,className:t("text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70",e),...a})});export{d as L};

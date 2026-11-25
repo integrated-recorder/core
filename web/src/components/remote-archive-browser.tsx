@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { globalIdentityAPI, peerArchivesAPI } from '@/api'
 import { Button } from '@/components/ui/button'
@@ -15,35 +15,47 @@ import type { PeerArchiveCapabilities, PeerArchiveHead, ReplicaManifest } from '
 const maxPeerArchiveHeadFanout = 16
 
 type ArchiveGrant = PeerArchiveCapabilities['capabilities'][number]
-type ResolvedArchiveHead = PeerArchiveHead & { checkedReplicaCount: number; unavailableReplicaCount: number }
+type ResolvedArchiveHead = PeerArchiveHead & { peerIdentityID: string; checkedReplicaCount: number; unavailableReplicaCount: number }
+
+function uniquePeerSessions(sessions: PeerArchiveCapabilities['sessions']) {
+  const peers = new Map<string, PeerArchiveCapabilities['sessions'][number]>()
+  for (const session of sessions) {
+    const existing = peers.get(session.node_id)
+    if (existing && existing.identity_id !== session.identity_id) {
+      throw new Error('A connected Node ID is associated with multiple Global Identities.')
+    }
+    peers.set(session.node_id, session)
+  }
+  return [...peers.values()].sort((left, right) => left.node_id.localeCompare(right.node_id))
+}
 
 async function resolvePeerArchiveHead(
   sessions: PeerArchiveCapabilities['sessions'],
   grant: ArchiveGrant,
 ): Promise<ResolvedArchiveHead> {
-  const peers = [...new Map(sessions.map(session => [session.node_id, session])).values()]
-    .sort((left, right) => left.node_id.localeCompare(right.node_id))
+  const peers = uniquePeerSessions(sessions)
   if (peers.length === 0) throw new Error('No connected archive replica is available.')
   if (peers.length > maxPeerArchiveHeadFanout) throw new Error('Too many connected archive replicas to verify safely.')
 
   const results = await Promise.allSettled(peers.map(async session => {
     const response = await peerArchivesAPI.head(session.node_id, grant.owner_subject_id, grant.archive_id, grant.grant_hash)
     if (response.node_id !== session.node_id) throw new TypeError('peer archive response identity does not match the requested Node')
-    return response
+    return { response, peerIdentityID: session.identity_id }
   }))
   const heads = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : [])
   if (heads.length === 0) throw new Error('No connected archive replica returned a verified snapshot.')
 
   const first = heads[0]
   if (!first) throw new Error('No connected archive replica returned a verified snapshot.')
-  const firstSnapshot = first.snapshot
-  if (heads.some(item => item.snapshot.snapshot_id !== firstSnapshot.snapshot_id ||
-    item.snapshot.content_hash !== firstSnapshot.content_hash ||
-    item.snapshot.sequence !== firstSnapshot.sequence)) {
+  const firstSnapshot = first.response.snapshot
+  if (heads.some(item => item.response.snapshot.snapshot_id !== firstSnapshot.snapshot_id ||
+    item.response.snapshot.content_hash !== firstSnapshot.content_hash ||
+    item.response.snapshot.sequence !== firstSnapshot.sequence)) {
     throw new Error('Connected archive replicas disagree about the current immutable snapshot.')
   }
   return {
-    ...first,
+    ...first.response,
+    peerIdentityID: first.peerIdentityID,
     checkedReplicaCount: heads.length,
     unavailableReplicaCount: results.length - heads.length,
   }
@@ -55,8 +67,7 @@ async function resolvePeerArchiveSnapshot(
   snapshotID: string,
   expectedSequence: number,
 ): Promise<ResolvedArchiveHead> {
-  const peers = [...new Map(sessions.map(session => [session.node_id, session])).values()]
-    .sort((left, right) => left.node_id.localeCompare(right.node_id))
+  const peers = uniquePeerSessions(sessions)
   if (peers.length === 0 || peers.length > maxPeerArchiveHeadFanout) throw new Error('No connected archive replica is available.')
 
   const results = await Promise.allSettled(peers.map(async session => {
@@ -65,17 +76,17 @@ async function resolvePeerArchiveSnapshot(
       response.snapshot.sequence !== expectedSequence || response.snapshot.content.archive_id !== grant.archive_id) {
       throw new TypeError('peer archive snapshot does not match its immutable predecessor reference')
     }
-    return response
+    return { response, peerIdentityID: session.identity_id }
   }))
   const snapshots = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : [])
   if (snapshots.length === 0) throw new Error('No connected archive replica returned the requested historical snapshot.')
   const first = snapshots[0]
   if (!first) throw new Error('No connected archive replica returned the requested historical snapshot.')
-  if (snapshots.some(item => item.snapshot.content_hash !== first.snapshot.content_hash ||
-    item.snapshot.sequence !== first.snapshot.sequence)) {
+  if (snapshots.some(item => item.response.snapshot.content_hash !== first.response.snapshot.content_hash ||
+    item.response.snapshot.sequence !== first.response.snapshot.sequence)) {
     throw new Error('Connected archive replicas disagree about the immutable snapshot history.')
   }
-  return { ...first, checkedReplicaCount: snapshots.length, unavailableReplicaCount: results.length - snapshots.length }
+  return { ...first.response, peerIdentityID: first.peerIdentityID, checkedReplicaCount: snapshots.length, unavailableReplicaCount: results.length - snapshots.length }
 }
 
 export function RemoteArchiveBrowser() {
@@ -95,6 +106,7 @@ export function RemoteArchiveBrowser() {
   const hlsRef = useRef<{ destroy: () => void } | null>(null)
   const playlistURLRef = useRef('')
   const dekRef = useRef<Uint8Array | null>(null)
+  const playbackScopeRef = useRef<{ identityID: string; nodeID: string; ownerSubjectID: string; archiveID: string; grantHash: string } | null>(null)
   const headRequestRef = useRef(0)
   const capabilities = useQuery({
     queryKey: ['peerArchives', 'capabilities'],
@@ -112,7 +124,8 @@ export function RemoteArchiveBrowser() {
   const grants = capabilities.data?.capabilities ?? []
   const selectedGrant = grants.find(item => item.grant_hash === grantHash) ?? grants[0]
 
-  const clearPlayback = () => {
+  const clearPlayback = useCallback(() => {
+    playbackScopeRef.current = null
     hlsRef.current?.destroy()
     hlsRef.current = null
     if (videoRef.current) {
@@ -127,7 +140,23 @@ export function RemoteArchiveBrowser() {
     setPlaybackPlan(null)
     setTrackID('')
     setPlaybackKeyEpoch('')
-  }
+  }, [])
+
+  useEffect(() => {
+    const scope = playbackScopeRef.current
+    if (!scope) return
+
+    const grantStillActive = !capabilities.error && (capabilities.data?.capabilities ?? []).some(grant =>
+      grant.owner_subject_id === scope.ownerSubjectID && grant.archive_id === scope.archiveID &&
+      grant.grant_hash === scope.grantHash && Date.parse(grant.expires_at) > Date.now())
+    const peerStillConnected = (capabilities.data?.sessions ?? []).some(session =>
+      session.identity_id === scope.identityID && session.node_id === scope.nodeID)
+    if (!grantStillActive || !peerStillConnected) {
+      clearPlayback()
+      setPlaybackMessage('')
+      setPlaybackError(t('identity.remotePlaybackAuthorizationEnded'))
+    }
+  }, [capabilities.data, capabilities.dataUpdatedAt, capabilities.error, clearPlayback, playbackPlan, t])
 
   useEffect(() => () => {
     headRequestRef.current++
@@ -217,6 +246,13 @@ export function RemoteArchiveBrowser() {
     const playlistURL = URL.createObjectURL(new Blob([plan.playlist(firstTrack)], { type: 'application/vnd.apple.mpegurl' }))
     playlistURLRef.current = playlistURL
     dekRef.current = dek
+    playbackScopeRef.current = {
+      identityID: selectedSnapshot.peerIdentityID,
+      nodeID,
+      ownerSubjectID: grant.owner_subject_id,
+      archiveID: grant.archive_id,
+      grantHash: grant.grant_hash,
+    }
     setPlaybackKeyEpoch(epoch)
     setPlaybackPlan(plan)
     setTrackID(firstTrack)
@@ -250,8 +286,12 @@ export function RemoteArchiveBrowser() {
       keys = await deriveRecoveryKeys(entropy)
       entropy.fill(0)
       entropy = null
-      const sessionIdentity = sessions.find(item => item.node_id === nodeID)?.identity_id
-      if (!sessionIdentity || keys.identityId !== sessionIdentity) throw new Error(t('identity.remotePlaybackWrongRecovery'))
+      const matchingSessions = sessions.filter(item => item.node_id === nodeID)
+      if (new Set(matchingSessions.map(item => item.identity_id)).size !== 1 ||
+        matchingSessions[0]?.identity_id !== selectedSnapshot.peerIdentityID ||
+        keys.identityId !== selectedSnapshot.peerIdentityID) {
+        throw new Error(t('identity.remotePlaybackWrongRecovery'))
+      }
       const snapshot = selectedSnapshot.snapshot
       const keyEpochResponse = await peerArchivesAPI.keyEpochs(nodeID, selectedGrant.owner_subject_id, selectedGrant.archive_id, selectedGrant.grant_hash, snapshot.snapshot_id)
       if (keyEpochResponse.node_id !== nodeID || keyEpochResponse.archive_id !== snapshot.content.archive_id || keyEpochResponse.snapshot_id !== snapshot.snapshot_id ||
@@ -416,8 +456,12 @@ export function RemoteArchiveBrowser() {
   }
 
   if (capabilities.isLoading) return null
-  if (capabilities.error) return <Card className="mb-4"><CardContent className="pt-5 text-sm text-destructive" role="alert">{errorMessage(capabilities.error)}</CardContent></Card>
-  if (grants.length === 0) return null
+  if (capabilities.error && !playbackPlan) return <Card className="mb-4"><CardContent className="pt-5 text-sm text-destructive" role="alert">{errorMessage(capabilities.error)}</CardContent></Card>
+  if (grants.length === 0 && !playbackPlan) {
+    return playbackError
+      ? <Card className="mb-4"><CardContent className="pt-5 text-sm text-destructive" role="alert">{playbackError}</CardContent></Card>
+      : null
+  }
 
   return <Card className="mb-4">
     <CardHeader><CardTitle>{t('identity.remoteArchiveBrowse')}</CardTitle><p className="text-xs text-muted-foreground">{t('identity.remoteArchiveHelp')}</p></CardHeader>

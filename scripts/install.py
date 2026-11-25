@@ -34,6 +34,9 @@ CONTAINER_UID = 10001
 CONTAINER_GID = 10001
 CONTAINER_HTTP_PORT = 8080
 CONTAINER_HTTPS_PORT = 8443
+CONTAINER_TURN_SECRET_FILE = "/run/secrets/ir-peer-turn-secret"
+MAX_ICE_URLS = 8
+MAX_TURN_SECRET_BYTES = 1024
 MANIFEST_ROLES = ("runtime-host", "control-plane", "recorder-engine", "adapter-runtime")
 SEMVER = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
@@ -220,6 +223,121 @@ def runtime_probe_url(bind: str, port: int, path: str) -> str:
     return f"http://{host}:{port}{path}"
 
 
+def parse_ice_urls(value: str | None, allowed_schemes: tuple[str, ...], label: str) -> list[str]:
+    if value is None or not value.strip():
+        return []
+    entries = [entry.strip() for entry in value.split(",")]
+    if len(entries) > MAX_ICE_URLS or any(not entry or len(entry) > 2048 for entry in entries):
+        raise InstallError(f"{label} must contain at most {MAX_ICE_URLS} valid ICE URLs.")
+    for entry in entries:
+        parsed = urllib.parse.urlsplit(entry)
+        scheme = parsed.scheme.lower()
+        if scheme not in allowed_schemes or parsed.fragment or parsed.username is not None or parsed.password is not None:
+            raise InstallError(f"{label} contains an invalid ICE URL.")
+        # ICE URIs use scheme:authority rather than scheme://authority.
+        authority_text = parsed.netloc if parsed.netloc else parsed.path
+        authority = urllib.parse.urlsplit("//" + authority_text)
+        if not authority.hostname or authority.username is not None or authority.password is not None or authority.path:
+            raise InstallError(f"{label} contains an invalid ICE host.")
+        try:
+            port = authority.port
+        except ValueError:
+            raise InstallError(f"{label} contains an invalid ICE port.") from None
+        if port is not None and not 1 <= port <= 65535:
+            raise InstallError(f"{label} contains an invalid ICE port.")
+        try:
+            query = urllib.parse.parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
+        except ValueError:
+            raise InstallError(f"{label} contains a malformed query.") from None
+        if scheme in ("turn", "turns"):
+            if set(query) - {"transport"} or len(query.get("transport", [])) > 1 or (query and query.get("transport", [""])[0] not in ("udp", "tcp")):
+                raise InstallError(f"{label} contains an unsupported TURN transport query.")
+        elif query:
+            raise InstallError(f"{label} STUN URLs must not contain query parameters.")
+    return entries
+
+
+def validate_private_turn_secret(path: Path) -> None:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+            raise InstallError("TURN shared-secret file must be a regular file with owner-only permissions (for example mode 0600).")
+        with path.open("rb") as source:
+            if not os.path.samestat(info, os.fstat(source.fileno())):
+                raise InstallError("TURN shared-secret file changed during validation.")
+            content = source.read(MAX_TURN_SECRET_BYTES + 1).strip()
+        if len(content) < 32 or len(content) > MAX_TURN_SECRET_BYTES:
+            raise InstallError("TURN shared-secret file must contain 32 to 1024 bytes of secret material.")
+    except InstallError:
+        raise
+    except OSError:
+        raise InstallError("TURN shared-secret file could not be safely read.") from None
+
+
+def peer_ice_settings(args: argparse.Namespace, existing: dict[str, Any] | None) -> dict[str, Any]:
+    prior = (existing or {}).get("peer_ice", {})
+    if not isinstance(prior, dict):
+        raise InstallError("Stored peer networking settings are invalid; refusing to replace deployment metadata.")
+    known = {"stun_urls", "turn_urls", "turn_secret_file", "credential_ttl", "relay_only"}
+    if set(prior) - known:
+        raise InstallError("Stored peer networking settings contain unknown fields.")
+    if args.disable_peer_ice:
+        if any(value is not None for value in (args.peer_stun_urls, args.peer_turn_urls, args.peer_turn_secret_file, args.peer_turn_credential_ttl, args.peer_ice_relay_only)):
+            raise InstallError("--disable-peer-ice cannot be combined with peer ICE configuration options.")
+        return {}
+    prior_stun = prior.get("stun_urls", [])
+    prior_turn = prior.get("turn_urls", [])
+    prior_secret = prior.get("turn_secret_file", "")
+    prior_ttl = prior.get("credential_ttl", "")
+    prior_relay = prior.get("relay_only", False)
+    if (not isinstance(prior_stun, list) or any(not isinstance(item, str) for item in prior_stun)
+            or not isinstance(prior_turn, list) or any(not isinstance(item, str) for item in prior_turn)
+            or not isinstance(prior_secret, str) or not isinstance(prior_ttl, str) or not isinstance(prior_relay, bool)):
+        raise InstallError("Stored peer networking settings are malformed; refusing to rewrite the Compose configuration.")
+    result = {
+        "stun_urls": parse_ice_urls(",".join(prior_stun), ("stun", "stuns"), "stored STUN URLs") if prior_stun else [],
+        "turn_urls": parse_ice_urls(",".join(prior_turn), ("turn", "turns"), "stored TURN URLs") if prior_turn else [],
+        "turn_secret_file": prior_secret,
+        "credential_ttl": prior_ttl,
+        "relay_only": prior_relay,
+    }
+    if result["turn_secret_file"]:
+        existing_secret = absolute_path(result["turn_secret_file"], "stored TURN shared-secret file")
+        validate_private_turn_secret(existing_secret)
+        result["turn_secret_file"] = str(existing_secret)
+    if result["credential_ttl"] and not re.fullmatch(r"(?:[1-9]|10)m", result["credential_ttl"]):
+        raise InstallError("Stored TURN credential TTL is invalid.")
+    if args.peer_stun_urls is not None:
+        result["stun_urls"] = parse_ice_urls(args.peer_stun_urls, ("stun", "stuns"), "--peer-stun-urls")
+    if args.peer_turn_urls is not None:
+        result["turn_urls"] = parse_ice_urls(args.peer_turn_urls, ("turn", "turns"), "--peer-turn-urls")
+    if args.peer_turn_secret_file is not None:
+        if not args.peer_turn_secret_file.strip():
+            result["turn_secret_file"] = ""
+        else:
+            secret_path = absolute_path(args.peer_turn_secret_file, "TURN shared-secret file")
+            validate_private_turn_secret(secret_path)
+            result["turn_secret_file"] = str(secret_path)
+    if args.peer_turn_credential_ttl is not None:
+        ttl = args.peer_turn_credential_ttl.strip()
+        if not re.fullmatch(r"(?:[1-9]|10)m", ttl):
+            raise InstallError("--peer-turn-credential-ttl must be from 1m through 10m.")
+        result["credential_ttl"] = ttl
+    if args.peer_ice_relay_only is not None:
+        result["relay_only"] = bool(args.peer_ice_relay_only)
+    turn_urls = result["turn_urls"]
+    secret_file = result["turn_secret_file"]
+    if turn_urls and not secret_file:
+        raise InstallError("TURN URLs require --peer-turn-secret-file with a private shared-secret file.")
+    if secret_file and not turn_urls:
+        raise InstallError("A TURN shared-secret file requires at least one TURN URL.")
+    if result["relay_only"] and not turn_urls:
+        raise InstallError("Relay-only ICE requires configured TURN URLs and a shared-secret file.")
+    if not turn_urls and not result["stun_urls"]:
+        return {}
+    return result
+
+
 def docker_architecture(value: str) -> str:
     os_name, sep, arch = value.strip().lower().partition("/")
     if not sep or os_name != "linux":
@@ -313,6 +431,25 @@ def render_compose(config: dict[str, Any]) -> str:
                 f'      IR_IMAGE_BUNDLE_UPGRADE_FROM_VERSION: {quote_yaml(transition_version)}\n'
                 f'      IR_IMAGE_BUNDLE_UPGRADE_FROM_COMMIT: {quote_yaml(transition_commit)}\n'
             )
+    peer_ice = config.get("peer_ice") or {}
+    peer_ice_env = ""
+    peer_secret_mount = ""
+    if peer_ice.get("stun_urls"):
+        peer_ice_env += f'      IR_PEER_STUN_URLS: {quote_yaml(",".join(peer_ice["stun_urls"]))}\n'
+    if peer_ice.get("turn_urls"):
+        peer_ice_env += f'      IR_PEER_TURN_URLS: {quote_yaml(",".join(peer_ice["turn_urls"]))}\n'
+        peer_ice_env += f'      IR_PEER_TURN_SHARED_SECRET_FILE: {quote_yaml(CONTAINER_TURN_SECRET_FILE)}\n'
+        if peer_ice.get("credential_ttl"):
+            peer_ice_env += f'      IR_PEER_TURN_CREDENTIAL_TTL: {quote_yaml(peer_ice["credential_ttl"])}\n'
+        if peer_ice.get("relay_only"):
+            peer_ice_env += '      IR_PEER_ICE_RELAY_ONLY: "true"\n'
+        peer_secret_mount = f'''      - type: bind
+        source: {quote_yaml(peer_ice["turn_secret_file"])}
+        target: {quote_yaml(CONTAINER_TURN_SECRET_FILE)}
+        read_only: true
+        bind:
+          create_host_path: false
+'''
     return f'''name: {COMPOSE_PROJECT}
 services:
   archiver:
@@ -358,6 +495,7 @@ services:
       IR_PLUGIN_REGISTRY_URL: https://integrated-recorder.github.io/plugin-registry/catalog-v3.json
       IR_RELEASE_TRUSTED_KEYS_JSON: ""
 {transition_env.rstrip()}
+{peer_ice_env.rstrip()}
     volumes:
       - type: volume
         source: application-state
@@ -367,6 +505,7 @@ services:
         target: /data/recordings
         bind:
           create_host_path: false
+{peer_secret_mount.rstrip()}
     labels:
       org.opencontainers.image.source: https://github.com/{REPOSITORY}
       org.opencontainers.image.version: {version}
@@ -874,6 +1013,22 @@ def compose_command(compose_file: Path, *args: str) -> list[str]:
     return ["docker", "compose", "--project-name", COMPOSE_PROJECT, "--file", str(compose_file), *args]
 
 
+def verify_peer_ice_secret_access(compose_file: Path, deployment: dict[str, Any]) -> None:
+    peer_ice = deployment.get("peer_ice") or {}
+    if not peer_ice.get("turn_urls"):
+        return
+    result = run(compose_command(
+        compose_file, "run", "--rm", "--no-deps", "--entrypoint", "/bin/sh",
+        "archiver", "-c", f"test -r {CONTAINER_TURN_SECRET_FILE}",
+    ), check=False)
+    if result.returncode != 0:
+        raise InstallError(
+            f"The TURN shared-secret file is not readable by container UID:GID {CONTAINER_UID}:{CONTAINER_GID}. "
+            "The installer did not change its permissions. Set ownership/mode on this dedicated secret file, "
+            "then rerun the same install command."
+        )
+
+
 def write_compose(path: Path, config: dict[str, Any]) -> None:
     atomic_write(path, render_compose(config).encode("utf-8"), 0o600)
 
@@ -1019,6 +1174,12 @@ def cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, help="application host port (default: 8080 if free, otherwise an available port)")
     parser.add_argument("--bind", help="explicit host interface IPv4/IPv6 address (default: 127.0.0.1)")
     parser.add_argument("--https-port", type=int, help="host port mapped to Runtime Host HTTPS (default: 8443 if free)")
+    parser.add_argument("--peer-stun-urls", help="optional comma-separated STUN ICE URLs")
+    parser.add_argument("--peer-turn-urls", help="optional comma-separated TURN ICE URLs")
+    parser.add_argument("--peer-turn-secret-file", help="private coturn REST shared-secret file mounted read-only for Control Plane")
+    parser.add_argument("--peer-turn-credential-ttl", help="short-lived coturn credential TTL from 1m through 10m (default: 5m)")
+    parser.add_argument("--peer-ice-relay-only", action=argparse.BooleanOptionalAction, default=None, help="require TURN relay candidates for peer sessions")
+    parser.add_argument("--disable-peer-ice", action="store_true", help="remove persisted optional STUN/TURN settings")
     parser.add_argument("--install-dir", help="deployment metadata and exact release source (platform-specific user-data default)")
     parser.add_argument("--upgrade", action="store_true", help="explicitly select/build another release for an existing installation")
     return parser
@@ -1054,6 +1215,7 @@ def install(args: argparse.Namespace) -> None:
 
     prior_deployment = pending or current
     selected_bind, selected_https_port = network_settings(args, prior_deployment, install_dir)
+    selected_peer_ice = peer_ice_settings(args, prior_deployment)
 
     policy, stored_release = pinned_release_decision(
         current.get("release") if current else None,
@@ -1162,6 +1324,7 @@ def install(args: argparse.Namespace) -> None:
         "https_port": selected_https_port,
         "container_uid": CONTAINER_UID,
         "container_gid": CONTAINER_GID,
+        "peer_ice": selected_peer_ice,
     }
     if bundle_upgrade_from is not None:
         candidate["bundle_upgrade_from"] = bundle_upgrade_from
@@ -1173,6 +1336,7 @@ def install(args: argparse.Namespace) -> None:
     run(compose_command(candidate_compose, "build", "archiver"), capture=False)
     verify_image_labels(image, release_data)
     verify_image_binaries(image, release_data)
+    verify_peer_ice_secret_access(candidate_compose, candidate)
     probe_archive_permissions(image, archive, archive_created)
 
     try:

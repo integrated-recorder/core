@@ -2216,6 +2216,7 @@ func (c *updateController) publishControl(ctx context.Context, id, directory str
 		"RUNTIME_RESOURCE_OWNER="+resourceOwner,
 		"CONTROL_ADAPTER_TRUST_JSON="+trustJSON,
 	)
+	env = append(env, controlNetworkingChildEnv(c.config)...)
 	env = append(env, storageProviderChildEnv(c.config.DataDir, gen.StorageProviderSetID)...)
 	if c.config.AuthDisabled {
 		env = append(env, "AUTH_DISABLED=1")

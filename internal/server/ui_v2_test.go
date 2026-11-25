@@ -86,6 +86,16 @@ func TestAuthPublicRoutesExposeOnlySPAAndStaticGetRequests(t *testing.T) {
 		}
 	}
 	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/api/global-identity/session", nil),
+		httptest.NewRequest(http.MethodPost, "/api/global-identity/login/options", nil),
+		httptest.NewRequest(http.MethodPost, "/api/global-identity/login/finish", nil),
+		httptest.NewRequest(http.MethodPost, "/api/global-identity/logout", nil),
+	} {
+		if !authRoutePublic(request) {
+			t.Errorf("expected global identity session route to be public to auth middleware: %s %s", request.Method, request.URL.Path)
+		}
+	}
+	for _, request := range []*http.Request{
 		httptest.NewRequest(http.MethodPost, "/recordings", nil),
 		httptest.NewRequest(http.MethodGet, "/recordings/id/extra", nil),
 		httptest.NewRequest(http.MethodGet, "/api/dashboard", nil),

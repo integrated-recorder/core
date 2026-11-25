@@ -10,6 +10,7 @@ import (
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/replication"
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
@@ -668,6 +669,72 @@ func (r *ManagerRouter) SealArchiveContext(ctx context.Context, id string) error
 		return callErr
 	}
 	return storage.ErrNotFound
+}
+
+// EncryptArchiveSnapshot routes to the Engine that currently owns the
+// recording lifecycle first, then tries attached generations only when an
+// Engine explicitly reports the archive absent. This preserves generation-
+// pinned storage visibility and never falls back to Control Plane writes.
+func (r *ManagerRouter) EncryptArchiveSnapshot(ctx context.Context, request EncryptArchiveSnapshotRequest) (replication.ReplicaManifest, error) {
+	defer func() { clear(request.DataKey) }()
+	r.mutation.RLock()
+	defer r.mutation.RUnlock()
+	clients := r.clientsSnapshot()
+	if len(clients) == 0 {
+		return replication.ReplicaManifest{}, ErrGenerationNotAttached
+	}
+	ordered, err := r.prioritizeLifecycleOwner(ctx, request.RecordingID, clients)
+	if err != nil {
+		return replication.ReplicaManifest{}, err
+	}
+	for _, attached := range ordered {
+		// ManagerClient clears the key passed to it. Give each generation a
+		// private one-shot copy so a NotFound fallback can still try the next
+		// attached Engine without retaining the caller's buffer afterward.
+		attempt := request
+		attempt.DataKey = append([]byte(nil), request.DataKey...)
+		manifest, callErr := attached.client.EncryptArchiveSnapshot(ctx, attempt)
+		if callErr == nil {
+			return manifest, nil
+		}
+		if errors.Is(callErr, storage.ErrNotFound) {
+			continue
+		}
+		return replication.ReplicaManifest{}, callErr
+	}
+	return replication.ReplicaManifest{}, storage.ErrNotFound
+}
+
+// RekeyArchiveHistory routes the archive-wide immutable re-encryption to the
+// Engine that owns the sealed Recording, preserving its generation-pinned
+// archive visibility. It never falls back to a different generation after an
+// authorization or integrity error; only an explicit NotFound permits trying
+// another attached Engine.
+func (r *ManagerRouter) RekeyArchiveHistory(ctx context.Context, request RekeyArchiveHistoryRequest) (RekeyArchiveHistoryResult, error) {
+	defer func() { clear(request.DataKey) }()
+	r.mutation.RLock()
+	defer r.mutation.RUnlock()
+	clients := r.clientsSnapshot()
+	if len(clients) == 0 {
+		return RekeyArchiveHistoryResult{}, ErrGenerationNotAttached
+	}
+	ordered, err := r.prioritizeLifecycleOwner(ctx, request.RecordingID, clients)
+	if err != nil {
+		return RekeyArchiveHistoryResult{}, err
+	}
+	for _, attached := range ordered {
+		attempt := request
+		attempt.DataKey = append([]byte(nil), request.DataKey...)
+		result, callErr := attached.client.RekeyArchiveHistory(ctx, attempt)
+		if callErr == nil {
+			return result, nil
+		}
+		if errors.Is(callErr, storage.ErrNotFound) {
+			continue
+		}
+		return RekeyArchiveHistoryResult{}, callErr
+	}
+	return RekeyArchiveHistoryResult{}, storage.ErrNotFound
 }
 
 func (r *ManagerRouter) Delete(id string) error {

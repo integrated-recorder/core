@@ -80,6 +80,24 @@ func (e *FetchError) Error() string {
 	return fmt.Sprintf("%s request failed", e.Operation)
 }
 
+// Is preserves the standard context error classifications without retaining
+// the underlying transport error, which can contain a signed URL or secret
+// request data. Callers can still stop recovery on cancellation and deadlines
+// instead of treating them as ordinary source failures.
+func (e *FetchError) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	switch e.FailureClass {
+	case "canceled":
+		return target == context.Canceled
+	case "timeout":
+		return target == context.DeadlineExceeded
+	default:
+		return false
+	}
+}
+
 func (e *FetchError) refreshStatus() int {
 	if e == nil || !e.statusResponse {
 		return 0
@@ -1116,8 +1134,10 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 		e.cancel = nil
 		e.mu.Unlock()
 	}()
+	var resumeReady *handoverOperation
 	for {
-		paused := m.runWorkerCycle(ctx, e, media)
+		paused := m.runWorkerCycle(ctx, e, media, resumeReady)
+		resumeReady = nil
 		if !paused {
 			return
 		}
@@ -1161,24 +1181,26 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			e.handover = nil
 		}
 		e.mu.Unlock()
-		// ResumeHandover waits for this signal before returning. Publish the
-		// cleared operation first so a caller can safely issue Stop or another
-		// handover as soon as resume completes.
-		op.resumedOnce.Do(func() { close(op.resumed) })
+		// ResumeHandover waits until runWorkerCycle has installed a fresh
+		// scheduler. That makes a subsequent pause safe immediately after
+		// ResumeHandover returns instead of racing scheduler reconstruction.
 		m.releaseHandoverRecoveryGate(e, op)
 		media, _ = currentMediaVersion(e)
+		resumeReady = op
 	}
 }
 
 // runWorkerCycle runs one fresh scheduler lifetime. A true result means the
 // worker has drained and closed that scheduler for a handover and must remain
 // parked until Manager explicitly resumes or completes it.
-func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterproto.MediaSource) (paused bool) {
+func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterproto.MediaSource, resumeReady *handoverOperation) (paused bool) {
 	scheduler, schedulerErr := newSegmentScheduler(ctx, m, e)
 	if schedulerErr != nil {
+		completeHandoverResume(e, resumeReady, schedulerErr)
 		m.fail(e, schedulerErr)
 		return false
 	}
+	completeHandoverResume(e, resumeReady, nil)
 	if e.stopWasRequested() {
 		scheduler.closeLiveAdmission()
 	}
@@ -1644,6 +1666,16 @@ func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterpro
 		}
 	}
 	return false
+}
+
+func completeHandoverResume(e *entry, op *handoverOperation, err error) {
+	if op == nil {
+		return
+	}
+	e.mu.Lock()
+	op.resumeErr = err
+	e.mu.Unlock()
+	op.resumedOnce.Do(func() { close(op.resumed) })
 }
 
 // pauseAtWorkerBoundary runs only on the manifest worker goroutine. The

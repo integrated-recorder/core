@@ -29,6 +29,7 @@ func (s *Server) registerAuthRoutes() {
 	s.mux.HandleFunc("GET /api/user/preferences", s.userPreferencesGet)
 	s.mux.HandleFunc("PUT /api/user/preferences", s.userPreferencesPut)
 	s.registerAccountRoutes()
+	s.registerGlobalIdentityRoutes()
 }
 
 func (s *Server) userPreferencesGet(w http.ResponseWriter, r *http.Request) {
@@ -266,6 +267,12 @@ func authRoutePublic(r *http.Request) bool {
 		}
 	}
 	if r.Method == http.MethodPost && (r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/bootstrap") {
+		return true
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/api/global-identity/session" {
+		return true
+	}
+	if r.Method == http.MethodPost && (r.URL.Path == "/api/global-identity/login/options" || r.URL.Path == "/api/global-identity/login/finish" || r.URL.Path == "/api/global-identity/logout") {
 		return true
 	}
 	return false

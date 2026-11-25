@@ -15,6 +15,7 @@ import (
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archivecatalog"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/recorderengine"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
@@ -52,6 +53,13 @@ func TestResolvedStartGetStopOverIPC(t *testing.T) {
 	}
 	engine, err := recorderengine.New(manager, &adapterhost.Host{}, "generation-a", "engine-instance-a")
 	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := archivecatalog.Open(filepath.Join(root, "archive-catalog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ConfigureArchiveCatalog(catalog); err != nil {
 		t.Fatal(err)
 	}
 	token := []byte("0123456789abcdef0123456789abcdef")
@@ -171,8 +179,30 @@ func TestResolvedStartGetStopOverIPC(t *testing.T) {
 	if err != nil || completed.State != domain.StateCompleted || completed.ArchiveSealed {
 		t.Fatalf("explicit completion over IPC = %#v err=%v", completed, err)
 	}
+	archiveID := started.ArchiveID
+	if !domain.ValidArchiveID(archiveID) {
+		t.Fatalf("new recording archive ID = %q, want valid immutable logical identity", archiveID)
+	}
+	invalidCatalogArchive := filepath.Join(root, "archive-catalog", archiveID)
+	if err := os.Mkdir(invalidCatalogArchive, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := managerClient.SealArchiveContext(context.Background(), started.ID); err == nil || !strings.Contains(err.Error(), "snapshot is pending") {
+		t.Fatalf("catalog publication failure should be reported as retryable after seal, got %v", err)
+	}
+	sealedRecording, err := managerClient.Get(started.ID)
+	if err != nil || !sealedRecording.ArchiveSealed {
+		t.Fatalf("catalog failure changed canonical seal state: recording=%#v err=%v", sealedRecording, err)
+	}
+	if err := os.Chmod(invalidCatalogArchive, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := managerClient.SealArchiveContext(context.Background(), started.ID); err != nil {
-		t.Fatalf("explicit seal over IPC: %v", err)
+		t.Fatalf("retry seal over IPC did not resume snapshot publication: %v", err)
+	}
+	snapshot, err := catalog.Head(context.Background(), archiveID)
+	if err != nil || snapshot.Sequence != 1 || snapshot.Content.ArchiveID != archiveID || len(snapshot.Content.Objects) != 1 {
+		t.Fatalf("sealed archive snapshot head=%#v err=%v", snapshot, err)
 	}
 	if count, err := managerClient.ActiveRecordings(context.Background(), "generation-a"); err != nil || count != 0 {
 		t.Fatalf("active recording count after stop = %d, err=%v; want 0", count, err)

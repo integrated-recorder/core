@@ -880,7 +880,8 @@ func (m *Manager) commitShardedArchiveSegment(e *entry, owner *OwnershipToken, s
 			Coordinate: coordinate, ClaimID: claimIdentity(source, segmentID, result.SHA256),
 			Source: source, AcquiredAt: time.Now().UTC(), PayloadPath: segment.StoragePath,
 			Size: result.Size, SHA256: result.SHA256, Verification: archiveindex.VerificationVerified,
-			Duration: segment.Duration, ProgramDateTime: segment.ProgramDateTime, InitIdentity: segment.InitSegmentID,
+			Duration: segment.Duration, ProgramDateTime: segment.ProgramDateTime, InitIdentity: archiveindex.InitIdentityForSegment(segment),
+			Discontinuity: segment.Discontinuity, ByteRange: segment.ByteRange,
 		}
 		if prior, ok := findInventoryClaim(inventory, input.ClaimID); ok {
 			input.AcquiredAt = prior.AcquiredAt
@@ -1176,6 +1177,7 @@ func claimInputForStoredClaim(coordinate archiveindex.Coordinate, claim archivei
 		Size: claim.Size, SHA256: claim.SHA256, Verification: claim.Verification,
 		Evidence: claim.Evidence, LegacySegmentID: claim.LegacySegmentID,
 		Duration: segment.Duration, ProgramDateTime: segment.ProgramDateTime,
-		InitIdentity: segment.InitSegmentID,
+		InitIdentity: archiveindex.InitIdentityForSegment(segment), Discontinuity: segment.Discontinuity,
+		ByteRange: segment.ByteRange,
 	}
 }

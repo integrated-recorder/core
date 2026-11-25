@@ -24,11 +24,21 @@ import (
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archivecatalog"
+	"github.com/integrated-recorder/core/internal/archiveindex"
+	"github.com/integrated-recorder/core/internal/archivesnapshot"
+	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/authority"
+	"github.com/integrated-recorder/core/internal/cryptoarchive"
 	"github.com/integrated-recorder/core/internal/derivative"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/identityprotocol"
 	"github.com/integrated-recorder/core/internal/integrity"
+	"github.com/integrated-recorder/core/internal/lease"
 	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/recorderengine"
 	"github.com/integrated-recorder/core/internal/recordquery"
+	"github.com/integrated-recorder/core/internal/replication"
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
@@ -58,6 +68,10 @@ func (s *Server) registerProductRoutes() {
 	s.mux.HandleFunc("PUT /api/recordings/{id}/tags", s.recordingTagsPut)
 	s.mux.HandleFunc("DELETE /api/recordings/{id}", s.recordingDelete)
 	s.mux.HandleFunc("GET /api/recordings/{id}/archive/index", s.archiveIndex)
+	s.mux.HandleFunc("GET /api/recordings/{id}/archive/snapshot", s.archiveSnapshotIdentity)
+	s.mux.HandleFunc("POST /api/recordings/{id}/replicas/encrypt", s.archiveReplicaEncrypt)
+	s.mux.HandleFunc("POST /api/recordings/{id}/replicas/offers", s.archiveReplicaOffer)
+	s.mux.HandleFunc("POST /api/recordings/{id}/replicas/rekey", s.archiveReplicaRekey)
 	s.mux.HandleFunc("GET /api/recordings/{id}/integrity", s.integrityGet)
 	s.mux.HandleFunc("POST /api/recordings/{id}/integrity/verify", s.integrityStart)
 	s.mux.HandleFunc("GET /api/integrity/jobs/{job_id}", s.integrityJobGet)
@@ -77,6 +91,501 @@ func (s *Server) registerProductRoutes() {
 	s.mux.HandleFunc("POST /api/notifications/sync", s.notificationSync)
 	s.mux.HandleFunc("POST /api/notifications/{id}/read", s.notificationRead)
 	s.mux.HandleFunc("POST /api/notifications/read-all", s.notificationReadAll)
+}
+
+type archiveSnapshotIdentityView struct {
+	RecordingID   string `json:"recording_id"`
+	ArchiveID     string `json:"archive_id"`
+	SnapshotID    string `json:"snapshot_id"`
+	Sequence      uint64 `json:"sequence"`
+	ObjectCount   int    `json:"object_count"`
+	CoverageCount int    `json:"coverage_count"`
+}
+
+// archiveSnapshotIdentity exposes only the identifiers needed to create an
+// owner-scoped capability. It never returns the snapshot, source provenance,
+// local paths, or media digests.
+func (s *Server) archiveSnapshotIdentity(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRecordingPathID(id) {
+		writeCodedError(w, http.StatusNotFound, "recording_not_found", "recording not found")
+		return
+	}
+	if s.manager == nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "recording_manager_unavailable", "recording state is unavailable")
+		return
+	}
+	recording, err := s.manager.Get(id)
+	if err != nil {
+		writeCodedError(w, http.StatusNotFound, "recording_not_found", "recording not found")
+		return
+	}
+	if s.archiveCatalog == nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "archive_snapshot_unavailable", "archive snapshot catalog is unavailable")
+		return
+	}
+	archiveID := recording.ArchiveID
+	if archiveID == "" {
+		archiveID, err = archivesnapshot.ArchiveIDForRecording(id)
+		if err != nil {
+			writeCodedError(w, http.StatusNotFound, "recording_not_found", "recording not found")
+			return
+		}
+	}
+	snapshot, err := s.archiveCatalog.Head(r.Context(), archiveID)
+	if errors.Is(err, archivecatalog.ErrNotFound) {
+		writeCodedError(w, http.StatusConflict, "archive_snapshot_pending", "seal the completed archive to publish its immutable snapshot")
+		return
+	}
+	if err != nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "archive_snapshot_unavailable", "archive snapshot catalog could not be read safely")
+		return
+	}
+	writeJSON(w, http.StatusOK, archiveSnapshotIdentityView{
+		RecordingID: id, ArchiveID: snapshot.Content.ArchiveID, SnapshotID: snapshot.SnapshotID,
+		Sequence: snapshot.Sequence, ObjectCount: len(snapshot.Content.Objects), CoverageCount: len(snapshot.Content.Coverage),
+	})
+}
+
+type archiveReplicaEncryptRequest struct {
+	OwnerSubjectID string                    `json:"owner_subject_id"`
+	GrantHash      string                    `json:"grant_hash"`
+	KeyEpoch       uint64                    `json:"key_epoch"`
+	DataKey        string                    `json:"data_key"`
+	KeyEnvelope    cryptoarchive.KeyEnvelope `json:"key_envelope"`
+	LeaseID        string                    `json:"lease_id,omitempty"`
+	ProviderNodeID string                    `json:"provider_node_id,omitempty"`
+}
+
+type archiveReplicaEncryptResponse struct {
+	Manifest *replication.ReplicaManifest `json:"manifest,omitempty"`
+	Lease    *replicaLeaseSummary         `json:"lease,omitempty"`
+	Reused   bool                         `json:"reused,omitempty"`
+}
+
+type archiveSnapshotEncryptor interface {
+	EncryptArchiveSnapshot(context.Context, recorderengine.EncryptArchiveSnapshotRequest) (replication.ReplicaManifest, error)
+}
+
+type archiveHistoryRekeyer interface {
+	RekeyArchiveHistory(context.Context, recorderengine.RekeyArchiveHistoryRequest) (recorderengine.RekeyArchiveHistoryResult, error)
+}
+
+// archiveReplicaEncrypt encrypts a sealed canonical snapshot into private
+// ciphertext storage. The DEK is accepted only over HTTPS and is forwarded
+// over authenticated local Engine IPC; it is never logged or sent to a peer.
+// The Engine retains only a locally wrapped copy for source-node recovery.
+func (s *Server) archiveReplicaEncrypt(w http.ResponseWriter, r *http.Request) {
+	s.archiveReplicaEncryptMode(w, r, false)
+}
+
+func (s *Server) archiveReplicaOffer(w http.ResponseWriter, r *http.Request) {
+	s.archiveReplicaEncryptMode(w, r, true)
+}
+
+type replicaLeaseIssuer interface {
+	Get(context.Context, string) (lease.Lease, error)
+	IssueOffer(context.Context, lease.SignedOffer) (lease.Lease, error)
+}
+
+func (s *Server) archiveReplicaEncryptMode(w http.ResponseWriter, r *http.Request, createOffer bool) {
+	principal, authenticated := authn.PrincipalFromContext(r.Context())
+	if !authenticated || s.auth == nil {
+		writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
+		return
+	}
+	if !authn.HasPermission(principal, authn.PermissionRecordingExport) {
+		writeCodedError(w, http.StatusForbidden, "permission_denied", "Permission denied.")
+		return
+	}
+	if !secureBrowserRequest(r) {
+		writeCodedError(w, http.StatusUpgradeRequired, "https_required", "Encrypted archive preparation requires HTTPS.")
+		return
+	}
+	id := r.PathValue("id")
+	if !validRecordingPathID(id) || s.manager == nil || s.archiveCatalog == nil {
+		writeCodedError(w, http.StatusNotFound, "recording_not_found", "Recording not found.")
+		return
+	}
+	if _, ok := s.manager.(archiveSnapshotEncryptor); !ok {
+		writeCodedError(w, http.StatusServiceUnavailable, "archive_replication_unavailable", "Encrypted archive replication is unavailable.")
+		return
+	}
+	recording, err := s.manager.Get(id)
+	if err != nil || recording == nil || !recording.ArchiveSealed ||
+		(recording.State != domain.StateStopped && recording.State != domain.StateCompleted && recording.State != domain.StateInterrupted) {
+		writeCodedError(w, http.StatusConflict, "archive_not_sealed", "Only a sealed, stopped archive can be prepared for replication.")
+		return
+	}
+	archiveID := recording.ArchiveID
+	if archiveID == "" {
+		archiveID, err = archivesnapshot.ArchiveIDForRecording(id)
+		if err != nil {
+			writeCodedError(w, http.StatusConflict, "archive_snapshot_unavailable", "Archive identity is unavailable.")
+			return
+		}
+	}
+	snapshot, err := s.archiveCatalog.Head(r.Context(), archiveID)
+	if err != nil || archivesnapshot.Verify(snapshot) != nil || snapshot.Content.Archive != archiveindex.ArchiveSealed {
+		writeCodedError(w, http.StatusConflict, "archive_snapshot_unavailable", "A verified sealed archive snapshot is required.")
+		return
+	}
+	var request archiveReplicaEncryptRequest
+	if err := decodeJSONBody(w, r, 64<<10, &request); err != nil || request.OwnerSubjectID == "" || request.GrantHash == "" || request.KeyEpoch == 0 ||
+		createOffer && (!validReplicaLeaseID(request.LeaseID) || request.ProviderNodeID == "") {
+		writeCodedError(w, http.StatusBadRequest, "archive_replication_request_invalid", "The encrypted archive request is invalid.")
+		return
+	}
+	var issuer replicaLeaseIssuer
+	if createOffer {
+		var ok bool
+		issuer, ok = s.replicaLeases.(replicaLeaseIssuer)
+		if !ok {
+			writeCodedError(w, http.StatusServiceUnavailable, "replica_leases_unavailable", "Replica lease creation is unavailable.")
+			return
+		}
+	}
+	if s.ownerAuthority == nil || s.globalIdentity == nil || s.nodeIdentity == nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "owner_authority_unavailable", "Current archive authority is unavailable.")
+		return
+	}
+	localIdentity, initialized, err := s.globalIdentity.Snapshot()
+	if err != nil || !initialized || localIdentity.Frozen || localIdentity.IdentityID == "" {
+		writeCodedError(w, http.StatusServiceUnavailable, "global_identity_unavailable", "Current identity history is unavailable.")
+		return
+	}
+	node, err := s.nodeIdentity.Info()
+	if err != nil || node.NodeID == "" {
+		writeCodedError(w, http.StatusServiceUnavailable, "node_identity_unavailable", "The local Node identity is unavailable.")
+		return
+	}
+	resolve := authority.IdentityStateResolverFromLocalAndRegistry(s.globalIdentity, s.globalIdentityRegistry)
+	if s.federatedIdentityResolver != nil {
+		resolve = authority.IdentityStateResolverFromFederated(s.globalIdentity, s.federatedIdentityResolver)
+	}
+	now := time.Now().UTC()
+	identityState, err := resolve(localIdentity.IdentityID, "", now)
+	nodePublic, nodeDecodeErr := base64.RawURLEncoding.DecodeString(node.PublicKey)
+	if err != nil || nodeDecodeErr != nil || identityState.Frozen || identityState.HeadHash == "" ||
+		!equalPeerPublicKey(identityState.CurrentKeys[authority.PrincipalNode+":"+node.NodeID], nodePublic) {
+		writeCodedError(w, http.StatusForbidden, "node_not_delegated", "The local Node is not currently delegated by this identity.")
+		return
+	}
+	authoritySnapshot, err := s.ownerAuthority.Snapshot(request.OwnerSubjectID, resolve, now)
+	if err != nil || authoritySnapshot.Frozen || authoritySnapshot.Subject.Controller != (authority.Principal{Kind: authority.PrincipalIdentity, ID: localIdentity.IdentityID}) {
+		writeCodedError(w, http.StatusForbidden, "archive_replication_denied", "The current OwnerSubject authority does not authorize this operation.")
+		return
+	}
+	chain, exists := authoritySnapshot.Grants[request.GrantHash]
+	if !exists || len(chain) == 0 {
+		writeCodedError(w, http.StatusForbidden, "archive_replication_denied", "The current OwnerSubject authority does not authorize this operation.")
+		return
+	}
+	if err := s.ownerAuthority.AuthorizeChain(request.OwnerSubjectID, chain, resolve, now,
+		authority.Principal{Kind: authority.PrincipalNode, ID: node.NodeID}, archiveID, snapshot.SnapshotID, "archive.replicate"); err != nil {
+		writeCodedError(w, http.StatusForbidden, "archive_replication_denied", "The current OwnerSubject authority does not authorize this operation.")
+		return
+	}
+	if createOffer {
+		providerKey := identityState.CurrentKeys[authority.PrincipalNode+":"+request.ProviderNodeID]
+		providerID, providerErr := identityprotocol.NodeID(providerKey)
+		if providerErr != nil || providerID != request.ProviderNodeID || providerID == node.NodeID {
+			writeCodedError(w, http.StatusForbidden, "replica_provider_not_delegated", "The replica provider must be another currently delegated Node.")
+			return
+		}
+		// A client-supplied lease ID is the idempotency key. On a lost response,
+		// revalidate the original signed offer against current authority and
+		// return its projection without re-encrypting the archive.
+		if existing, getErr := issuer.Get(r.Context(), request.LeaseID); getErr == nil {
+			offer := existing.Offer.Offer
+			if !replicaOfferMatchesRetry(offer, existing.Offer.Actor, request, archiveID, snapshot.SnapshotID, node.NodeID) {
+				writeCodedError(w, http.StatusConflict, "replica_lease_id_conflict", "This lease request ID is already bound to a different replication operation.")
+				return
+			}
+			confirmed, issueErr := issuer.IssueOffer(r.Context(), existing.Offer)
+			if issueErr != nil {
+				writeCodedError(w, http.StatusForbidden, "archive_replication_denied", "The existing replica offer is no longer authorized.")
+				return
+			}
+			if !s.auditMutation(w, r, "replica_offer_retried", offer.LeaseID) {
+				return
+			}
+			view := summarizeReplicaLease(confirmed)
+			writeJSON(w, http.StatusOK, archiveReplicaEncryptResponse{Lease: &view, Reused: true})
+			return
+		} else if !errors.Is(getErr, lease.ErrNotFound) {
+			writeCodedError(w, http.StatusServiceUnavailable, "replica_leases_unavailable", "Replica lease state could not be read safely.")
+			return
+		}
+	}
+	recipientPublic, recipientErr := base64.RawURLEncoding.DecodeString(localIdentity.RecoveryEncryptionPublicKey)
+	rootPublic := identityState.CurrentKeys[authority.PrincipalIdentity+":"+localIdentity.IdentityID]
+	_, signerErr := identityprotocol.KeyID(rootPublic)
+	if recipientErr != nil || len(recipientPublic) != 32 || signerErr != nil {
+		writeCodedError(w, http.StatusForbidden, "archive_key_envelope_invalid", "The recovery key envelope is not valid for the current identity.")
+		return
+	}
+	useStoredKey := request.DataKey == ""
+	request.KeyEnvelope, err = resolveArchiveReplicaKeyEnvelope(
+		s.replicaCiphertexts, snapshot, request.KeyEpoch, recipientPublic, rootPublic, request.KeyEnvelope,
+	)
+	if err != nil {
+		if useStoredKey && errors.Is(err, replication.ErrObjectUnavailable) {
+			writeCodedError(w, http.StatusConflict, "archive_replication_key_unavailable", "The previously prepared archive key is unavailable.")
+			return
+		}
+		writeCodedError(w, http.StatusForbidden, "archive_key_envelope_invalid", "The recovery key envelope is not valid for the current identity.")
+		return
+	}
+	var dekBytes []byte
+	if !useStoredKey {
+		dekBytes, err = base64.StdEncoding.DecodeString(request.DataKey)
+		if err != nil || len(dekBytes) != 32 || base64.StdEncoding.EncodeToString(dekBytes) != request.DataKey {
+			clear(dekBytes)
+			writeCodedError(w, http.StatusBadRequest, "archive_replication_request_invalid", "The encrypted archive request is invalid.")
+			return
+		}
+		defer clear(dekBytes)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
+	defer cancel()
+	manager := s.manager.(archiveSnapshotEncryptor)
+	manifest, err := manager.EncryptArchiveSnapshot(ctx, recorderengine.EncryptArchiveSnapshotRequest{
+		RecordingID: id, SnapshotID: snapshot.SnapshotID, SubjectID: request.OwnerSubjectID,
+		GrantChain: chain, KeyEpoch: request.KeyEpoch, DataKey: dekBytes, UseStoredKey: useStoredKey, KeyEnvelope: request.KeyEnvelope,
+	})
+	if err != nil {
+		writeCodedError(w, http.StatusConflict, "archive_replication_failed", "The sealed archive could not be encrypted for replication.")
+		return
+	}
+	response := archiveReplicaEncryptResponse{Manifest: &manifest}
+	if createOffer {
+		issuedAt := time.Now().UTC().Truncate(time.Second)
+		offer, offerErr := replication.BuildLeaseOffer(snapshot, manifest, replication.LeaseOfferSpec{
+			LeaseID: request.LeaseID, ProviderNodeID: request.ProviderNodeID, OwnerSubjectID: request.OwnerSubjectID,
+			KeyEpoch: request.KeyEpoch, IssuedAt: issuedAt, ExpiresAt: issuedAt.Add(7 * 24 * time.Hour),
+		})
+		if offerErr != nil {
+			writeCodedError(w, http.StatusConflict, "archive_replication_failed", "The encrypted archive could not be bound to a replica lease.")
+			return
+		}
+		signed, signErr := s.nodeIdentity.SignReplicaOffer(offer, chain)
+		if signErr != nil {
+			writeCodedError(w, http.StatusServiceUnavailable, "node_identity_unavailable", "The local Node could not sign the replica offer.")
+			return
+		}
+		created, issueErr := issuer.IssueOffer(r.Context(), signed)
+		if issueErr != nil {
+			if errors.Is(issueErr, lease.ErrDenied) || errors.Is(issueErr, lease.ErrFrozen) {
+				writeCodedError(w, http.StatusForbidden, "archive_replication_denied", "The current OwnerSubject authority does not authorize this replica lease.")
+			} else {
+				writeCodedError(w, http.StatusConflict, "replica_lease_conflict", "The replica lease could not be committed safely.")
+			}
+			return
+		}
+		view := summarizeReplicaLease(created)
+		response.Lease = &view
+	}
+	auditKind := "archive_encrypted_for_replication"
+	if createOffer {
+		auditKind = "replica_offer_created"
+	}
+	if !s.auditMutation(w, r, auditKind, archiveID) {
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+type archiveReplicaRekeyRequest struct {
+	OwnerSubjectID      string                    `json:"owner_subject_id"`
+	GrantHash           string                    `json:"grant_hash"`
+	RecipientIdentityID string                    `json:"recipient_identity_id"`
+	PreviousKeyEpoch    uint64                    `json:"previous_key_epoch"`
+	KeyEpoch            uint64                    `json:"key_epoch"`
+	DataKey             string                    `json:"data_key,omitempty"`
+	KeyEnvelope         cryptoarchive.KeyEnvelope `json:"key_envelope"`
+}
+
+// archiveReplicaRekey prepares the complete immutable archive history for a
+// recipient Global Identity while the current OwnerSubject controller still
+// has authority. Ownership transfer remains a separate, dual-consent signed
+// action. This route never accepts a caller-supplied recipient public key:
+// Control Plane resolves the recipient through its verified identity source.
+func (s *Server) archiveReplicaRekey(w http.ResponseWriter, r *http.Request) {
+	principal, authenticated := authn.PrincipalFromContext(r.Context())
+	if !authenticated || s.auth == nil {
+		writeCodedError(w, http.StatusUnauthorized, "authentication_required", "Authentication required.")
+		return
+	}
+	if !authn.HasPermission(principal, authn.PermissionRecordingExport) {
+		writeCodedError(w, http.StatusForbidden, "permission_denied", "Permission denied.")
+		return
+	}
+	if !secureBrowserRequest(r) {
+		writeCodedError(w, http.StatusUpgradeRequired, "https_required", "Archive key rotation requires HTTPS.")
+		return
+	}
+	id := r.PathValue("id")
+	if !validRecordingPathID(id) || s.manager == nil || s.archiveCatalog == nil || s.ownerAuthority == nil || s.globalIdentity == nil || s.nodeIdentity == nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "archive_rekey_unavailable", "Archive key rotation is unavailable.")
+		return
+	}
+	manager, ok := s.manager.(archiveHistoryRekeyer)
+	if !ok {
+		writeCodedError(w, http.StatusServiceUnavailable, "archive_rekey_unavailable", "Archive key rotation is unavailable.")
+		return
+	}
+	recording, err := s.manager.Get(id)
+	if err != nil || recording == nil || !recording.ArchiveSealed ||
+		(recording.State != domain.StateStopped && recording.State != domain.StateCompleted && recording.State != domain.StateInterrupted) {
+		writeCodedError(w, http.StatusConflict, "archive_not_sealed", "Only a sealed, stopped archive can be rotated.")
+		return
+	}
+	archiveID := recording.ArchiveID
+	if archiveID == "" {
+		archiveID, err = archivesnapshot.ArchiveIDForRecording(id)
+		if err != nil {
+			writeCodedError(w, http.StatusConflict, "archive_snapshot_unavailable", "Archive identity is unavailable.")
+			return
+		}
+	}
+	snapshot, err := s.archiveCatalog.Head(r.Context(), archiveID)
+	if err != nil || archivesnapshot.Verify(snapshot) != nil || snapshot.Content.Archive != archiveindex.ArchiveSealed {
+		writeCodedError(w, http.StatusConflict, "archive_snapshot_unavailable", "A verified sealed archive snapshot is required.")
+		return
+	}
+	var request archiveReplicaRekeyRequest
+	if err := decodeJSONBody(w, r, 64<<10, &request); err != nil || request.OwnerSubjectID == "" || request.GrantHash == "" ||
+		request.RecipientIdentityID == "" || request.PreviousKeyEpoch == 0 || request.KeyEpoch <= request.PreviousKeyEpoch {
+		writeCodedError(w, http.StatusBadRequest, "archive_rekey_request_invalid", "The archive key rotation request is invalid.")
+		return
+	}
+	local, initialized, err := s.globalIdentity.Snapshot()
+	if err != nil || !initialized || local.Frozen || local.IdentityID == "" || local.IdentityID == request.RecipientIdentityID {
+		writeCodedError(w, http.StatusConflict, "global_identity_unavailable", "The current identity cannot prepare this archive transfer.")
+		return
+	}
+	if s.federatedIdentityResolver == nil {
+		writeCodedError(w, http.StatusServiceUnavailable, "recipient_identity_unavailable", "A verified current recipient identity is unavailable.")
+		return
+	}
+	resolve := authority.IdentityStateResolverFromFederated(s.globalIdentity, s.federatedIdentityResolver)
+	now := time.Now().UTC()
+	localState, err := resolve(local.IdentityID, "", now)
+	if err != nil || localState.Frozen {
+		writeCodedError(w, http.StatusServiceUnavailable, "global_identity_unavailable", "The current signed identity history is unavailable.")
+		return
+	}
+	recipientState, err := resolve(request.RecipientIdentityID, "", now)
+	if err != nil || recipientState.Frozen || recipientState.IdentityID == local.IdentityID {
+		writeCodedError(w, http.StatusConflict, "recipient_identity_unavailable", "A current, unforked recipient identity could not be verified.")
+		return
+	}
+	node, err := s.nodeIdentity.Info()
+	if err != nil || node.NodeID == "" {
+		writeCodedError(w, http.StatusServiceUnavailable, "node_identity_unavailable", "The local Node identity is unavailable.")
+		return
+	}
+	state, err := s.ownerAuthority.Snapshot(request.OwnerSubjectID, resolve, now)
+	if err != nil || state.Frozen || state.Subject.Controller != (authority.Principal{Kind: authority.PrincipalIdentity, ID: local.IdentityID}) ||
+		!containsArchiveString(state.ArchiveIDs, archiveID) {
+		writeCodedError(w, http.StatusForbidden, "archive_rekey_denied", "The current OwnerSubject does not authorize this archive rotation.")
+		return
+	}
+	if _, pending := state.RekeyRequiredArchives[archiveID]; pending {
+		writeCodedError(w, http.StatusConflict, "archive_rekey_required", "This archive is already awaiting completion of an ownership transfer.")
+		return
+	}
+	chain, exists := state.Grants[request.GrantHash]
+	if !exists || len(chain) == 0 {
+		writeCodedError(w, http.StatusForbidden, "archive_rekey_denied", "A current key rotation capability is required.")
+		return
+	}
+	actor := authority.Principal{Kind: authority.PrincipalNode, ID: node.NodeID}
+	for _, action := range []string{"key.rotate", "archive.replicate"} {
+		if err := s.ownerAuthority.AuthorizeChain(request.OwnerSubjectID, chain, resolve, now, actor, archiveID, snapshot.SnapshotID, action); err != nil {
+			writeOwnerAuthorityError(w, err)
+			return
+		}
+	}
+	var dataKey []byte
+	useStoredKey := request.DataKey == ""
+	if !useStoredKey {
+		dataKey, err = base64.StdEncoding.DecodeString(request.DataKey)
+		if err != nil || len(dataKey) != 32 || base64.StdEncoding.EncodeToString(dataKey) != request.DataKey {
+			clear(dataKey)
+			writeCodedError(w, http.StatusBadRequest, "archive_rekey_request_invalid", "The archive key rotation request is invalid.")
+			return
+		}
+		defer clear(dataKey)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+	defer cancel()
+	result, err := manager.RekeyArchiveHistory(ctx, recorderengine.RekeyArchiveHistoryRequest{
+		RecordingID: id, SnapshotID: snapshot.SnapshotID, SubjectID: request.OwnerSubjectID, GrantChain: chain,
+		PreviousKeyEpoch: request.PreviousKeyEpoch, KeyEpoch: request.KeyEpoch, DataKey: dataKey,
+		UseStoredKey: useStoredKey, KeyEnvelope: request.KeyEnvelope, Recipient: recipientState,
+	})
+	if err != nil {
+		writeCodedError(w, http.StatusConflict, "archive_rekey_failed", "The archive history could not be safely re-encrypted for this recipient.")
+		return
+	}
+	if !s.auditMutation(w, r, "archive_history_rekey_prepared", archiveID) {
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func containsArchiveString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func replicaOfferMatchesRetry(offer lease.Offer, actor authority.Principal, request archiveReplicaEncryptRequest, archiveID, snapshotID, nodeID string) bool {
+	return request.LeaseID == offer.LeaseID && offer.ProviderNodeID == request.ProviderNodeID && offer.OwnerSubjectID == request.OwnerSubjectID &&
+		offer.ArchiveID == archiveID && offer.SnapshotID == snapshotID && offer.KeyEpoch == strconv.FormatUint(request.KeyEpoch, 10) &&
+		actor == (authority.Principal{Kind: authority.PrincipalNode, ID: nodeID})
+}
+
+// resolveArchiveReplicaKeyEnvelope validates the signed public envelope on
+// every request. When a retry omits it, only the exact durable envelope bound
+// to this snapshot, epoch, and current recovery recipient is loaded. The
+// source DEK is not handled here; Engine recovers that separately from its
+// Node-Key-protected local slot.
+func resolveArchiveReplicaKeyEnvelope(
+	store *replication.Store,
+	snapshot archivesnapshot.Snapshot,
+	keyEpoch uint64,
+	recipientPublic, rootPublic []byte,
+	requested cryptoarchive.KeyEnvelope,
+) (cryptoarchive.KeyEnvelope, error) {
+	if keyEpoch == 0 || len(recipientPublic) != 32 || len(rootPublic) != 32 {
+		return cryptoarchive.KeyEnvelope{}, cryptoarchive.ErrEnvelopeUnauthorized
+	}
+	if requested == (cryptoarchive.KeyEnvelope{}) {
+		if store == nil {
+			return cryptoarchive.KeyEnvelope{}, replication.ErrObjectUnavailable
+		}
+		var err error
+		requested, err = store.LoadKeyEnvelope(snapshot, keyEpoch, cryptoarchive.RecipientKeyID(recipientPublic))
+		if err != nil {
+			return cryptoarchive.KeyEnvelope{}, err
+		}
+	}
+	signerKeyID, err := identityprotocol.KeyID(rootPublic)
+	if err != nil || requested.ArchiveID != snapshot.Content.ArchiveID ||
+		requested.KeyEpoch != strconv.FormatUint(keyEpoch, 10) ||
+		requested.RecipientKeyID != cryptoarchive.RecipientKeyID(recipientPublic) ||
+		requested.RecipientPublicKeySHA256 != cryptoarchive.RecipientPublicKeyHash(recipientPublic) ||
+		requested.SignerKeyID != signerKeyID ||
+		cryptoarchive.VerifyKeyEnvelopeSignature(requested, rootPublic) != nil {
+		return cryptoarchive.KeyEnvelope{}, cryptoarchive.ErrEnvelopeUnauthorized
+	}
+	return requested, nil
 }
 
 func (s *Server) productLock(id string) *sync.RWMutex {

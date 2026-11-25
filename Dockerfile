@@ -6,7 +6,7 @@ COPY web ./web
 COPY internal/server/static ./internal/server/static
 RUN npm --prefix web run build
 
-FROM golang:1.23-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 ARG VERSION=dev
 ARG COMMIT=unknown

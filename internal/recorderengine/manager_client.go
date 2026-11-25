@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/replication"
 	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
 	"github.com/integrated-recorder/core/internal/storage"
@@ -523,6 +526,66 @@ func (m *ManagerClient) SealArchiveContext(ctx context.Context, id string) error
 		return errors.New("recorder engine did not confirm archive sealing")
 	}
 	return nil
+}
+
+// EncryptArchiveSnapshot sends the one-shot DEK only over authenticated local
+// Engine IPC. The caller's key slice is cleared when the operation returns;
+// the Engine retains only its Node-Key-wrapped durable copy.
+func (m *ManagerClient) EncryptArchiveSnapshot(ctx context.Context, request EncryptArchiveSnapshotRequest) (replication.ReplicaManifest, error) {
+	// The caller owns the original slice and expects this one-shot secret to be
+	// erased when the IPC operation completes. Keep a separate transport copy
+	// so clearing the local request does not race JSON serialization.
+	callerKey := request.DataKey
+	defer clear(callerKey)
+	if request.UseStoredKey {
+		if len(callerKey) != 0 {
+			return replication.ReplicaManifest{}, errors.New("stored archive key request must not carry key bytes")
+		}
+	} else {
+		request.DataKey = append([]byte(nil), callerKey...)
+		defer clear(request.DataKey)
+	}
+	var result EncryptArchiveSnapshotResult
+	if err := m.client.CallWithTimeout(ctx, 15*time.Minute, OperationEncryptArchiveSnapshot, request, &result); err != nil {
+		return replication.ReplicaManifest{}, normalizeEngineError(err)
+	}
+	manifest := result.Manifest
+	if manifest.Version != replication.ReplicaManifestVersion || manifest.SnapshotID != request.SnapshotID ||
+		manifest.KeyEpoch != strconv.FormatUint(request.KeyEpoch, 10) || manifest.ArchiveID == "" || len(manifest.Objects) == 0 {
+		return replication.ReplicaManifest{}, errors.New("recorder engine returned an invalid encrypted archive manifest")
+	}
+	return manifest, nil
+}
+
+// RekeyArchiveHistory forwards the recipient's public identity projection and
+// a one-shot DEK over authenticated local Engine IPC. The DEK slice supplied by
+// the caller is cleared on return; the Engine persists only its Node-Key-
+// wrapped copy so an interrupted immutable-history rewrite can be retried.
+func (m *ManagerClient) RekeyArchiveHistory(ctx context.Context, request RekeyArchiveHistoryRequest) (RekeyArchiveHistoryResult, error) {
+	callerKey := request.DataKey
+	defer clear(callerKey)
+	if request.UseStoredKey {
+		if len(callerKey) != 0 {
+			return RekeyArchiveHistoryResult{}, errors.New("stored archive key request must not carry key bytes")
+		}
+	} else {
+		request.DataKey = append([]byte(nil), callerKey...)
+		defer clear(request.DataKey)
+	}
+	var result RekeyArchiveHistoryResult
+	if err := m.client.CallWithTimeout(ctx, 15*time.Minute, OperationRekeyArchiveHistory, request, &result); err != nil {
+		return RekeyArchiveHistoryResult{}, normalizeEngineError(err)
+	}
+	verification := result.Verification
+	if verification.ArchiveID == "" || verification.ArchiveID != request.KeyEnvelope.ArchiveID ||
+		verification.NewKeyEpoch != strconv.FormatUint(request.KeyEpoch, 10) ||
+		verification.PreviousKeyEpoch != strconv.FormatUint(request.PreviousKeyEpoch, 10) ||
+		verification.RecipientKeyID != request.KeyEnvelope.RecipientKeyID ||
+		verification.HeadSnapshotID != request.SnapshotID ||
+		result.Envelope.RecipientKeyID != verification.RecipientKeyID || result.Envelope.KeyEpoch != verification.NewKeyEpoch {
+		return RekeyArchiveHistoryResult{}, errors.New("recorder engine returned invalid archive rekey evidence")
+	}
+	return result, nil
 }
 
 func (m *ManagerClient) Delete(id string) error {

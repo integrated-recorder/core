@@ -248,6 +248,59 @@ export type RuntimeHTTPSSettings = { enabled: boolean; configured: boolean; list
 export type SearchResult = { type: 'recording' | 'adapter' | 'resource' | 'workflow'; id?: string; workflow_id?: string; adapter_id?: string; resource_type?: string; resource_id?: string; title?: string; name?: string; display_name?: string; state?: string; resource?: ResourceRef }
 export type ArchiveEntry = { kind: string; path: string; size: number; sha256?: string }
 export type ArchiveIndexPage = { recording_id: string; entries: ArchiveEntry[]; next_cursor?: string; has_more: boolean }
+export type ArchiveSnapshotIdentity = { recording_id: string; archive_id: string; snapshot_id: string; sequence: number; object_count: number; coverage_count: number }
+export type ReplicaManifest = {
+  replica_manifest_version: string; archive_id: string; snapshot_id: string; key_epoch: string;
+  objects: Array<{ coordinate: { session_id: string; track_id: string; source_epoch: number; discontinuity_sequence: number; sequence: number; kind: 'media' | 'init' }; object_id: string; ciphertext_size: string; ciphertext_sha256: string }>
+}
+
+export type ReplicaLeaseSummary = {
+  lease_id: string
+  archive_id: string
+  snapshot_id: string
+  key_epoch: string
+  owner_subject_id: string
+  grant_hash: string
+  provider_node_id: string
+  status: string
+  revision: string
+  expires_at: string
+  reserved_bytes: string
+  object_count: number
+  completed_objects: number
+}
+export type ReplicaInboxOffer = {
+  lease_id: string
+  archive_id: string
+  snapshot_id: string
+  owner_subject_id: string
+  offer_hash: string
+  key_epoch: string
+  expires_at: string
+  reserved_bytes: string
+  object_count: number
+  grant_hash: string
+}
+export type ReplicaInbox = { source_node_id: string; archive_id: string; offers: ReplicaInboxOffer[] }
+export type ReplicaLeaseList = {
+  leases: ReplicaLeaseSummary[]
+  tombstones: Array<{
+    archive_id: string
+    deletion_epoch: string
+    issued_at: string
+    frozen: boolean
+    acknowledged_nodes: string[]
+  }>
+}
+export type ReplicaTombstoneResult = {
+  archive_id: string
+  deletion_epoch: string
+  tombstone_hash: string
+  frozen: boolean
+  local_decision: 'durable'
+  physical_deletion_performed: false
+  peers: Array<{ node_id: string; status: 'durable_receipt' | 'pending' }>
+}
 export type RecordingEvent = { id: string; recording_id: string; type: string; at: string; count?: number; message?: string }
 export type TimedEvent = {
   event_archive_ordinal: number
@@ -274,6 +327,60 @@ export type ApiSession = { auth_enabled: boolean; authenticated: boolean; needs_
 export type PermissionID = string
 export type AccountRole = { id: string; name: string; built_in: boolean; permissions: PermissionID[]; created_at?: string }
 export type AccountAuthorization = { user_id: string; login: string; roles: string[]; permissions: PermissionID[] }
+export type GlobalIdentitySnapshot = { identity_id: string; sequence: string; head_hash: string; recovery_encryption_public_key: string; created_at: string; credential_count: number; credential_ids: string[]; frozen: boolean; fork_count: number; node_ids: string[] }
+export type GlobalIdentityStatus = { initialized: boolean; identity: GlobalIdentitySnapshot | null }
+export type GlobalIdentitySession = { authenticated: boolean; identity_id?: string; global_csrf_token?: string; playback_key_bound?: boolean }
+export type NodeIdentityInfo = { node_id: string; public_key: string }
+export type NodeIdentityStatus = { created: boolean; node: NodeIdentityInfo | null }
+export type PeerSessionInfo = { identity_id: string; node_id: string; connected_at: string }
+export type PeerSessions = { sessions: PeerSessionInfo[] }
+export type PeerArchiveHead = {
+  node_id: string
+  snapshot: ArchiveSnapshot
+}
+export type ArchiveSnapshot = {
+  schema_version: number
+  sequence: number
+  previous_snapshot_id?: string
+  snapshot_id: string
+  content_hash: string
+  provenance_hash: string
+  content: {
+    archive_id: string
+    session: { id: string; adapter_id: string; resource_hash?: string; session_hash?: string }
+    capture_state: 'open' | 'closed'
+    archive_state: 'repairable' | 'sealed'
+    objects: Array<{
+      timeline_ordinal: number
+      duration: number
+      init_identity?: string
+      discontinuity?: boolean
+      program_date_time?: string
+      byte_range?: { length: number; offset: number }
+      state: 'present' | 'conflict'
+      plaintext_size: number
+      plaintext_sha256: string
+      coordinate: { session_id: string; track_id: string; source_epoch: number; discontinuity_sequence: number; sequence: number; kind?: 'media' | 'init' }
+    }>
+    coverage: unknown[]
+  }
+  provenance: unknown[]
+}
+export type PeerReplicaManifest = ReplicaManifest
+export type PeerArchiveCapabilities = {
+  local_node_id: string
+  sessions: PeerSessionInfo[]
+  capabilities: { owner_subject_id: string; archive_id: string; grant_hash: string; expires_at: string }[]
+}
+export type NodeEnrollmentProof = { identity_id: string; previous_event_hash: string; node_id: string; node_public_key: string; enrollment_nonce: string; node_proof: string; expires_at: string }
+export type OwnerSubjectReplicationPolicy = { minimum_replicas: string; grace_period_seconds: string; capacity_limit_bytes: string; relocate_after_grace: boolean }
+export type OwnerAuthoritySubject = { subject: { subject_id: string; subject_type: 'person'; controller: { kind: 'identity' | 'node'; id: string }; controller_policy: string; policy_epoch: string; created_at: string }; replication_policy: OwnerSubjectReplicationPolicy; archive_ids: string[]; rekey_required_archives?: string[]; rekey_required_since_event_hash?: string; sequence: string; head_hash: string; frozen: boolean; fork_count: number; grants: { grant_hash: string; issuer: { kind: 'identity' | 'node'; id: string }; audience: { kind: 'identity' | 'node'; id: string }; archive_id: string; snapshot_id?: string; actions: string[]; expires_at: string; revoked: boolean; delegation_depth: string }[] }
+export type OwnerAuthoritySubjects = { subjects: OwnerAuthoritySubject[] }
+export type GlobalIdentityHistoryEvent = { canonical_event: string; signature: string }
+export type GlobalIdentityForkChoice = { fork_id: string; previous_event_hash: string; first_head_hash: string; second_head_hash: string; first_sequence: string; second_sequence: string }
+export type GlobalIdentityHistoryBundle = { format: 'ir.identity.history/1'; identity_id: string; events: GlobalIdentityHistoryEvent[]; fork_evidence?: { previous_event_hash: string; first_event: GlobalIdentityHistoryEvent; second_event: GlobalIdentityHistoryEvent; first_branch?: GlobalIdentityHistoryEvent[]; second_branch?: GlobalIdentityHistoryEvent[] }[] }
+export type RegisteredGlobalIdentity = { identity_id: string; sequence: string; head_hash: string; frozen: boolean; fork_count: number; node_ids: string[]; verified_at: string }
+export type VerifiedGlobalIdentityRecipient = { identity_id: string; head_hash: string; verified_at: string; fresh_until: string; frozen: boolean; identity_signing_public_key: string; recovery_encryption_public_key: string }
 export type AccountUser = { user_id: string; login: string; roles: string[]; role?: string; status: 'active' | 'disabled'; created_at: string }
 export type AccountSession = { id: string; expires_at: string; current: boolean }
 export type UserPreferences = { locale: 'system' | 'ko-KR' | 'en-US'; theme: 'system' | 'light' | 'dark'; timezone: string }

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "media": {
+    "type": "hls",
+    "manifest_url": "https://fixture.invalid/channel/index.m3u8"
+  }
+}

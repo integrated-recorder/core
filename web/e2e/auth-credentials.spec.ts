@@ -154,6 +154,10 @@ test('WebKit account credential forms preserve username context and submit brows
     if (path === '/api/notifications') return route.fulfill({ json: { items: [] } })
     if (path === '/api/user/authorization') return route.fulfill({ json: authorization(accountLogin) })
     if (path === '/api/user' && request.method() === 'GET') return route.fulfill({ json: user(accountLogin) })
+    if (path === '/api/global-identity/status') return route.fulfill({ json: { initialized: false, identity: null } })
+    if (path === '/api/global-identity/registry') return route.fulfill({ json: { identities: [] } })
+    if (path === '/api/global-identity/session') return route.fulfill({ json: { authenticated: false } })
+    if (path === '/api/node-identity/status') return route.fulfill({ json: { created: false, node: null } })
     if (path === '/api/user' && request.method() === 'PATCH') {
       const body = request.postDataJSON() as { login: string; current_password: string }
       patches.push({ path, body })
@@ -200,6 +204,10 @@ test('WebKit password change includes readonly username context and invalidates 
     if (path === '/api/notifications') return route.fulfill({ json: { items: [] } })
     if (path === '/api/user/authorization') return route.fulfill({ json: authorization() })
     if (path === '/api/user' && request.method() === 'GET') return route.fulfill({ json: user() })
+    if (path === '/api/global-identity/status') return route.fulfill({ json: { initialized: false, identity: null } })
+    if (path === '/api/global-identity/registry') return route.fulfill({ json: { identities: [] } })
+    if (path === '/api/global-identity/session') return route.fulfill({ json: { authenticated: false } })
+    if (path === '/api/node-identity/status') return route.fulfill({ json: { created: false, node: null } })
     if (path === '/api/user/password' && request.method() === 'POST') {
       expect(request.postDataJSON()).toEqual({ current_password: 'current-secret', new_password: 'new-secret-1234' })
       authenticated = false

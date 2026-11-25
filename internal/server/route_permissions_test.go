@@ -65,9 +65,13 @@ func TestEveryRegisteredAPIHasAuthorizationClassification(t *testing.T) {
 		})
 	}
 	public := map[string]bool{
-		"GET /api/auth/session":    true,
-		"POST /api/auth/login":     true,
-		"POST /api/auth/bootstrap": true,
+		"GET /api/auth/session":                   true,
+		"POST /api/auth/login":                    true,
+		"POST /api/auth/bootstrap":                true,
+		"GET /api/global-identity/session":        true,
+		"POST /api/global-identity/login/options": true,
+		"POST /api/global-identity/login/finish":  true,
+		"POST /api/global-identity/logout":        true,
 	}
 	for route := range registered {
 		if public[route] {

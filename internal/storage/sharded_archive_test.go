@@ -149,6 +149,38 @@ func TestSaveRecordingHeaderRejectsStaleRevisionAfterClaimAdmission(t *testing.T
 	}
 }
 
+func TestV2ArchiveIdentityIsValidatedAndImmutable(t *testing.T) {
+	ctx := context.Background()
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := &domain.Recording{
+		FormatVersion: ShardedArchiveFormatVersion, ShardedArchive: &domain.ShardedArchiveSummary{},
+		ID: "a4e2f247ab144c6a850fd5c07fb1e6a1", ArchiveID: "arc_AAAAAAAAAAAAAAAAAAAAAA",
+		SourceSessionID: "session-" + strings.Repeat("a", 64), State: domain.StateRecording,
+		CreatedAt: time.Now().UTC(), StartedAt: time.Now().UTC(),
+		Tracks: map[string]*domain.Track{"main": {ID: "main", NextArchiveOrdinal: 1}},
+	}
+	if err := store.CreateShardedRecording(header); err != nil {
+		t.Fatalf("create fixture root: %v", err)
+	}
+
+	changed, err := store.LoadRecordingHeader(ctx, header.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.ArchiveID = "arc_AAAAAAAAAAAAAAAAAAAAAQ"
+	if err := store.SaveRecordingHeader(ctx, changed); !errors.Is(err, ErrShardedArchiveInvalid) {
+		t.Fatalf("changed immutable archive identity error = %v, want ErrShardedArchiveInvalid", err)
+	}
+
+	changed.ArchiveID = "not-an-archive-id"
+	if err := store.SaveRecordingHeader(ctx, changed); !errors.Is(err, ErrShardedArchiveInvalid) {
+		t.Fatalf("malformed archive identity error = %v, want ErrShardedArchiveInvalid", err)
+	}
+}
+
 func TestPublishShardedMediaRejectsStaleHeaderAfterMetadataAppend(t *testing.T) {
 	ctx := context.Background()
 	store, header := newShardedArchiveTestStore(t, "b6e2f247ab144c6a850fd5c07fb1e6a1")

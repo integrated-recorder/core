@@ -23,15 +23,23 @@ import (
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/applog"
+	"github.com/integrated-recorder/core/internal/archivecatalog"
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/authority"
 	"github.com/integrated-recorder/core/internal/buildinfo"
 	"github.com/integrated-recorder/core/internal/derivative"
+	"github.com/integrated-recorder/core/internal/discovery"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/globalidentity"
 	"github.com/integrated-recorder/core/internal/integrity"
+	"github.com/integrated-recorder/core/internal/lease"
 	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/nodeidentity"
+	"github.com/integrated-recorder/core/internal/peerapi"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
 	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/preview"
+	"github.com/integrated-recorder/core/internal/replication"
 	"github.com/integrated-recorder/core/internal/storage"
 	"github.com/integrated-recorder/core/internal/storagediagnostic"
 	"github.com/integrated-recorder/core/internal/systemsettings"
@@ -41,6 +49,7 @@ import (
 type Server struct {
 	manager                     recordingManager
 	storage                     *storage.Store
+	archiveCatalog              *archivecatalog.Store
 	adapters                    *adapterhost.Host
 	adapterTrust                map[string]plugintrust.Attestation
 	configs                     *pluginconfig.Service
@@ -50,6 +59,17 @@ type Server struct {
 	previews                    *preview.Service
 	watches                     *watch.Service
 	auth                        *authn.Service
+	globalIdentity              *globalidentity.Store
+	globalIdentityRegistry      *globalidentity.HistoryRegistry
+	identityFederation          *discovery.FederationClient
+	federatedIdentityResolver   *authority.FederatedIdentityResolver
+	ownerAuthority              *authority.Store
+	globalIdentityCeremonies    *globalidentity.CeremonyManager
+	nodeIdentity                *nodeidentity.Store
+	peerSessions                peerSessionManager
+	replicaLeases               replicaLeaseStore
+	replicaCiphertexts          *replication.Store
+	replicaImportGate           *replication.ImportGate
 	logoutSession               func(string) error
 	storageDiagnostics          *storagediagnostic.Store
 	settings                    *systemsettings.Store
@@ -143,6 +163,16 @@ type Options struct {
 	Previews                    *preview.Service
 	Watches                     *watch.Service
 	Auth                        *authn.Service
+	GlobalIdentity              *globalidentity.Store
+	GlobalIdentityRegistry      *globalidentity.HistoryRegistry
+	IdentityFederation          *discovery.FederationClient
+	OwnerAuthority              *authority.Store
+	ArchiveCatalog              *archivecatalog.Store
+	NodeIdentity                *nodeidentity.Store
+	PeerSessions                peerSessionManager
+	ReplicaLeases               replicaLeaseStore
+	ReplicaCiphertexts          *replication.Store
+	ReplicaImportGate           *replication.ImportGate
 	StorageDiagnostics          *storagediagnostic.Store
 	Settings                    *systemsettings.Store
 	Logs                        *applog.Store
@@ -164,6 +194,16 @@ type Options struct {
 	BackgroundMutationGate interface {
 		WaitAdmission(context.Context) (func(), error)
 	}
+}
+
+type peerSessionManager interface {
+	List() []peerapi.SessionInfo
+	Connect(context.Context, string, string) error
+	Disconnect(string) error
+}
+
+type replicaLeaseStore interface {
+	Snapshot(context.Context) ([]lease.Lease, []lease.TombstoneRecord, error)
 }
 
 type workflowTitle struct {
@@ -219,7 +259,17 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 			archiveStore = local.Store()
 		}
 	}
-	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, adapterTrust: validatedAdapterTrust(options.AdapterTrust), configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, storageDiagnostics: options.StorageDiagnostics, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, installationManaged: options.InstallationManaged, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
+	importGate := options.ReplicaImportGate
+	if importGate == nil {
+		importGate = replication.NewImportGate()
+	}
+	s := &Server{manager: manager, storage: archiveStore, archiveCatalog: options.ArchiveCatalog, adapters: adapters, adapterTrust: validatedAdapterTrust(options.AdapterTrust), configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, globalIdentity: options.GlobalIdentity, globalIdentityRegistry: options.GlobalIdentityRegistry, identityFederation: options.IdentityFederation, ownerAuthority: options.OwnerAuthority, nodeIdentity: options.NodeIdentity, peerSessions: options.PeerSessions, replicaLeases: options.ReplicaLeases, replicaCiphertexts: options.ReplicaCiphertexts, replicaImportGate: importGate, storageDiagnostics: options.StorageDiagnostics, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, installationManaged: options.InstallationManaged, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
+	if options.GlobalIdentityRegistry != nil && options.IdentityFederation != nil {
+		s.federatedIdentityResolver = authority.NewFederatedIdentityResolver(options.GlobalIdentityRegistry, options.IdentityFederation)
+	}
+	if options.GlobalIdentity != nil {
+		s.globalIdentityCeremonies = globalidentity.NewCeremonyManager(options.GlobalIdentity)
+	}
 	if options.Auth != nil {
 		s.logoutSession = options.Auth.Logout
 	}
@@ -253,6 +303,9 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 	s.mux.HandleFunc("GET /api/recordings/{id}/lifecycle", s.recordingLifecycle)
 	s.mux.HandleFunc("GET /api/recordings/{id}/acquisition-flow", s.acquisitionFlow)
 	s.registerWatchRoutes()
+	s.registerPeerSessionRoutes()
+	s.registerReplicaLeaseRoutes()
+	s.registerPeerArchiveRoutes()
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/master.m3u8", s.masterPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/tracks/{track}/playlist.m3u8", s.trackPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/live/master.m3u8", s.liveMasterPlaylist)
@@ -1671,7 +1724,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; worker-src 'self' blob:; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; connect-src 'self' blob:; font-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; worker-src 'self' blob:; frame-ancestors 'none'; form-action 'self'")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Frame-Options", "DENY")

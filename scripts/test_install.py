@@ -205,6 +205,65 @@ class ReleaseSelectionTests(unittest.TestCase):
         self.assertNotIn("caddy:", rendered.lower())
         self.assertNotIn("COOKIE_SECURE: \"1\"", rendered)
 
+    def test_optional_peer_ice_settings_are_persisted_and_secret_is_read_only_mounted(self):
+        with tempfile.TemporaryDirectory() as root:
+            secret_path = Path(root) / "turn-rest-secret"
+            secret_path.write_text("synthetic-coturn-rest-secret-material-0123456789\n", encoding="utf-8")
+            secret_path.chmod(0o600)
+            args = install.cli_parser().parse_args([
+                "--recordings-dir", "/tmp/records",
+                "--peer-stun-urls", "stun:stun.example.test:3478",
+                "--peer-turn-urls", "turn:turn.example.test:3478?transport=udp,turns:turn.example.test:5349?transport=tcp",
+                "--peer-turn-secret-file", str(secret_path),
+                "--peer-turn-credential-ttl", "4m",
+                "--peer-ice-relay-only",
+            ])
+            selected = install.peer_ice_settings(args, None)
+            self.assertEqual(selected["turn_urls"], [
+                "turn:turn.example.test:3478?transport=udp",
+                "turns:turn.example.test:5349?transport=tcp",
+            ])
+            config = deployment_config()
+            config["peer_ice"] = selected
+            rendered = install.render_compose(config)
+            self.assertIn('IR_PEER_TURN_SHARED_SECRET_FILE: "/run/secrets/ir-peer-turn-secret"', rendered)
+            self.assertIn('IR_PEER_ICE_RELAY_ONLY: "true"', rendered)
+            self.assertIn('source: "' + str(secret_path.resolve()) + '"', rendered)
+            self.assertIn('target: "/run/secrets/ir-peer-turn-secret"', rendered)
+            self.assertIn("        read_only: true", rendered)
+            self.assertNotIn("synthetic-coturn-rest-secret-material", rendered)
+
+            rerun = install.cli_parser().parse_args(["--recordings-dir", "/tmp/records"])
+            preserved = install.peer_ice_settings(rerun, {"peer_ice": selected})
+            self.assertEqual(preserved, selected)
+            disabled = install.cli_parser().parse_args(["--recordings-dir", "/tmp/records", "--disable-peer-ice"])
+            self.assertEqual(install.peer_ice_settings(disabled, {"peer_ice": selected}), {})
+
+    def test_peer_ice_configuration_rejects_untrusted_urls_and_incomplete_turn_setup(self):
+        for arguments in (
+            ["--peer-turn-urls", "turn:user:pass@turn.example.test:3478"],
+            ["--peer-turn-urls", "turn:turn.example.test:3478"],
+            ["--peer-turn-urls", "turn:turn.example.test:3478", "--peer-turn-secret-file", "/missing/secret"],
+            ["--peer-ice-relay-only"],
+            ["--peer-turn-urls", "turn:turn.example.test:3478", "--peer-turn-secret-file", "/tmp/key", "--peer-turn-credential-ttl", "11m"],
+        ):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as root:
+                args = install.cli_parser().parse_args(["--recordings-dir", "/tmp/records", *arguments])
+                with self.assertRaises(install.InstallError):
+                    install.peer_ice_settings(args, None)
+
+    def test_turn_secret_readability_is_checked_as_the_compose_service_user(self):
+        config = deployment_config()
+        config["peer_ice"] = {"turn_urls": ["turn:turn.example.test:3478"], "turn_secret_file": "/tmp/private-turn-secret"}
+        with mock.patch.object(install, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            install.verify_peer_ice_secret_access(Path("compose.yaml"), config)
+        command = run.call_args.args[0]
+        self.assertIn("--no-deps", command)
+        self.assertIn("test -r /run/secrets/ir-peer-turn-secret", command)
+        with mock.patch.object(install, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            with self.assertRaisesRegex(install.InstallError, "container UID:GID 10001:10001"):
+                install.verify_peer_ice_secret_access(Path("compose.yaml"), config)
+
     def test_network_options_are_persisted_and_existing_defaults_are_preserved(self):
         parser = install.cli_parser()
         with tempfile.TemporaryDirectory() as root:

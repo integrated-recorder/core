@@ -18,6 +18,7 @@ import { EmptyState, ErrorState, LoadingState } from '@/components/query-state'
 import { useToast } from '@/components/ui/use-toast'
 import { errorMessage } from '@/lib/errors'
 import type { TranslationKey } from '@/i18n/catalog'
+import { GlobalIdentityPanel } from '@/components/settings/global-identity'
 
 export function AccountSecurityPanel({ account, section = 'security' }: { account: AccountUser; section?: 'security' | 'sessions' }) {
   const { t } = useI18n()
@@ -26,6 +27,7 @@ export function AccountSecurityPanel({ account, section = 'security' }: { accoun
     <Card><CardContent className="pt-4"><dl className="grid gap-4 sm:grid-cols-3"><ProfileValue label={t('account.login')} value={account.login} /><ProfileValue label={t('account.role')} value={(account.roles ?? []).map(role => displayRoleName(role, t)).join(', ')} /><ProfileValue label={t('account.status')} value={account.status === 'active' ? t('account.status.active') : t('account.status.disabled')} /></dl></CardContent></Card>
     <RenameLoginCard account={account} />
     <PasswordCard account={account} />
+    <GlobalIdentityPanel />
     <Link to="/account/sessions" className="block rounded-lg border border-border px-4 py-3 text-sm font-medium hover:bg-muted/50">{t('account.sessions')} →</Link>
     <Card><CardHeader><CardTitle>{t('account.localRecovery')}</CardTitle></CardHeader><CardContent className="space-y-2 text-sm text-muted-foreground"><p>{t('account.localRecoveryHelp')}</p><code className="block rounded bg-muted px-3 py-2 text-xs">runtime-host reset-password &lt;login&gt;</code></CardContent></Card>
   </div>

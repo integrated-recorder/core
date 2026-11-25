@@ -1,0 +1,54 @@
+{
+  "format_version": 2,
+  "id": "4d6f3c8208754a8cbff5064a171c2490",
+  "source_session_id": "session-31217b722b43e04fc1db8fbd065929d0b19ab092904faedb39c177144faf1996",
+  "title": "sharded recovery fixture",
+  "adapter_id": "fixture",
+  "source_uri_classification": "public",
+  "state": "stopped",
+  "archive_sealed": true,
+  "created_at": "2026-11-04T14:35:45.509782Z",
+  "started_at": "2026-11-04T14:35:45.509782Z",
+  "stopped_at": "2024-01-02T03:05:00Z",
+  "tracks": {
+    "main": {
+      "id": "main",
+      "source_playlist_url": "https://fixture.invalid/channel/index.m3u8",
+      "next_archive_ordinal": 3,
+      "live_presentation": {
+        "next_ordinal": 3,
+        "discontinuity_sequence": 1,
+        "has_last_coordinate": true,
+        "last_source_epoch": 1,
+        "last_discontinuity_sequence": 7,
+        "last_sequence": 11,
+        "has_epoch_mapping": true,
+        "mapped_source_epoch": 1,
+        "source_sequence_base": 10,
+        "presentation_ordinal_base": 1,
+        "max_source_sequence": 11,
+        "source_discontinuity_base": 7,
+        "presentation_disc_base": 1,
+        "first_presentation_ordinal": 1
+      },
+      "live_slot_high_water": 2,
+      "media_count": 2,
+      "init_count": 1,
+      "media_high_water": 2,
+      "payload_bytes": 88,
+      "duration_seconds": 8,
+      "segments": null
+    }
+  },
+  "timeline_revision": 3,
+  "archive_revision": 5,
+  "sharded_archive": {
+    "media_count": 2,
+    "init_count": 1,
+    "manifest_snapshot_count": 1,
+    "metadata_revision_count": 1,
+    "claim_count": 3,
+    "payload_bytes": 88,
+    "duration_seconds": 8
+  }
+}

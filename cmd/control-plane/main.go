@@ -24,16 +24,24 @@ import (
 
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archivecatalog"
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/authority"
 	"github.com/integrated-recorder/core/internal/buildinfo"
 	"github.com/integrated-recorder/core/internal/controlplane"
 	"github.com/integrated-recorder/core/internal/derivative"
+	"github.com/integrated-recorder/core/internal/discovery"
+	"github.com/integrated-recorder/core/internal/globalidentity"
 	"github.com/integrated-recorder/core/internal/integrity"
+	"github.com/integrated-recorder/core/internal/lease"
 	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/nodeidentity"
+	"github.com/integrated-recorder/core/internal/peerapi"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
 	"github.com/integrated-recorder/core/internal/plugintrust"
 	"github.com/integrated-recorder/core/internal/preview"
 	"github.com/integrated-recorder/core/internal/recorderengine"
+	"github.com/integrated-recorder/core/internal/replication"
 	"github.com/integrated-recorder/core/internal/runtimehost/installation"
 	"github.com/integrated-recorder/core/internal/runtimehost/resources"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
@@ -654,11 +662,152 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 			return nil, fmt.Errorf("initialize administrator authentication: %w", err)
 		}
 	}
+	globalIdentityStore, globalIdentityErr := globalidentity.Open(config.dataDir)
+	if globalIdentityErr != nil {
+		// Global identity is an optional distributed feature. A damaged identity
+		// state fails closed for identity operations, while remaining local
+		// recording and archive access stay available.
+		log.Printf("global identity unavailable: state validation failed")
+		globalIdentityStore = nil
+	}
+	var globalIdentityRegistry *globalidentity.HistoryRegistry
+	if globalIdentityStore != nil {
+		globalIdentityRegistry, err = globalidentity.OpenHistoryRegistry(config.dataDir)
+		if err != nil {
+			// The remote public-history registry is an optional distributed
+			// authorization input. Corrupt state disables remote authority
+			// resolution without affecting local recording or local identity.
+			log.Printf("global identity registry unavailable: state validation failed")
+			globalIdentityRegistry = nil
+		}
+	}
+	var ownerAuthorityStore *authority.Store
+	if globalIdentityStore != nil {
+		ownerAuthorityStore, err = authority.Open(config.dataDir)
+		if err != nil {
+			// Distributed authority state is optional for local recording. Any
+			// malformed persisted state disables authority APIs; it is never
+			// reset or repaired during startup.
+			log.Printf("owner authority unavailable: state validation failed")
+			ownerAuthorityStore = nil
+		}
+	}
+	var archiveCatalogStore *archivecatalog.Store
+	archiveCatalogStore, err = archivecatalog.Open(filepath.Join(config.dataDir, "archive-catalog"))
+	if err != nil {
+		// Catalog state is separate from canonical recording data. A damaged
+		// catalog disables snapshot-aware distributed operations without
+		// affecting local recording or archive playback.
+		log.Printf("archive snapshot catalog unavailable: state validation failed")
+		archiveCatalogStore = nil
+	}
+	nodeIdentityStore, nodeIdentityErr := nodeidentity.Open(config.dataDir)
+	if nodeIdentityErr != nil {
+		// Node identity is optional for local recording. Invalid persisted key
+		// state fails closed and is never silently replaced.
+		log.Printf("node identity unavailable: state validation failed")
+		nodeIdentityStore = nil
+	}
+	var identityFederation *discovery.FederationClient
+	if providerConfig := strings.TrimSpace(os.Getenv("IR_DISCOVERY_PROVIDERS")); providerConfig != "" {
+		providerURLs := strings.Split(providerConfig, ",")
+		for i := range providerURLs {
+			providerURLs[i] = strings.TrimSpace(providerURLs[i])
+		}
+		identityFederation, err = discovery.NewFederationClient(providerURLs, nil)
+		if err != nil {
+			// Invalid optional Discovery configuration must not disrupt local
+			// recording. Remote authority stays unavailable and fails closed.
+			log.Printf("identity history federation unavailable: configuration invalid")
+			identityFederation = nil
+		}
+	}
+	var replicaLeaseStore *lease.Store
+	if globalIdentityStore != nil && ownerAuthorityStore != nil {
+		replicaLeaseStore, err = openReplicaLeaseStore(config.dataDir, globalIdentityStore, globalIdentityRegistry, identityFederation, ownerAuthorityStore)
+		if err != nil {
+			// Invalid replica-retention state disables only the distributed
+			// lease surface; local acquisition and archive access remain usable.
+			log.Printf("replica lease state unavailable: state validation failed")
+			replicaLeaseStore = nil
+		}
+	}
+	var replicaCiphertexts *replication.Store
+	if replicaLeaseStore != nil {
+		replicaCiphertexts, err = replication.Open(filepath.Join(config.dataDir, "replication", "ciphertext"))
+		if err != nil {
+			// Replication remains unavailable when its private encrypted-object
+			// catalog is invalid; local recording and the rest of the API continue.
+			log.Printf("replica ciphertext storage unavailable: validation failed")
+			replicaCiphertexts = nil
+		}
+	}
+	peerTURNAuth, peerTURNErr := loadPeerTURNAuthConfig()
+	if peerTURNErr != nil {
+		// Peer networking is optional. Invalid TURN credentials/configuration
+		// disable remote sessions without affecting local recording or VOD.
+		log.Printf("peer ICE configuration unavailable: settings invalid")
+		peerTURNAuth = nil
+	}
+	peerSessions := newPeerSessionSlot(config.dataDir, globalIdentityStore, globalIdentityRegistry, identityFederation, ownerAuthorityStore, archiveCatalogStore, nodeIdentityStore, replicaLeaseStore, replicaCiphertexts, peerTURNAuth)
+	var peerConnectionPass func(context.Context) error
+	if peerSessions != nil && globalIdentityStore != nil && globalIdentityRegistry != nil &&
+		identityFederation != nil && ownerAuthorityStore != nil && archiveCatalogStore != nil &&
+		nodeIdentityStore != nil && replicaLeaseStore != nil && replicaCiphertexts != nil {
+		identityResolver := authority.IdentityStateResolverFromFederated(
+			globalIdentityStore,
+			authority.NewFederatedIdentityResolver(globalIdentityRegistry, identityFederation),
+		)
+		peerReconciler := &peerConnectionReconciler{
+			identity: globalIdentityStore, node: nodeIdentityStore, peers: peerSessions,
+			resolve: identityResolver, owners: ownerAuthorityStore,
+		}
+		peerConnectionPass = peerReconciler.Reconcile
+	}
+	replicaImportGate := replication.NewImportGate()
+	var replicaTransferPass func(context.Context, time.Time) error
+	var replicaOfferPass func(context.Context, time.Time) error
+	var replicaRenewalPass func(context.Context, time.Time) error
+	if replicaLeaseStore != nil && replicaCiphertexts != nil && globalIdentityStore != nil &&
+		globalIdentityRegistry != nil && ownerAuthorityStore != nil && nodeIdentityStore != nil && peerSessions != nil && identityFederation != nil {
+		identityResolver := authority.IdentityStateResolverFromFederated(
+			globalIdentityStore,
+			authority.NewFederatedIdentityResolver(globalIdentityRegistry, identityFederation),
+		)
+		transferReconciler := &replicaTransferReconciler{
+			leases: replicaLeaseStore, identity: globalIdentityStore, resolve: identityResolver,
+			ownerSnapshot: func(subjectID string, now time.Time) (authority.AuthoritySnapshot, error) {
+				return ownerAuthorityStore.Snapshot(subjectID, identityResolver, now)
+			},
+			authorize: func(subjectID string, chain []authority.SignedGrant, now time.Time, audience authority.Principal, archiveID, snapshotID, action string) error {
+				return ownerAuthorityStore.AuthorizeChain(subjectID, chain, identityResolver, now, audience, archiveID, snapshotID, action)
+			},
+			node: nodeIdentityStore, signer: nodeIdentityStore, peers: peerSessions, importGate: replicaImportGate,
+			importReplica: func(ctx context.Context, sourceNodeID string, scope peerapi.RequestScope, archiveID, snapshotID, leaseID string) (lease.Lease, error) {
+				result, err := peerSessions.ImportReplicaFromPeer(ctx, sourceNodeID, scope,
+					replicaLeaseStore, replicaCiphertexts, nodeIdentityStore, nodeIdentityStore, archiveID, snapshotID, leaseID)
+				return result.Lease, err
+			},
+		}
+		replicaTransferPass = transferReconciler.Reconcile
+		offerReconciler := &replicaOfferReconciler{
+			leases: replicaLeaseStore, identity: globalIdentityStore, resolve: identityResolver,
+			authority: ownerAuthorityStore, node: nodeIdentityStore, peers: peerSessions,
+			catalog: archiveCatalogStore, ciphertext: replicaCiphertexts, manager: manager,
+		}
+		replicaOfferPass = offerReconciler.Reconcile
+		renewalReconciler := &replicaRenewalReconciler{
+			leases: replicaLeaseStore, identity: globalIdentityStore, resolve: identityResolver,
+			owners: ownerAuthorityStore, node: nodeIdentityStore, peers: peerSessions, store: replicaLeaseStore,
+		}
+		replicaRenewalPass = renewalReconciler.Reconcile
+	}
 	api := server.NewWithOptions(manager, adapters, configs, server.Options{
 		Storage: store, Management: products, Integrity: integrityService, Derivatives: exportService,
 		StorageDiagnostics: storageDiagnostics,
-		Previews:           previewService, Watches: watchService, Auth: authService, Settings: settings,
+		Previews:           previewService, Watches: watchService, Auth: authService, GlobalIdentity: globalIdentityStore, GlobalIdentityRegistry: globalIdentityRegistry, IdentityFederation: identityFederation, OwnerAuthority: ownerAuthorityStore, ArchiveCatalog: archiveCatalogStore, NodeIdentity: nodeIdentityStore, PeerSessions: peerSessions, ReplicaLeases: replicaLeaseStore, ReplicaCiphertexts: replicaCiphertexts, Settings: settings,
 		InitialIntegrityConcurrency: settings.IntegrityConcurrency(), InitialStorageSettings: &startupSettings.Storage,
+		ReplicaImportGate:  replicaImportGate,
 		ForceSecureCookies: config.forceSecureCookies, StartedAt: time.Now().UTC(), BuildInfo: buildinfo.Current(),
 		MutationGate: gate, BackgroundMutationGate: gate,
 		InstallationManaged: config.installationManaged,
@@ -666,7 +815,33 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 	})
 	cleanupAdapters, cleanupIntegrity, cleanupExport, cleanupPreview, cleanupWatch = false, false, false, false, false
 	cleanupStorageRuntime = false
-	return &controlApplication{adapters: adapters, manager: manager, store: store, storageRuntime: storageRuntime, integrity: integrityService, exports: exportService, previews: previewService, watches: watchService, api: api, gate: gate, lifetime: processCtx, dataDir: config.dataDir, installationManaged: config.installationManaged}, nil
+	tombstoneDelivery := &replicaTombstoneDeliveryReconciler{
+		leases: replicaLeaseStore, identity: globalIdentityStore, registry: globalIdentityRegistry,
+		federated: identityFederation, authority: ownerAuthorityStore, node: nodeIdentityStore, peers: peerSessions,
+	}
+	replicaMaintenancePass := func(ctx context.Context, now time.Time) error {
+		var passErrors []error
+		if err := tombstoneDelivery.Reconcile(ctx, now); err != nil {
+			passErrors = append(passErrors, err)
+		}
+		if replicaRenewalPass != nil {
+			if err := replicaRenewalPass(ctx, now); err != nil {
+				passErrors = append(passErrors, err)
+			}
+		}
+		if replicaTransferPass != nil {
+			if err := replicaTransferPass(ctx, now); err != nil {
+				passErrors = append(passErrors, err)
+			}
+		}
+		if replicaOfferPass != nil {
+			if err := replicaOfferPass(ctx, now); err != nil {
+				passErrors = append(passErrors, err)
+			}
+		}
+		return errors.Join(passErrors...)
+	}
+	return &controlApplication{adapters: adapters, manager: manager, store: store, storageRuntime: storageRuntime, peerSessions: peerSessions, peerConnectionPass: peerConnectionPass, replicaLeases: replicaLeaseStore, replicaMaintenancePass: replicaMaintenancePass, integrity: integrityService, exports: exportService, previews: previewService, watches: watchService, api: api, gate: gate, lifetime: processCtx, dataDir: config.dataDir, installationManaged: config.installationManaged}, nil
 }
 
 func configureRuntimeResources(store *storage.Store, config processConfig) error {
@@ -755,6 +930,8 @@ type controlApplication struct {
 	manager             *recorderengine.ManagerRouter
 	store               *storage.Store
 	storageRuntime      *storageprocess.Runtime
+	peerSessions        *peerapi.SessionManagerSlot
+	replicaLeases       replicaLeaseExpirer
 	integrity           *integrity.Service
 	exports             *derivative.Service
 	previews            *preview.Service
@@ -780,7 +957,21 @@ type controlApplication struct {
 	storageMetricsDone     chan struct{}
 	storageMetricsRestart  bool
 	storageMetricsStopping bool
+	leaseExpiryCancel      context.CancelFunc
+	leaseExpiryDone        chan struct{}
+	leaseExpiryRestart     bool
+	leaseExpiryStopping    bool
+	replicaMaintenancePass func(context.Context, time.Time) error
+	peerConnectionPass     func(context.Context) error
+	peerConnectionCancel   context.CancelFunc
+	peerConnectionDone     chan struct{}
 }
+
+type replicaLeaseExpirer interface {
+	Expire(context.Context, time.Time) ([]string, error)
+}
+
+const replicaLeaseExpiryInterval = time.Minute
 
 func (a *controlApplication) handler() http.Handler { return a.api }
 
@@ -884,7 +1075,97 @@ func (a *controlApplication) startBackground(parent context.Context) error {
 		_ = a.stopPreviewReconciler(context.Background())
 		return err
 	}
+	if a.peerSessions != nil {
+		if err := a.peerSessions.Start(ctx); err != nil {
+			log.Printf("Control peer sessions unavailable")
+		}
+	}
+	if err := a.startReplicaLeaseExpiryLoop(ctx); err != nil {
+		_ = a.stopStorageMetricsLoop(context.Background())
+		_ = a.stopRetentionLoop(context.Background())
+		_ = a.stopPreviewReconciler(context.Background())
+		return err
+	}
+	if err := a.startPeerConnectionLoop(ctx); err != nil {
+		_ = a.stopReplicaLeaseExpiryLoop(context.Background())
+		_ = a.stopStorageMetricsLoop(context.Background())
+		_ = a.stopRetentionLoop(context.Background())
+		_ = a.stopPreviewReconciler(context.Background())
+		return err
+	}
 	return nil
+}
+
+func (a *controlApplication) startPeerConnectionLoop(parent context.Context) error {
+	if a == nil || a.peerConnectionPass == nil {
+		return nil
+	}
+	if parent == nil {
+		return errors.New("peer connection reconciliation context is unavailable")
+	}
+	a.mu.Lock()
+	if a.peerConnectionCancel != nil {
+		a.mu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	a.peerConnectionCancel, a.peerConnectionDone = cancel, done
+	a.mu.Unlock()
+	go func() {
+		defer func() {
+			a.mu.Lock()
+			if a.peerConnectionDone == done {
+				a.peerConnectionCancel, a.peerConnectionDone = nil, nil
+			}
+			close(done)
+			a.mu.Unlock()
+		}()
+		lastFailed := false
+		run := func() {
+			if err := a.peerConnectionPass(ctx); err != nil && ctx.Err() == nil {
+				// Transport errors can contain addresses; retain only a bounded,
+				// non-sensitive operational signal in process logs.
+				if !lastFailed {
+					log.Printf("Control delegated peer connection pass failed")
+				}
+				lastFailed = true
+				return
+			}
+			lastFailed = false
+		}
+		run()
+		ticker := time.NewTicker(peerConnectionReconcileInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				run()
+			}
+		}
+	}()
+	return nil
+}
+
+func (a *controlApplication) stopPeerConnectionLoop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.mu.Lock()
+	cancel, done := a.peerConnectionCancel, a.peerConnectionDone
+	a.mu.Unlock()
+	if cancel == nil || done == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (a *controlApplication) startStorageMetricsLoop(parent context.Context) error {
@@ -1056,7 +1337,90 @@ func (a *controlApplication) stopRetentionLoop(ctx context.Context) error {
 	}
 }
 
+func (a *controlApplication) startReplicaLeaseExpiryLoop(parent context.Context) error {
+	if a == nil || a.replicaLeases == nil {
+		return nil
+	}
+	if parent == nil || replicaLeaseExpiryInterval <= 0 {
+		return errors.New("replica lease expiry loop configuration is invalid")
+	}
+	a.mu.Lock()
+	if a.leaseExpiryCancel != nil {
+		if a.leaseExpiryStopping {
+			a.leaseExpiryRestart = true
+		}
+		a.mu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	a.leaseExpiryCancel, a.leaseExpiryDone = cancel, done
+	a.mu.Unlock()
+	go func() {
+		defer func() {
+			a.mu.Lock()
+			restart := a.leaseExpiryDone == done && a.leaseExpiryRestart
+			nextParent := a.lifetime
+			if a.leaseExpiryDone == done {
+				a.leaseExpiryCancel, a.leaseExpiryDone = nil, nil
+				a.leaseExpiryRestart, a.leaseExpiryStopping = false, false
+			}
+			close(done)
+			a.mu.Unlock()
+			if restart && nextParent != nil && nextParent.Err() == nil {
+				_ = a.startReplicaLeaseExpiryLoop(nextParent)
+			}
+		}()
+		lease.RunMaintenanceLoop(ctx, a.replicaLeases, replicaLeaseExpiryInterval, a.replicaMaintenancePass, func(err error) {
+			// Lease state and filesystem diagnostics stay private. The status API
+			// exposes only the sanitized durable projection. Offer failures may
+			// expose only a bounded stage label, never the underlying error.
+			if diagnostic, ok := err.(replicaOfferReconcileError); ok {
+				log.Printf("Control replica maintenance pass failed: stage=%s", diagnostic.DiagnosticStage())
+				return
+			}
+			log.Printf("Control replica maintenance pass failed")
+		})
+	}()
+	return nil
+}
+
+func (a *controlApplication) stopReplicaLeaseExpiryLoop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.mu.Lock()
+	cancel, done := a.leaseExpiryCancel, a.leaseExpiryDone
+	if cancel != nil && done != nil && a.leaseExpiryDone == done {
+		a.leaseExpiryStopping = true
+	}
+	a.mu.Unlock()
+	if cancel == nil || done == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (a *controlApplication) pauseForHandoff(ctx context.Context) error {
+	// Join peer and replica maintenance before stopping the peer manager: either
+	// may establish a session and must not resurrect it during generation handoff.
+	if err := a.stopPeerConnectionLoop(ctx); err != nil {
+		return err
+	}
+	if err := a.stopReplicaLeaseExpiryLoop(ctx); err != nil {
+		return err
+	}
+	if a.peerSessions != nil {
+		if err := a.peerSessions.Stop(); err != nil {
+			return errors.New("peer sessions could not be drained for generation handoff")
+		}
+	}
 	if err := a.watches.Pause(ctx); err != nil {
 		return err
 	}
@@ -1110,6 +1474,14 @@ func (a *controlApplication) resumeAfterHandoff() error {
 	if err := a.watches.Resume(); err != nil {
 		return err
 	}
+	if a.peerSessions != nil {
+		if err := a.peerSessions.Start(a.lifetime); err != nil {
+			return errors.New("peer sessions could not be restarted after generation handoff")
+		}
+	}
+	if err := a.startPeerConnectionLoop(a.lifetime); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	previewRunning := a.previewCancel != nil
 	if previewRunning && a.previewStopping {
@@ -1135,6 +1507,9 @@ func (a *controlApplication) resumeAfterHandoff() error {
 			return err
 		}
 	}
+	if err := a.startReplicaLeaseExpiryLoop(a.lifetime); err != nil {
+		return err
+	}
 	return a.startStorageMetricsLoop(a.lifetime)
 }
 
@@ -1146,12 +1521,15 @@ func (a *controlApplication) close(ctx context.Context) error {
 	cancel, done := a.backgroundCancel, a.backgroundDone
 	a.previewRestart = false
 	a.retentionRestart = false
+	a.leaseExpiryRestart = false
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	peerConnectionErr := a.stopPeerConnectionLoop(ctx)
 	previewErr := a.stopPreviewReconciler(ctx)
 	retentionErr := a.stopRetentionLoop(ctx)
+	leaseExpiryErr := a.stopReplicaLeaseExpiryLoop(ctx)
 	storageMetricsErr := a.stopStorageMetricsLoop(ctx)
 	var joined error
 	if done != nil {
@@ -1161,7 +1539,11 @@ func (a *controlApplication) close(ctx context.Context) error {
 			joined = ctx.Err()
 		}
 	}
-	joined = errors.Join(previewErr, retentionErr, storageMetricsErr, joined, a.watches.Close(ctx), a.previews.Close(ctx), a.exports.Close(ctx), a.integrity.Close(ctx))
+	var peerErr error
+	if a.peerSessions != nil {
+		peerErr = a.peerSessions.Close()
+	}
+	joined = errors.Join(peerConnectionErr, previewErr, retentionErr, leaseExpiryErr, storageMetricsErr, peerErr, joined, a.watches.Close(ctx), a.previews.Close(ctx), a.exports.Close(ctx), a.integrity.Close(ctx))
 	a.adapters.Close()
 	if a.storageRuntime != nil {
 		joined = errors.Join(joined, a.storageRuntime.Close())

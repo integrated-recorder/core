@@ -1,5 +1,5 @@
 import { queryOptions } from '@tanstack/react-query'
-import { accountAPI, adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, pluginsAPI, productAPI, recordingsAPI, runtimeUpdateAPI, setupAPI, storageAPI, userPreferencesAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery, type StorageMetricWindow } from './index'
+import { accountAPI, adaptersAPI, authAPI, dashboardAPI, derivativeAPI, globalIdentityAPI, integrityAPI, peerSessionsAPI, pluginsAPI, productAPI, recordingsAPI, replicaLeasesAPI, runtimeUpdateAPI, setupAPI, storageAPI, userPreferencesAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery, type StorageMetricWindow } from './index'
 
 export const qk = {
   session: ['auth', 'session'] as const, installation: ['installation', 'status'] as const, dashboard: ['dashboard'] as const, storage: ['system', 'storage'] as const, info: ['system', 'info'] as const,
@@ -18,12 +18,28 @@ export const qk = {
   notifications: ['notifications'] as const, audit: ['audit'] as const, logs: (query: unknown) => ['logs', query] as const,
   userPreferences: ['user', 'preferences'] as const,
   account: ['user', 'account'] as const, accountAuthorization: ['user', 'authorization'] as const, accountSessions: ['user', 'sessions'] as const, users: ['users'] as const, roles: ['roles'] as const,
+  globalIdentity: ['global-identity', 'status'] as const,
+  globalIdentityForks: ['global-identity', 'forks'] as const,
+  globalIdentityRegistry: ['global-identity', 'registry'] as const,
+  ownerAuthoritySubjects: ['owner-authority', 'subjects'] as const,
+  globalIdentitySession: ['global-identity', 'session'] as const,
+  nodeIdentity: ['node-identity', 'status'] as const,
+  peerSessions: ['peer-sessions'] as const,
+  replicaLeases: ['replica-leases'] as const,
 }
 export const accountQuery = queryOptions({ queryKey: qk.account, queryFn: () => accountAPI.self(), staleTime: 30_000, retry: false })
 export const accountAuthorizationQuery = queryOptions({ queryKey: qk.accountAuthorization, queryFn: () => accountAPI.authorization(), staleTime: 0, refetchOnWindowFocus: true, retry: false })
 export const accountSessionsQuery = queryOptions({ queryKey: qk.accountSessions, queryFn: () => accountAPI.sessions(), staleTime: 5_000, retry: false })
 export const usersQuery = queryOptions({ queryKey: qk.users, queryFn: () => accountAPI.users(), staleTime: 10_000, retry: false })
 export const rolesQuery = queryOptions({ queryKey: qk.roles, queryFn: () => accountAPI.roles(), staleTime: 10_000, retry: false })
+export const globalIdentityQuery = queryOptions({ queryKey: qk.globalIdentity, queryFn: globalIdentityAPI.status, staleTime: 0, retry: false })
+export const globalIdentityForkChoicesQuery = queryOptions({ queryKey: qk.globalIdentityForks, queryFn: globalIdentityAPI.forkChoices, staleTime: 0, retry: false })
+export const globalIdentityRegistryQuery = queryOptions({ queryKey: qk.globalIdentityRegistry, queryFn: globalIdentityAPI.registry, staleTime: 0, retry: false })
+export const ownerAuthoritySubjectsQuery = queryOptions({ queryKey: qk.ownerAuthoritySubjects, queryFn: globalIdentityAPI.ownerAuthoritySubjects, staleTime: 0, retry: false })
+export const globalIdentitySessionQuery = queryOptions({ queryKey: qk.globalIdentitySession, queryFn: globalIdentityAPI.session, staleTime: 0, retry: false })
+export const nodeIdentityQuery = queryOptions({ queryKey: qk.nodeIdentity, queryFn: globalIdentityAPI.nodeStatus, staleTime: 0, retry: false })
+export const peerSessionsQuery = queryOptions({ queryKey: qk.peerSessions, queryFn: peerSessionsAPI.list, staleTime: 0, retry: false, refetchInterval: 5_000, refetchIntervalInBackground: false })
+export const replicaLeasesQuery = queryOptions({ queryKey: qk.replicaLeases, queryFn: replicaLeasesAPI.list, staleTime: 0, retry: false, refetchInterval: 15_000, refetchIntervalInBackground: false })
 export const sessionQuery = queryOptions({ queryKey: qk.session, queryFn: authAPI.session, retry: false, staleTime: 10_000 })
 export const userPreferencesQuery = queryOptions({ queryKey: qk.userPreferences, queryFn: () => userPreferencesAPI.get(), staleTime: 60_000, retry: false })
 export const installationQuery = queryOptions({

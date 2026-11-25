@@ -15,6 +15,11 @@ const (
 type Recording struct {
 	FormatVersion int    `json:"format_version"`
 	ID            string `json:"id"`
+	// ArchiveID is the immutable logical identity shared by copies of this
+	// recording across Recorder nodes. It is independent of this installation's
+	// local Recording ID. Empty is accepted only for RC12-era archives, whose
+	// migration identity is derived by archivesnapshot.ArchiveIDForRecording.
+	ArchiveID string `json:"archive_id,omitempty"`
 	// SourceSessionID identifies the broadcast/resource session independently
 	// from ID, which identifies this one recording execution. It is a bounded,
 	// opaque Core-generated fingerprint; raw adapter session references are not

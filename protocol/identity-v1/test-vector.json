@@ -1,0 +1,24 @@
+{
+  "vector_version": "ir.identity.event.vector/1",
+  "test_only_key_note": "The signer is the public RFC 8032 test key seed. This vector key is public test material and MUST NEVER be used for a real identity or production signing.",
+  "event": {
+    "event_version": "ir.identity.event/1",
+    "identity_id": "gi_NgLJOCrMiSllxIuMKTBZYw",
+    "sequence": "0",
+    "previous_event_hash": null,
+    "operation": "genesis",
+    "issued_at": "2026-10-25T00:00:00Z",
+    "signer_key_id": "ik_QO4emvrimDq84aAusoZEauyYol7eKNusD3Zc8GvTDAs",
+    "signer_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "payload": {
+      "display_label": "녹화 🚀",
+      "identity_format": "global-identity/v1",
+      "recovery_encryption_public_key": "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8",
+      "credential_id": "dGVzdC1wYXNza2V5LWNyZWRlbnRpYWwtaWQ",
+      "webauthn_challenge": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+    }
+  },
+  "canonical_json": "{\"event_version\":\"ir.identity.event/1\",\"identity_id\":\"gi_NgLJOCrMiSllxIuMKTBZYw\",\"issued_at\":\"2026-10-25T00:00:00Z\",\"operation\":\"genesis\",\"payload\":{\"credential_id\":\"dGVzdC1wYXNza2V5LWNyZWRlbnRpYWwtaWQ\",\"display_label\":\"녹화 🚀\",\"identity_format\":\"global-identity/v1\",\"recovery_encryption_public_key\":\"j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8\",\"webauthn_challenge\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\"},\"previous_event_hash\":null,\"sequence\":\"0\",\"signer_key_id\":\"ik_QO4emvrimDq84aAusoZEauyYol7eKNusD3Zc8GvTDAs\",\"signer_public_key\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}",
+  "event_hash": "sha256:c24bd8d3e496718245f3c2b697a5aecc9c485879c9911895f4fb130b7a54c8fd",
+  "signature": "tWEj3AShp4_k-5q4fyVCqfA6yLMiQt2yQCioObI2uU3kP8ykImuuJRuaiuTtW2i3rcFxwnVJlUfA06Yn87PVDQ"
+}

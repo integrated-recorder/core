@@ -1,11 +1,85 @@
 import { api, queryString } from './client'
-import type { AccountAuthorization, AccountRole, AccountSession, AccountUser, Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PermissionID, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, TimedEventPage, UserPreferences, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import { fetchCiphertextRangeWithRetry } from '@/identity/ciphertext-range'
+import type { AccountAuthorization, AccountRole, AccountSession, AccountUser, Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveIndexPage, ArchiveSnapshotIdentity, AuditEvent, Dashboard, ExportJob, GlobalIdentityForkChoice, GlobalIdentityHistoryBundle, GlobalIdentitySession, GlobalIdentitySnapshot, GlobalIdentityStatus, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, NodeEnrollmentProof, NodeIdentityInfo, NodeIdentityStatus, Notification, OwnerAuthoritySubject, OwnerAuthoritySubjects, PeerArchiveCapabilities, PeerArchiveHead, PeerSessions, PermissionID, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, RegisteredGlobalIdentity, ReplicaInbox, ReplicaLeaseList, ReplicaManifest, ReplicaTombstoneResult, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageInstanceCreateBody, StorageInstanceSummary, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, TimedEventPage, UserPreferences, VerifiedGlobalIdentityRecipient, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
   bootstrap: (login: string, password: string) => api<ApiSession>('/api/auth/bootstrap', { method: 'POST', body: { login, password } }),
   login: (login: string, password: string) => api<ApiSession>('/api/auth/login', { method: 'POST', body: { login, password } }),
   logout: () => api<void>('/api/auth/logout', { method: 'POST' }),
+}
+export const globalIdentityAPI = {
+  status: () => api<GlobalIdentityStatus>('/api/global-identity/status'),
+  ownerAuthoritySubjects: () => api<OwnerAuthoritySubjects>('/api/owner-authority/subjects'),
+  ownerAuthoritySubject: (subjectId: string) => api<OwnerAuthoritySubject>(`/api/owner-authority/subjects/${encodeURIComponent(subjectId)}`),
+  syncOwnerAuthorityHistory: (subjectId: string) => api<OwnerAuthoritySubject>(`/api/owner-authority/subjects/${encodeURIComponent(subjectId)}/sync`, { method: 'POST' }),
+  applyOwnerAuthorityEvent: (signedEvent: { event: unknown; signature: string }) => api<OwnerAuthoritySubject>('/api/owner-authority/events', { method: 'POST', body: signedEvent }),
+  exportHistory: () => api<GlobalIdentityHistoryBundle>('/api/global-identity/history'),
+  forkChoices: () => api<{ forks: GlobalIdentityForkChoice[] }>('/api/global-identity/forks'),
+  resolveFork: (body: { canonical_event: string; signature: string }) => api<GlobalIdentitySnapshot>('/api/global-identity/forks/resolve', { method: 'POST', body }),
+  publishHistory: () => api<{ identity_id: string; head_hash: string; providers: Array<{ host: string; success: boolean }> }>('/api/global-identity/history/publish', { method: 'POST' }),
+  importHistory: (bundle: GlobalIdentityHistoryBundle) => api<GlobalIdentitySnapshot>('/api/global-identity/history/import', { method: 'POST', body: bundle }),
+  registry: () => api<{ identities: RegisteredGlobalIdentity[] }>('/api/global-identity/registry'),
+  verifiedRecipient: (identityId: string) => api<VerifiedGlobalIdentityRecipient>(`/api/global-identity/verified/${encodeURIComponent(identityId)}`),
+  importRegistryHistory: (bundle: GlobalIdentityHistoryBundle) => api<RegisteredGlobalIdentity>('/api/global-identity/registry/import', { method: 'POST', body: bundle }),
+  enrollmentChallenge: (identityId: string, previousEventHash: string) => api<NodeEnrollmentProof>('/api/node-identity/enrollment/challenge', { method: 'POST', body: { identity_id: identityId, previous_event_hash: previousEventHash } }),
+  delegateNode: (body: { canonical_event: string; signature: string }) => api<GlobalIdentitySnapshot>('/api/global-identity/nodes/delegate', { method: 'POST', body }),
+  revokeNode: (nodeId: string, body: { canonical_event: string; signature: string }) => api<GlobalIdentitySnapshot>(`/api/global-identity/nodes/${encodeURIComponent(nodeId)}/revoke`, { method: 'POST', body }),
+  nodeStatus: () => api<NodeIdentityStatus>('/api/node-identity/status'),
+  createNodeIdentity: () => api<{ created: true; node: NodeIdentityInfo; audit_recorded: boolean }>('/api/node-identity/create', { method: 'POST' }),
+  registrationOptions: (identityId: string) => api<unknown>('/api/global-identity/registration/options', { method: 'POST', body: { identity_id: identityId } }),
+  finishRegistration: (body: { credential: Record<string, unknown>; canonical_event: string; signature: string }) => api<{ initialized: true; identity: GlobalIdentitySnapshot }>('/api/global-identity/registration/finish', { method: 'POST', body }),
+  revokeCredential: (credentialId: string, body: { canonical_event: string; signature: string }) => api<GlobalIdentitySnapshot>(`/api/global-identity/credentials/${encodeURIComponent(credentialId)}/revoke`, { method: 'POST', body }),
+  loginOptions: (recipientPublicKey?: string) => api<unknown>('/api/global-identity/login/options', { method: 'POST', body: recipientPublicKey ? { recipient_public_key: recipientPublicKey } : {} }),
+  loginFinish: (credential: Record<string, unknown>) => api<{ authenticated: true; identity_id: string }>('/api/global-identity/login/finish', { method: 'POST', body: credential }),
+  session: () => api<GlobalIdentitySession>('/api/global-identity/session'),
+  sessionKeyEpochs: (nodeID: string, ownerSubjectID: string, archiveID: string, grantHash: string, snapshotID: string) =>
+    api<{ node_id: string; archive_id: string; snapshot_id: string; key_epochs: string[] }>(`/api/global-identity/peer-archives/${encodeURIComponent(nodeID)}/snapshots/${encodeURIComponent(snapshotID)}/session-key-epochs${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID, grant_hash: grantHash })}`),
+  sessionDEKEnvelope: (nodeID: string, ownerSubjectID: string, archiveID: string, grantHash: string, snapshotID: string, keyEpoch: string, csrfToken: string) =>
+    api<import('@/identity/cryptoarchive').SessionDEKEnvelope>(`/api/global-identity/peer-archives/${encodeURIComponent(nodeID)}/snapshots/${encodeURIComponent(snapshotID)}/session-key-envelope${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID, grant_hash: grantHash, key_epoch: keyEpoch })}`, { method: 'POST', headers: { 'X-IR-Global-CSRF': csrfToken }, body: {} }),
+  logout: (csrfToken: string) => api<void>('/api/global-identity/logout', { method: 'POST', headers: { 'X-IR-Global-CSRF': csrfToken }, body: {} }),
+}
+export const peerSessionsAPI = {
+  list: () => api<PeerSessions>('/api/peer-sessions'),
+  connect: (identityId: string, nodeId: string) => api<void>('/api/peer-sessions', { method: 'POST', body: { identity_id: identityId, node_id: nodeId } }),
+  disconnect: (nodeId: string) => api<void>(`/api/peer-sessions/${encodeURIComponent(nodeId)}`, { method: 'DELETE' }),
+}
+export const replicaImportsAPI = {
+  offers: (sourceNodeID: string, ownerSubjectID: string, archiveID: string) =>
+    api<ReplicaInbox>(`/api/peer-archives/${encodeURIComponent(sourceNodeID)}/replica-offers${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID })}`),
+  importFromPeer: (body: { source_node_id: string; owner_subject_id: string; grant_hash: string; archive_id: string; snapshot_id: string; lease_id: string }) =>
+    api<{ lease: import('@/types/api').ReplicaLeaseSummary; snapshot_id: string; objects: number }>('/api/replica-imports', { method: 'POST', body }),
+}
+export const replicaLeasesAPI = {
+  list: () => api<ReplicaLeaseList>('/api/replica-leases'),
+}
+export const replicaTombstonesAPI = {
+  submit: (body: { owner_subject_id: string; archive_id: string; grant_hash: string; reason_code?: 'owner_requested' | 'policy_retention' }) =>
+    api<ReplicaTombstoneResult>('/api/replica-tombstones', { method: 'POST', body }),
+}
+export const peerArchivesAPI = {
+  capabilities: () => api<PeerArchiveCapabilities>('/api/peer-archives/capabilities'),
+  head: (nodeID: string, ownerSubjectID: string, archiveID: string, grantHash: string) => api<PeerArchiveHead>(`/api/peer-archives/${encodeURIComponent(nodeID)}/head${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID, grant_hash: grantHash })}`),
+  snapshot: (nodeID: string, ownerSubjectID: string, archiveID: string, grantHash: string, snapshotID: string) =>
+    api<PeerArchiveHead>(`/api/peer-archives/${encodeURIComponent(nodeID)}/snapshots/${encodeURIComponent(snapshotID)}${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID, grant_hash: grantHash })}`),
+  manifest: (nodeID: string, ownerSubjectID: string, archiveID: string, grantHash: string, snapshotID: string, keyEpoch: string) =>
+    api<ReplicaManifest>(`/api/peer-archives/${encodeURIComponent(nodeID)}/snapshots/${encodeURIComponent(snapshotID)}/manifest${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID, grant_hash: grantHash, key_epoch: keyEpoch })}`),
+  keyEpochs: (nodeID: string, ownerSubjectID: string, archiveID: string, grantHash: string, snapshotID: string) =>
+    api<{ node_id: string; archive_id: string; snapshot_id: string; key_epochs: string[] }>(`/api/peer-archives/${encodeURIComponent(nodeID)}/snapshots/${encodeURIComponent(snapshotID)}/key-epochs${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID, grant_hash: grantHash })}`),
+  keyEnvelope: (nodeID: string, ownerSubjectID: string, archiveID: string, grantHash: string, snapshotID: string, keyEpoch: string) =>
+    api<import('@/identity/cryptoarchive').KeyEnvelope>(`/api/peer-archives/${encodeURIComponent(nodeID)}/snapshots/${encodeURIComponent(snapshotID)}/key-envelope${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID, grant_hash: grantHash, key_epoch: keyEpoch })}`),
+  ciphertextRange: async (nodeID: string, ownerSubjectID: string, archiveID: string, grantHash: string, snapshotID: string, keyEpoch: string, objectID: string, offset: number, length: number, signal?: AbortSignal) => {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1 || length > 4 * 1024 * 1024) {
+      throw new TypeError('peer archive range is invalid')
+    }
+    const path = `/api/peer-archives/${encodeURIComponent(nodeID)}/snapshots/${encodeURIComponent(snapshotID)}/objects/${encodeURIComponent(objectID)}${queryString({ owner_subject_id: ownerSubjectID, archive_id: archiveID, grant_hash: grantHash, key_epoch: keyEpoch, offset, length })}`
+    return fetchCiphertextRangeWithRetry(
+      requestSignal => fetch(path, { credentials: 'same-origin', cache: 'no-store', signal: requestSignal }),
+      offset,
+      length,
+      signal,
+    )
+  },
 }
 export const setupAPI = {
   status: () => api<InstallationStatus>('/api/setup/status'),
@@ -50,6 +124,10 @@ export const recordingsAPI = {
   tags: (id: string) => api<{ tags: string[] }>(`/api/recordings/${encodeURIComponent(id)}/tags`),
   setTags: (id: string, tags: string[]) => api<{ tags: string[] }>(`/api/recordings/${encodeURIComponent(id)}/tags`, { method: 'PUT', body: { tags } }),
   archive: (id: string, query: { limit?: number; cursor?: string } = {}) => api<ArchiveIndexPage>(`/api/recordings/${encodeURIComponent(id)}/archive/index${queryString(query)}`),
+  archiveSnapshotIdentity: (id: string) => api<ArchiveSnapshotIdentity>(`/api/recordings/${encodeURIComponent(id)}/archive/snapshot`),
+  encryptArchiveReplica: (id: string, body: { owner_subject_id: string; grant_hash: string; key_epoch: number; data_key?: string; key_envelope?: import('@/identity/cryptoarchive').KeyEnvelope }) => api<{ manifest: ReplicaManifest }>(`/api/recordings/${encodeURIComponent(id)}/replicas/encrypt`, { method: 'POST', body }),
+  rekeyArchiveHistory: (id: string, body: { owner_subject_id: string; grant_hash: string; recipient_identity_id: string; previous_key_epoch: number; key_epoch: number; data_key?: string; key_envelope: import('@/identity/cryptoarchive').KeyEnvelope }) => api<{ verification: { archive_id: string; previous_key_epoch: string; new_key_epoch: string; snapshot_count: string; head_sequence: string; head_snapshot_id: string; bundle_set_commitment: string; envelope_sha256: string; recipient_key_id: string }; key_envelope: import('@/identity/cryptoarchive').KeyEnvelope }>(`/api/recordings/${encodeURIComponent(id)}/replicas/rekey`, { method: 'POST', body }),
+  createReplicaOffer: (id: string, body: { owner_subject_id: string; grant_hash: string; key_epoch: number; data_key?: string; key_envelope?: import('@/identity/cryptoarchive').KeyEnvelope; lease_id: string; provider_node_id: string }) => api<{ manifest?: ReplicaManifest; lease: import('@/types/api').ReplicaLeaseSummary; reused?: boolean }>(`/api/recordings/${encodeURIComponent(id)}/replicas/offers`, { method: 'POST', body }),
   events: (id: string) => api<{ items: RecordingEvent[] }>(`/api/recordings/${encodeURIComponent(id)}/events`),
   timedEvents: (id: string, query: { limit?: number; cursor?: string; after?: number; tail?: 1; type?: string; from_ms?: number; to_ms?: number } = {}) => api<TimedEventPage>(`/api/recordings/${encodeURIComponent(id)}/timed-events${queryString(query)}`),
   timedEventsExport: (id: string) => `/api/recordings/${encodeURIComponent(id)}/timed-events/export`,

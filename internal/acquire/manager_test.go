@@ -386,11 +386,18 @@ func TestStartResolvedWithIDUsesExactCallerID(t *testing.T) {
 	if recording.ID != recordingID {
 		t.Fatalf("recording id = %q, want preallocated id %q", recording.ID, recordingID)
 	}
+	if !domain.ValidArchiveID(recording.ArchiveID) {
+		t.Fatalf("new recording archive id = %q, want a valid logical identity", recording.ArchiveID)
+	}
 	if _, err := manager.StartResolvedWithID(context.Background(), "../escape", "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: source.URL + "/live.m3u8"}, nil, "invalid", nil); err == nil {
 		t.Fatal("invalid caller-provided recording id was accepted")
 	}
 	if err := manager.Close(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	persisted, err := store.LoadRecordingReadOnly(recordingID)
+	if err != nil || persisted.ArchiveID != recording.ArchiveID {
+		t.Fatalf("persisted archive identity = %q, err=%v; want %q", persisted.ArchiveID, err, recording.ArchiveID)
 	}
 	if items := manager.List(); len(items) != 1 || items[0].ID != recordingID {
 		t.Fatalf("recordings after close = %#v", items)

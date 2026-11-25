@@ -1,0 +1,23 @@
+{
+  "advertisement": {
+    "address_envelope": "eyJhZWFkIjoiQUVTLTI1Ni1HQ00iLCJjaXBoZXJ0ZXh0Ijoib0RKdDZfOHd0MVVTbFcyUEZRSWpfRXpOdHNUdFM4T3oxY0pJRzlST3M1UldsMHNiNVlEajY1NlF3RGNlRE9XQkVkRWtnTlNidEJVX056OWlZMHVOSkEiLCJlbmNhcHN1bGF0aW9uIjoiQ2VkV0E2WVc5R3RPaWZrU1BDMFVCNkRwSmNEVHNWY09fY19Qb2d6Zm4wQSIsImVudmVsb3BlX3ZlcnNpb24iOiJpci5ub2RlLWFkZHJlc3MtZW52ZWxvcGUvMSIsImtkZiI6IkhLREYtU0hBMjU2Iiwia2VtIjoiREhLRU0oWDI1NTE5LEhLREYtU0hBMjU2KSIsInJlY2lwaWVudF9wdWJsaWNfa2V5X3NoYTI1NiI6InNoYTI1NjowNTZhODNiY2U4ZTg1NWY4YjJhZmM2MTEyMzYzOTllNTZlZDU1ZThkY2I3ZmRlOTk4MDhhZTgwZmRhMjNkYjkwIn0",
+    "advertisement_version": "ir.node.advertisement/1",
+    "capabilities": [
+      "webrtc-datachannel/1"
+    ],
+    "expires_at": "2026-11-02T12:10:00Z",
+    "global_identity_hint": "gih_c9UPBHnHfFTwANXnslVw9Q",
+    "identity_head_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued_at": "2026-11-02T12:00:00Z",
+    "node_id": "nd_P6a3uX14UUjDN-03HPhkmQ",
+    "node_public_key": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+    "relay_ids": [
+      "rly_abcdefghijklmnop"
+    ],
+    "sequence": "7"
+  },
+  "canonical_json": "{\"address_envelope\":\"eyJhZWFkIjoiQUVTLTI1Ni1HQ00iLCJjaXBoZXJ0ZXh0Ijoib0RKdDZfOHd0MVVTbFcyUEZRSWpfRXpOdHNUdFM4T3oxY0pJRzlST3M1UldsMHNiNVlEajY1NlF3RGNlRE9XQkVkRWtnTlNidEJVX056OWlZMHVOSkEiLCJlbmNhcHN1bGF0aW9uIjoiQ2VkV0E2WVc5R3RPaWZrU1BDMFVCNkRwSmNEVHNWY09fY19Qb2d6Zm4wQSIsImVudmVsb3BlX3ZlcnNpb24iOiJpci5ub2RlLWFkZHJlc3MtZW52ZWxvcGUvMSIsImtkZiI6IkhLREYtU0hBMjU2Iiwia2VtIjoiREhLRU0oWDI1NTE5LEhLREYtU0hBMjU2KSIsInJlY2lwaWVudF9wdWJsaWNfa2V5X3NoYTI1NiI6InNoYTI1NjowNTZhODNiY2U4ZTg1NWY4YjJhZmM2MTEyMzYzOTllNTZlZDU1ZThkY2I3ZmRlOTk4MDhhZTgwZmRhMjNkYjkwIn0\",\"advertisement_version\":\"ir.node.advertisement/1\",\"capabilities\":[\"webrtc-datachannel/1\"],\"expires_at\":\"2026-11-02T12:10:00Z\",\"global_identity_hint\":\"gih_c9UPBHnHfFTwANXnslVw9Q\",\"identity_head_hash\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"issued_at\":\"2026-11-02T12:00:00Z\",\"node_id\":\"nd_P6a3uX14UUjDN-03HPhkmQ\",\"node_public_key\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\",\"relay_ids\":[\"rly_abcdefghijklmnop\"],\"sequence\":\"7\"}",
+  "signature": "AauZtOvH4GLnYugnU-1z-WEXRGyYgtDzkM1FXqGCaZr-DXrcsLK7ANJyYrciid6HW33LvgDWbLp1mLlZZt6bBg",
+  "verified_at": "2026-11-02T12:01:00Z",
+  "test_key_note": "The corresponding private seed is a deterministic public test fixture only; never use it for identity or deployment."
+}

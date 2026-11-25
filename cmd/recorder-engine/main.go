@@ -19,8 +19,13 @@ import (
 
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/adapterhost"
+	"github.com/integrated-recorder/core/internal/archivecatalog"
+	"github.com/integrated-recorder/core/internal/authority"
+	"github.com/integrated-recorder/core/internal/globalidentity"
+	"github.com/integrated-recorder/core/internal/nodeidentity"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
 	"github.com/integrated-recorder/core/internal/recorderengine"
+	"github.com/integrated-recorder/core/internal/replication"
 	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
 	"github.com/integrated-recorder/core/internal/runtimehost/resources"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
@@ -156,6 +161,45 @@ func run() error {
 		_ = manager.Close(context.Background())
 		adapters.Close()
 		return err
+	}
+	archiveCatalogRoot, catalogPathErr := filepath.Abs(filepath.Join(dataDir, "archive-catalog"))
+	var archiveCatalogStore *archivecatalog.Store
+	if catalogPathErr == nil {
+		catalog, openErr := archivecatalog.Open(archiveCatalogRoot)
+		if openErr == nil {
+			archiveCatalogStore = catalog
+			if err := engine.ConfigureArchiveCatalog(catalog); err != nil {
+				_ = engine.Close(context.Background())
+				return fmt.Errorf("configure archive snapshot catalog: %w", err)
+			}
+		} else {
+			// Snapshot publication is a separate, retryable metadata projection.
+			// Keep the local recording Engine available if that directory is not
+			// writable; never redirect it into the canonical media archive.
+			log.Printf("immutable archive snapshot catalog is unavailable; distributed snapshot publication is disabled")
+		}
+	} else {
+		log.Printf("immutable archive snapshot catalog is unavailable; distributed snapshot publication is disabled")
+	}
+	if archiveCatalogStore != nil {
+		identityStore, identityErr := globalidentity.Open(dataDir)
+		authorityStore, authorityErr := authority.Open(dataDir)
+		nodeStore, nodeErr := nodeidentity.Open(dataDir)
+		cipherRoot, cipherPathErr := filepath.Abs(filepath.Join(dataDir, "replication", "ciphertext"))
+		var ciphertextStore *replication.Store
+		if cipherPathErr == nil {
+			ciphertextStore, _ = replication.Open(cipherRoot)
+		}
+		if identityErr == nil && authorityErr == nil && nodeErr == nil && ciphertextStore != nil {
+			if err := engine.ConfigureArchiveReplication(ciphertextStore, identityStore, authorityStore, nodeStore); err != nil {
+				log.Printf("encrypted archive replication is unavailable: local configuration could not be completed")
+			}
+		} else {
+			// Distributed encryption is optional and fails closed when any local
+			// identity dependency is absent or malformed. Local recordings remain
+			// independent of this feature.
+			log.Printf("encrypted archive replication is unavailable: verified local identity configuration is incomplete")
+		}
 	}
 	if managedRuntime {
 		if err := engine.ConfigureRecordingOwnerClient(runtimeClient); err != nil {

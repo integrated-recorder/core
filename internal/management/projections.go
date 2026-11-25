@@ -138,7 +138,16 @@ var auditTypes = map[string]struct{}{
 	"storage_instance_activated": {}, "storage_provider_configured": {}, "storage_provider_probed": {},
 	"storage_provider_activated": {}, "installation_setup_begun": {}, "installation_setup_completed": {},
 	"password_changed": {}, "password_recovered": {}, "session_revoked": {}, "sessions_revoked": {},
-	"user_created": {}, "user_disabled": {}, "user_enabled": {},
+	"user_created": {}, "user_disabled": {}, "user_enabled": {}, "node_identity_created": {},
+	"node_enrollment_challenge_issued": {}, "node_identity_delegated": {}, "node_identity_revoked": {},
+	"node_advertisement_signed": {},
+	"identity_history_imported": {}, "identity_history_fork_detected": {}, "owner_subject_event_applied": {},
+	"owner_subject_history_sync":            {},
+	"replica_tombstone_recorded":            {},
+	"global_identity_fork_resolved":         {},
+	"global_identity_history_published":     {},
+	"remote_identity_history_imported":      {},
+	"remote_identity_history_fork_detected": {},
 }
 
 var notificationTypes = map[string]struct{}{

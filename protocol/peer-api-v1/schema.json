@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://integrated-recorder.dev/protocol/peer-api-v1/schema.json",
+  "title": "Integrated Recorder authenticated peer archive request",
+  "oneOf": [
+    { "$ref": "#/$defs/snapshotHead" },
+    { "$ref": "#/$defs/snapshotGet" },
+    { "$ref": "#/$defs/replicaManifest" },
+    { "$ref": "#/$defs/keyEpochs" },
+    { "$ref": "#/$defs/keyEnvelope" },
+    { "$ref": "#/$defs/replicaOfferPage" },
+    { "$ref": "#/$defs/replicaAcceptance" },
+    { "$ref": "#/$defs/replicaRenewalRequest" },
+    { "$ref": "#/$defs/replicaRenewalReceipt" },
+    { "$ref": "#/$defs/replicaTombstone" },
+    { "$ref": "#/$defs/ciphertextRange" }
+  ],
+  "$defs": {
+    "snapshotHead": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation"],
+      "properties": { "operation": { "const": "snapshot.head" } }
+    },
+    "snapshotGet": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation"],
+      "properties": { "operation": { "const": "snapshot.get" } }
+    },
+    "replicaManifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "key_epoch"],
+      "properties": {
+        "operation": { "const": "replica.manifest" },
+        "key_epoch": { "$ref": "#/$defs/positiveDecimal" }
+      }
+    },
+    "keyEpochs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "recipient_key_id"],
+      "properties": {
+        "operation": { "const": "replica.key-epochs" },
+        "recipient_key_id": { "type": "string", "pattern": "^rk_[A-Za-z0-9_-]{43}$" }
+      }
+    },
+    "keyEnvelope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "key_epoch", "recipient_key_id"],
+      "properties": {
+        "operation": { "const": "replica.key-envelope" },
+        "key_epoch": { "$ref": "#/$defs/positiveDecimal" },
+        "recipient_key_id": { "type": "string", "pattern": "^rk_[A-Za-z0-9_-]{43}$" }
+      }
+    },
+    "replicaOfferPage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "lease_id", "offset", "limit"],
+      "properties": {
+        "operation": { "const": "replica.offer.page" },
+        "lease_id": { "type": "string", "pattern": "^rl_[A-Za-z0-9_-]{22}$" },
+        "offset": { "$ref": "#/$defs/decimal" },
+        "limit": { "type": "string", "pattern": "^(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-6])$" }
+      }
+    },
+    "replicaAcceptance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "lease_id", "acceptance"],
+      "properties": {
+        "operation": { "const": "replica.acceptance" },
+        "lease_id": { "type": "string", "pattern": "^rl_[A-Za-z0-9_-]{22}$" },
+        "acceptance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["acceptance", "signature"],
+          "properties": {
+            "acceptance": {
+              "type": "object", "additionalProperties": false,
+              "required": ["receipt_version", "lease_id", "offer_hash", "provider_node_id", "reserved_bytes", "accepted_at"],
+              "properties": {
+                "receipt_version": { "const": "ir.replica-lease/1" },
+                "lease_id": { "type": "string", "pattern": "^rl_[A-Za-z0-9_-]{22}$" },
+                "offer_hash": { "$ref": "#/$defs/hash" },
+                "provider_node_id": { "type": "string", "pattern": "^nd_[A-Za-z0-9_-]{22}$" },
+                "reserved_bytes": { "$ref": "#/$defs/positiveDecimal" },
+                "accepted_at": { "type": "string", "format": "date-time" }
+              }
+            },
+            "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$" }
+          }
+        }
+      }
+    },
+    "replicaRenewalRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "lease_id"],
+      "properties": {
+        "operation": { "const": "replica.renewal.request" },
+        "lease_id": { "type": "string", "pattern": "^rl_[A-Za-z0-9_-]{22}$" }
+      }
+    },
+    "replicaRenewalReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "lease_id", "renewal"],
+      "properties": {
+        "operation": { "const": "replica.renewal.receipt" },
+        "lease_id": { "type": "string", "pattern": "^rl_[A-Za-z0-9_-]{22}$" },
+        "renewal": { "$ref": "#/$defs/signedRenewal" }
+      }
+    },
+    "replicaTombstone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "tombstone"],
+      "properties": {
+        "operation": { "const": "replica.tombstone" },
+        "tombstone": { "$ref": "#/$defs/signedTombstone" }
+      }
+    },
+    "signedTombstone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tombstone", "actor", "grant_chain", "signature"],
+      "properties": {
+        "tombstone": { "$ref": "#/$defs/tombstone" },
+        "actor": { "$ref": "#/$defs/principal" },
+        "grant_chain": {
+          "type": "array", "minItems": 1, "maxItems": 16,
+          "items": { "$ref": "#/$defs/signedGrant" }
+        },
+        "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$" }
+      }
+    },
+    "tombstone": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tombstone_version", "archive_id", "owner_subject_id", "deletion_epoch", "previous_head", "reason_code", "issued_at", "authorized_evidence"],
+      "properties": {
+        "tombstone_version": { "const": "ir.archive-tombstone/1" },
+        "archive_id": { "type": "string", "pattern": "^arc_[A-Za-z0-9_-]{22}$" },
+        "owner_subject_id": { "type": "string", "pattern": "^os_[A-Za-z0-9_-]{22}$" },
+        "deletion_epoch": { "$ref": "#/$defs/positiveDecimal" },
+        "previous_head": { "type": "string", "pattern": "^(?:|sha256:[a-f0-9]{64})$" },
+        "reason_code": { "type": "string", "pattern": "^[a-z0-9_-]{1,64}$" },
+        "issued_at": { "type": "string", "format": "date-time" },
+        "authorized_evidence": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "signedRenewal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["renewal", "actor", "grant_chain", "owner_signature", "provider_signature"],
+      "properties": {
+        "renewal": { "$ref": "#/$defs/renewal" },
+        "actor": { "$ref": "#/$defs/principal" },
+        "grant_chain": {
+          "type": "array", "minItems": 1, "maxItems": 16,
+          "items": { "$ref": "#/$defs/signedGrant" }
+        },
+        "owner_signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$" },
+        "provider_signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$" }
+      }
+    },
+    "renewal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["renewal_version", "lease_id", "offer_hash", "owner_subject_id", "authorized_evidence", "expires_at", "issued_at"],
+      "properties": {
+        "renewal_version": { "const": "ir.replica-lease/1" },
+        "lease_id": { "type": "string", "pattern": "^rl_[A-Za-z0-9_-]{22}$" },
+        "offer_hash": { "$ref": "#/$defs/hash" },
+        "owner_subject_id": { "type": "string", "pattern": "^os_[A-Za-z0-9_-]{22}$" },
+        "authorized_evidence": { "$ref": "#/$defs/hash" },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "issued_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "principal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "enum": ["identity", "node"] },
+        "id": { "type": "string", "pattern": "^(gi|nd)_[A-Za-z0-9_-]{22}$" }
+      }
+    },
+    "signedGrant": {
+      "type": "object", "additionalProperties": false,
+      "required": ["grant", "signature"],
+      "properties": {
+        "grant": { "type": "object" },
+        "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$" }
+      }
+    },
+    "ciphertextRange": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "object_id", "key_epoch", "offset", "length"],
+      "properties": {
+        "operation": { "const": "ciphertext.range" },
+        "object_id": { "type": "string", "pattern": "^ob_[A-Za-z0-9_-]{43}$" },
+        "key_epoch": { "$ref": "#/$defs/positiveDecimal" },
+        "offset": { "$ref": "#/$defs/decimal" },
+        "length": { "$ref": "#/$defs/positiveDecimal" }
+      }
+    },
+    "hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "decimal": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,18})$" },
+    "positiveDecimal": { "type": "string", "pattern": "^[1-9][0-9]{0,18}$" }
+  }
+}

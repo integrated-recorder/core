@@ -1,0 +1,51 @@
+{
+  "format": "ir.capability.test-vector/1",
+  "root_seed": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+  "grant": {
+    "grant_version": "ir.capability.grant/1",
+    "subject_id": "os_AAECAwQFBgcICQoLDA0ODw",
+    "issuer": {
+      "kind": "identity",
+      "id": "gi_rkYgfWmBzqC3Cs6C17L5Zg"
+    },
+    "audience": {
+      "kind": "identity",
+      "id": "gi_RoOOg507Ff0ShmO9Lu3SAw"
+    },
+    "archive_id": "arc_AAECAwQFBgcICQoLDA0ODw",
+    "actions": [
+      "archive.delegate",
+      "archive.view"
+    ],
+    "not_before": "2026-11-02T01:00:00Z",
+    "expires_at": "2026-11-03T01:00:00Z",
+    "delegation_depth": "1",
+    "nonce": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU",
+    "policy_epoch": "7",
+    "issuer_key_id": "ik_RnG3q7eiSfKW8oWCHNIBiEfQK2bN74Kkjn3wLaR2sdk"
+  },
+  "signature": "KPBA9HLjlBGXgNNzd0fUA6wm0rDQ_p1vrpVn0YbODTEYGTmPhRl2o3gBXVjvH1XsR6_eVfJQvdCykEcCikx5Dw",
+  "grant_hash": "sha256:e403836c3d20f2e6f6722c587b92ebed744c944c0eb01c0c21c28bdeb76d5a5a",
+  "archive_claim_event": {
+    "event": {
+      "event_version": "ir.owner-authority.event/1",
+      "identity_id": "gi_rkYgfWmBzqC3Cs6C17L5Zg",
+      "identity_head_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "subject_id": "os_AAECAwQFBgcICQoLDA0ODw",
+      "sequence": "2",
+      "previous_event_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "operation": "archive_claim",
+      "issued_at": "2026-11-02T01:00:00Z",
+      "signer": {
+        "kind": "identity",
+        "id": "gi_rkYgfWmBzqC3Cs6C17L5Zg"
+      },
+      "signer_key_id": "ik_RnG3q7eiSfKW8oWCHNIBiEfQK2bN74Kkjn3wLaR2sdk",
+      "payload": {
+        "archive_id": "arc_AAECAwQFBgcICQoLDA0ODw"
+      }
+    },
+    "signature": "eyA830axF6NO_47RYV17jxsof0tfEg5beiZRDkyjUhkpHN6Z8M4fL1D2aA64YUNJm-W8neGTnF36m4Ovj4xVAw",
+    "event_hash": "sha256:e5e22ab1cd9fd5ef143741aaa86eae2b772deaab509eab19045fa1dee879dbe0"
+  }
+}

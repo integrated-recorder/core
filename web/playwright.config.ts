@@ -8,7 +8,17 @@ export default defineConfig({
   // with its own private data directory and credential handoff.
   // Setup and legacy-migration scenarios are run by their owning native Host
   // runners with private isolated data directories.
-  testIgnore: ['**/setup-first-run.spec.ts', '**/auth-migration.spec.ts'],
+  testIgnore: [
+    '**/setup-first-run.spec.ts',
+    '**/auth-migration.spec.ts',
+    '**/global-identity.spec.ts',
+    // This focused WebKit fixture is served by Vite in its own project and
+    // is not part of the production-process Chrome E2E server.
+    '**/peer-playback-webkit.spec.ts',
+    // The QR decoder spec dynamically imports its TypeScript fixture from the
+    // Vite dev server; the production-process E2E serves only built assets.
+    '**/node-enrollment-qr.spec.ts',
+  ],
   fullyParallel: false,
   workers: 1,
   reporter: 'list',

@@ -1,0 +1,24 @@
+{
+  "vector_version": "ir.cryptoarchive.browser-object.vector/1",
+  "test_only_note": "Public test-only key and ciphertext; never use for real recording data.",
+  "dek_hex": "5353535353535353535353535353535353535353535353535353535353535353",
+  "plaintext_base64": "djAuMi4wIGJyb3dzZXItdG8tR28gYXJjaGl2ZSBvYmplY3QgdmVjdG9yCg==",
+  "ciphertext_base64": "SVJBQwEAAQAAAAAAAAAAACtndUgbTHmS64fuRpasfFZ5387jzMNfgly5r9JODhbleYkipGFNlWbTYybKEplUPHLnAf8Z78W10kPLmtxf9PZQ7krZy20BgO/aYY2L3p/RnWclaH0xQ4Gbc4Zq",
+  "descriptor": {
+    "archive_id": "arc_0123456789abcdefghijkl",
+    "coordinate": {
+      "session_id": "session-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "track_id": "track-0",
+      "source_epoch": "2",
+      "discontinuity_sequence": "3",
+      "sequence": "43",
+      "kind": "media"
+    },
+    "object_type": "media",
+    "plaintext_size": 43,
+    "plaintext_sha256": "sha256:a74d138e9e003f6d450cc8b3ec8e5555ab71c00f4b2c481201c8d7eb3514eb3a",
+    "key_epoch": "8",
+    "ciphertext_size": 108,
+    "ciphertext_sha256": "sha256:bf60c79f493cb8f6813ac347d13781c32405d8983c62066e76d1da71f3ffd597"
+  }
+}

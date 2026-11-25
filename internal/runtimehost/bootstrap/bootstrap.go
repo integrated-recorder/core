@@ -87,20 +87,27 @@ type Config struct {
 	// one image-bundled release with another. It lets cold startup distinguish
 	// a legacy image-bundled generation from a signed release without changing
 	// or reinterpreting the immutable generation record.
-	BundleUpgradeFrom    buildinfo.Info
-	StorageLocalBinary   string
-	BundledHLSBinary     string
-	ListenAddr           string
-	HTTPPublicPort       int
-	HTTPSListenAddr      string
-	HTTPSPublicPort      int
-	AdapterDirs          string
-	AllowOperatorPlugins bool
-	FFmpegPath           string
-	AuthDisabled         bool
-	ForceSecureCookies   bool
-	TrustedReleaseKeys   map[string]ed25519.PublicKey
-	PluginRegistryURL    string
+	BundleUpgradeFrom     buildinfo.Info
+	StorageLocalBinary    string
+	BundledHLSBinary      string
+	ListenAddr            string
+	HTTPPublicPort        int
+	HTTPSListenAddr       string
+	HTTPSPublicPort       int
+	AdapterDirs           string
+	AllowOperatorPlugins  bool
+	FFmpegPath            string
+	AuthDisabled          bool
+	ForceSecureCookies    bool
+	TrustedReleaseKeys    map[string]ed25519.PublicKey
+	PluginRegistryURL     string
+	DiscoveryProviders    string
+	PeerTURNURLs          string
+	PeerSTUNURLs          string
+	PeerTURNSecretFile    string
+	PeerTURNCredentialTTL string
+	PeerICERelayOnly      string
+	PeerICEConfigInvalid  bool
 	// PluginRegistryHTTPClient is a deterministic test seam. Production hosts
 	// leave it nil and use the bounded public HTTPS client.
 	PluginRegistryHTTPClient *http.Client
@@ -184,6 +191,23 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if value := strings.TrimSpace(getenv("IR_PLUGIN_REGISTRY_URL")); value != "" {
 		c.PluginRegistryURL = value
 	}
+	c.DiscoveryProviders = strings.TrimSpace(getenv("IR_DISCOVERY_PROVIDERS"))
+	c.PeerTURNURLs = strings.TrimSpace(getenv("IR_PEER_TURN_URLS"))
+	c.PeerSTUNURLs = strings.TrimSpace(getenv("IR_PEER_STUN_URLS"))
+	c.PeerTURNSecretFile = strings.TrimSpace(getenv("IR_PEER_TURN_SHARED_SECRET_FILE"))
+	c.PeerTURNCredentialTTL = strings.TrimSpace(getenv("IR_PEER_TURN_CREDENTIAL_TTL"))
+	c.PeerICERelayOnly = strings.TrimSpace(getenv("IR_PEER_ICE_RELAY_ONLY"))
+	for _, value := range []string{c.PeerTURNURLs, c.PeerSTUNURLs, c.PeerTURNSecretFile, c.PeerTURNCredentialTTL, c.PeerICERelayOnly} {
+		if len(value) > 4096 || strings.ContainsRune(value, 0) {
+			// Malformed optional networking settings must not stop local
+			// recording. The child receives a fail-closed marker and disables
+			// peer transport while the rest of the application stays available.
+			c.PeerICEConfigInvalid = true
+			c.PeerTURNURLs, c.PeerSTUNURLs, c.PeerTURNSecretFile = "", "", ""
+			c.PeerTURNCredentialTTL, c.PeerICERelayOnly = "", ""
+			break
+		}
+	}
 	trustedKeys, err := parseTrustedReleaseKeys(strings.TrimSpace(getenv("IR_RELEASE_TRUSTED_KEYS_JSON")))
 	if err != nil {
 		return Config{}, err
@@ -216,6 +240,9 @@ func (c Config) Validate() error {
 	}
 	if c.ReleaseBundleDir != "" && (!filepath.IsAbs(c.ReleaseBundleDir) || filepath.Clean(c.ReleaseBundleDir) != c.ReleaseBundleDir || strings.ContainsRune(c.ReleaseBundleDir, 0)) {
 		return errors.New("IR_RELEASE_BUNDLE_DIR must be an absolute clean path")
+	}
+	if len(c.DiscoveryProviders) > 16<<10 || strings.ContainsRune(c.DiscoveryProviders, 0) {
+		return errors.New("IR_DISCOVERY_PROVIDERS exceeds the supported size")
 	}
 	if (c.BundleUpgradeFrom.Version == "") != (c.BundleUpgradeFrom.Commit == "") ||
 		(c.BundleUpgradeFrom.Version != "" && (!imageBundleUpgradeIdentityPattern.MatchString(c.BundleUpgradeFrom.Version) || !imageBundleUpgradeCommitPattern.MatchString(c.BundleUpgradeFrom.Commit))) {
@@ -605,6 +632,7 @@ func Run(ctx context.Context, config Config) error {
 		"ACTIVE_ENGINE_GENERATION="+generationID,
 		"COOKIE_SECURE="+boolEnv(config.ForceSecureCookies),
 	)
+	controlEnv = append(controlEnv, controlNetworkingChildEnv(config)...)
 	trustJSON, err := marshalAdapterTrust(adapterSet)
 	if err != nil {
 		return errors.New("generation adapter trust projection is unavailable")
@@ -959,6 +987,38 @@ func childEnvValue(environment []string, key string) string {
 		}
 	}
 	return ""
+}
+
+func identityDiscoveryChildEnv(providers string) []string {
+	if strings.TrimSpace(providers) == "" {
+		return nil
+	}
+	return []string{"IR_DISCOVERY_PROVIDERS=" + providers}
+}
+
+func controlNetworkingChildEnv(config Config) []string {
+	env := identityDiscoveryChildEnv(config.DiscoveryProviders)
+	return append(env, peerICEChildEnv(config)...)
+}
+
+func peerICEChildEnv(config Config) []string {
+	if config.PeerICEConfigInvalid {
+		return []string{"IR_PEER_ICE_CONFIGURATION_INVALID=1"}
+	}
+	values := []struct{ name, value string }{
+		{"IR_PEER_TURN_URLS", config.PeerTURNURLs},
+		{"IR_PEER_STUN_URLS", config.PeerSTUNURLs},
+		{"IR_PEER_TURN_SHARED_SECRET_FILE", config.PeerTURNSecretFile},
+		{"IR_PEER_TURN_CREDENTIAL_TTL", config.PeerTURNCredentialTTL},
+		{"IR_PEER_ICE_RELAY_ONLY", config.PeerICERelayOnly},
+	}
+	env := make([]string, 0, len(values))
+	for _, value := range values {
+		if value.value != "" {
+			env = append(env, value.name+"="+value.value)
+		}
+	}
+	return env
 }
 
 func commonChildEnv(config Config, adapterDirectory string) []string {

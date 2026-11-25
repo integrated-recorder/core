@@ -1,0 +1,24 @@
+{
+  "vector_version": "ir.cryptoarchive.go-envelope.vector/1",
+  "test_only_note": "Public test-only keys and envelope; never use for real archives or identities.",
+  "dek_hex": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+  "recovery_entropy_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+  "archive_id": "arc_0123456789abcdefghijkl",
+  "key_epoch": "4",
+  "signer_key_id": "ik_kQ-SpHzCPkqIJN1PafegM7LIw7TNIsLeIjH6TqpLUZU",
+  "envelope": {
+    "envelope_version": "ir.key-envelope/1",
+    "archive_id": "arc_0123456789abcdefghijkl",
+    "key_epoch": "4",
+    "recipient_key_id": "rk_plS6V1THoWBiomO5KmCQEn_AntuKwK3mh5r-nzeObTM",
+    "recipient_public_key_sha256": "sha256:1ef474e81eeec2c36c87899ad0a48b0d5669a54ab7e40e796c27520d58902fa8",
+    "kem": "DHKEM(X25519,HKDF-SHA256)",
+    "kdf": "HKDF-SHA256",
+    "aead": "AES-256-GCM",
+    "encapsulation": "dmbLd3wRss9IHMlQKljwxe2nnyZkiDlwA7A6Ma_sFhk",
+    "ciphertext": "KWhzrY80rTLd07FytP5HDK65SMaWlcKWbp9mWEeqQtUTrskVJcFMCVD0haACrY_F",
+    "signer_key_id": "ik_kQ-SpHzCPkqIJN1PafegM7LIw7TNIsLeIjH6TqpLUZU",
+    "binding_hash": "sha256:c4a2df35a4b1764b9521d2087492f8d37ba20072625b49b199069b45d381886c",
+    "signature": "VTg9QJljqeYjCmzXVF99k1h3a_RijFvm_XgERZ5Es6Ao40dHqoqjFitRhwo7wKbcUcLgmEQni70kN9wkiJMaCA"
+  }
+}

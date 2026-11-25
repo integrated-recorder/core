@@ -28,6 +28,26 @@ import (
 	"github.com/integrated-recorder/core/internal/storage"
 )
 
+func TestFetchErrorPreservesContextClassificationWithoutRawCause(t *testing.T) {
+	canceled := newFetchErrorCause("segment", 0, true, false, context.Canceled)
+	if !errors.Is(canceled, context.Canceled) {
+		t.Fatal("canceled fetch error does not preserve context.Canceled classification")
+	}
+	deadline := newFetchErrorCause("segment", 0, true, false, context.DeadlineExceeded)
+	if !errors.Is(deadline, context.DeadlineExceeded) {
+		t.Fatal("timed out fetch error does not preserve context.DeadlineExceeded classification")
+	}
+	if errors.Is(canceled, context.DeadlineExceeded) || errors.Is(deadline, context.Canceled) {
+		t.Fatal("fetch error matched the wrong context classification")
+	}
+
+	private := errors.New("https://media.example/segment?signature=secret")
+	transport := newFetchErrorCause("segment", 0, true, false, private)
+	if strings.Contains(transport.Error(), "signature=secret") {
+		t.Fatal("fetch error exposed its raw transport cause")
+	}
+}
+
 func TestObservePlaylistRecordsWindowAndManifestGaps(t *testing.T) {
 	store, err := storage.New(t.TempDir())
 	if err != nil {

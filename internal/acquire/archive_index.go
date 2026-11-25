@@ -288,6 +288,14 @@ func (m *Manager) shardedArchiveInventory(header *domain.Recording) (archiveinde
 		}
 		return archiveindex.Inventory{}, err
 	}
+	// Claim/coverage application is a validating read projection, but the
+	// archiveindex mutation helpers intentionally reject sealed inventories.
+	// Temporarily use the repairable projection while reconciling read-only
+	// supplements, then restore the durable sealed state before returning.
+	sealed := inventory.Archive == archiveindex.ArchiveSealed
+	if sealed {
+		inventory.Archive = archiveindex.ArchiveRepairable
+	}
 	applyInlineClaims := func(iterator func(func(storage.V2MediaRecord) error) error) error {
 		return iterator(func(record storage.V2MediaRecord) error {
 			if record.SelectedClaim == nil {
@@ -368,6 +376,9 @@ func (m *Manager) shardedArchiveInventory(header *domain.Recording) (archiveinde
 		}
 		return archiveindex.Inventory{}, newStorageStageError("load sharded archive coverage", err)
 	}
+	if sealed {
+		inventory.Archive = archiveindex.ArchiveSealed
+	}
 	if err := inventory.Validate(); err != nil {
 		if isArchiveIndexCapacityError(err) {
 			return archiveindex.Inventory{}, ErrArchiveIndexLimit
@@ -402,6 +413,14 @@ func (m *Manager) loadArchiveInventory(recording *domain.Recording, allowRootOnl
 	inventory, err := archiveindex.FromRecording(recording, legacy)
 	if err != nil {
 		return archiveindex.Inventory{}, err
+	}
+	// This function reconstructs a read-only projection by applying durable
+	// provenance/coverage supplements. The archiveindex append helpers reject
+	// sealed archives by design, so temporarily project them as repairable and
+	// restore the persisted lifecycle state before the final validation.
+	sealed := inventory.Archive == archiveindex.ArchiveSealed
+	if sealed {
+		inventory.Archive = archiveindex.ArchiveRepairable
 	}
 	manifest := archiveIndexManifest{}
 	manifestErr := m.store.LoadSidecar(recording.ID, archiveIndexManifestPath, archiveIndexMaxBytes, &manifest)
@@ -460,7 +479,8 @@ func (m *Manager) loadArchiveInventory(recording *domain.Recording, allowRootOnl
 					Size: claim.Size, SHA256: claim.SHA256, Verification: claim.Verification,
 					Evidence: claim.Evidence, LegacySegmentID: claim.LegacySegmentID,
 					Duration: segment.Duration, ProgramDateTime: segment.ProgramDateTime,
-					InitIdentity: segment.InitIdentity,
+					InitIdentity: segment.InitIdentity, Discontinuity: segment.Discontinuity,
+					ByteRange: segment.ByteRange,
 				})
 				if applyErr != nil {
 					return archiveindex.Inventory{}, fmt.Errorf("%w: claim shard does not reconcile", ErrArchiveIndexUnavailable)
@@ -493,6 +513,9 @@ func (m *Manager) loadArchiveInventory(recording *domain.Recording, allowRootOnl
 				return archiveindex.Inventory{}, ErrArchiveIndexUnavailable
 			}
 		}
+	}
+	if sealed {
+		inventory.Archive = archiveindex.ArchiveSealed
 	}
 	if err := inventory.Validate(); err != nil {
 		return archiveindex.Inventory{}, fmt.Errorf("%w: inventory exceeds supported bounds", ErrArchiveIndexLimit)
@@ -977,7 +1000,8 @@ func (m *Manager) commitArchiveSegmentOwned(e *entry, owner *OwnershipToken, seg
 			Coordinate: coordinate, ClaimID: claimIdentity(source, segmentID, result.SHA256),
 			Source: source, AcquiredAt: time.Now().UTC(), PayloadPath: segment.StoragePath,
 			Size: result.Size, SHA256: result.SHA256, Verification: archiveindex.VerificationVerified,
-			Duration: segment.Duration, ProgramDateTime: segment.ProgramDateTime, InitIdentity: segment.InitSegmentID,
+			Duration: segment.Duration, ProgramDateTime: segment.ProgramDateTime, InitIdentity: archiveindex.InitIdentityForSegment(segment),
+			Discontinuity: segment.Discontinuity, ByteRange: segment.ByteRange,
 		}
 		if !capacityExceeded {
 			if current, ok := findInventoryClaim(inventory, input.ClaimID); ok {

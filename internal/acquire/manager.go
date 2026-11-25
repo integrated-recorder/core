@@ -557,6 +557,7 @@ type handoverOperation struct {
 	cancel           context.CancelFunc
 	expected         OwnershipToken
 	state            handoverOperationState
+	resumeErr        error
 	snapshot         HandoverSnapshot
 	paused           chan struct{}
 	resumed          chan struct{}
@@ -875,8 +876,11 @@ func (m *Manager) ResumeHandover(id string, newOwner OwnershipToken, snapshot Ha
 	op.resumeOnce.Do(func() { close(op.resume) })
 	e.mu.Unlock()
 	<-op.resumed
+	e.mu.Lock()
+	resumeErr := op.resumeErr
+	e.mu.Unlock()
 	m.releaseHandoverRecoveryGate(e, op)
-	return nil
+	return resumeErr
 }
 
 // CompleteHandover detaches a fully drained, parked source Engine without
@@ -1980,9 +1984,13 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 	if err != nil {
 		return nil, errors.New("recording source identity is invalid")
 	}
+	archiveID, err := domain.NewArchiveID()
+	if err != nil {
+		return nil, errors.New("recording archive identity could not be generated")
+	}
 	now := time.Now().UTC()
 	classification := media.SourceURIClassification()
-	recording := &domain.Recording{FormatVersion: storage.ShardedArchiveFormatVersion, ShardedArchive: &domain.ShardedArchiveSummary{}, ID: id, SourceSessionID: sessionIdentity.ID, Title: title, AdapterID: adapterID, Adapter: archiveProvenance(provenance), Resource: archiveResource(resource), SourceURIClassification: classification, State: domain.StateRecording, CreatedAt: now, StartedAt: now, ArchiveRevision: 1, Tracks: map[string]*domain.Track{
+	recording := &domain.Recording{FormatVersion: storage.ShardedArchiveFormatVersion, ShardedArchive: &domain.ShardedArchiveSummary{}, ID: id, ArchiveID: archiveID, SourceSessionID: sessionIdentity.ID, Title: title, AdapterID: adapterID, Adapter: archiveProvenance(provenance), Resource: archiveResource(resource), SourceURIClassification: classification, State: domain.StateRecording, CreatedAt: now, StartedAt: now, ArchiveRevision: 1, Tracks: map[string]*domain.Track{
 		"main": {ID: "main", SourcePlaylistURL: media.ManifestURL, NextArchiveOrdinal: 1, LivePresentation: &domain.LivePresentationState{NextOrdinal: 1}, Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
 	}}
 	if err = m.withOwnershipCommit(owner, func() error {

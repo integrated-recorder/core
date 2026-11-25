@@ -5,6 +5,13 @@ import { join } from 'node:path'
 const httpsURL = readFileSync(join(process.env.IR_E2E_DATA_DIR!, 'e2e-https-url'), 'utf8').trim()
 const httpsPort = new URL(httpsURL).port
 
+// The test deliberately installs a self-signed certificate. Ignore trust
+// errors in this isolated browser context so the test can verify the actual
+// TLS listener, redirect, cookies, and recovery path. This does not establish
+// browser trust for the self-signed certificate or test manual warning
+// acceptance.
+test.use({ ignoreHTTPSErrors: true })
+
 test('Runtime Host direct HTTPS disable and saved reactivation preserve browser access and Secure session', async ({ page, context }) => {
   const httpURL = 'http://127.0.0.1:4173'
   await page.goto(`${httpURL}/login`)
@@ -96,4 +103,10 @@ test('Runtime Host direct HTTPS disable and saved reactivation preserve browser 
   expect(reactivatedRedirect.headers()['cache-control']).toBe('no-store')
   const finalStatus = await page.request.get(`${httpsURL}/api/runtime/https`)
   expect(await finalStatus.json()).toMatchObject({ enabled: true, configured: true, redirect_active: true })
+
+  // Leave the shared isolated E2E backend in local HTTP mode so following
+  // tests do not inherit this test's HTTPS redirect configuration.
+  await page.goto(`${httpsURL}/system`)
+  await page.getByRole('button', { name: /disable HTTPS|HTTPS 끄기/i }).click()
+  await expect(page).toHaveURL(`${httpURL}/system`)
 })

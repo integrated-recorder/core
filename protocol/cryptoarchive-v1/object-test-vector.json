@@ -1,0 +1,33 @@
+{
+  "vector_version": "ir.cryptoarchive.object.vector/1",
+  "test_only_note": "Test keys are public fixtures; never use these values for a real archive.",
+  "dek_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "object_salt_hex": "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c",
+  "plaintext_base64": "djAuMi4wIGNyb3NzLWxhbmd1YWdlIGFyY2hpdmUgb2JqZWN0IHZlY3Rvcgo=",
+  "ciphertext_base64": "SVJBQwEAAQAAAAAAAAAAACx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fM4AvkwQgmqI6JsalW9cy9yCVmz8Q99ejGg0+T+okU/Bmtl5lVwH36wiWq7pNJ6roLrAs5F8ODboGpJX0g==",
+  "descriptor": {
+    "archive_id": "arc_0123456789abcdefghijkl",
+    "coordinate": {
+      "session_id": "session-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "track_id": "track-0",
+      "source_epoch": "1",
+      "discontinuity_sequence": "2",
+      "sequence": "42",
+      "kind": "media"
+    },
+    "object_type": "media",
+    "plaintext_size": 44,
+    "plaintext_sha256": "sha256:40832698240cd41cc223c5e1a46137d7c651e94c157756b27919bab1715f7fd4",
+    "key_epoch": "7",
+    "ciphertext_size": 109,
+    "ciphertext_sha256": "sha256:2135aabe99051ef57bc346fe58e7ea65132e2280991d95080e452d09d0ab1e03"
+  },
+  "result": {
+    "crypto_format_version": 1,
+    "plaintext_size": 44,
+    "plaintext_sha256": "sha256:40832698240cd41cc223c5e1a46137d7c651e94c157756b27919bab1715f7fd4",
+    "ciphertext_size": 109,
+    "ciphertext_sha256": "sha256:2135aabe99051ef57bc346fe58e7ea65132e2280991d95080e452d09d0ab1e03",
+    "chunk_count": 1
+  }
+}

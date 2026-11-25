@@ -25,9 +25,12 @@ import (
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/authority"
 	"github.com/integrated-recorder/core/internal/derivative"
+	"github.com/integrated-recorder/core/internal/globalidentity"
 	"github.com/integrated-recorder/core/internal/integrity"
 	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/nodeidentity"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
 	"github.com/integrated-recorder/core/internal/preview"
 	"github.com/integrated-recorder/core/internal/runtimehost/httpapi"
@@ -52,6 +55,13 @@ type sourceFixture struct {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--identity-peer" {
+		if err := runIdentityPeerProcess(); err != nil {
+			log.Printf("browser e2e identity peer: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		log.Printf("browser e2e backend: %v", err)
 		os.Exit(1)
@@ -202,11 +212,50 @@ func run() error {
 		adapters.Close()
 		return fmt.Errorf("seed isolated E2E administrator: %w", err)
 	}
+	identityStore, err := globalidentity.Open(dataDir)
+	if err != nil {
+		_ = watchService.Close(context.Background())
+		_ = previewService.Close(context.Background())
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("open isolated global identity store: %w", err)
+	}
+	identityRegistry, err := globalidentity.OpenHistoryRegistry(dataDir)
+	if err != nil {
+		_ = watchService.Close(context.Background())
+		_ = previewService.Close(context.Background())
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("open isolated public identity history registry: %w", err)
+	}
+	nodeIdentityStore, err := nodeidentity.Open(dataDir)
+	if err != nil {
+		_ = watchService.Close(context.Background())
+		_ = previewService.Close(context.Background())
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("open isolated Node Key store: %w", err)
+	}
+	ownerAuthorityStore, err := authority.Open(dataDir)
+	if err != nil {
+		return fmt.Errorf("open isolated OwnerSubject authority store: %w", err)
+	}
+	var playbackPeer *e2ePlaybackPeer
+	if os.Getenv("IR_E2E_SECOND_NODE") == "1" {
+		playbackPeer = newE2EPlaybackPeer(identityStore)
+	}
 	api := server.NewWithOptions(manager, adapters, configs, server.Options{
 		Management: products, Integrity: integrityService, Derivatives: exportService,
 		Previews: previewService, Watches: watchService,
-		Auth: auth, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage,
-		StartedAt: time.Now().UTC(), Version: "browser-e2e", Commit: "test-fixture",
+		Auth: auth, GlobalIdentity: identityStore, GlobalIdentityRegistry: identityRegistry, OwnerAuthority: ownerAuthorityStore, NodeIdentity: nodeIdentityStore, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage,
+		PeerSessions: playbackPeer,
+		StartedAt:    time.Now().UTC(), Version: "browser-e2e", Commit: "test-fixture",
 	})
 	httpsProbe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -242,12 +291,23 @@ func run() error {
 	if err := os.WriteFile(filepath.Join(dataDir, "e2e-https-url"), []byte(initialHTTPSURL), 0o600); err != nil {
 		return fmt.Errorf("record HTTPS browser fixture URL: %w", err)
 	}
+	var identityPeer *identityPeerManager
+	if os.Getenv("IR_E2E_SECOND_NODE") == "1" {
+		if err := os.WriteFile(filepath.Join(dataDir, "e2e-node-a-pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+			return fmt.Errorf("record isolated first-node process identity: %w", err)
+		}
+		identityPeer, err = startIdentityPeerManager(dataDir)
+		if err != nil {
+			return fmt.Errorf("start isolated second identity process: %w", err)
+		}
+		defer identityPeer.Close()
+	}
 
 	addr := strings.TrimSpace(os.Getenv("ADDR"))
 	if addr == "" {
 		addr = "127.0.0.1:4173"
 	}
-	web := &http.Server{Addr: addr, Handler: publicHandler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	web := &http.Server{Addr: addr, Handler: identityPeerTestControl(publicHandler, identityPeer, playbackPeer), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- web.ListenAndServe() }()
 	log.Printf("browser e2e API listening on %s", addr)
@@ -298,6 +358,264 @@ func run() error {
 	}
 	adapters.Close()
 	return nil
+}
+
+// startIdentityPeer starts a separate OS process with its own durable state and
+// Control Plane listener. The focused identity Playwright project enables it
+// only with an isolated temporary data root.
+type identityPeerProcess struct {
+	cmd     *exec.Cmd
+	done    chan struct{}
+	waitErr error
+}
+
+type identityPeerManager struct {
+	mu      sync.Mutex
+	dataDir string
+	process *identityPeerProcess
+}
+
+func startIdentityPeerManager(dataDir string) (*identityPeerManager, error) {
+	_, process, err := startIdentityPeer(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	return &identityPeerManager{dataDir: dataDir, process: process}, nil
+}
+
+func (m *identityPeerManager) Restart() error {
+	if m == nil {
+		return errors.New("identity peer manager is unavailable")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stopIdentityPeerProcess(m.process)
+	m.process = nil
+	_, process, err := startIdentityPeer(m.dataDir)
+	if err != nil {
+		return err
+	}
+	m.process = process
+	return nil
+}
+
+func (m *identityPeerManager) Close() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stopIdentityPeerProcess(m.process)
+	m.process = nil
+}
+
+func identityPeerTestControl(next http.Handler, peer *identityPeerManager, playback *e2ePlaybackPeer) http.Handler {
+	if peer == nil && playback == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/__e2e/peer-playback/connect" && playback != nil {
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			var request struct {
+				NodeID string `json:"node_id"`
+			}
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&request); err != nil || !validE2EPeerNodeID(request.NodeID) {
+				http.Error(w, "invalid isolated peer fixture", http.StatusBadRequest)
+				return
+			}
+			playback.ConnectNode(request.NodeID)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path != "/__e2e/identity-peer/restart" || peer == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := peer.Restart(); err != nil {
+			http.Error(w, "identity peer restart failed", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
+func startIdentityPeer(dataDir string) (string, *identityPeerProcess, error) {
+	peerData := filepath.Join(dataDir, "identity-peer-b")
+	if err := os.MkdirAll(peerData, 0o700); err != nil {
+		return "", nil, err
+	}
+	urlFile := filepath.Join(dataDir, "e2e-node-b-url")
+	if err := os.Remove(urlFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", nil, err
+	}
+	pidFile := filepath.Join(dataDir, "e2e-node-b-pid")
+	if err := os.Remove(pidFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", nil, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", nil, err
+	}
+	peer := exec.Command(executable, "--identity-peer")
+	peer.Env = replaceEnvironment(os.Environ(), map[string]string{
+		"IR_E2E_IDENTITY_PEER_DATA_DIR": peerData,
+		"IR_E2E_NODE_B_URL_FILE":        urlFile,
+	})
+	peer.Stdout = os.Stdout
+	peer.Stderr = os.Stderr
+	if err := peer.Start(); err != nil {
+		return "", nil, err
+	}
+	process := &identityPeerProcess{cmd: peer, done: make(chan struct{})}
+	go func() {
+		process.waitErr = peer.Wait()
+		close(process.done)
+	}()
+	ready := false
+	defer func() {
+		if !ready {
+			stopIdentityPeerProcess(process)
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	client := &http.Client{Timeout: time.Second}
+	for time.Now().Before(deadline) {
+		select {
+		case <-process.done:
+			if process.waitErr != nil {
+				return "", nil, fmt.Errorf("identity peer exited during startup: %w", process.waitErr)
+			}
+			return "", nil, errors.New("identity peer exited cleanly before becoming ready")
+		default:
+		}
+		if data, readErr := os.ReadFile(urlFile); readErr == nil {
+			url := strings.TrimSpace(string(data))
+			request, requestErr := http.NewRequest(http.MethodGet, url+"/login", nil)
+			if requestErr != nil {
+				return "", nil, fmt.Errorf("create identity peer readiness request: %w", requestErr)
+			}
+			request.Header.Set("Accept", "text/html")
+			response, requestErr := client.Do(request)
+			if requestErr == nil {
+				_ = response.Body.Close()
+				if response.StatusCode == http.StatusOK {
+					ready = true
+					return url, process, nil
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return "", nil, errors.New("identity peer did not become ready within 10 seconds")
+}
+
+func runIdentityPeerProcess() error {
+	dataDir := strings.TrimSpace(os.Getenv("IR_E2E_IDENTITY_PEER_DATA_DIR"))
+	urlFile := strings.TrimSpace(os.Getenv("IR_E2E_NODE_B_URL_FILE"))
+	if dataDir == "" || urlFile == "" {
+		return errors.New("isolated identity peer configuration is missing")
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return err
+	}
+	auth, err := authn.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	if auth.NeedsBootstrap() {
+		if err := auth.Bootstrap("owner", "browser-e2e-strong-password"); err != nil {
+			return err
+		}
+	}
+	identity, err := globalidentity.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	node, err := nodeidentity.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	ownerAuthority, err := authority.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	products, err := management.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	handler := legacyWorkflowReadyHostProjection(server.NewWithOptions(nil, nil, nil, server.Options{Auth: auth, GlobalIdentity: identity, OwnerAuthority: ownerAuthority, NodeIdentity: node, Management: products}), auth)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	address := listener.Addr().(*net.TCPAddr)
+	url := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(address.Port))
+	pidFile := filepath.Join(filepath.Dir(urlFile), "e2e-node-b-pid")
+	if err := os.WriteFile(urlFile, []byte(url), 0o600); err != nil {
+		_ = listener.Close()
+		return err
+	}
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		_ = listener.Close()
+		return err
+	}
+	web := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- web.Serve(listener) }()
+	shutdown, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	select {
+	case err := <-serveErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case <-shutdown.Done():
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return web.Shutdown(ctx)
+	}
+	return nil
+}
+
+func stopIdentityPeerProcess(peer *identityPeerProcess) {
+	if peer == nil || peer.cmd == nil || peer.cmd.Process == nil {
+		return
+	}
+	select {
+	case <-peer.done:
+		return
+	default:
+	}
+	_ = peer.cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-peer.done:
+	case <-time.After(5 * time.Second):
+		_ = peer.cmd.Process.Kill()
+		<-peer.done
+	}
+}
+
+func replaceEnvironment(environment []string, values map[string]string) []string {
+	output := make([]string, 0, len(environment)+len(values))
+	for _, entry := range environment {
+		key, _, found := strings.Cut(entry, "=")
+		if _, replace := values[key]; !replace || !found {
+			output = append(output, entry)
+		}
+	}
+	for key, value := range values {
+		output = append(output, key+"="+value)
+	}
+	return output
 }
 
 // legacyWorkflowReadyHostProjection exists only for the legacy application-

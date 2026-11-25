@@ -1,0 +1,29 @@
+{
+  "test_only_note": "Test vector only; the private key and DEK are public test material and must never be used for real archives.",
+  "recipient_private_key_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+  "dek_hex": "6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a",
+  "binding": {
+    "archive_id": "arc_0123456789abcdefghijkl",
+    "snapshot_id": "snap_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "key_epoch": "7",
+    "owner_subject_id": "os_0123456789abcdefghijkl",
+    "grant_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "supplier_node_id": "nd_60DHPwVN7WW7pkaYj2hCQQ"
+  },
+  "envelope": {
+    "envelope_version": "ir.session-dek-envelope/1",
+    "archive_id": "arc_0123456789abcdefghijkl",
+    "snapshot_id": "snap_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "key_epoch": "7",
+    "owner_subject_id": "os_0123456789abcdefghijkl",
+    "grant_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "supplier_node_id": "nd_60DHPwVN7WW7pkaYj2hCQQ",
+    "recipient_key_id": "rk_JXLtrtt6AQPnSgzag9cd8nJi8I60Pr4GMEPxZYeCwew",
+    "recipient_public_key_sha256": "sha256:42407bcd5477fc372d6b22e68ffea463c5fe7a5ba5366e2436677c546f8e2a04",
+    "kem": "DHKEM(X25519,HKDF-SHA256)",
+    "kdf": "HKDF-SHA256",
+    "aead": "AES-256-GCM",
+    "encapsulation": "B2pFfn32_dlKooLf0cmVUoNB7_-Bo-MdTaaLvtz2oG0",
+    "ciphertext": "fWCv3Ul3kBsENGijgTzATQFENen9GZ1c2Q4-s7UfOfqPQQKTfMVwogZaidO-FBOj"
+  }
+}

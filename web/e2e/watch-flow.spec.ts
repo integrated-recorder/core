@@ -53,7 +53,11 @@ test('actual Go backend: Watch detects live, records segments, and resumes monit
   const liveWatch = await getJSON<WatchWire>(page, `/api/watches/${watchID}`)
   expect(liveWatch.current_recording_id).toMatch(/^[a-f0-9]{32}$/)
   const recordingID = liveWatch.current_recording_id!
-  await expect.poll(async () => page.getByText('녹화 중', { exact: true }).first().isVisible(), { timeout: 10_000 }).toBe(true)
+  // The page may still be on its 10-second offline polling interval when the
+  // external source fixture turns live. Force one normal UI refresh after the
+  // API confirms the recording transition, then assert the rendered status.
+  await page.getByRole('button', { name: '새로고침' }).click()
+  await expect(page.getByText('녹화 중', { exact: true }).first()).toBeVisible()
   await expect.poll(async () => segmentCount(await getJSON<RecordingWire>(page, `/api/recordings/${recordingID}`)), { timeout: 20_000 }).toBeGreaterThan(0)
   const activeRecording = await getJSON<RecordingWire>(page, `/api/recordings/${recordingID}`)
   expect(activeRecording.state).toBe('recording')

@@ -4005,7 +4005,7 @@ func (s *Store) saveHeaderLocked(ctx context.Context, supplied, known *domain.Re
 			return err
 		}
 	}
-	if known.ID != merged.ID || known.FormatVersion != ShardedArchiveFormatVersion {
+	if known.ID != merged.ID || known.ArchiveID != merged.ArchiveID || known.FormatVersion != ShardedArchiveFormatVersion {
 		return ErrShardedArchiveInvalid
 	}
 	if merged.ArchiveRevision < known.ArchiveRevision || merged.TimelineRevision < known.TimelineRevision {
@@ -4205,6 +4205,9 @@ func (s *Store) v2Lock(id string) *sync.Mutex {
 
 func validateV2Header(recording *domain.Recording) error {
 	if recording == nil || recording.FormatVersion != ShardedArchiveFormatVersion || !recordingIDPattern.MatchString(recording.ID) || recording.ShardedArchive == nil {
+		return ErrShardedArchiveInvalid
+	}
+	if recording.ArchiveID != "" && !domain.ValidArchiveID(recording.ArchiveID) {
 		return ErrShardedArchiveInvalid
 	}
 	if len(recording.Gaps) != 0 || len(recording.Snapshots) != 0 || len(recording.MetadataTimeline) != 0 {

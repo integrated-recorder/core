@@ -16,6 +16,7 @@ import (
 	"github.com/integrated-recorder/core/internal/acquire"
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
+	"github.com/integrated-recorder/core/internal/archivecatalog"
 	"github.com/integrated-recorder/core/internal/domain"
 	"github.com/integrated-recorder/core/internal/runtimehost/recordingowner"
 	"github.com/integrated-recorder/core/internal/runtimeipc"
@@ -39,6 +40,8 @@ const (
 	OperationStop                          = "stop"
 	OperationComplete                      = "complete_recording"
 	OperationSealArchive                   = "seal_archive"
+	OperationEncryptArchiveSnapshot        = "encrypt_archive_snapshot"
+	OperationRekeyArchiveHistory           = "rekey_archive_history"
 	OperationDelete                        = "delete"
 	OperationDeleteTerminal                = "delete_terminal_archive"
 	OperationInventory                     = "inventory"
@@ -184,23 +187,42 @@ type ActiveRecordingCountResult struct {
 }
 
 type Engine struct {
-	manager          *acquire.Manager
-	adapters         *adapterhost.Host
-	generation       string
-	instance         string
-	startedAt        time.Time
-	mu               sync.RWMutex
-	admissionMu      sync.RWMutex
-	draining         bool
-	ready            bool
-	closed           bool
-	adapterCloseOnce sync.Once
-	ownerClient      recordingOwnerClient
-	ownerMu          sync.Mutex
-	owners           map[string]recordingowner.Owner
-	releasedOwners   map[recordingowner.Owner]struct{}
-	releasedOrder    []recordingowner.Owner
-	startSeen        bool
+	manager            *acquire.Manager
+	archiveCatalog     *archivecatalog.Store
+	archiveReplication archiveReplicationDependencies
+	adapters           *adapterhost.Host
+	generation         string
+	instance           string
+	startedAt          time.Time
+	mu                 sync.RWMutex
+	started            bool
+	admissionMu        sync.RWMutex
+	draining           bool
+	ready              bool
+	closed             bool
+	adapterCloseOnce   sync.Once
+	ownerClient        recordingOwnerClient
+	ownerMu            sync.Mutex
+	owners             map[string]recordingowner.Owner
+	releasedOwners     map[recordingowner.Owner]struct{}
+	releasedOrder      []recordingowner.Owner
+	startSeen          bool
+}
+
+// ConfigureArchiveCatalog enables persistence of immutable snapshots after an
+// archive is sealed. The catalog is a separate projection: it never replaces
+// or mutates the canonical recording. Call before serving Engine IPC.
+func (e *Engine) ConfigureArchiveCatalog(catalog *archivecatalog.Store) error {
+	if e == nil || catalog == nil {
+		return errors.New("archive snapshot catalog is required")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed || e.started || e.archiveCatalog != nil {
+		return errors.New("archive snapshot catalog must be configured once before Engine starts")
+	}
+	e.archiveCatalog = catalog
+	return nil
 }
 
 type recordingOwnerClient interface {
@@ -293,9 +315,10 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	e.mu.RLock()
+	e.mu.Lock()
 	closed, ready := e.closed, e.ready
-	e.mu.RUnlock()
+	e.started = true
+	e.mu.Unlock()
 	if closed {
 		return nil, publicError("engine_unavailable", "recorder engine is shutting down")
 	}
@@ -552,9 +575,48 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 			}
 			return nil, publicError("seal_failed", "archive could not be sealed")
 		}
+		e.mu.RLock()
+		catalog := e.archiveCatalog
+		e.mu.RUnlock()
+		if catalog != nil {
+			if _, err := e.manager.PersistArchiveSnapshot(ctx, catalog, request.RecordingID); err != nil {
+				// Sealing is already durable. Returning a distinct retryable error
+				// makes the separate snapshot projection visible without rolling
+				// back or rewriting the canonical archive.
+				return nil, publicError("snapshot_failed", "archive is sealed but its immutable snapshot is pending; retry sealing to resume")
+			}
+		}
 		return struct {
 			Sealed bool `json:"sealed"`
 		}{Sealed: true}, nil
+	case OperationEncryptArchiveSnapshot:
+		defer clear(payload)
+		var request EncryptArchiveSnapshotRequest
+		if err := decodePayload(payload, &request); err != nil {
+			return nil, publicError("invalid_request", "archive replication request is invalid")
+		}
+		result, err := e.encryptArchiveSnapshot(ctx, request)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, publicError("not_found", "recording was not found")
+			}
+			return nil, publicError("archive_replication_failed", "archive could not be encrypted for replication; verify the sealed archive and current authorization")
+		}
+		return result, nil
+	case OperationRekeyArchiveHistory:
+		defer clear(payload)
+		var request RekeyArchiveHistoryRequest
+		if err := decodePayload(payload, &request); err != nil {
+			return nil, publicError("invalid_request", "archive key rotation request is invalid")
+		}
+		result, err := e.rekeyArchiveHistory(ctx, request)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, publicError("not_found", "recording was not found")
+			}
+			return nil, publicError("archive_rekey_failed", "archive key rotation could not be verified; check the sealed archive and current authorization")
+		}
+		return result, nil
 	case OperationDelete:
 		var request RecordingIDRequest
 		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" {

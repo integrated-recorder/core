@@ -361,8 +361,21 @@ func newClient(socketPath, generationID string, token []byte, timeout time.Durat
 }
 
 func (c *Client) Call(ctx context.Context, operation string, payload any, result any) error {
+	return c.CallWithTimeout(ctx, c.timeout, operation, payload, result)
+}
+
+// CallWithTimeout applies an operation-specific upper bound without mutating
+// the generation-pinned client's default timeout. It is intended for bounded
+// bulk operations whose duration depends on archive size.
+func (c *Client) CallWithTimeout(ctx context.Context, timeout time.Duration, operation string, payload any, result any) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		timeout = defaultCallTimeout
+	}
+	if timeout > maxCallTimeout {
+		timeout = maxCallTimeout
 	}
 	if !validErrorField(operation, 64) {
 		return errors.New("runtime IPC operation is invalid")
@@ -376,7 +389,7 @@ func (c *Client) Call(ctx context.Context, operation string, payload any, result
 		payloadJSON = encoded
 	}
 	now := time.Now()
-	deadline := now.Add(c.timeout)
+	deadline := now.Add(timeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}

@@ -22,6 +22,6 @@ export default defineConfig(({ command }) => ({
     environmentOptions: { jsdom: { url: 'http://localhost' } },
     setupFiles: ['./src/test/setup.ts'],
     css: true,
-    exclude: ['e2e/**', 'node_modules/**'],
+    exclude: ['e2e/**', 'scripts/**', 'node_modules/**'],
   },
 }))

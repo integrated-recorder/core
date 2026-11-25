@@ -131,6 +131,78 @@ func TestConfigFromEnvKeepsPublishedHTTPPortForHTTPSRecovery(t *testing.T) {
 	}
 }
 
+func TestDiscoveryProviderConfigurationReachesOnlyControlProcess(t *testing.T) {
+	const providers = "https://discovery-one.example,https://discovery-two.example"
+	config, err := ConfigFromEnv(func(key string) string {
+		if key == "IR_DISCOVERY_PROVIDERS" {
+			return providers
+		}
+		return ""
+	})
+	if err != nil || config.DiscoveryProviders != providers {
+		t.Fatalf("discovery providers=%q err=%v", config.DiscoveryProviders, err)
+	}
+	environment := identityDiscoveryChildEnv(config.DiscoveryProviders)
+	if got := childEnvValue(environment, "IR_DISCOVERY_PROVIDERS"); got != providers {
+		t.Fatalf("Control discovery provider environment=%q, want %q", got, providers)
+	}
+	if len(identityDiscoveryChildEnv("  ")) != 0 {
+		t.Fatal("unset Discovery configuration was passed to Control")
+	}
+	tooLarge := strings.Repeat("x", (16<<10)+1)
+	if _, err := ConfigFromEnv(func(key string) string {
+		if key == "IR_DISCOVERY_PROVIDERS" {
+			return tooLarge
+		}
+		return ""
+	}); err == nil {
+		t.Fatal("oversized Discovery configuration was accepted")
+	}
+}
+
+func TestPeerICEConfigurationReachesControlAndOptionalInputFailureIsIsolated(t *testing.T) {
+	values := map[string]string{
+		"IR_PEER_TURN_URLS":               "turn:turn.example.test:3478?transport=udp",
+		"IR_PEER_STUN_URLS":               "stun:stun.example.test:3478",
+		"IR_PEER_TURN_SHARED_SECRET_FILE": "/run/secrets/turn-rest-key",
+		"IR_PEER_TURN_CREDENTIAL_TTL":     "5m",
+		"IR_PEER_ICE_RELAY_ONLY":          "true",
+	}
+	config, err := ConfigFromEnv(func(key string) string { return values[key] })
+	if err != nil {
+		t.Fatalf("valid optional peer ICE values blocked Runtime Host: %v", err)
+	}
+	env := controlNetworkingChildEnv(config)
+	for key, want := range values {
+		if got := childEnvValue(env, key); got != want {
+			t.Fatalf("Control child %s=%q, want %q", key, got, want)
+		}
+	}
+	for _, entry := range env {
+		if strings.Contains(entry, "0123456789") || strings.Contains(entry, "secret-value") {
+			t.Fatal("shared-secret material was copied into child environment")
+		}
+	}
+	if got := peerICEChildEnv(Config{}); len(got) != 0 {
+		t.Fatalf("unset peer ICE config emitted child values: %v", got)
+	}
+
+	tooLarge := strings.Repeat("x", 4097)
+	config, err = ConfigFromEnv(func(key string) string {
+		if key == "IR_PEER_TURN_URLS" {
+			return tooLarge
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("invalid optional peer config blocked local Runtime Host: %v", err)
+	}
+	invalidEnv := peerICEChildEnv(config)
+	if len(invalidEnv) != 1 || invalidEnv[0] != "IR_PEER_ICE_CONFIGURATION_INVALID=1" {
+		t.Fatalf("oversized optional peer setting did not fail closed in Control: %v", invalidEnv)
+	}
+}
+
 func TestPluginRegistryDefaultsToOfficialCatalogAndAllowsOverride(t *testing.T) {
 	config, err := ConfigFromEnv(func(string) string { return "" })
 	if err != nil {

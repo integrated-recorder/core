@@ -28,6 +28,22 @@ func testInventory(t *testing.T, recordingID string) Inventory {
 	return inventory
 }
 
+func TestFromRecordingCarriesAndValidatesLogicalArchiveID(t *testing.T) {
+	recording := &domain.Recording{
+		ID: "recording-from-import", ArchiveID: "arc_AAAAAAAAAAAAAAAAAAAAAA",
+		AdapterID: "fixture", State: domain.StateCompleted,
+		Tracks: map[string]*domain.Track{"main": {ID: "main"}},
+	}
+	inventory, err := FromRecording(recording, false)
+	if err != nil || inventory.ArchiveID != recording.ArchiveID {
+		t.Fatalf("inventory archive ID = %q, err=%v; want %q", inventory.ArchiveID, err, recording.ArchiveID)
+	}
+	recording.ArchiveID = "invalid"
+	if _, err := FromRecording(recording, false); !errors.Is(err, ErrInvalidInventory) {
+		t.Fatalf("malformed recording archive ID error = %v, want ErrInvalidInventory", err)
+	}
+}
+
 func testCoord(inventory Inventory, sequence uint64) Coordinate {
 	return Coordinate{SessionID: inventory.Session.ID, TrackID: "main", SourceEpoch: 3, DiscontinuitySequence: 1, Sequence: sequence}
 }
@@ -136,6 +152,50 @@ func TestDuplicateIdenticalBytesRetainClaimsAndOneTimelineSlot(t *testing.T) {
 	segment := segmentBySequence(t, inventory, 30)
 	if len(segment.Claims) != 2 || segment.TimelineOrdinal != 1 || segment.SelectedClaimID != "origin-claim" {
 		t.Fatalf("duplicate claims changed logical projection: %#v", segment)
+	}
+}
+
+func TestClaimMetadataCannotRewriteCanonicalPlaybackMetadata(t *testing.T) {
+	inventory := testInventory(t, "recording-immutable-playback-meta")
+	input := testInput(inventory, 40, "origin-40", string(ClaimLiveOrigin), "canonical bytes")
+	input.Discontinuity = true
+	input.ByteRange = &domain.ByteRange{Offset: 32, Length: 128}
+	if _, err := ApplyClaim(&inventory, input); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, mutate := range map[string]func(*ClaimInput){
+		"discontinuity": func(value *ClaimInput) { value.Discontinuity = false },
+		"byte range":    func(value *ClaimInput) { value.ByteRange = &domain.ByteRange{Offset: 33, Length: 128} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := input
+			mutate(&changed)
+			if _, err := ApplyClaim(&inventory, changed); !errors.Is(err, ErrClaimIdentityChange) {
+				t.Fatalf("same claim ID with changed metadata accepted: %v", err)
+			}
+		})
+	}
+
+	// A separately sourced claim may report different observation metadata, but
+	// it must not replace the first canonical projection at that coordinate.
+	alternate := input
+	alternate.ClaimID = "peer-40"
+	alternate.Source = ClaimPeer
+	alternate.Discontinuity = false
+	alternate.ByteRange = nil
+	if _, err := ApplyClaim(&inventory, alternate); err != nil {
+		t.Fatalf("alternate provenance claim was rejected: %v", err)
+	}
+	if got := inventory.Segments[0]; !got.Discontinuity || got.ByteRange == nil || *got.ByteRange != (domain.ByteRange{Offset: 32, Length: 128}) {
+		t.Fatalf("alternate claim rewrote canonical playback metadata: %+v", got)
+	}
+
+	invalid := input
+	invalid.ClaimID = "invalid-range"
+	invalid.ByteRange = &domain.ByteRange{Offset: ^uint64(0), Length: 2}
+	if _, err := ApplyClaim(&inventory, invalid); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("overflowing source byte range accepted: %v", err)
 	}
 }
 
@@ -309,6 +369,23 @@ func TestFromRecordingAllowsRepeatedInitObjectIDAtDistinctCoordinates(t *testing
 	}
 }
 
+func TestInitIdentityForSegmentBoundsOversizedSourceIDsDeterministically(t *testing.T) {
+	longID := strings.Repeat("init-id-", 80)
+	initSegment := domain.Segment{ID: longID, IsInit: true}
+	mediaSegment := domain.Segment{InitSegmentID: longID}
+	initIdentity := InitIdentityForSegment(initSegment)
+	mediaIdentity := InitIdentityForSegment(mediaSegment)
+	if initIdentity == "" || initIdentity != mediaIdentity || len(initIdentity) > MaxInitIdentityBytes {
+		t.Fatalf("init-map identities differ or exceed bound: init=%q media=%q", initIdentity, mediaIdentity)
+	}
+	if strings.HasPrefix(initIdentity, "initref_") == false {
+		t.Fatalf("oversized init identity was not made opaque: %q", initIdentity)
+	}
+	if got := InitIdentityForSegment(domain.Segment{ID: "init-short", IsInit: true}); got != "init-short" {
+		t.Fatalf("short init ID changed: %q", got)
+	}
+}
+
 func TestSessionIdentityRequiresExplicitSessionReferenceToCrossRecordings(t *testing.T) {
 	resource := &domain.ResourceReference{Type: "channel", ID: "channel-1"}
 	first, err := NewSessionIdentity("recording-a", "fixture", resource, "")
@@ -346,6 +423,36 @@ func TestFromRecordingPreservesValidSourceSessionAndAdoptionIsExplicit(t *testin
 	}
 	if inventory.Session.ID != recording.SourceSessionID || inventory.LegacyAdoption || inventory.Capture != CaptureOpen {
 		t.Fatalf("new recording reconstruction mismatch: %#v", inventory)
+	}
+}
+
+func TestFromRecordingPreservesPlaybackDiscontinuityAndByteRange(t *testing.T) {
+	payload := []byte("range payload")
+	digest := sha256.Sum256(payload)
+	recording := &domain.Recording{
+		ID: "recording-playback-metadata", AdapterID: "fixture",
+		SourceSessionID: "session-" + strings.Repeat("c", 64),
+		State:           domain.StateStopped, Tracks: map[string]*domain.Track{
+			"main": {ID: "main", Segments: []domain.Segment{{
+				ID: "seg-00000000000000000001", TrackID: "main", Sequence: 12,
+				SourceEpoch: 3, DiscontinuitySequence: 8, Discontinuity: true,
+				ByteRange: &domain.ByteRange{Offset: 64, Length: uint64(len(payload))},
+				Duration:  4.25, SourceURI: "https://media.example/playlist.bin",
+				StoragePath: "tracks/main/segment-1.bin", PayloadSize: int64(len(payload)),
+				SHA256: hex.EncodeToString(digest[:]),
+			}}},
+		},
+	}
+	inventory, err := FromRecording(recording, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.Segments) != 1 {
+		t.Fatalf("inventory segments=%d, want one", len(inventory.Segments))
+	}
+	segment := inventory.Segments[0]
+	if !segment.Discontinuity || segment.ByteRange == nil || *segment.ByteRange != (domain.ByteRange{Offset: 64, Length: uint64(len(payload))}) {
+		t.Fatalf("archive inventory lost playback metadata: %+v", segment)
 	}
 }
 

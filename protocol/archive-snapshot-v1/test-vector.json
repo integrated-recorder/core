@@ -1,0 +1,5 @@
+{
+  "input": "{\"value\":333333333.33333329,\"numbers\":[1.0,0.000001,0.0000001,1e21],\"archive_id\":\"arc_x\"}",
+  "canonical": "{\"archive_id\":\"arc_x\",\"numbers\":[1,0.000001,1e-7,1e+21],\"value\":333333333.3333333}",
+  "content_hash": "sha256:688f305693f9ea75e825671a17175a0c68fe329b18ca817525bbc01b69c3ea62"
+}

@@ -314,13 +314,13 @@ def diagnose_rc9_state_with_diagnostic_image(
 
 
 class OfficialRC9OfficialReleaseDockerUpgradeTests(unittest.TestCase):
-    """Exercise official installer rollback/retry and release upgrades."""
+    """Exercise official installer rollback, forward retry and release upgrades."""
 
     @unittest.skipUnless(
         os.environ.get("IR_RUN_STORAGE_UPGRADE_DOCKER_E2E") == "1",
         "requires a fresh Linux Docker runner; set IR_RUN_STORAGE_UPGRADE_DOCKER_E2E=1",
     )
-    def test_official_rc9_install_target_upgrade_and_pending_rollback_retry(self):
+    def test_official_rc9_install_target_and_pending_retry(self):
         if shutil.which("docker") is None:
             self.fail("Docker acceptance was requested but Docker is unavailable")
         project = f"ir-storage-upgrade-{uuid.uuid4().hex[:12]}"
@@ -390,9 +390,10 @@ class OfficialRC9OfficialReleaseDockerUpgradeTests(unittest.TestCase):
                     release_dirs_before = release_directories(container)
                     print(f"RC9 baseline healthy: generation={rc9['registry']['active_generation_id']} storage_set={storage_set}")
 
-                    # Inject failure after the candidate container has passed
-                    # Compose health but before installer readiness accepts it.
-                    # This exercises the real installer rollback/pending path.
+                    # Inject readiness failure after the candidate image starts.
+                    # The Runtime Host may already have durably activated the
+                    # image-bundled generation, so rollback is allowed only if
+                    # startup failed before the injected readiness rejection.
                     original_wait_for_runtime = install.wait_for_runtime
                     rejected_candidate_readiness = False
                     candidate_startup_diagnostic = "stage=not_reported code=not_reported"
@@ -481,28 +482,67 @@ class OfficialRC9OfficialReleaseDockerUpgradeTests(unittest.TestCase):
                     self.assertTrue(pending.get("compose_started"))
                     self.assertTrue((install_dir / "compose.pending.yaml").is_file())
 
-                    rollback_container = compose_container(install_dir)
-                    rolled_back = assert_running_identity(self, rollback_container, RC9_TAG, RC9_COMMIT)
-                    self.assertEqual(rolled_back["registry"]["active_generation_id"], rc9["registry"]["active_generation_id"])
-                    self.assertEqual(install.wait_for_runtime(meta_rc9["port"], meta_rc9["release"], timeout=30, bind=meta_rc9["bind"])["version"], RC9_TAG[1:])
-                    self.assertEqual(docker([
-                        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", rollback_container,
-                        "/bin/sh", "-ec", f"test \"$(cat /data/{data_marker})\" = preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
-                    ]).returncode, 0)
-                    rollback_release_dirs = release_directories(rollback_container)
-                    self.assertTrue(release_dirs_before.issubset(rollback_release_dirs))
-                    if require_archive_fixture:
-                        run_upgrade_archive_fixture(self, rollback_container, "verify", storage_set)
-
                     if candidate_failed_before_readiness:
+                        generation_state = install.candidate_generation_state(
+                            install_dir / "compose.pending.yaml", pending["release"],
+                        )
+                        if generation_state != "uncommitted":
+                            self.fail(
+                                f"{target_tag} candidate failed before injected readiness rejection; "
+                                f"generation_state={generation_state}; installer retained the pending "
+                                f"candidate to avoid an unsafe rollback; {candidate_startup_diagnostic}"
+                            )
+
+                        rollback_container = compose_container(install_dir)
+                        rolled_back = assert_running_identity(self, rollback_container, RC9_TAG, RC9_COMMIT)
+                        self.assertEqual(rolled_back["registry"]["active_generation_id"], rc9["registry"]["active_generation_id"])
+                        self.assertEqual(install.wait_for_runtime(meta_rc9["port"], meta_rc9["release"], timeout=30, bind=meta_rc9["bind"])["version"], RC9_TAG[1:])
+                        self.assertEqual(docker([
+                            "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", rollback_container,
+                            "/bin/sh", "-ec", f"test \"$(cat /data/{data_marker})\" = preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
+                        ]).returncode, 0)
+                        rollback_release_dirs = release_directories(rollback_container)
+                        self.assertTrue(release_dirs_before.issubset(rollback_release_dirs))
+                        if require_archive_fixture:
+                            run_upgrade_archive_fixture(self, rollback_container, "verify", storage_set)
                         self.fail(
                             f"{target_tag} candidate failed before injected readiness rejection; "
-                            "automatic RC9 rollback was healthy and preserved generation, state, "
-                            f"archive, and release directories; {candidate_startup_diagnostic}"
+                            "installer safely restored the prior image because the candidate generation "
+                            f"was not active; {candidate_startup_diagnostic}"
                         )
 
+                    pending_container = compose_container(install_dir)
+                    pending_active = assert_running_identity(self, pending_container, target_tag, target_commit)
+                    self.assertNotEqual(
+                        pending_active["registry"]["active_generation_id"],
+                        rc9["registry"]["active_generation_id"],
+                        "candidate generation was not active when post-start verification failed",
+                    )
+                    pending_status = install.wait_for_runtime(
+                        meta_rc9["port"],
+                        {"version": target_tag[1:], "commit": target_commit, "channel": "prerelease"},
+                        timeout=30,
+                        bind=meta_rc9["bind"],
+                    )
+                    self.assertEqual(pending_status["version"], target_tag[1:])
+                    self.assertEqual(docker([
+                        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", pending_container,
+                        "/bin/sh", "-ec", f"test \"$(cat /data/{data_marker})\" = preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
+                    ]).returncode, 0)
+                    self.assertTrue(release_dirs_before.issubset(release_directories(pending_container)))
+                    pending_tuple = (
+                        pending_active["generation"].get("adapter_set_id"),
+                        pending_active["generation"].get("storage_provider_set_id"),
+                        pending_active["generation"].get("storage_instance_id"),
+                    )
+                    self.assertEqual(pending_tuple, old_tuple)
+                    pending_generation_id = pending_active["registry"]["active_generation_id"]
+                    if require_archive_fixture:
+                        run_upgrade_archive_fixture(self, pending_container, "verify", storage_set)
+
                     # Official retry resumes the exact pending release identity;
-                    # it neither changes nor replaces the application data.
+                    # it neither changes application data nor stages a second
+                    # generation after the candidate is already active.
                     install.install(args_target)
                     final_metadata = install.load_metadata(install_dir / "deployment.json")
                     self.assertIsNone(install.read_pending(pending_path))
@@ -512,10 +552,10 @@ class OfficialRC9OfficialReleaseDockerUpgradeTests(unittest.TestCase):
                     self.assertTrue(final_metadata["release"].get("manifest_identity_checked"))
                     final_container = compose_container(install_dir)
                     upgraded = assert_running_identity(self, final_container, target_tag, target_commit)
-                    self.assertNotEqual(
+                    self.assertEqual(
                         upgraded["registry"]["active_generation_id"],
-                        rc9["registry"]["active_generation_id"],
-                        "image upgrade did not activate a generation with the target application identity",
+                        pending_generation_id,
+                        "forward recovery replaced an already active generation",
                     )
                     target_status = install.wait_for_runtime(
                         final_metadata["port"], final_metadata["release"], timeout=30, bind=final_metadata["bind"],

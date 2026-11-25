@@ -141,15 +141,20 @@ type Claim struct {
 }
 
 type Segment struct {
-	ID              string        `json:"id"`
-	Coordinate      Coordinate    `json:"coordinate"`
-	Duration        float64       `json:"duration"`
-	ProgramDateTime *time.Time    `json:"program_date_time,omitempty"`
-	InitIdentity    string        `json:"init_identity,omitempty"`
-	SelectedClaimID string        `json:"selected_claim_id,omitempty"`
-	Claims          []Claim       `json:"claims"`
-	TimelineOrdinal uint64        `json:"timeline_ordinal,omitempty"`
-	State           CoverageState `json:"state"`
+	ID              string     `json:"id"`
+	Coordinate      Coordinate `json:"coordinate"`
+	Duration        float64    `json:"duration"`
+	ProgramDateTime *time.Time `json:"program_date_time,omitempty"`
+	InitIdentity    string     `json:"init_identity,omitempty"`
+	// These source properties are part of the immutable playback projection.
+	// ByteRange describes the source extent; the canonical payload remains the
+	// exact bytes persisted for this coordinate.
+	Discontinuity   bool              `json:"discontinuity,omitempty"`
+	ByteRange       *domain.ByteRange `json:"byte_range,omitempty"`
+	SelectedClaimID string            `json:"selected_claim_id,omitempty"`
+	Claims          []Claim           `json:"claims"`
+	TimelineOrdinal uint64            `json:"timeline_ordinal,omitempty"`
+	State           CoverageState     `json:"state"`
 }
 
 type Coverage struct {
@@ -166,8 +171,12 @@ type Coverage struct {
 }
 
 type Inventory struct {
-	SchemaVersion  int             `json:"schema_version"`
-	RecordingID    string          `json:"recording_id"`
+	SchemaVersion int    `json:"schema_version"`
+	RecordingID   string `json:"recording_id"`
+	// ArchiveID is the stable cross-node identity added after the RC12 archive
+	// format. Empty is retained for legacy recordings and resolves through the
+	// migration-stable RecordingID mapping in archivesnapshot.
+	ArchiveID      string          `json:"archive_id,omitempty"`
 	Session        SessionIdentity `json:"session"`
 	Revision       uint64          `json:"revision"`
 	Capture        CaptureState    `json:"capture_state"`
@@ -191,6 +200,8 @@ type ClaimInput struct {
 	Duration        float64
 	ProgramDateTime *time.Time
 	InitIdentity    string
+	Discontinuity   bool
+	ByteRange       *domain.ByteRange
 }
 
 var (
@@ -297,9 +308,29 @@ func SegmentIdentity(coordinate Coordinate) (string, error) {
 	return "segment-" + digestString(encoded), nil
 }
 
+// InitIdentityForSegment returns the bounded, opaque init-map identity used by
+// archive inventories for a source segment. Init records identify themselves;
+// media records carry their referenced HLS map ID. Oversized source values are
+// domain-hashed so the persisted archive index stays bounded without losing a
+// deterministic edge between the media and its init object.
+func InitIdentityForSegment(segment domain.Segment) string {
+	identity := segment.InitSegmentID
+	if segment.IsInit {
+		identity = segment.ID
+	}
+	if len(identity) <= MaxInitIdentityBytes {
+		return identity
+	}
+	digest := sha256.Sum256([]byte("IR/archive-index/init-identity/v1/oversized\x00" + identity))
+	return "initref_" + hex.EncodeToString(digest[:])
+}
+
 func (inventory Inventory) Validate() error {
 	if inventory.SchemaVersion != SchemaVersion || !validText(inventory.RecordingID, MaxRecordingIDBytes, false) || inventory.Revision == 0 {
 		return fmt.Errorf("%w: unsupported schema, recording ID, or revision", ErrInvalidInventory)
+	}
+	if inventory.ArchiveID != "" && !domain.ValidArchiveID(inventory.ArchiveID) {
+		return fmt.Errorf("%w: invalid logical archive ID", ErrInvalidInventory)
 	}
 	if err := validateSession(inventory.Session); err != nil {
 		return err
@@ -342,7 +373,7 @@ func (inventory Inventory) Validate() error {
 		}
 		segmentIDs[segment.ID] = struct{}{}
 		coordinates[coordinate] = struct{}{}
-		if !validDuration(segment.Duration, coordinate.Kind) || !validText(segment.InitIdentity, MaxInitIdentityBytes, true) || !validCoverageState(segment.State) {
+		if !validDuration(segment.Duration, coordinate.Kind) || !validText(segment.InitIdentity, MaxInitIdentityBytes, true) || !validCoverageState(segment.State) || !validByteRange(segment.ByteRange) {
 			return fmt.Errorf("%w: invalid segment metadata", ErrInvalidInventory)
 		}
 		if segment.ProgramDateTime != nil && segment.ProgramDateTime.IsZero() {
@@ -443,7 +474,7 @@ func ApplyClaim(inventory *Inventory, input ClaimInput) (ClaimDisposition, error
 	if err := validateClaim(newClaim); err != nil {
 		return "", err
 	}
-	if !validDuration(input.Duration, input.Coordinate.Kind) || !validText(input.InitIdentity, MaxInitIdentityBytes, true) || input.ProgramDateTime != nil && input.ProgramDateTime.IsZero() {
+	if !validDuration(input.Duration, input.Coordinate.Kind) || !validText(input.InitIdentity, MaxInitIdentityBytes, true) || input.ProgramDateTime != nil && input.ProgramDateTime.IsZero() || !validByteRange(input.ByteRange) {
 		return "", fmt.Errorf("%w: invalid segment metadata", ErrInvalidClaim)
 	}
 	for _, segment := range inventory.Segments {
@@ -485,7 +516,7 @@ func ApplyClaim(inventory *Inventory, input ClaimInput) (ClaimDisposition, error
 
 	if segmentIndex < 0 {
 		segmentID, _ := SegmentIdentity(input.Coordinate)
-		segment := Segment{ID: segmentID, Coordinate: input.Coordinate, Duration: input.Duration, ProgramDateTime: cloneTime(input.ProgramDateTime), InitIdentity: input.InitIdentity, State: CoverageUnknown, Claims: []Claim{}}
+		segment := Segment{ID: segmentID, Coordinate: input.Coordinate, Duration: input.Duration, ProgramDateTime: cloneTime(input.ProgramDateTime), InitIdentity: input.InitIdentity, Discontinuity: input.Discontinuity, ByteRange: cloneByteRange(input.ByteRange), State: CoverageUnknown, Claims: []Claim{}}
 		newClaim.Disposition = DispositionAccepted
 		segment.Claims = append(segment.Claims, newClaim)
 		if newClaim.Verification == VerificationVerified {
@@ -705,6 +736,12 @@ func FromRecording(recording *domain.Recording, legacyAdoption bool) (Inventory,
 	if err != nil {
 		return Inventory{}, err
 	}
+	if recording.ArchiveID != "" {
+		if !domain.ValidArchiveID(recording.ArchiveID) {
+			return Inventory{}, fmt.Errorf("%w: invalid logical archive ID", ErrInvalidInventory)
+		}
+		inventory.ArchiveID = recording.ArchiveID
+	}
 	inventory.LegacyAdoption = legacyAdoption
 	if recording.State != domain.StateRecording {
 		inventory.Capture = CaptureClosed
@@ -815,7 +852,8 @@ func appendLegacySegment(inventory *Inventory, legacy domain.Segment, fallbackTr
 	claimID := "legacy-" + string(kind) + ":" + segmentID
 	segment := Segment{
 		ID: segmentID, Coordinate: coordinate, Duration: legacy.Duration,
-		ProgramDateTime: cloneTime(legacy.ProgramDateTime), InitIdentity: legacy.InitSegmentID,
+		ProgramDateTime: cloneTime(legacy.ProgramDateTime), InitIdentity: InitIdentityForSegment(legacy),
+		Discontinuity: legacy.Discontinuity, ByteRange: cloneByteRange(legacy.ByteRange),
 		SelectedClaimID: claimID, TimelineOrdinal: 0, State: CoveragePresent,
 		Claims: []Claim{{
 			ID: claimID, Source: ClaimUnknown, AcquiredAt: acquiredAt,
@@ -824,6 +862,9 @@ func appendLegacySegment(inventory *Inventory, legacy domain.Segment, fallbackTr
 			Evidence: "legacy archive adoption", LegacySegmentID: legacy.ID,
 		}},
 	}
+	// Snapshot v2 needs to bind a media segment's opaque InitSegmentID to the
+	// corresponding init object. For init objects, preserve that identity in
+	// the existing bounded opaque field; it is not a URI or filesystem path.
 	if err := validateSegmentForLegacy(segment); err != nil {
 		return err
 	}
@@ -925,7 +966,26 @@ func sameClaimMetadata(left, right Claim) bool {
 }
 
 func sameSegmentMetadata(segment Segment, input ClaimInput) bool {
-	return segment.Duration == input.Duration && sameOptionalTime(segment.ProgramDateTime, input.ProgramDateTime) && segment.InitIdentity == input.InitIdentity
+	return segment.Duration == input.Duration && sameOptionalTime(segment.ProgramDateTime, input.ProgramDateTime) && segment.InitIdentity == input.InitIdentity && segment.Discontinuity == input.Discontinuity && sameOptionalByteRange(segment.ByteRange, input.ByteRange)
+}
+
+func sameOptionalByteRange(left, right *domain.ByteRange) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func cloneByteRange(value *domain.ByteRange) *domain.ByteRange {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func validByteRange(value *domain.ByteRange) bool {
+	return value == nil || value.Length > 0 && value.Offset <= ^uint64(0)-(value.Length-1)
 }
 
 func sameOptionalTime(left, right *time.Time) bool {
@@ -1085,6 +1145,7 @@ func cloneInventory(source Inventory) Inventory {
 	for i, segment := range source.Segments {
 		clone.Segments[i] = segment
 		clone.Segments[i].ProgramDateTime = cloneTime(segment.ProgramDateTime)
+		clone.Segments[i].ByteRange = cloneByteRange(segment.ByteRange)
 		clone.Segments[i].Claims = append([]Claim(nil), segment.Claims...)
 	}
 	clone.Coverage = append([]Coverage(nil), source.Coverage...)

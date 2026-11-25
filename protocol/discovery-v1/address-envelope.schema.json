@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://integrated-recorder.github.io/protocol/discovery-v1/address-envelope.schema.json",
+  "title": "Integrated Recorder Node Address Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "envelope_version",
+    "recipient_public_key_sha256",
+    "kem",
+    "kdf",
+    "aead",
+    "encapsulation",
+    "ciphertext"
+  ],
+  "properties": {
+    "envelope_version": { "const": "ir.node-address-envelope/1" },
+    "recipient_public_key_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "kem": { "const": "DHKEM(X25519,HKDF-SHA256)" },
+    "kdf": { "const": "HKDF-SHA256" },
+    "aead": { "const": "AES-256-GCM" },
+    "encapsulation": { "type": "string", "minLength": 43, "maxLength": 43, "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "ciphertext": { "type": "string", "minLength": 23, "maxLength": 10944, "pattern": "^[A-Za-z0-9_-]+$" }
+  }
+}

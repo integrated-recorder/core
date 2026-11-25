@@ -37,6 +37,18 @@ jobs:
       - name: Test
         working-directory: web
         run: npm run test
+      - name: Cross-language identity protocol vector
+        working-directory: web
+        run: node --test ../protocol/identity-v1/vector.test.mjs
+      - name: Cross-language discovery protocol vector
+        working-directory: web
+        run: node --test ../protocol/discovery-v1/vector.test.mjs
+      - name: Cross-language archive snapshot vector
+        working-directory: web
+        run: node --test ../protocol/archive-snapshot-v1/vector.test.mjs
+      - name: Cross-language recovery key vector
+        working-directory: web
+        run: node --test scripts/recovery-vector.test.mjs
       - name: Build
         working-directory: web
         run: npm run build

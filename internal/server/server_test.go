@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,11 +20,19 @@ import (
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/discovery"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/globalidentity"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
 	"github.com/integrated-recorder/core/internal/preview"
 	"github.com/integrated-recorder/core/internal/storage"
 )
+
+type unavailableDiscoveryTransport struct{}
+
+func (unavailableDiscoveryTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("fixture Discovery network unavailable")
+}
 
 func TestMain(m *testing.M) {
 	if os.Getenv("IR_SERVER_ADAPTER_HELPER") == "1" {
@@ -63,7 +72,11 @@ func runServerTestAdapter() int {
 		case adapterproto.MethodShutdown:
 			response, _ = adapterproto.Success(request.ID, map[string]bool{"stopped": true})
 		case adapterproto.MethodResolve:
-			response, _ = adapterproto.Success(request.ID, adapterproto.ResolveResult{Media: adapterproto.MediaSource{Type: "hls", ManifestURL: "http://127.0.0.1:9/live.m3u8", ArchivePolicy: &adapterproto.ArchivePolicy{SourceURI: "sensitive"}}})
+			manifestURL := os.Getenv("IR_SERVER_ADAPTER_MANIFEST_URL")
+			if manifestURL == "" {
+				manifestURL = "http://127.0.0.1:9/live.m3u8"
+			}
+			response, _ = adapterproto.Success(request.ID, adapterproto.ResolveResult{Media: adapterproto.MediaSource{Type: "hls", ManifestURL: manifestURL, ArchivePolicy: &adapterproto.ArchivePolicy{SourceURI: "sensitive"}}})
 		default:
 			response = adapterproto.Failure(request.ID, "unsupported_method", "unsupported", nil)
 		}
@@ -156,6 +169,107 @@ func TestDirectRecordingCreateDefaultsPreviewOnAndKeepsItBestEffort(t *testing.T
 	}
 	if _, err := manager.Stop(id); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLocalRecordingCommitsCanonicalMediaDuringDiscoveryOutage(t *testing.T) {
+	const payload = "rc12-local-recording-survives-discovery-outage"
+	segmentRequested := make(chan struct{})
+	var segmentOnce sync.Once
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/live.m3u8":
+			_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,fixture\nsegment.ts\n#EXT-X-ENDLIST\n")
+		case "/segment.ts":
+			segmentOnce.Do(func() { close(segmentRequested) })
+			_, _ = io.WriteString(w, payload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer source.Close()
+	t.Setenv("IR_SERVER_ADAPTER_MANIFEST_URL", source.URL+"/live.m3u8")
+
+	root := t.TempDir()
+	identity, err := globalidentity.Open(filepath.Join(root, "security"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, genesis, signature, handle, credential, challenge, _ := signedTestGenesis(t)
+	if err := identity.CreateGenesis(genesis, signature, handle, credential, challenge); err != nil {
+		t.Fatalf("create test Global Identity: %v", err)
+	}
+	bundle, err := identity.ExportHistory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	federation, err := discovery.NewFederationClient(
+		[]string{"https://discovery-a.example", "https://discovery-b.example"},
+		&http.Client{Transport: unavailableDiscoveryTransport{}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := federation.PublishIdentityHistory(context.Background(), bundle, time.Now().UTC()); err == nil {
+		t.Fatal("Discovery publication unexpectedly succeeded")
+	}
+
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configFiles, secretFiles, err := pluginconfig.NewTypedFileStores(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs, err := pluginconfig.NewService(configFiles, secretFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapterDir := t.TempDir()
+	writeServerTestAdapter(t, adapterDir)
+	host, err := adapterhost.Discover(context.Background(), adapterDir, configs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	manager, err := acquire.NewManager(store, source.Client(), nil, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	api := NewWithOptions(manager, host, configs, Options{Storage: store, GlobalIdentity: identity, IdentityFederation: federation})
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(`{"adapter_id":"schema-test","input":{},"title":"local during Discovery outage"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("local recording create status=%d body=%s", response.Code, response.Body.String())
+	}
+	id := extractJSONID(t, response.Body.Bytes())
+	select {
+	case <-segmentRequested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("local HLS acquisition did not request the segment while Discovery was unavailable")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var recording *domain.Recording
+	for time.Now().Before(deadline) {
+		recording, err = manager.Get(id)
+		if err == nil && len(recording.Tracks["main"].Segments) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil || recording == nil || len(recording.Tracks["main"].Segments) != 1 {
+		t.Fatalf("local recording did not canonically commit media during Discovery outage: recording=%+v err=%v", recording, err)
+	}
+	committed := recording.Tracks["main"].Segments[0]
+	archiveBytes, err := os.ReadFile(filepath.Join(store.Root(), "recordings", id, filepath.FromSlash(committed.StoragePath)))
+	if err != nil || string(archiveBytes) != payload {
+		t.Fatalf("canonical segment bytes changed or were unavailable: got=%q err=%v", archiveBytes, err)
+	}
+	if _, err := manager.Stop(id); err != nil {
+		t.Fatalf("stop local recording after Discovery outage: %v", err)
 	}
 }
 

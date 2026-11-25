@@ -37,7 +37,7 @@ jobs:
       - name: Install official RC9, exercise rollback, retry official RC10
         env:
           IR_RUN_STORAGE_UPGRADE_DOCKER_E2E: '1'
-        run: python3 scripts/test_storage_provider_linux_acceptance.py OfficialRC9OfficialReleaseDockerUpgradeTests.test_official_rc9_install_target_upgrade_and_pending_rollback_retry -v
+        run: python3 scripts/test_storage_provider_linux_acceptance.py OfficialRC9OfficialReleaseDockerUpgradeTests.test_official_rc9_install_target_and_pending_retry -v
 
   official-rc9-to-rc11-upgrade:
     name: Official RC9 install and RC11 upgrade
@@ -76,7 +76,7 @@ jobs:
           IR_EXPECTED_RELEASE_COMMIT: ${{ github.event.workflow_run.head_sha }}
           IR_REQUIRE_ARCHIVE_FIXTURE: '1'
           IR_DOCKER_ARCHIVE_FIXTURE_BINARY: ${{ runner.temp }}/storageprocess-upgrade-fixture.test
-        run: python3 scripts/test_storage_provider_linux_acceptance.py OfficialRC9OfficialReleaseDockerUpgradeTests.test_official_rc9_install_target_upgrade_and_pending_rollback_retry -v
+        run: python3 scripts/test_storage_provider_linux_acceptance.py OfficialRC9OfficialReleaseDockerUpgradeTests.test_official_rc9_install_target_and_pending_retry -v
 
   candidate-image-bundle-upgrade:
     name: RC9 install and candidate image-bundle upgrade

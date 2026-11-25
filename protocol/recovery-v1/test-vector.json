@@ -1,0 +1,16 @@
+{
+  "vector_version": "ir.recovery.vector/1",
+  "test_only_note": "All-zero entropy is public test data and MUST NEVER be used as a recovery root.",
+  "entropy_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+  "mnemonic_english": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+  "hkdf_salt_utf8": "IR/recovery/v1/HKDF-SHA256/salt",
+  "signing_info_utf8": "IR/recovery/v1/identity-signing-ed25519-seed",
+  "signing_seed_hex": "4a42772013744ac49444cabe191141fb5a6051362dffc26dd9849051deb13fa3",
+  "signing_public_key_base64url": "-purqCj6vOJ3KIQHs7yX2Jw39v94byHCppGn2aSEjIw",
+  "encryption_info_utf8": "IR/recovery/v1/recovery-encryption-x25519-scalar",
+  "encryption_private_key_hex": "624215aa9467ad5f2a32526cca20ff0e5faa5cba638f90ff13ce913f3df7718e",
+  "encryption_public_key_base64url": "z-xHbQnvbzfevTP7fJ0n7HZSJGSORyKXPpL7PRNdAlc",
+  "identity_id": "gi_FZHpkMERS415hhqLqd6caA",
+  "signer_key_id": "ik_kQ-SpHzCPkqIJN1PafegM7LIw7TNIsLeIjH6TqpLUZU",
+  "recovery_file_hex": "49525243010000000000000000000000000000000000000000000000000000000000000000901d12b3ef6adbcf44ebb376697cb159"
+}

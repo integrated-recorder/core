@@ -66,6 +66,9 @@ func TestManagementAssetsAreLocalAndSecurityHeadersArePresent(t *testing.T) {
 		}
 	}
 	csp := page.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "connect-src 'self' blob:") {
+		t.Fatalf("CSP must permit fetch of the app-created encrypted-playback playlist Blob: %q", csp)
+	}
 	if !strings.Contains(csp, "script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'") {
 		t.Fatalf("CSP must allow component positioning styles without allowing inline scripts: %q", csp)
 	}

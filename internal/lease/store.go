@@ -20,7 +20,8 @@ import (
 )
 
 const (
-	stateVersion    = "1"
+	stateVersionV1  = "1"
+	stateVersion    = "2"
 	stateName       = "replica-leases-v1.json"
 	lockName        = ".replica-leases.lock"
 	privateDirMode  = 0700
@@ -66,6 +67,36 @@ func (s *Store) Snapshot(ctx context.Context) ([]Lease, []TombstoneRecord, error
 		return false, nil
 	})
 	return leases, tombstones, err
+}
+
+// GetTombstoneDeliveryCursor returns the last planned tombstone delivery
+// target. A zero-value cursor means iteration starts at the first target.
+func (s *Store) GetTombstoneDeliveryCursor(ctx context.Context) (TombstoneDeliveryCursor, error) {
+	var cursor TombstoneDeliveryCursor
+	err := s.withLocked(ctx, func(state *snapshot) (bool, error) {
+		if state.DeliveryCursor != nil {
+			cursor = *state.DeliveryCursor
+		}
+		return false, nil
+	})
+	return cursor, err
+}
+
+// SetTombstoneDeliveryCursor atomically persists bounded retry scheduling
+// metadata. It does not acknowledge delivery; only MarkTombstoneDelivered
+// accepts an authenticated receipt as a durable acknowledgement.
+func (s *Store) SetTombstoneDeliveryCursor(ctx context.Context, cursor TombstoneDeliveryCursor) error {
+	if !hashPattern.MatchString(cursor.TombstoneHash) || !nodeIDPattern.MatchString(cursor.NodeID) {
+		return ErrInvalid
+	}
+	return s.withLocked(ctx, func(state *snapshot) (bool, error) {
+		if state.DeliveryCursor != nil && *state.DeliveryCursor == cursor {
+			return false, nil
+		}
+		copy := cursor
+		state.DeliveryCursor = &copy
+		return true, nil
+	})
 }
 
 func (s *Store) Get(ctx context.Context, leaseID string) (Lease, error) {
@@ -1009,6 +1040,7 @@ func (s *Store) withLocked(ctx context.Context, fn func(*snapshot) (bool, error)
 		return err
 	}
 	changed, opErr := fn(&state)
+	changed = changed || state.Migrated
 	if opErr != nil {
 		if changed {
 			if writeErr := s.writeState(state); writeErr != nil {
@@ -1041,8 +1073,25 @@ func (s *Store) readState() (snapshot, error) {
 	if err != nil || len(data) > maxStateBytes {
 		return snapshot{}, ErrInvalid
 	}
+	var header struct {
+		Version string `json:"state_version"`
+	}
+	if json.Unmarshal(data, &header) != nil {
+		return snapshot{}, ErrInvalid
+	}
 	var state snapshot
-	if err := strictDecode(data, &state); err != nil || state.Version != stateVersion || state.Leases == nil || state.Tombstones == nil {
+	switch header.Version {
+	case stateVersionV1:
+		var old snapshotV1
+		if err := strictDecode(data, &old); err != nil || old.Version != stateVersionV1 || old.Leases == nil || old.Tombstones == nil {
+			return snapshot{}, ErrInvalid
+		}
+		state = snapshot{Version: stateVersion, Leases: old.Leases, Tombstones: old.Tombstones, Migrated: true}
+	case stateVersion:
+		if err := strictDecode(data, &state); err != nil || state.Version != stateVersion || state.Leases == nil || state.Tombstones == nil {
+			return snapshot{}, ErrInvalid
+		}
+	default:
 		return snapshot{}, ErrInvalid
 	}
 	if err := s.validateState(context.Background(), state); err != nil {
@@ -1053,6 +1102,9 @@ func (s *Store) readState() (snapshot, error) {
 
 func (s *Store) validateState(ctx context.Context, state snapshot) error {
 	if len(state.Leases) > 100000 || len(state.Tombstones) > 100000 {
+		return ErrInvalid
+	}
+	if state.DeliveryCursor != nil && (!hashPattern.MatchString(state.DeliveryCursor.TombstoneHash) || !nodeIDPattern.MatchString(state.DeliveryCursor.NodeID)) {
 		return ErrInvalid
 	}
 	lastLease, lastArchive := "", ""

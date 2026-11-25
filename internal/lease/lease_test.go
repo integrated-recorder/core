@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -820,6 +821,111 @@ func TestStateDirectoryAndStoredStateMustBePrivateAndValid(t *testing.T) {
 	}
 	if _, err := Open(Options{Root: f.root, Keys: testKeys{}}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unknown durable fields accepted: %v", err)
+	}
+}
+
+func TestLeaseStateV1MigratesAndPersistsTombstoneDeliveryCursorAcrossReopen(t *testing.T) {
+	f := newLeaseFixture(t)
+	ctx := context.Background()
+	signedOffer := f.signedOffer(t, f.offer.LeaseID)
+	if _, err := f.store.IssueOffer(ctx, signedOffer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Accept(ctx, f.signedAcceptance(t, signedOffer)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.BeginTransfer(ctx, f.offer.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := grantEvidenceHash(f.chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone, err := SignTombstone(Tombstone{
+		Version: TombstoneVersion, ArchiveID: f.offer.ArchiveID, OwnerSubjectID: f.offer.OwnerSubjectID,
+		DeletionEpoch: "1", ReasonCode: "owner_requested", IssuedAt: f.now.Add(5 * time.Second).Format(time.RFC3339),
+		AuthorizedEvidence: evidence,
+	}, f.offer.OwnerSubjectID, f.owner, f.chain, f.ownerPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedTombstone, err := f.store.AddTombstone(ctx, tombstone)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Materialize the exact existing lease and tombstone payloads as the old
+	// strict v1 shape. This exercises preservation, not only an empty migration.
+	path := filepath.Join(f.root, stateName)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seeded snapshot
+	if err := strictDecode(contents, &seeded); err != nil {
+		t.Fatalf("decode seeded state: %v", err)
+	}
+	legacy, err := json.Marshal(snapshotV1{Version: stateVersionV1, Leases: seeded.Leases, Tombstones: seeded.Tombstones})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, legacy, privateFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(Options{Root: f.root, Authorizer: allowAuthority{}, Keys: f.store.keys, Now: f.store.now})
+	if err != nil {
+		t.Fatalf("open/migrate v1 state: %v", err)
+	}
+	contents, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migrated map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &migrated); err != nil || string(migrated["state_version"]) != `"2"` {
+		t.Fatalf("v1 state was not atomically migrated to v2: version=%s err=%v", migrated["state_version"], err)
+	}
+	leases, tombstones, err := store.Snapshot(ctx)
+	if err != nil || len(leases) != 1 || leases[0].Status != StatusTerminating || len(tombstones) != 1 || tombstones[0].Hash != storedTombstone.Hash {
+		t.Fatalf("migration did not preserve existing data: leases=%+v tombstones=%+v err=%v", leases, tombstones, err)
+	}
+	want := TombstoneDeliveryCursor{TombstoneHash: "sha256:" + strings.Repeat("a", 64), NodeID: "nd_" + strings.Repeat("b", 22)}
+	if err := store.SetTombstoneDeliveryCursor(ctx, want); err != nil {
+		t.Fatalf("persist cursor: %v", err)
+	}
+	reopened, err := Open(Options{Root: f.root, Authorizer: allowAuthority{}, Keys: f.store.keys, Now: f.store.now})
+	if err != nil {
+		t.Fatalf("reopen migrated state: %v", err)
+	}
+	got, err := reopened.GetTombstoneDeliveryCursor(context.Background())
+	if err != nil || got != want {
+		t.Fatalf("reopened cursor=%+v err=%v, want %+v", got, err, want)
+	}
+}
+
+func TestLeaseStateV2RejectsMalformedTombstoneDeliveryCursor(t *testing.T) {
+	tests := []struct {
+		name   string
+		cursor string
+	}{
+		{name: "invalid hash", cursor: `{"tombstone_hash":"not-a-hash","node_id":"nd_bbbbbbbbbbbbbbbbbbbbbb"}`},
+		{name: "invalid node", cursor: `{"tombstone_hash":"sha256:` + strings.Repeat("a", 64) + `","node_id":"node"}`},
+		{name: "unknown cursor field", cursor: `{"tombstone_hash":"sha256:` + strings.Repeat("a", 64) + `","node_id":"nd_bbbbbbbbbbbbbbbbbbbbbb","extra":true}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "lease-state")
+			if err := os.Mkdir(root, privateDirMode); err != nil {
+				t.Fatal(err)
+			}
+			state := `{"state_version":"2","leases":[],"tombstones":[],"tombstone_delivery_cursor":` + test.cursor + `}`
+			if err := os.WriteFile(filepath.Join(root, stateName), []byte(state), privateFileMode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(Options{Root: root, Keys: testKeys{}}); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("malformed v2 cursor accepted: %v", err)
+			}
+		})
 	}
 }
 

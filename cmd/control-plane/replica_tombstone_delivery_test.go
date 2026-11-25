@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
+	"crypto/ed25519"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +48,102 @@ func TestReplicaTombstoneProviderTargetsResolveCrossIdentityLease(t *testing.T) 
 	}
 	if resolved != 1 {
 		t.Fatalf("remote identity refresh count=%d, want 1", resolved)
+	}
+}
+
+func TestTombstoneDeliveryBatchRotatesAfterFailedBoundedPass(t *testing.T) {
+	work := make([]replicaTombstoneDeliveryTarget, 20)
+	for i := range work {
+		work[i].key = fmt.Sprintf("tombstone-%02d/provider", i)
+	}
+	cursor := ""
+	first := tombstoneDeliveryBatch(append([]replicaTombstoneDeliveryTarget(nil), work...), cursor, maxTombstoneDeliveryAttemptsPerPass)
+	if len(first) != maxTombstoneDeliveryAttemptsPerPass {
+		t.Fatalf("first batch size=%d, want %d", len(first), maxTombstoneDeliveryAttemptsPerPass)
+	}
+	// Reconcile persists the planned batch endpoint before the first network
+	// call. Model the entire bounded batch remaining unacknowledged after a
+	// failed pass: future work must still move past these providers.
+	cursor = first[len(first)-1].key
+	second := tombstoneDeliveryBatch(append([]replicaTombstoneDeliveryTarget(nil), work...), cursor, maxTombstoneDeliveryAttemptsPerPass)
+	if len(second) != maxTombstoneDeliveryAttemptsPerPass {
+		t.Fatalf("second batch size=%d, want %d", len(second), maxTombstoneDeliveryAttemptsPerPass)
+	}
+	for i := range second {
+		var want replicaTombstoneDeliveryTarget
+		if i < len(work)-maxTombstoneDeliveryAttemptsPerPass {
+			want = work[maxTombstoneDeliveryAttemptsPerPass+i]
+		} else {
+			want = work[i-(len(work)-maxTombstoneDeliveryAttemptsPerPass)]
+		}
+		if second[i].key != want.key {
+			t.Fatalf("second batch[%d]=%q, want %q", i, second[i].key, want.key)
+		}
+	}
+}
+
+type tombstoneCursorTestKeys struct{}
+
+func (tombstoneCursorTestKeys) VerifiedKey(context.Context, authority.Principal, time.Time) (ed25519.PublicKey, error) {
+	return nil, nil
+}
+
+func TestTombstoneDeliveryBatchResumesAfterStoreReopen(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "lease-state")
+	store, err := lease.Open(lease.Options{Root: root, Keys: tombstoneCursorTestKeys{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := "sha256:" + strings.Repeat("a", 64)
+	work := make([]replicaTombstoneDeliveryTarget, 20)
+	for i := range work {
+		nodeID := fmt.Sprintf("nd_%022d", i+1)
+		work[i] = replicaTombstoneDeliveryTarget{
+			key:          hash + "\x00" + nodeID,
+			tombstone:    lease.TombstoneRecord{Hash: hash},
+			targetNodeID: nodeID,
+		}
+	}
+
+	first := tombstoneDeliveryBatch(append([]replicaTombstoneDeliveryTarget(nil), work...), "", maxTombstoneDeliveryAttemptsPerPass)
+	if len(first) == 0 {
+		t.Fatal("first batch is empty")
+	}
+	// The reconciler persists the batch endpoint once before the first network
+	// attempt. Simulate a crash after that durable write.
+	if err := store.SetTombstoneDeliveryCursor(ctx, lease.TombstoneDeliveryCursor{
+		TombstoneHash: hash, NodeID: first[len(first)-1].targetNodeID,
+	}); err != nil {
+		t.Fatalf("persist planned batch cursor: %v", err)
+	}
+
+	// A new Store simulates a Control Plane restart. The next pass must select
+	// the remaining targets before wrapping back to the unavailable prefix.
+	reopened, err := lease.Open(lease.Options{Root: root, Keys: tombstoneCursorTestKeys{}})
+	if err != nil {
+		t.Fatalf("reopen lease state: %v", err)
+	}
+	cursor, err := reopened.GetTombstoneDeliveryCursor(ctx)
+	if err != nil {
+		t.Fatalf("read persisted cursor: %v", err)
+	}
+	second := tombstoneDeliveryBatch(append([]replicaTombstoneDeliveryTarget(nil), work...), tombstoneDeliveryCursorKey(cursor), maxTombstoneDeliveryAttemptsPerPass)
+	if len(second) != maxTombstoneDeliveryAttemptsPerPass {
+		t.Fatalf("second batch size=%d, want %d", len(second), maxTombstoneDeliveryAttemptsPerPass)
+	}
+	for i := maxTombstoneDeliveryAttemptsPerPass; i < len(work); i++ {
+		want := work[i].targetNodeID
+		found := false
+		for _, got := range second {
+			if got.targetNodeID == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("later provider %q was not selected after reopen: %+v", want, second)
+		}
 	}
 }
 

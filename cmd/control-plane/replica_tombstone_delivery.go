@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/integrated-recorder/core/internal/authority"
@@ -32,6 +33,16 @@ type replicaTombstoneDeliveryReconciler struct {
 	authority *authority.Store
 	node      *nodeidentity.Store
 	peers     *peerapi.SessionManagerSlot
+
+	mu sync.Mutex
+}
+
+type replicaTombstoneDeliveryTarget struct {
+	key          string
+	tombstone    lease.TombstoneRecord
+	identityID   string
+	targetNodeID string
+	grantChain   []authority.SignedGrant
 }
 
 // Reconcile retries the exact persisted tombstone to Nodes with a durable
@@ -42,9 +53,15 @@ func (r *replicaTombstoneDeliveryReconciler) Reconcile(ctx context.Context, now 
 	if r == nil || ctx == nil || now.IsZero() || r.leases == nil {
 		return nil
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	leases, tombstones, err := r.leases.Snapshot(ctx)
 	if err != nil {
 		return errors.New("replica tombstone state is unavailable")
+	}
+	cursor, err := r.leases.GetTombstoneDeliveryCursor(ctx)
+	if err != nil {
+		return errors.New("replica tombstone delivery cursor is unavailable")
 	}
 	if len(tombstones) == 0 {
 		return nil
@@ -87,8 +104,8 @@ func (r *replicaTombstoneDeliveryReconciler) Reconcile(ctx context.Context, now 
 			acknowledged[tombstone.Hash][delivery.NodeID] = struct{}{}
 		}
 	}
-	attempted := 0
 	pending := false
+	work := make([]replicaTombstoneDeliveryTarget, 0)
 	for _, tombstone := range tombstones {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -119,21 +136,43 @@ func (r *replicaTombstoneDeliveryReconciler) Reconcile(ctx context.Context, now 
 		}
 		sort.Strings(targets)
 		for _, target := range targets {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
 			if _, done := acknowledged[tombstone.Hash][target]; done {
 				continue
 			}
-			if attempted >= maxTombstoneDeliveryAttemptsPerPass {
-				return errors.New("replica tombstone delivery pass reached its bounded work limit")
+			work = append(work, replicaTombstoneDeliveryTarget{
+				key: tombstone.Hash + "\x00" + target, tombstone: tombstone,
+				identityID: providerSet[target], targetNodeID: target,
+				grantChain: append([]authority.SignedGrant(nil), chain...),
+			})
+		}
+	}
+	workCount := len(work)
+	work = tombstoneDeliveryBatch(work, tombstoneDeliveryCursorKey(cursor), maxTombstoneDeliveryAttemptsPerPass)
+	if len(work) > 0 {
+		if workCount > len(work) {
+			// Remaining targets are retried in the next maintenance pass.
+			pending = true
+		}
+		// Persist the batch's final position before any provider call. If the
+		// process stops mid-batch, the next pass starts after this batch, then
+		// wraps around because unacknowledged deliveries remain in durable state.
+		lastPlanned := work[len(work)-1]
+		if err := r.leases.SetTombstoneDeliveryCursor(ctx, lease.TombstoneDeliveryCursor{
+			TombstoneHash: lastPlanned.tombstone.Hash,
+			NodeID:        lastPlanned.targetNodeID,
+		}); err != nil {
+			return errors.New("replica tombstone delivery cursor could not be persisted")
+		}
+		for _, target := range work {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			attempted++
+			tombstone := target.tombstone
+			decision := tombstone.Signed.Tombstone
 			passCtx, cancel := context.WithTimeout(ctx, tombstoneDeliveryTimeout)
-			targetIdentityID := providerSet[target]
-			if !peerSessionConnected(r.peers.List(), targetIdentityID, target) {
-				connectErr := r.peers.Connect(passCtx, targetIdentityID, target)
-				if connectErr != nil && !peerSessionConnected(r.peers.List(), targetIdentityID, target) {
+			if !peerSessionConnected(r.peers.List(), target.identityID, target.targetNodeID) {
+				connectErr := r.peers.Connect(passCtx, target.identityID, target.targetNodeID)
+				if connectErr != nil && !peerSessionConnected(r.peers.List(), target.identityID, target.targetNodeID) {
 					cancel()
 					pending = true
 					continue
@@ -141,12 +180,12 @@ func (r *replicaTombstoneDeliveryReconciler) Reconcile(ctx context.Context, now 
 			}
 			scope := peerapi.RequestScope{
 				IdentityID: local.IdentityID, IdentityHead: identityState.HeadHash, NodeID: nodeInfo.NodeID,
-				TargetIdentityID: targetIdentityID, TargetNodeID: target,
+				TargetIdentityID: target.identityID, TargetNodeID: target.targetNodeID,
 				OwnerSubjectID: decision.OwnerSubjectID, ArchiveID: decision.ArchiveID,
-				Action: "archive.replicate", GrantChain: chain,
+				Action: "archive.replicate", GrantChain: target.grantChain,
 				Resolve: peerprotocol.IdentityResolver(resolve), Signer: r.node,
 			}
-			receipt, deliveryErr := r.peers.SubmitTombstoneWithReceipt(passCtx, target, scope, tombstone.Signed)
+			receipt, deliveryErr := r.peers.SubmitTombstoneWithReceipt(passCtx, target.targetNodeID, scope, tombstone.Signed)
 			cancel()
 			if deliveryErr != nil || receipt.Erasure == nil || receipt.Erasure.ArchiveID != decision.ArchiveID || receipt.Erasure.TombstoneHash != tombstone.Hash {
 				pending = true
@@ -155,7 +194,7 @@ func (r *replicaTombstoneDeliveryReconciler) Reconcile(ctx context.Context, now 
 			reported := make(map[string]struct{}, len(receipt.DeletionReports))
 			receiptPending := false
 			for _, report := range receipt.DeletionReports {
-				if report.Report.ProviderNodeID != target || report.Report.TombstoneHash != tombstone.Hash || report.Report.Status != string(lease.StatusDeleted) {
+				if report.Report.ProviderNodeID != target.targetNodeID || report.Report.TombstoneHash != tombstone.Hash || report.Report.Status != string(lease.StatusDeleted) {
 					receiptPending = true
 					break
 				}
@@ -171,7 +210,7 @@ func (r *replicaTombstoneDeliveryReconciler) Reconcile(ctx context.Context, now 
 			}
 			completeReports := true
 			for _, item := range leases {
-				if item.Offer.Offer.ArchiveID != decision.ArchiveID || item.Offer.Offer.ProviderNodeID != target ||
+				if item.Offer.Offer.ArchiveID != decision.ArchiveID || item.Offer.Offer.ProviderNodeID != target.targetNodeID ||
 					(item.Status != lease.StatusTerminating && item.Status != lease.StatusExpired && item.Status != lease.StatusUnconfirmed &&
 						!(item.Status == lease.StatusFailed && item.FailureCode != "tombstoned_before_acceptance")) {
 					continue
@@ -185,14 +224,14 @@ func (r *replicaTombstoneDeliveryReconciler) Reconcile(ctx context.Context, now 
 				pending = true
 				continue
 			}
-			if err := r.leases.MarkTombstoneDelivered(ctx, decision.ArchiveID, target, tombstone.Hash, now); err != nil {
+			if err := r.leases.MarkTombstoneDelivered(ctx, decision.ArchiveID, target.targetNodeID, tombstone.Hash, now); err != nil {
 				pending = true
 				continue
 			}
 			if acknowledged[tombstone.Hash] == nil {
 				acknowledged[tombstone.Hash] = make(map[string]struct{})
 			}
-			acknowledged[tombstone.Hash][target] = struct{}{}
+			acknowledged[tombstone.Hash][target.targetNodeID] = struct{}{}
 		}
 	}
 	if pending {
@@ -202,6 +241,35 @@ func (r *replicaTombstoneDeliveryReconciler) Reconcile(ctx context.Context, now 
 		return err
 	}
 	return nil
+}
+
+func tombstoneDeliveryCursorKey(cursor lease.TombstoneDeliveryCursor) string {
+	if cursor.TombstoneHash == "" && cursor.NodeID == "" {
+		return ""
+	}
+	return cursor.TombstoneHash + "\x00" + cursor.NodeID
+}
+
+// tombstoneDeliveryBatch sorts pending target work and rotates the bounded
+// batch after the previous planned batch. The caller persists the batch's
+// final target before any network attempt, including attempts that may fail.
+func tombstoneDeliveryBatch(work []replicaTombstoneDeliveryTarget, cursor string, limit int) []replicaTombstoneDeliveryTarget {
+	if len(work) == 0 || limit <= 0 {
+		return nil
+	}
+	sort.Slice(work, func(i, j int) bool { return work[i].key < work[j].key })
+	start := sort.Search(len(work), func(i int) bool { return work[i].key > cursor })
+	if start == len(work) {
+		start = 0
+	}
+	if limit > len(work) {
+		limit = len(work)
+	}
+	batch := make([]replicaTombstoneDeliveryTarget, limit)
+	for i := range batch {
+		batch[i] = work[(start+i)%len(work)]
+	}
+	return batch
 }
 
 // replicaTombstoneProviderTargets resolves each durable provider Node to one

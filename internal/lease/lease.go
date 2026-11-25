@@ -256,6 +256,13 @@ type TombstoneDelivery struct {
 	AcknowledgedAt string `json:"acknowledged_at"`
 }
 
+// TombstoneDeliveryCursor is bounded scheduling metadata for retry fairness.
+// It is not an acknowledgement and never changes deletion authority.
+type TombstoneDeliveryCursor struct {
+	TombstoneHash string `json:"tombstone_hash"`
+	NodeID        string `json:"node_id"`
+}
+
 type Authorizer interface {
 	Authorize(context.Context, string, string, string, string, authority.Principal, []authority.SignedGrant, time.Time) error
 }
@@ -279,6 +286,14 @@ type Options struct {
 }
 
 type snapshot struct {
+	Version        string                   `json:"state_version"`
+	Leases         []Lease                  `json:"leases"`
+	Tombstones     []TombstoneRecord        `json:"tombstones"`
+	DeliveryCursor *TombstoneDeliveryCursor `json:"tombstone_delivery_cursor,omitempty"`
+	Migrated       bool                     `json:"-"`
+}
+
+type snapshotV1 struct {
 	Version    string            `json:"state_version"`
 	Leases     []Lease           `json:"leases"`
 	Tombstones []TombstoneRecord `json:"tombstones"`

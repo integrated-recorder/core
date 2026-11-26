@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,21 +15,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/integrated-recorder/core/internal/archivesnapshot"
 	"github.com/integrated-recorder/core/internal/authn"
 	"github.com/integrated-recorder/core/internal/authority"
 	"github.com/integrated-recorder/core/internal/discovery"
 	"github.com/integrated-recorder/core/internal/globalidentity"
 	"github.com/integrated-recorder/core/internal/identityprotocol"
 	"github.com/integrated-recorder/core/internal/lease"
+	"github.com/integrated-recorder/core/internal/management"
 	"github.com/integrated-recorder/core/internal/nodeidentity"
 	"github.com/integrated-recorder/core/internal/peerapi"
+	"github.com/integrated-recorder/core/internal/replication"
 )
 
 type replicaInboxPeerFixture struct {
 	peerSessionManagerFixture
-	called int
-	scope  peerapi.RequestScope
-	offers []lease.PendingOffer
+	called      int
+	scope       peerapi.RequestScope
+	offers      []lease.PendingOffer
+	imported    bool
+	importScope peerapi.RequestScope
 }
 
 func (m *replicaInboxPeerFixture) ListReplicaOffers(_ context.Context, nodeID string, scope peerapi.RequestScope) ([]lease.PendingOffer, error) {
@@ -38,6 +44,32 @@ func (m *replicaInboxPeerFixture) ListReplicaOffers(_ context.Context, nodeID st
 		return nil, peerapi.ErrPeerNotConnected
 	}
 	return append([]lease.PendingOffer(nil), m.offers...), nil
+}
+
+func (m *replicaInboxPeerFixture) ImportReplicaFromPeer(_ context.Context, sourceNodeID string, scope peerapi.RequestScope, _ *lease.Store, _ *replication.Store,
+	_ peerapi.ReplicaAcceptanceSigner, _ replication.ReplicaCheckpointSigner, archiveID, snapshotID, leaseID string) (peerapi.ReplicaImportResult, error) {
+	m.imported = true
+	m.importScope = scope
+	if sourceNodeID != scope.TargetNodeID || archiveID != scope.ArchiveID || snapshotID != scope.SnapshotID || scope.OwnerSubjectID == "" || leaseID == "" {
+		return peerapi.ReplicaImportResult{}, peerapi.ErrInvalidRequest
+	}
+	return peerapi.ReplicaImportResult{
+		Lease: lease.Lease{
+			Offer: lease.SignedOffer{Offer: lease.Offer{
+				LeaseID: leaseID, ArchiveID: archiveID, SnapshotID: snapshotID,
+				OwnerSubjectID: scope.OwnerSubjectID, ProviderNodeID: scope.NodeID,
+			}},
+			Status: lease.StatusActive, OfferHash: "sha256:" + strings.Repeat("c", 64), Revision: "1",
+		},
+		Snapshot: archivesnapshot.Snapshot{SnapshotID: snapshotID},
+		Bundle:   replication.Bundle{Objects: []replication.ObjectBinding{{ObjectID: "ob_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}},
+	}, nil
+}
+
+type replicaInboxLeaseKeyResolver struct{}
+
+func (replicaInboxLeaseKeyResolver) VerifiedKey(context.Context, authority.Principal, time.Time) (ed25519.PublicKey, error) {
+	return nil, errors.New("unused in route fixture")
 }
 
 func TestReplicaInboxUsesCurrentNodeScopedReplicationAuthority(t *testing.T) {
@@ -270,6 +302,41 @@ func TestReplicaInboxUsesCurrentNodeScopedReplicationAuthority(t *testing.T) {
 		importScope.TargetIdentityID != sourceIdentityID || importScope.TargetNodeID != remoteNodeID ||
 		importScope.OwnerSubjectID != subject.ID || importScope.Action != "archive.replicate" {
 		t.Fatalf("cross-identity import scope was not bound to the authenticated source: ok=%v status=%d scope=%+v", scopeOK, importResponse.Code, importScope)
+	}
+
+	// Exercise the public authenticated import route, not only the scope helper.
+	// The fake importer stands at the peer transport boundary; all local route,
+	// session, HTTPS, current identity, source identity, OwnerSubject, and grant
+	// checks still run through the real handler.
+	leases, err := lease.Open(lease.Options{Root: filepath.Join(root, "replica-leases"), Keys: replicaInboxLeaseKeyResolver{}, LocalProviderNodeID: localNode.NodeID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertexts, err := replication.Open(filepath.Join(root, "replica-ciphertexts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	products, err := management.Open(filepath.Join(root, "products"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	importHandler := NewWithOptions(nil, nil, nil, Options{
+		Auth: users, Management: products, GlobalIdentity: identity, GlobalIdentityRegistry: registry,
+		IdentityFederation: federation, NodeIdentity: localNodeStore, OwnerAuthority: ownerStore,
+		PeerSessions: peers, ReplicaLeases: leases, ReplicaCiphertexts: ciphertexts,
+	})
+	importBody := `{"source_node_id":"` + remoteNodeID + `","owner_subject_id":"` + subject.ID +
+		`","grant_hash":"` + grantHash + `","archive_id":"` + archiveID + `","snapshot_id":"` + snapshotID +
+		`","lease_id":"` + leaseID + `"}`
+	fullImportResponse := httptest.NewRecorder()
+	fullImportRequest := authenticatedIdentityRequest(http.MethodPost, "https://recorder.example.com/api/replica-imports", importBody, session)
+	importHandler.ServeHTTP(fullImportResponse, fullImportRequest)
+	if fullImportResponse.Code != http.StatusOK || fullImportResponse.Header().Get("X-Audit-Status") != "recorded" || !peers.imported ||
+		peers.importScope.IdentityID != identityID || peers.importScope.NodeID != localNode.NodeID ||
+		peers.importScope.TargetIdentityID != sourceIdentityID || peers.importScope.TargetNodeID != remoteNodeID ||
+		peers.importScope.ArchiveID != archiveID || peers.importScope.SnapshotID != snapshotID ||
+		!strings.Contains(fullImportResponse.Body.String(), `"objects":1`) {
+		t.Fatalf("full cross-identity import status=%d audit=%q called=%v scope=%+v body=%s", fullImportResponse.Code, fullImportResponse.Header().Get("X-Audit-Status"), peers.imported, peers.importScope, fullImportResponse.Body.String())
 	}
 
 	// A Node connected under two different authenticated identities is

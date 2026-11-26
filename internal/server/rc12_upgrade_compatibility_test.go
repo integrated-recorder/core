@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/authority"
 	"github.com/integrated-recorder/core/internal/globalidentity"
 	"github.com/integrated-recorder/core/internal/nodeidentity"
 	"github.com/integrated-recorder/core/internal/pluginconfig"
@@ -284,6 +286,28 @@ func TestV02IdentityInitializationPreservesRC12LocalAccountsSessionsAndArchive(t
 	}
 	if err != nil || !instancePreserved {
 		t.Fatalf("RC12 Storage Provider instance changed: instances=%+v err=%v", instances, err)
+	}
+
+	// Creating a new Global Identity after opening an RC12 installation still
+	// must not silently convert the local Owner or legacy recording into global
+	// archive authority. Ownership requires an explicit recovery-root-signed
+	// OwnerSubject creation and archive claim.
+	_, genesis, signature, handle, credential, challenge, _ := signedTestGenesis(t)
+	if err := reopenedIdentity.CreateGenesis(genesis, signature, handle, credential, challenge); err != nil {
+		t.Fatalf("create an explicit post-migration Global Identity: %v", err)
+	}
+	ownerAuthority, err := authority.Open(root)
+	if err != nil {
+		t.Fatalf("open OwnerSubject authority store: %v", err)
+	}
+	identityResolver := authority.IdentityStateResolverFromLocalAndRegistry(reopenedIdentity, nil)
+	subjects, err := ownerAuthority.List(identityResolver, time.Now().UTC())
+	if err != nil || len(subjects) != 0 {
+		t.Fatalf("RC12 local Owner/archive were implicitly mapped into OwnerSubject authority: subjects=%+v err=%v", subjects, err)
+	}
+	if err := ownerAuthority.Authorize("os_"+strings.Repeat("A", 22), identityResolver, time.Now().UTC(),
+		authority.Principal{Kind: authority.PrincipalIdentity, ID: "untrusted"}, "arc_"+strings.Repeat("A", 22), "", "archive.view"); !errors.Is(err, authority.ErrAuthorityStore) {
+		t.Fatalf("archive authority existed without an explicit signed claim: %v", err)
 	}
 }
 

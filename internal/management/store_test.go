@@ -349,6 +349,24 @@ func TestWatchAuditActionsAreExplicitlyAllowlisted(t *testing.T) {
 	}
 }
 
+func TestProductMutationAuditActionsAreAllowlisted(t *testing.T) {
+	store, _ := openTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	actions := []string{
+		"archive_encrypted_for_replication", "archive_history_rekey_prepared", "login_renamed",
+		"replica_import_completed", "replica_offer_created", "replica_offer_retried",
+		"replica_readback_verified", "role_changed", "role_created", "role_deleted",
+		"user_deleted", "user_roles_changed",
+	}
+	for i, action := range actions {
+		if err := store.AppendAudit(AuditEvent{
+			ID: fmt.Sprintf("product-audit-%d", i), Type: action, At: now.Add(time.Duration(i) * time.Second), ObjectID: "opaque-object-id",
+		}); err != nil {
+			t.Fatalf("product mutation audit action %q rejected: %v", action, err)
+		}
+	}
+}
+
 func TestForgetRecordingRemovesOnlyManagementProjectionsAndIsIdempotent(t *testing.T) {
 	store, root := openTestStore(t)
 	if err := store.SetTags(testRecordingID, []string{"keep? no", "archive"}); err != nil {

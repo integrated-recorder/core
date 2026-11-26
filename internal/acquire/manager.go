@@ -2003,6 +2003,10 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 	}); err != nil {
 		return nil, errors.New("recording storage could not be initialized")
 	}
+	// Capture the creation response before publishing the entry or starting its
+	// worker. The worker may append timed-event metadata immediately; cloning
+	// this shared Recording afterward would race with canonical metadata updates.
+	created := clone(recording)
 	workerCtx, cancel := context.WithCancel(context.Background())
 	var ownershipCopy *OwnershipToken
 	if owner != nil {
@@ -2020,7 +2024,7 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 	m.managementEntryIDsValid = false
 	m.mu.Unlock()
 	go m.run(workerCtx, e, cloneMediaSource(media))
-	return clone(recording), nil
+	return created, nil
 }
 
 func validOwnershipToken(owner OwnershipToken) bool {

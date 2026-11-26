@@ -505,6 +505,9 @@ func TestHandoverDrainsTimedEventStreamAndResumesDurableCursor(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("source timed event was not durably acknowledged")
 	}
+	if recording.ArchiveRevision != 1 || recording.ShardedArchive == nil || recording.ShardedArchive.TimedEventCount != 0 {
+		t.Fatalf("StartResolved response changed after the worker committed a timed event: revision=%d summary=%+v", recording.ArchiveRevision, recording.ShardedArchive)
+	}
 	select {
 	case <-transport.started:
 	case <-time.After(3 * time.Second):

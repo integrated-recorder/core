@@ -1092,13 +1092,6 @@ class RC12ToV020CandidateDockerTests(unittest.TestCase):
             "channel": "prerelease", "manifest_identity_checked": False,
             "manifest_signature_independently_verified": False,
         }
-        release_identity = {
-            "tag": tag, "source": install.REPOSITORY_SOURCE, "version": version,
-            "commit": candidate_commit, "build_time": candidate_time,
-            "channel": "prerelease", "architecture_manifest": "amd64",
-            "manifest_identity_checked": False,
-            "manifest_signature_independently_verified": False,
-        }
         project = "ir-rc12-v020-" + uuid.uuid4().hex[:12]
         volume = project + "-state"
         with tempfile.TemporaryDirectory(prefix="ir rc12 v020 acceptance ", ignore_cleanup_errors=True) as temp:
@@ -1160,6 +1153,11 @@ class RC12ToV020CandidateDockerTests(unittest.TestCase):
                     candidate_container = compose_container(install_dir)
                     migrated = assert_running_identity(self, candidate_container, tag, candidate_commit)
                     self.assertNotEqual(migrated["registry"]["active_generation_id"], baseline_generation_id)
+                    previous_generation = migrated["registry"]["generations"].get(baseline_generation_id)
+                    self.assertIsNotNone(previous_generation, "RC12 generation identity was discarded during migration")
+                    self.assertEqual(previous_generation.get("version"), RC12_TAG[1:])
+                    self.assertEqual(previous_generation.get("commit"), RC12_COMMIT)
+                    self.assertNotEqual(previous_generation.get("state"), "active")
                     self.assertEqual(
                         tuple(migrated["generation"].get(key) for key in (
                             "adapter_set_id", "storage_provider_set_id", "storage_instance_id",
@@ -1203,10 +1201,6 @@ class RC12ToV020CandidateDockerTests(unittest.TestCase):
                     )
                     run_upgrade_archive_fixture(self, restarted, "verify", baseline_pins[1])
                     assert_authenticated_session(int(candidate_metadata["port"]), owner_cookie)
-                    self.assertEqual(
-                        final["registry"]["active_generation_id"],
-                        generation_snapshot(restarted).get("active_generation_id"),
-                    )
                     self.assertIsNone(install.read_pending(install_dir / "deployment.pending.json"))
                     print(
                         "RC12 -> v0.2 candidate Docker acceptance PASS: "

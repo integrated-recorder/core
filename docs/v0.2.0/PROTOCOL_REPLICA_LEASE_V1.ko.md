@@ -58,7 +58,7 @@ Authenticated Peer API의 `replica.tombstone` 명령은 비어 있는 `snapshot_
 
 아직 완료되지 않은 작업:
 
-- 실제 RC12 archive catalog/snapshot, cryptoarchive output 및 peer API를 background coordinator로 자동화하고 Offer 생성·provider 선택·수락·transfer를 scheduling하는 기능.
+- Control Plane의 bounded background pass는 sealed snapshot, 이미 준비된 암호화 manifest/Owner recovery envelope, 최신 OwnerSubject 복제 정책과 현재 capability를 확인해 연결·인가된 Provider 후보에 signed Offer를 생성한다. Provider의 명시적 저장 동의는 자동화하지 않으며, 수락된 Lease만 transfer reconciler가 재개·전송한다. 따라서 첫 snapshot encryption/recovery-key preparation을 제품 UI의 명시적 사용자 절차 없이 시작하거나, Provider consent를 대체하는 end-to-end 자동 enrollment은 미완료다. 현재 회귀시험은 `TestReplicaOfferReconcilerCreatesBoundedOwnerAuthorizedOffersAndIsIdempotent` 및 `TestReplicaTransferReconcilerResumesOnlyExplicitlyAcceptedLiveLeases`이며, 실제 독립 Node 수렴은 아래 acceptance gate에 남는다.
 - 서로 독립적인 실제 Node와 Discovery 환경에서 offer/accept/checkpoint/renewal/tombstone 전달 시 최신성·폐기·fork 반영을 end-to-end 검증하는 acceptance.
 - NFS/WAN partition, malicious provider receipt, node restart, quota/storage-full을 포함한 독립 Linux two-node chaos 시험.
 - 로컬 content-addressed digest dedup과 설정 가능한 Provider lease-capacity 예약/반납 회귀시험은 추가됐다. readback 기반 lease failure 및 대체 Provider Offer 재조정은 구현됐지만, 제공자 손상 주입을 실제 peer transport로 검증하고 재시작·WAN/NFS·quota/full-disk 환경에서 repair lifecycle을 acceptance하는 작업은 남아 있다.

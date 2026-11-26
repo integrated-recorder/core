@@ -2,6 +2,8 @@
 
 요구사항별 실제 구현 위치, 실행된 검증, 미해결 조건은 [Requirement-to-Evidence Matrix](REQUIREMENT_EVIDENCE.ko.md)에 추적한다. 마일스톤 표의 상태는 해당 acceptance gate가 모두 완료됐다는 뜻이 아니다.
 
+최신 로컬 검증은 Requirement-to-Evidence Matrix의 날짜·대상 SHA별 항목을 기준으로 확인한다. 아래의 날짜가 표시된 개발환경 기록은 그 시점의 스냅샷이며, 이후 Matrix에 추가된 증거를 포함하지 않을 수 있다.
+
 기준 소스는 `v0.1.0-rc.12`의 commit `d4a14d4fab908a0cb415dacd47e7f0d9bc63be8d`입니다. 이 문서는 구현 완료를 선언하지 않고, 단계별 증거와 미완료 gate를 기록합니다.
 
 | 단계 | 목표 | 상태 | 완료 증거 |

@@ -26,15 +26,32 @@ const (
 )
 
 type replicaTombstoneDeliveryReconciler struct {
-	leases    *lease.Store
+	leases    replicaTombstoneLeaseStore
 	identity  *globalidentity.Store
 	registry  *globalidentity.HistoryRegistry
 	federated *discovery.FederationClient
 	authority *authority.Store
 	node      *nodeidentity.Store
-	peers     *peerapi.SessionManagerSlot
+	peers     replicaTombstonePeerSessions
 
 	mu sync.Mutex
+}
+
+// These narrow boundaries keep the durable lease and authenticated peer
+// behaviors replaceable in lifecycle tests without changing reconciliation
+// policy or introducing a generic transport abstraction.
+type replicaTombstoneLeaseStore interface {
+	Snapshot(context.Context) ([]lease.Lease, []lease.TombstoneRecord, error)
+	GetTombstoneDeliveryCursor(context.Context) (lease.TombstoneDeliveryCursor, error)
+	SetTombstoneDeliveryCursor(context.Context, lease.TombstoneDeliveryCursor) error
+	ReportDeletion(context.Context, lease.SignedDeletionReport) (lease.Lease, error)
+	MarkTombstoneDelivered(context.Context, string, string, string, time.Time) error
+}
+
+type replicaTombstonePeerSessions interface {
+	List() []peerapi.SessionInfo
+	Connect(context.Context, string, string) error
+	SubmitTombstoneWithReceipt(context.Context, string, peerapi.RequestScope, lease.SignedTombstone) (peerapi.TombstoneReceipt, error)
 }
 
 type replicaTombstoneDeliveryTarget struct {

@@ -59,4 +59,6 @@ Pion fixture의 추가 누락 및 M6 로컬 수직 테스트: `194ef0f26aceb3801
 
 M6 rekey HTTP fail-closed 경계 (`f8d0b2012f2dbf8bd1274693160382489bae3d6a`): 실제 sealed archive snapshot과 인증된 HTTPS/CSRF 요청을 이용해 클라이언트가 `recipient_public_key`를 주입하면 `archive_rekey_request_invalid`로 거부되고 rekey manager가 호출되지 않는지 확인했다. `go test ./internal/server -run '^TestArchiveReplicaRekeyRejectsCallerSuppliedRecipientPublicKey$' -count=1` 및 해당 race 테스트 통과. 이 테스트는 수신자 공개키가 요청자가 지정할 수 없는 서버 검증 경계임을 확인하지만, federated identity resolver가 성공 경로에서 선택한 수신자 상태를 manager까지 전달하는 긍정 end-to-end 경로는 검증하지 않는다. 독립 노드의 transfer/rekey 수렴 acceptance도 미완료다.
 
+M0 archive snapshot parser fuzz (`bb75220ada2c0df9d7c7af5775719eab73942b75`): canonical sealed snapshot seed에서 시작해 `archivesnapshot.Parse`가 받아들이는 모든 fuzz 입력이 `Marshal` 후 원래 바이트와 동일하게 왕복하는지 확인한다. malformed, duplicate-field 및 trailing-byte seed를 포함했다. `go test ./internal/archivesnapshot -count=1`, `go test -race ./internal/archivesnapshot -count=1`, 3초 fuzz campaign(75,141 executions, 신규 interesting input 24개) 통과. 이 검증은 parser panic/비정규 accept 경계를 다루며 전체 프로토콜 악의성, 긴 fuzz soak, 교차 구현체/독립 노드 검증은 증명하지 않는다.
+
 **Release eligibility는 NO-GO다.** 독립 운영 노드/Discovery, 외부 NAT/TURN, 실제 Docker upgrade, 물리 iPhone Safari 및 독립 보안 검토 같은 필수 acceptance 게이트가 남아 있다. Docker와 실기기 검증은 이 개발 세션에서 실행하지 않는다.

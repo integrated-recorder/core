@@ -429,6 +429,43 @@ func TestConcurrentValidNodeSuccessorsPersistEvidenceAndFreezeIdentity(t *testin
 	}
 }
 
+func TestNodeEventRetryOnRejectedForkBranchDoesNotReportSuccess(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, signature, userHandle, credential, challenge := testGenesis(t)
+	if err := store.CreateGenesis(genesis, signature, userHandle, credential, challenge); err != nil {
+		t.Fatal(err)
+	}
+	initial, _, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, acceptedSignature, _ := signNodeDelegate(t, initial.IdentityID, "1", initial.HeadHash, bytes.Repeat([]byte{0x43}, 32))
+	rejected, rejectedSignature, _ := signNodeDelegate(t, initial.IdentityID, "1", initial.HeadHash, bytes.Repeat([]byte{0x44}, 32))
+	if err := store.ApplyNodeEvent(accepted, acceptedSignature); err != nil {
+		t.Fatalf("apply first valid successor: %v", err)
+	}
+	if err := store.ApplyNodeEvent(rejected, rejectedSignature); !errors.Is(err, ErrIdentityFork) {
+		t.Fatalf("competing valid successor did not freeze identity: %v", err)
+	}
+	frozenBefore, exists, err := store.Snapshot()
+	if err != nil || !exists || !frozenBefore.Frozen || frozenBefore.ForkCount != 1 {
+		t.Fatalf("fork evidence not retained: snapshot=%+v exists=%v err=%v", frozenBefore, exists, err)
+	}
+	if err := store.ApplyNodeEvent(accepted, acceptedSignature); err != nil {
+		t.Fatalf("exact retry of active-history event should remain idempotent: %v", err)
+	}
+	if err := store.ApplyNodeEvent(rejected, rejectedSignature); !errors.Is(err, ErrIdentityFrozen) {
+		t.Fatalf("event present only in rejected fork evidence must not report success: %v", err)
+	}
+	frozenAfter, exists, err := store.Snapshot()
+	if err != nil || !exists || !frozenAfter.Frozen || frozenAfter.HeadHash != frozenBefore.HeadHash || frozenAfter.Sequence != frozenBefore.Sequence || frozenAfter.ForkCount != frozenBefore.ForkCount {
+		t.Fatalf("rejected-branch retry changed frozen authority: before=%+v after=%+v exists=%v err=%v", frozenBefore, frozenAfter, exists, err)
+	}
+}
+
 func TestRecoveryRootForkResolutionSelectsExplicitBranchAndPersists(t *testing.T) {
 	root := t.TempDir()
 	store, err := Open(root)
@@ -513,6 +550,112 @@ func TestRecoveryRootForkResolutionSelectsExplicitBranchAndPersists(t *testing.T
 	final, _, err := reopened.Snapshot()
 	if err != nil || final.Frozen || len(final.NodeIDs) != 0 {
 		t.Fatalf("post-resolution revoke projection=%+v err=%v", final, err)
+	}
+}
+
+func TestForkResolutionRetryRejectsCompetingResolutionEvidence(t *testing.T) {
+	genesis, genesisSignature, userHandle, credential, challenge := testGenesis(t)
+	identity, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := identity.CreateGenesis(genesis, genesisSignature, userHandle, credential, challenge); err != nil {
+		t.Fatal(err)
+	}
+	initial, _, err := identity.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, firstSignature, _ := signNodeDelegate(t, initial.IdentityID, "1", initial.HeadHash, bytes.Repeat([]byte{0x71}, 32))
+	second, secondSignature, _ := signNodeDelegate(t, initial.IdentityID, "1", initial.HeadHash, bytes.Repeat([]byte{0x72}, 32))
+	if err := identity.ApplyNodeEvent(first, firstSignature); err != nil {
+		t.Fatal(err)
+	}
+	if err := identity.ApplyNodeEvent(second, secondSignature); !errors.Is(err, ErrIdentityFork) {
+		t.Fatalf("competing signed successor did not freeze identity: %v", err)
+	}
+	forkedHistory := mustExportHistory(t, identity)
+
+	stores := make([]*Store, 2)
+	resolutions := make([][]byte, 2)
+	signatures := make([][]byte, 2)
+	rootKey := rootRecoveryPrivateKey(t)
+	for i := range stores {
+		stores[i], err = Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stores[i].CreateGenesis(genesis, genesisSignature, userHandle, credential, challenge); err != nil {
+			t.Fatal(err)
+		}
+		if err := stores[i].ImportHistory(forkedHistory, ""); err != nil && !errors.Is(err, ErrIdentityFork) {
+			t.Fatalf("store %d could not import initial fork: %v", i, err)
+		}
+		forked, exists, err := stores[i].Snapshot()
+		if err != nil || !exists || !forked.Frozen {
+			t.Fatalf("store %d did not retain initial fork: snapshot=%+v exists=%v err=%v", i, forked, exists, err)
+		}
+		choices, err := stores[i].ForkChoices()
+		if err != nil || len(choices) != 1 {
+			t.Fatalf("store %d choices=%+v err=%v", i, choices, err)
+		}
+		choice := choices[0]
+		// Both roots explicitly select the same observed branch, but the
+		// independently signed resolution events differ. They are valid
+		// competing successors of that branch head and therefore become direct
+		// fork evidence when histories are merged.
+		selected := choice.FirstHeadHash
+		payload := map[string]any{
+			"fork_id": choice.ForkID, "previous_event_hash": choice.PreviousHash,
+			"first_head_hash": choice.FirstHeadHash, "second_head_hash": choice.SecondHeadHash,
+			"selected_head_hash": selected,
+		}
+		publicKey := rootKey.Public().(ed25519.PublicKey)
+		keyID, err := identityprotocol.KeyID(publicKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		event := map[string]any{
+			"event_version": identityprotocol.EventVersion, "identity_id": initial.IdentityID, "sequence": "2",
+			"previous_event_hash": selected, "operation": "fork_resolve",
+			"issued_at":     time.Date(2030, time.January, 1+i, 0, 0, 0, 0, time.UTC).Format(time.RFC3339),
+			"signer_key_id": keyID, "signer_public_key": base64.RawURLEncoding.EncodeToString(publicKey), "payload": payload,
+		}
+		input, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolutions[i], signatures[i], err = identityprotocol.SignEvent(input, rootKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stores[i].ApplyForkResolution(resolutions[i], signatures[i]); err != nil {
+			t.Fatalf("store %d could not apply root-signed resolution: %v", i, err)
+		}
+	}
+
+	// Importing the other valid root-signed decision must freeze the local
+	// authority instead of silently choosing one resolution event.
+	if err := stores[0].ImportHistory(mustExportHistory(t, stores[1]), ""); !errors.Is(err, ErrIdentityFork) {
+		t.Fatalf("competing resolution history did not freeze store: %v", err)
+	}
+	frozenBefore, exists, err := stores[0].Snapshot()
+	if err != nil || !exists || !frozenBefore.Frozen {
+		t.Fatalf("competing resolutions did not leave a frozen store: snapshot=%+v exists=%v err=%v", frozenBefore, exists, err)
+	}
+
+	// The selected event is authoritative and exact retries remain idempotent.
+	if err := stores[0].ApplyForkResolution(resolutions[0], signatures[0]); err != nil {
+		t.Fatalf("exact retry of selected resolution should succeed: %v", err)
+	}
+	// The other event exists only as fork evidence. Treating that evidence as
+	// an applied resolution would falsely report success while still frozen.
+	if err := stores[0].ApplyForkResolution(resolutions[1], signatures[1]); err == nil {
+		t.Fatal("non-selected resolution found only in fork evidence was reported as applied")
+	}
+	frozenAfter, exists, err := stores[0].Snapshot()
+	if err != nil || !exists || !frozenAfter.Frozen || frozenAfter.HeadHash != frozenBefore.HeadHash || frozenAfter.Sequence != frozenBefore.Sequence || frozenAfter.ForkCount != frozenBefore.ForkCount {
+		t.Fatalf("rejected non-selected retry changed frozen authority: before=%+v after=%+v exists=%v err=%v", frozenBefore, frozenAfter, exists, err)
 	}
 }
 

@@ -87,7 +87,10 @@ func (s *Store) ApplyForkResolution(canonicalEvent, signature []byte) error {
 	if err != nil {
 		return err
 	}
-	if eventKnown(stored, event.EventHash) {
+	// Only an event in the active authoritative history has already been
+	// applied. Fork evidence is retained for audit and may include a competing
+	// root-signed resolution that was never selected.
+	if eventInHistory(stored.History, event.EventHash) {
 		return nil
 	}
 	if !stored.Frozen {
@@ -447,12 +450,64 @@ func forkResolvedInHistory(history []signedEvent, fork forkEvidence) bool {
 
 func hasUnresolvedForks(stored record) bool {
 	for _, fork := range stored.ForkEvidence {
+		// A recovery-root resolution is itself authority-bearing. If two valid
+		// branches retain different decisions for the same observed fork, the
+		// presence of either decision in the selected history must not make the
+		// conflict appear resolved.
+		if forkHasConflictingResolutionEvidence(stored, fork) {
+			return true
+		}
 		if forkResolvedInHistory(stored.History, fork) || forkOrphanedByResolution(stored, fork) {
 			continue
 		}
 		first, second := normalizedForkBranches(fork)
 		if branchPresent(stored.History, first, fork.PreviousHash == "") != branchPresent(stored.History, second, fork.PreviousHash == "") {
 			return true
+		}
+	}
+	return false
+}
+
+func forkHasConflictingResolutionEvidence(stored record, fork forkEvidence) bool {
+	if len(stored.History) == 0 {
+		return false
+	}
+	root, err := identityprotocol.VerifyEvent(stored.History[0].Canonical, stored.History[0].Signature)
+	if err != nil {
+		return false
+	}
+	forkID, err := forkEvidenceID(fork)
+	if err != nil {
+		return false
+	}
+	firstBranch, secondBranch := normalizedForkBranches(fork)
+	var selectedHead string
+	for _, branch := range [][]signedEvent{firstBranch, secondBranch} {
+		for _, signed := range branch {
+			event, verifyErr := identityprotocol.VerifyEvent(signed.Canonical, signed.Signature)
+			if verifyErr != nil || event.Operation != "fork_resolve" || !bytes.Equal(event.SignerPublicKey, root.SignerPublicKey) {
+				continue
+			}
+			resolution, parseErr := parseForkResolution(event)
+			if parseErr != nil || resolution.ForkID != forkID || resolution.PreviousHash != fork.PreviousHash {
+				continue
+			}
+			if resolution.SelectedHead != resolution.FirstHeadHash && resolution.SelectedHead != resolution.SecondHeadHash {
+				continue
+			}
+			if _, ok := branchThroughHash(firstBranch, resolution.FirstHeadHash); !ok {
+				continue
+			}
+			if _, ok := branchThroughHash(secondBranch, resolution.SecondHeadHash); !ok {
+				continue
+			}
+			if selectedHead == "" {
+				selectedHead = resolution.SelectedHead
+				continue
+			}
+			if selectedHead != resolution.SelectedHead {
+				return true
+			}
 		}
 	}
 	return false

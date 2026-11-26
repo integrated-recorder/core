@@ -526,8 +526,14 @@ func (s *Store) ApplyNodeEvent(canonicalEvent, signature []byte) error {
 	if verified.IdentityID != stored.IdentityID {
 		return ErrInvalidEvent
 	}
-	if eventKnown(stored, verified.EventHash) {
+	if eventInHistory(stored.History, verified.EventHash) {
 		return nil
+	}
+	if eventKnown(stored, verified.EventHash) {
+		if stored.Frozen {
+			return ErrIdentityFrozen
+		}
+		return ErrInvalidEvent
 	}
 	if err := validateNodeSuccessor(stored, verified); err != nil {
 		return err
@@ -570,11 +576,8 @@ func (s *Store) ApplyNodeEvent(canonicalEvent, signature []byte) error {
 }
 
 func eventKnown(stored record, eventHash string) bool {
-	for _, entry := range stored.History {
-		event, err := identityprotocol.VerifyEvent(entry.Canonical, entry.Signature)
-		if err == nil && event.EventHash == eventHash {
-			return true
-		}
+	if eventInHistory(stored.History, eventHash) {
+		return true
 	}
 	for _, fork := range stored.ForkEvidence {
 		for _, entry := range []signedEvent{fork.First, fork.Second} {
@@ -582,6 +585,16 @@ func eventKnown(stored record, eventHash string) bool {
 			if err == nil && event.EventHash == eventHash {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func eventInHistory(history []signedEvent, eventHash string) bool {
+	for _, entry := range history {
+		event, err := identityprotocol.VerifyEvent(entry.Canonical, entry.Signature)
+		if err == nil && event.EventHash == eventHash {
+			return true
 		}
 	}
 	return false

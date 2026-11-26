@@ -124,6 +124,50 @@ func (s *Store) Get(ctx context.Context, leaseID string) (Lease, error) {
 	return result, err
 }
 
+// FailReadbackMismatch marks an outbound replica lease failed
+// after the caller has independently observed an exact ciphertext size or
+// digest mismatch on source-side readback. This records that observation; it
+// is not proof of provider malice or future durability. The expected revision
+// and offer hash make the observation conditional on the exact active lease
+// generation that was checked by the caller.
+func (s *Store) FailReadbackMismatch(ctx context.Context, leaseID, offerHash, expectedRevision string, observedAt time.Time) (Lease, error) {
+	if s == nil || ctx == nil || !leaseIDPattern.MatchString(leaseID) || !hashPattern.MatchString(offerHash) || !decimal(expectedRevision) || observedAt.IsZero() {
+		return Lease{}, ErrInvalid
+	}
+	var result Lease
+	err := s.withLocked(ctx, func(state *snapshot) (bool, error) {
+		current, index := findLease(state.Leases, leaseID)
+		if index < 0 {
+			return false, ErrNotFound
+		}
+		if findTombstone(state.Tombstones, current.Offer.Offer.ArchiveID) != nil {
+			return false, ErrDenied
+		}
+		if current.Revision != expectedRevision || current.OfferHash != offerHash {
+			return false, ErrConflict
+		}
+		// A retry against the failed revision is idempotent. Retrying with the
+		// old active revision remains a conflict after the first commit.
+		if current.Status == StatusFailed && current.FailureCode == "ciphertext_readback_mismatch" {
+			result = cloneLease(current)
+			return false, nil
+		}
+		if current.Status != StatusActive || s.localProviderNodeID == "" || current.Offer.Offer.ProviderNodeID == s.localProviderNodeID {
+			return false, ErrTransition
+		}
+		current.Status = StatusFailed
+		current.FailureCode = "ciphertext_readback_mismatch"
+		current.FailureAt = observedAt.UTC().Truncate(time.Second).Format(time.RFC3339)
+		if err := bumpLease(&current); err != nil {
+			return false, err
+		}
+		state.Leases[index] = current
+		result = cloneLease(current)
+		return true, nil
+	})
+	return result, err
+}
+
 // OfferForProvider returns the original source-Node-signed offer only while it is
 // still awaiting delivery to its designated provider. It does not authorize
 // acceptance; the receiving Store must pass the returned value through
@@ -1243,7 +1287,11 @@ func (s *Store) validateState(ctx context.Context, state snapshot) error {
 		if lease.Status == StatusDeleted && (lease.DeletionReport == nil || lease.DeletionReport.Report.Status != string(StatusDeleted)) {
 			return ErrInvalid
 		}
-		if lease.FailureCode != "" && lease.FailureCode != "tombstoned_before_acceptance" {
+		if lease.FailureCode != "" && lease.FailureCode != "tombstoned_before_acceptance" && lease.FailureCode != "ciphertext_readback_mismatch" {
+			return ErrInvalid
+		}
+		if lease.FailureAt != "" && (lease.FailureCode != "ciphertext_readback_mismatch" ||
+			(lease.Status != StatusFailed && lease.Status != StatusDeleted && lease.Status != StatusUnconfirmed) || parseTime(lease.FailureAt).IsZero()) {
 			return ErrInvalid
 		}
 		if len(lease.Checkpoints) > len(lease.Offer.Offer.EncryptedObjectSet) {

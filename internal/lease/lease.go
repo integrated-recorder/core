@@ -238,6 +238,7 @@ type Lease struct {
 	DeletionReport         *SignedDeletionReport `json:"deletion_report,omitempty"`
 	TerminationRequestedAt string                `json:"termination_requested_at,omitempty"`
 	FailureCode            string                `json:"failure_code,omitempty"`
+	FailureAt              string                `json:"failure_at,omitempty"`
 	Revision               string                `json:"revision"`
 }
 

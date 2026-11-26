@@ -1008,6 +1008,156 @@ func TestProviderCapacityFailsClosedWithoutLocalNodeIdentity(t *testing.T) {
 	}
 }
 
+func activeOutboundLease(t *testing.T) (leaseFixture, Lease) {
+	t.Helper()
+	f := newLeaseFixture(t)
+	ctx := context.Background()
+	signed := f.signedOffer(t, f.offer.LeaseID)
+	if _, err := f.store.IssueOffer(ctx, signed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Accept(ctx, f.signedAcceptance(t, signed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.BeginTransfer(ctx, f.offer.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	object := f.offer.EncryptedObjectSet[0]
+	checkpoint, err := SignCheckpoint(Checkpoint{
+		Version: ProtocolVersion, LeaseID: f.offer.LeaseID, OfferHash: f.offerHash,
+		ProviderNodeID: f.providerID, ObjectID: object.ObjectID,
+		CommittedOffset: object.CiphertextSize, RecordedAt: f.now.Add(2 * time.Second).Format(time.RFC3339),
+	}, f.providerPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Checkpoint(ctx, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	active, err := f.store.VerifyReplica(ctx, f.offer.LeaseID, objectMap{object.ObjectID: f.ciphertext})
+	if err != nil || active.Status != StatusActive {
+		t.Fatalf("activate outbound fixture: lease=%+v err=%v", active, err)
+	}
+	f.store.localProviderNodeID = "nd_zzzzzzzzzzzzzzzzzzzzzz"
+	return f, active
+}
+
+func TestMarkOutboundCiphertextReadbackMismatch(t *testing.T) {
+	t.Run("success and retry idempotency", func(t *testing.T) {
+		f, active := activeOutboundLease(t)
+		failed, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, active.OfferHash, active.Revision, f.now.Add(3*time.Second))
+		if err != nil || failed.Status != StatusFailed || failed.FailureCode != "ciphertext_readback_mismatch" || failed.FailureAt == "" {
+			t.Fatalf("failed=%+v err=%v", failed, err)
+		}
+		if failed.Revision == active.Revision || !reflect.DeepEqual(failed.Acceptance, active.Acceptance) || !reflect.DeepEqual(failed.Checkpoints, active.Checkpoints) || !reflect.DeepEqual(failed.Renewals, active.Renewals) {
+			t.Fatal("failure transition did not preserve lease evidence or advance revision")
+		}
+		retried, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, failed.OfferHash, failed.Revision, f.now.Add(3*time.Second))
+		if err != nil || !reflect.DeepEqual(retried, failed) {
+			t.Fatalf("same-revision retry=%+v err=%v", retried, err)
+		}
+		if _, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, active.OfferHash, active.Revision, f.now.Add(3*time.Second)); !errors.Is(err, ErrConflict) {
+			t.Fatalf("stale revision retry error=%v", err)
+		}
+	})
+
+	t.Run("stale revision or offer hash", func(t *testing.T) {
+		f, active := activeOutboundLease(t)
+		if _, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, active.OfferHash, "999", f.now.Add(3*time.Second)); !errors.Is(err, ErrConflict) {
+			t.Fatalf("stale revision error=%v", err)
+		}
+		wrongHash := "sha256:" + strings.Repeat("f", 64)
+		if _, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, wrongHash, active.Revision, f.now.Add(3*time.Second)); !errors.Is(err, ErrConflict) {
+			t.Fatalf("stale offer hash error=%v", err)
+		}
+	})
+
+	t.Run("non-active lease", func(t *testing.T) {
+		f := newLeaseFixture(t)
+		f.store.localProviderNodeID = "nd_zzzzzzzzzzzzzzzzzzzzzz"
+		offer, err := f.store.IssueOffer(context.Background(), f.signedOffer(t, f.offer.LeaseID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, offer.OfferHash, offer.Revision, f.now.Add(3*time.Second)); !errors.Is(err, ErrTransition) {
+			t.Fatalf("non-active transition error=%v", err)
+		}
+	})
+
+	t.Run("tombstoned archive", func(t *testing.T) {
+		f, active := activeOutboundLease(t)
+		if _, err := f.store.CreateTombstone(context.Background(), f.offer.OwnerSubjectID, f.offer.ArchiveID, "owner_requested", f.now.Add(time.Minute), func(tombstone Tombstone) (SignedTombstone, error) {
+			return SignTombstone(tombstone, f.offer.OwnerSubjectID, f.owner, f.chain, f.ownerPrivate)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, active.OfferHash, active.Revision, f.now.Add(3*time.Second)); !errors.Is(err, ErrDenied) {
+			t.Fatalf("tombstoned transition error=%v", err)
+		}
+	})
+
+	t.Run("concurrent stale observation", func(t *testing.T) {
+		f, active := activeOutboundLease(t)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var succeeded, conflicted int
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, active.OfferHash, active.Revision, f.now.Add(3*time.Second))
+				mu.Lock()
+				defer mu.Unlock()
+				if err == nil {
+					succeeded++
+				} else if errors.Is(err, ErrConflict) {
+					conflicted++
+				} else {
+					t.Errorf("race result: %v", err)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if succeeded != 1 || conflicted != 1 {
+			t.Fatalf("success=%d conflict=%d, want one each", succeeded, conflicted)
+		}
+	})
+}
+
+func TestReadbackFailureMetadataSurvivesAuthorizedTombstoneDeletion(t *testing.T) {
+	f, active := activeOutboundLease(t)
+	failed, err := f.store.FailReadbackMismatch(context.Background(), f.offer.LeaseID, active.OfferHash, active.Revision, f.now.Add(3*time.Second))
+	if err != nil || failed.Status != StatusFailed {
+		t.Fatalf("mark verified mismatch: status=%s err=%v", failed.Status, err)
+	}
+	tombstone, err := f.store.CreateTombstone(context.Background(), f.offer.OwnerSubjectID, f.offer.ArchiveID,
+		"owner_requested", f.now.Add(time.Minute), func(value Tombstone) (SignedTombstone, error) {
+			return SignTombstone(value, f.offer.OwnerSubjectID, f.owner, f.chain, f.ownerPrivate)
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := DeletionReport{
+		Version: ProtocolVersion, LeaseID: f.offer.LeaseID, OfferHash: failed.OfferHash,
+		ProviderNodeID: f.providerID, Status: string(StatusDeleted),
+		ReportedAt: f.now.Add(2 * time.Minute).Format(time.RFC3339), TombstoneHash: tombstone.Hash,
+	}
+	signed, err := SignDeletionReport(report, f.providerPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := f.store.ReportDeletion(context.Background(), signed)
+	if err != nil || deleted.Status != StatusDeleted || deleted.FailureCode != "ciphertext_readback_mismatch" || deleted.FailureAt != failed.FailureAt {
+		t.Fatalf("authorized deletion did not preserve failure history: lease=%+v err=%v", deleted, err)
+	}
+	if _, err := Open(Options{Root: f.store.root, Keys: f.store.keys, Authorizer: f.store.authorizer, Now: f.store.now}); err != nil {
+		t.Fatalf("reopen after deletion rejected preserved failure history: %v", err)
+	}
+}
+
 func TestWrongTombstonePredecessorConflictsWithoutFreezing(t *testing.T) {
 	f := newLeaseFixture(t)
 	ctx := context.Background()

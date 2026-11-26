@@ -780,6 +780,7 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 	}
 	replicaImportGate := replication.NewImportGate()
 	var replicaTransferPass func(context.Context, time.Time) error
+	var replicaIntegrityPass func(context.Context, time.Time) error
 	var replicaOfferPass func(context.Context, time.Time) error
 	var replicaRenewalPass func(context.Context, time.Time) error
 	if replicaLeaseStore != nil && replicaCiphertexts != nil && globalIdentityStore != nil &&
@@ -804,6 +805,11 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 			},
 		}
 		replicaTransferPass = transferReconciler.Reconcile
+		integrityReconciler := &replicaIntegrityReconciler{
+			leases: replicaLeaseStore, identity: globalIdentityStore, resolve: identityResolver,
+			owners: ownerAuthorityStore, node: nodeIdentityStore, peers: peerSessions,
+		}
+		replicaIntegrityPass = integrityReconciler.Reconcile
 		offerReconciler := &replicaOfferReconciler{
 			leases: replicaLeaseStore, identity: globalIdentityStore, resolve: identityResolver,
 			authority: ownerAuthorityStore, node: nodeIdentityStore, peers: peerSessions,
@@ -850,6 +856,14 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 		}
 		if replicaOfferPass != nil {
 			if err := replicaOfferPass(ctx, now); err != nil {
+				passErrors = append(passErrors, err)
+			}
+		}
+		// Full ciphertext readback may be expensive. Run it after deadline- and
+		// lease-sensitive maintenance so a slow peer cannot delay tombstones,
+		// renewals, imports, or offer creation in this pass.
+		if replicaIntegrityPass != nil {
+			if err := replicaIntegrityPass(ctx, now); err != nil {
 				passErrors = append(passErrors, err)
 			}
 		}
@@ -1389,7 +1403,8 @@ func (a *controlApplication) startReplicaLeaseExpiryLoop(parent context.Context)
 			// Lease state and filesystem diagnostics stay private. The status API
 			// exposes only the sanitized durable projection. Offer failures may
 			// expose only a bounded stage label, never the underlying error.
-			if diagnostic, ok := err.(replicaOfferReconcileError); ok {
+			var diagnostic interface{ DiagnosticStage() string }
+			if errors.As(err, &diagnostic) {
 				log.Printf("Control replica maintenance pass failed: stage=%s", diagnostic.DiagnosticStage())
 				return
 			}

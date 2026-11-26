@@ -486,6 +486,7 @@ func planAutomaticReplicaOffers(policy authority.ReplicationPolicy, ownerSubject
 	activeProviders := make(map[string]struct{})
 	pendingProviders := make(map[string]struct{})
 	occupiedProviders := make(map[string]struct{})
+	damagedProviders := make(map[string]struct{})
 	var capacityUsed uint64
 	var latestTerminal time.Time
 	hasTerminal := false
@@ -505,6 +506,13 @@ func planAutomaticReplicaOffers(policy authority.ReplicationPolicy, ownerSubject
 			continue
 		}
 		if replicaLeaseTerminal(item.Status) {
+			if offer.SnapshotID == snapshotID && item.Status == lease.StatusFailed && item.FailureCode == "ciphertext_readback_mismatch" {
+				// Do not immediately place another copy on a provider whose exact
+				// ciphertext failed a complete source-side digest readback. A later
+				// explicit owner/provider action can restore trust; until then choose
+				// another authorized provider or leave the target unmet.
+				damagedProviders[offer.ProviderNodeID] = struct{}{}
+			}
 			if terminalAt := replicaLeaseTerminalTime(item); terminalAt.After(latestTerminal) {
 				latestTerminal = terminalAt
 				hasTerminal = true
@@ -536,6 +544,9 @@ func planAutomaticReplicaOffers(policy authority.ReplicationPolicy, ownerSubject
 	}
 	for provider := range pendingProviders {
 		coveredOrPending[provider] = struct{}{}
+	}
+	for provider := range damagedProviders {
+		occupiedProviders[provider] = struct{}{}
 	}
 	if uint64(len(coveredOrPending)) >= minimum {
 		return nil, nil
@@ -611,6 +622,11 @@ func replicaLeaseTerminal(status lease.Status) bool {
 }
 
 func replicaLeaseTerminalTime(item lease.Lease) time.Time {
+	if item.Status == lease.StatusFailed && item.FailureCode == "ciphertext_readback_mismatch" {
+		if failedAt := parseReplicaExpiry(item.FailureAt); !failedAt.IsZero() {
+			return failedAt
+		}
+	}
 	latest := replicaLeaseEffectiveExpiry(item)
 	if item.DeletionReport != nil {
 		if reported := parseReplicaExpiry(item.DeletionReport.Report.ReportedAt); reported.After(latest) {

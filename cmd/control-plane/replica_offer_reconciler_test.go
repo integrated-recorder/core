@@ -79,6 +79,28 @@ func TestReplicaOfferPlannerEnforcesSubjectCapacityAndRelocationGrace(t *testing
 	}
 }
 
+func TestReplicaOfferPlannerRelocatesReadbackMismatchAfterFailureGrace(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	policy := authority.ReplicationPolicy{MinimumReplicas: "1", GracePeriodSeconds: "60", CapacityLimitBytes: "0", RelocateAfterGrace: true}
+	damaged := replicaOfferPlanningLease("rl_0000000000000000000011", "owner", "archive", "snapshot", "provider-bad", lease.StatusFailed, "20", now.Add(24*time.Hour))
+	damaged.FailureCode = "ciphertext_readback_mismatch"
+	damaged.FailureAt = now.Add(-30 * time.Second).Format(time.RFC3339)
+	if got, err := planAutomaticReplicaOffers(policy, "owner", "archive", "snapshot", "source",
+		[]lease.Lease{damaged}, nil, []string{"provider-bad", "provider-good"}, now, 2, 10); err != nil || len(got) != 0 {
+		t.Fatalf("relocation bypassed configured grace: providers=%v err=%v", got, err)
+	}
+	got, err := planAutomaticReplicaOffers(policy, "owner", "archive", "snapshot", "source",
+		[]lease.Lease{damaged}, nil, []string{"provider-bad", "provider-good"}, now.Add(31*time.Second), 2, 10)
+	if err != nil || !reflect.DeepEqual(got, []string{"provider-good"}) {
+		t.Fatalf("relocation after observed mismatch=%v err=%v, want only provider-good", got, err)
+	}
+	policy.CapacityLimitBytes = "20"
+	if got, err := planAutomaticReplicaOffers(policy, "owner", "archive", "snapshot", "source",
+		[]lease.Lease{damaged}, nil, []string{"provider-bad", "provider-good"}, now.Add(31*time.Second), 2, 10); err != nil || !reflect.DeepEqual(got, []string{"provider-good"}) {
+		t.Fatalf("valid replacement was blocked by failed lease or returned to damaged provider: providers=%v err=%v", got, err)
+	}
+}
+
 func TestReplicaOfferPlannerNeverReintroducesTombstonedArchive(t *testing.T) {
 	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	policy := authority.ReplicationPolicy{MinimumReplicas: "1", GracePeriodSeconds: "0", CapacityLimitBytes: "0", RelocateAfterGrace: true}

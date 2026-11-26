@@ -18,15 +18,94 @@ import (
 	"github.com/integrated-recorder/core/internal/adapterhost"
 	"github.com/integrated-recorder/core/internal/adapterproto"
 	"github.com/integrated-recorder/core/internal/applog"
+	"github.com/integrated-recorder/core/internal/archivecatalog"
 	"github.com/integrated-recorder/core/internal/authn"
+	"github.com/integrated-recorder/core/internal/authority"
 	"github.com/integrated-recorder/core/internal/buildinfo"
 	"github.com/integrated-recorder/core/internal/derivative"
 	"github.com/integrated-recorder/core/internal/domain"
+	"github.com/integrated-recorder/core/internal/globalidentity"
 	"github.com/integrated-recorder/core/internal/integrity"
 	"github.com/integrated-recorder/core/internal/management"
+	"github.com/integrated-recorder/core/internal/nodeidentity"
+	"github.com/integrated-recorder/core/internal/recorderengine"
 	"github.com/integrated-recorder/core/internal/storage"
 	"github.com/integrated-recorder/core/internal/systemsettings"
 )
+
+type rekeyRouteManagerFixture struct {
+	recordingManager
+	rekeyCalls int
+}
+
+func (m *rekeyRouteManagerFixture) RekeyArchiveHistory(context.Context, recorderengine.RekeyArchiveHistoryRequest) (recorderengine.RekeyArchiveHistoryResult, error) {
+	m.rekeyCalls++
+	return recorderengine.RekeyArchiveHistoryResult{}, nil
+}
+
+func TestArchiveReplicaRekeyRejectsCallerSuppliedRecipientPublicKey(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(filepath.Join(root, "recordings"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const recordingID = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	writeProductRecording(t, store, recordingID, domain.StateCompleted)
+	baseManager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baseManager.Close(context.Background())
+	if err := baseManager.SealArchiveContext(context.Background(), recordingID); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := archivecatalog.Open(filepath.Join(root, "archive-catalog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := baseManager.PersistArchiveSnapshot(context.Background(), catalog, recordingID); err != nil {
+		t.Fatal(err)
+	}
+	users, err := authn.Open(filepath.Join(root, "auth"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := users.Bootstrap("rekey-owner", "rekey-owner-test-password"); err != nil {
+		t.Fatal(err)
+	}
+	session, err := users.LoginAs("rekey-owner", "rekey-owner-test-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &rekeyRouteManagerFixture{recordingManager: baseManager}
+	identity, err := globalidentity.Open(filepath.Join(root, "identity"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := nodeidentity.Open(filepath.Join(root, "node"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerAuthority, err := authority.Open(filepath.Join(root, "owner-authority"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(manager, nil, nil, Options{Auth: users, ArchiveCatalog: catalog, GlobalIdentity: identity, NodeIdentity: node, OwnerAuthority: ownerAuthority})
+
+	// Recipient key material is not a request parameter. Even an otherwise
+	// well-formed rekey request must fail closed if a caller attempts to inject
+	// it, before any rekey manager operation can run.
+	body := `{"owner_subject_id":"os_aaaaaaaaaaaaaaaaaaaaaa","grant_hash":"sha256:` + strings.Repeat("a", 64) + `","recipient_identity_id":"gi_aaaaaaaaaaaaaaaaaaaaaa","previous_key_epoch":1,"key_epoch":2,"recipient_public_key":"attacker-controlled"}`
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authenticatedIdentityRequest(http.MethodPost,
+		"https://recorder.example.com/api/recordings/"+recordingID+"/replicas/rekey", body, session))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"error_code":"archive_rekey_request_invalid"`) {
+		t.Fatalf("caller-supplied recipient key status=%d body=%s", response.Code, response.Body.String())
+	}
+	if manager.rekeyCalls != 0 {
+		t.Fatalf("rekey manager was invoked %d times for caller-supplied recipient key", manager.rekeyCalls)
+	}
+}
 
 func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
 	root := t.TempDir()

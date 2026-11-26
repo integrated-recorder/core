@@ -125,6 +125,13 @@ export function RemoteArchiveBrowser() {
   const sessions = capabilities.data?.sessions ?? []
   const grants = capabilities.data?.capabilities ?? []
   const selectedGrant = grants.find(item => item.grant_hash === grantHash) ?? grants[0]
+  const selectedNodeSessions = sessions.filter(session => session.node_id === nodeID)
+  const selectedPeerConnected = Boolean(selectedSnapshot && selectedNodeSessions.length > 0 &&
+    new Set(selectedNodeSessions.map(session => session.identity_id)).size === 1 &&
+    selectedNodeSessions[0]?.identity_id === selectedSnapshot.peerIdentityID)
+  const selectedGrantActive = Boolean(selectedGrant && grants.some(grant => grant.owner_subject_id === selectedGrant.owner_subject_id &&
+    grant.archive_id === selectedGrant.archive_id && grant.grant_hash === selectedGrant.grant_hash && Date.parse(grant.expires_at) > Date.now()))
+  const canStartPlayback = !capabilities.error && selectedPeerConnected && selectedGrantActive && Boolean(selectedSnapshot && nodeID)
 
   const clearPlayback = useCallback(() => {
     playbackScopeRef.current = null
@@ -155,8 +162,9 @@ export function RemoteArchiveBrowser() {
           return
         }
         const pendingScope = peerRecoveryScopeRef.current
-        const peerReturned = Boolean(pendingScope && (capabilities.data?.sessions ?? []).some(session =>
-          session.identity_id === pendingScope.identityID && session.node_id === pendingScope.nodeID))
+        const sessionsForPeer = pendingScope ? (capabilities.data?.sessions ?? []).filter(session => session.node_id === pendingScope.nodeID) : []
+        const peerIdentityIDs = new Set(sessionsForPeer.map(session => session.identity_id))
+        const peerReturned = Boolean(pendingScope && peerIdentityIDs.size === 1 && peerIdentityIDs.has(pendingScope.identityID))
         const capabilityStillActive = Boolean(pendingScope && (capabilities.data?.capabilities ?? []).some(grant =>
           grant.owner_subject_id === pendingScope.ownerSubjectID && grant.archive_id === pendingScope.archiveID &&
           grant.grant_hash === pendingScope.grantHash && Date.parse(grant.expires_at) > Date.now()))
@@ -164,6 +172,10 @@ export function RemoteArchiveBrowser() {
           setPeerRecoveryPending(false)
           peerRecoveryScopeRef.current = null
           setPlaybackError(t('identity.remotePlaybackGrantEnded'))
+        } else if (peerIdentityIDs.size > 1 || (peerIdentityIDs.size === 1 && !peerIdentityIDs.has(pendingScope?.identityID ?? ''))) {
+          setPeerRecoveryPending(false)
+          peerRecoveryScopeRef.current = null
+          setPlaybackError(t('identity.remotePlaybackPeerAmbiguous'))
         } else if (peerReturned) {
           setPeerRecoveryPending(false)
           peerRecoveryScopeRef.current = null
@@ -178,7 +190,9 @@ export function RemoteArchiveBrowser() {
       grant.owner_subject_id === scope.ownerSubjectID && grant.archive_id === scope.archiveID &&
       grant.grant_hash === scope.grantHash && Date.parse(grant.expires_at) > Date.now())
     const peerStillConnected = (capabilities.data?.sessions ?? []).some(session =>
-      session.identity_id === scope.identityID && session.node_id === scope.nodeID)
+      session.identity_id === scope.identityID && session.node_id === scope.nodeID) &&
+      new Set((capabilities.data?.sessions ?? []).filter(session => session.node_id === scope.nodeID).map(session => session.identity_id)).size === 1
+    const hasPeerSessions = (capabilities.data?.sessions ?? []).some(session => session.node_id === scope.nodeID)
     if (capabilities.error) {
       clearPlayback()
       setPlaybackMessage('')
@@ -191,10 +205,15 @@ export function RemoteArchiveBrowser() {
       setPlaybackError(t('identity.remotePlaybackGrantEnded'))
     } else if (!peerStillConnected) {
       clearPlayback()
-      peerRecoveryScopeRef.current = scope
-      setPeerRecoveryPending(true)
       setPlaybackMessage('')
-      setPlaybackError(t('identity.remotePlaybackPeerDisconnected'))
+      if (hasPeerSessions) {
+        setPeerRecoveryPending(false)
+        setPlaybackError(t('identity.remotePlaybackPeerAmbiguous'))
+      } else {
+        peerRecoveryScopeRef.current = scope
+        setPeerRecoveryPending(true)
+        setPlaybackError(t('identity.remotePlaybackPeerDisconnected'))
+      }
     }
   }, [capabilities.data, capabilities.dataUpdatedAt, capabilities.error, clearPlayback, peerRecoveryPending, playbackPlan, t])
 
@@ -310,7 +329,7 @@ export function RemoteArchiveBrowser() {
   }
 
   const startPlayback = async () => {
-    if (!nodeID || !selectedGrant || !selectedSnapshot) return
+    if (!canStartPlayback || !nodeID || !selectedGrant || !selectedSnapshot) return
     clearPlayback()
     setPlaybackError('')
     setPlaybackMessage('')
@@ -387,7 +406,7 @@ export function RemoteArchiveBrowser() {
   }
 
   const startPlaybackWithPasskey = async () => {
-    if (!nodeID || !selectedGrant || !selectedSnapshot) return
+    if (!canStartPlayback || !nodeID || !selectedGrant || !selectedSnapshot) return
     clearPlayback()
     setPlaybackError('')
     setPlaybackMessage('')
@@ -540,8 +559,8 @@ export function RemoteArchiveBrowser() {
           <label className="block space-y-1.5 text-sm">{t('identity.remotePlaybackRecoveryPhrase')}<textarea className="min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" value={recoveryPhrase} onChange={event => { setRecoveryPhrase(event.target.value); setRecoveryFile(null) }} autoComplete="off" spellCheck={false} /></label>
           <label className="block space-y-1.5 text-sm">{t('identity.remotePlaybackRecoveryFile')}<Input type="file" accept=".irrc,application/octet-stream" onChange={event => { setRecoveryFile(event.target.files?.[0] ?? null); if (event.target.files?.[0]) setRecoveryPhrase('') }} /></label>
           <div className="flex flex-wrap gap-2">
-            <Button type="button" size="sm" disabled={Boolean(playbackPlan) || !nodeID || !selectedGrant || head.isPending || (!recoveryFile && !recoveryPhrase.trim())} onClick={() => void startPlayback()}>{t('identity.remotePlaybackStart')}</Button>
-            <Button type="button" size="sm" variant="outline" disabled={Boolean(playbackPlan) || !nodeID || !selectedGrant || head.isPending} onClick={() => void startPlaybackWithPasskey()}>{t('identity.remotePlaybackPasskey')}</Button>
+            <Button type="button" size="sm" disabled={Boolean(playbackPlan) || !canStartPlayback || head.isPending || (!recoveryFile && !recoveryPhrase.trim())} onClick={() => void startPlayback()}>{t('identity.remotePlaybackStart')}</Button>
+            <Button type="button" size="sm" variant="outline" disabled={Boolean(playbackPlan) || !canStartPlayback || head.isPending} onClick={() => void startPlaybackWithPasskey()}>{t('identity.remotePlaybackPasskey')}</Button>
             {playbackPlan && <>
               {playbackPlan.tracks.length > 1 && <label className="flex items-center gap-2 text-sm">{t('identity.remotePlaybackTrack')}<select aria-label={t('identity.remotePlaybackTrack')} className="h-9 rounded-md border border-input bg-background px-3" value={trackID} onChange={event => changeTrack(event.target.value)}>{playbackPlan.tracks.map(track => <option key={track} value={track}>{track}</option>)}</select></label>}
               <Button type="button" size="sm" variant="outline" onClick={clearPlayback}>{t('identity.remotePlaybackStop')}</Button>

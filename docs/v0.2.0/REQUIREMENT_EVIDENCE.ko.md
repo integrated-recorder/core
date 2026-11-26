@@ -23,6 +23,8 @@
 
 추가 M7/M9 경계 보강 (기준 `4d0015355dd999726be53246555ea93fd1797d24` 위의 검증된 작업 트리): 교차 Identity의 인증·freshness·capability 검증을 통과한 명시적 replica import를 실제 HTTP handler까지 실행하는 회귀시험에서 완료 뒤 응답이 비어 있음을 재현했다. 원인은 제품에서 사용하는 `replica_import_completed` 등 mutation audit 유형이 management allowlist에 없어 감사 append가 실패한 것이었다. 모든 현재 server mutation audit 유형을 allowlist에 추가하고 저장 테스트를 보강했다. 회귀시험은 fake peer transport 경계만 대체하며 실제 import HTTP 응답, scope, HTTPS 및 감사 결과를 검증한다. RC12 migration fixture에도 기존 local Owner/archive가 새 Global Identity 생성만으로 OwnerSubject claim으로 자동 승격되지 않고 authority 검사에서 거부되는지 확인을 추가했다. 변경 후 `go test -short -count=1 ./...`, `go test -race -short -count=1 ./...`, `go vet ./...`, `go build ./...`, `git diff --check` 통과. 이 검증은 실제 독립 노드/네트워크·Docker migration acceptance를 대체하지 않으며 해당 게이트는 계속 미완료다. 후보 SHA 변경 후 원격 CI가 필요하다.
 
+복구 파일 임시 버퍼 위생 (`1da78d218a7672bdc52de15c864d27c8cd7d17c0`, CI run [45754537493](https://github.com/integrated-recorder/core/actions/runs/45754537493)): Global Identity 복구와 원격 Archive 복호화의 파일 입력 경로가 정확한 크기를 읽기 전에 확인하고, 디코딩 성공·실패 모두에서 임시 `ArrayBuffer`를 지우도록 했다. valid/invalid backing buffer zeroing 및 oversized file의 선거부 테스트를 추가했다. Vitest 60 files / 291 tests, typecheck, lint, build, encrypted peer playback WebKit fixture 1/1 통과; GitHub의 Fast Go checks, Fast Go race, Frontend checks, Production process E2E 모두 통과. 이 변경은 브라우저가 소유한 원본 `File` 저장소의 삭제를 보장하지 않으며 하드웨어 키 저장소·실기기 및 독립 노드 검증을 대체하지 않는다.
+
 | 검증 | 대상 | 결과 | 증명하지 않는 것 |
 |---|---|---|---|
 | `go test -short -count=1 ./...` | 구현 코드 SHA `0b3f882` | 통과 | race, 외부망, Docker 및 실제 노드 acceptance |

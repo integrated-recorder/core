@@ -353,6 +353,7 @@ func validateSnapshotContent(schemaVersion int, content Content, provenance []Cl
 	if err := validationInventory.Validate(); err != nil {
 		return fmt.Errorf("%w: archive index projection: %v", ErrInvalidSnapshot, err)
 	}
+	coordinates := make(map[archiveindex.Coordinate]struct{}, len(content.Objects))
 	for i, object := range content.Objects {
 		_, coordinateErr := archiveindex.SegmentIdentity(object.Coordinate)
 		if coordinateErr != nil || object.Coordinate.SessionID != content.Session.ID || object.PlaintextSize <= 0 || object.PlaintextSize > archiveindex.MaxPayloadBytes || !validDigest(object.PlaintextSHA256) ||
@@ -363,6 +364,10 @@ func validateSnapshotContent(schemaVersion int, content Content, provenance []Cl
 			(i > 0 && !objectLess(content.Objects[i-1], object)) {
 			return fmt.Errorf("%w: object %d", ErrInvalidSnapshot, i)
 		}
+		if _, duplicate := coordinates[object.Coordinate]; duplicate {
+			return fmt.Errorf("%w: duplicate object coordinate", ErrInvalidSnapshot)
+		}
+		coordinates[object.Coordinate] = struct{}{}
 		if object.ProgramDateTime != "" {
 			parsed, err := time.Parse(time.RFC3339Nano, object.ProgramDateTime)
 			if err != nil || parsed.Location() != time.UTC || parsed.UTC().Format(time.RFC3339Nano) != object.ProgramDateTime {

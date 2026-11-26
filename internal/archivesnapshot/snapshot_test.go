@@ -75,6 +75,34 @@ func TestArchiveIdentitySurvivesDifferentLocalRecordingIDs(t *testing.T) {
 	}
 }
 
+func TestVerifyRejectsDuplicateCanonicalCoordinateWithDifferentTimelineOrdinal(t *testing.T) {
+	inventory := snapshotInventory(t)
+	addSnapshotClaim(t, &inventory, 1, "origin", archiveindex.ClaimLiveOrigin, "canonical media bytes")
+	snapshot, err := Build(inventory, 1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Content.Objects) != 1 {
+		t.Fatalf("fixture objects=%d, want one", len(snapshot.Content.Objects))
+	}
+
+	// Model a self-consistent untrusted snapshot. The old ordering check sorted
+	// media by timeline ordinal before source coordinate, so this duplicate
+	// coordinate could be made strictly ordered and pass content-hash checks.
+	duplicate := snapshot.Content.Objects[0]
+	duplicate.TimelineOrdinal++
+	snapshot.Content.Objects = append(snapshot.Content.Objects, duplicate)
+	contentBytes, err := canonicalJSON(snapshot.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.ContentHash = hashWithDomain(contentDomainV2, contentBytes)
+	snapshot.SnapshotID = snapshotID(snapshot.ContentHash)
+	if err := Verify(snapshot); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("snapshot with duplicate canonical coordinate was accepted: %v", err)
+	}
+}
+
 func TestLegacyArchiveIdentityUsesMigrationFallback(t *testing.T) {
 	inventory := snapshotInventory(t)
 	archiveID, err := ArchiveIDForRecording(inventory.RecordingID)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import http.cookies
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import tempfile
 import time
 import unittest
 import uuid
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -32,6 +34,8 @@ RC9_TAG = "v0.1.0-rc.9"
 RC9_COMMIT = "5f7761e32cb1156115c24dfd9e62d49661a16a81"
 RC10_TAG = "v0.1.0-rc.10"
 RC10_COMMIT = "85e1daa7eba52f562b3b1a1c3ce881c39b9afcd3"
+RC12_TAG = "v0.1.0-rc.12"
+RC12_COMMIT = "d4a14d4fab908a0cb415dacd47e7f0d9bc63be8d"
 
 
 def docker(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -135,6 +139,44 @@ def run_upgrade_archive_fixture(test: unittest.TestCase, container_id: str, acti
     ])
     test.assertIn("PASS", result.stdout)
     test.assertNotIn("FAIL", result.stdout)
+
+
+def bootstrap_and_capture_session(port: int) -> str:
+    """Bootstrap an isolated installed Runtime Host and return its cookie header."""
+    origin = f"http://127.0.0.1:{port}"
+    with urllib.request.urlopen(origin + "/api/setup/status", timeout=10) as response:
+        status = json.loads(response.read())
+    if status.get("state") not in ("uninitialized", "setup_in_progress") or status.get("administrator_configured"):
+        raise AssertionError("fresh RC12 Docker installation was not in first-owner setup state")
+    body = json.dumps({"login": "rc12-migration-owner", "password": "rc12-migration-password-unique"}).encode()
+    request = urllib.request.Request(
+        origin + "/api/auth/bootstrap", data=body, method="POST",
+        headers={"Content-Type": "application/json", "Origin": origin},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read())
+        cookie_headers = response.headers.get_all("Set-Cookie") or []
+    if payload.get("authenticated") is not True:
+        raise AssertionError("RC12 first Owner bootstrap did not create an authenticated session")
+    jar = http.cookies.SimpleCookie()
+    for header in cookie_headers:
+        jar.load(header)
+    session = jar.get("ir_session")
+    csrf = jar.get("ir_csrf")
+    if session is None or csrf is None:
+        raise AssertionError("RC12 bootstrap did not issue both session and CSRF cookies")
+    return f"ir_session={session.value}; ir_csrf={csrf.value}"
+
+
+def assert_authenticated_session(port: int, cookie_header: str) -> None:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/auth/session",
+        headers={"Cookie": cookie_header},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        session = json.loads(response.read())
+    if session.get("authenticated") is not True or session.get("needs_bootstrap") is True:
+        raise AssertionError("persisted RC12 Owner session did not survive image upgrade or restart")
 
 
 def build_diagnostic_image() -> tuple[str, str, str]:
@@ -1022,6 +1064,170 @@ class CandidateImageBundleUpgradeDockerTests(unittest.TestCase):
                         ], check=False)
                         if cleanup.returncode != 0:
                             raise AssertionError("could not restore ownership of the isolated candidate archive")
+
+
+class RC12ToV020CandidateDockerTests(unittest.TestCase):
+    """Exercise an installed RC12 data volume across a v0.2 candidate image."""
+
+    @unittest.skipUnless(
+        os.environ.get("IR_RUN_RC12_V020_DOCKER_E2E") == "1",
+        "requires an isolated Linux Docker runner; set IR_RUN_RC12_V020_DOCKER_E2E=1",
+    )
+    def test_rc12_install_migrates_to_v020_candidate_and_restarts_idempotently(self):
+        if shutil.which("docker") is None:
+            self.fail("RC12-to-v0.2 Docker acceptance was requested but Docker is unavailable")
+        candidate_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+        candidate_time = subprocess.run(
+            ["git", "show", "-s", "--format=%cI", candidate_commit], check=True, text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", candidate_commit) or candidate_commit == RC12_COMMIT:
+            self.fail("candidate image must have a distinct, exact source commit")
+        version = "0.2.0-dev." + candidate_commit[:12]
+        tag = "v" + version
+        selected = {"tag_name": tag, "prerelease": True, "draft": False}
+        identity = {
+            "channel": "prerelease", "manifest_identity_checked": False,
+            "manifest_signature_independently_verified": False,
+        }
+        release_identity = {
+            "tag": tag, "source": install.REPOSITORY_SOURCE, "version": version,
+            "commit": candidate_commit, "build_time": candidate_time,
+            "channel": "prerelease", "architecture_manifest": "amd64",
+            "manifest_identity_checked": False,
+            "manifest_signature_independently_verified": False,
+        }
+        project = "ir-rc12-v020-" + uuid.uuid4().hex[:12]
+        volume = project + "-state"
+        with tempfile.TemporaryDirectory(prefix="ir rc12 v020 acceptance ", ignore_cleanup_errors=True) as temp:
+            root = Path(temp)
+            install_dir = root / "deployment with spaces"
+            archive = root / "recordings with spaces"
+            state_marker = "rc12-v020-state-marker"
+            archive_marker = "rc12-v020-archive-marker"
+            args_rc12 = install.cli_parser().parse_args([
+                "--install-dir", str(install_dir), "--recordings-dir", str(archive),
+                "--version", RC12_TAG,
+            ])
+            args_candidate = install.cli_parser().parse_args([
+                "--install-dir", str(install_dir), "--upgrade", "--version", tag,
+            ])
+
+            def install_candidate():
+                with mock.patch.object(
+                    install, "prepare_release",
+                    return_value=(selected, candidate_commit, candidate_time, identity),
+                ), mock.patch.object(
+                    install, "prepare_source", return_value=(Path.cwd().resolve(), candidate_time),
+                ):
+                    install.install(args_candidate)
+
+            with mock.patch.object(install, "COMPOSE_PROJECT", project), mock.patch.object(install, "STATE_VOLUME", volume):
+                try:
+                    # The baseline is selected from the published RC12 release
+                    # and built by the unmodified installer source path.
+                    install.install(args_rc12)
+                    baseline_metadata = install.load_metadata(install_dir / "deployment.json")
+                    self.assertEqual(baseline_metadata["release"]["tag"], RC12_TAG)
+                    self.assertEqual(baseline_metadata["release"]["commit"], RC12_COMMIT)
+                    baseline_container = compose_container(install_dir)
+                    baseline = assert_running_identity(self, baseline_container, RC12_TAG, RC12_COMMIT)
+                    baseline_generation_id = baseline["registry"]["active_generation_id"]
+                    baseline_pins = tuple(
+                        baseline["generation"].get(key)
+                        for key in ("adapter_set_id", "storage_provider_set_id", "storage_instance_id")
+                    )
+                    self.assertTrue(all(baseline_pins), "RC12 active generation is missing immutable provider pins")
+                    docker([
+                        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", baseline_container,
+                        "/bin/sh", "-ec",
+                        f"printf state-preserved > /data/{state_marker}; printf archive-preserved > /data/recordings/{archive_marker}",
+                    ])
+                    owner_cookie = bootstrap_and_capture_session(int(baseline_metadata["port"]))
+                    assert_authenticated_session(int(baseline_metadata["port"]), owner_cookie)
+                    run_upgrade_archive_fixture(self, baseline_container, "create", baseline_pins[1])
+                    before_release_dirs = release_directories(baseline_container)
+
+                    # Install a distinct development candidate from this exact
+                    # checkout; it is not represented as a published release.
+                    install_candidate()
+                    candidate_metadata = install.load_metadata(install_dir / "deployment.json")
+                    self.assertIsNone(install.read_pending(install_dir / "deployment.pending.json"))
+                    self.assertEqual(candidate_metadata["release"]["version"], version)
+                    self.assertEqual(candidate_metadata["release"]["commit"], candidate_commit)
+                    candidate_container = compose_container(install_dir)
+                    migrated = assert_running_identity(self, candidate_container, tag, candidate_commit)
+                    self.assertNotEqual(migrated["registry"]["active_generation_id"], baseline_generation_id)
+                    self.assertEqual(
+                        tuple(migrated["generation"].get(key) for key in (
+                            "adapter_set_id", "storage_provider_set_id", "storage_instance_id",
+                        )),
+                        baseline_pins,
+                        "RC12 upgrade changed pinned adapter/storage/provider instance identity",
+                    )
+                    self.assertTrue(before_release_dirs.issubset(release_directories(candidate_container)))
+                    assert_storage_pin(self, candidate_container, baseline_pins[1])
+                    run_upgrade_archive_fixture(self, candidate_container, "verify", baseline_pins[1])
+                    self.assertEqual(install.wait_for_runtime(
+                        int(candidate_metadata["port"]), candidate_metadata["release"], timeout=30,
+                        bind=candidate_metadata["bind"],
+                    )["version"], version)
+                    assert_authenticated_session(int(candidate_metadata["port"]), owner_cookie)
+                    docker([
+                        "exec", "--user", f"{install.CONTAINER_UID}:{install.CONTAINER_GID}", candidate_container,
+                        "/bin/sh", "-ec",
+                        f"test \"$(cat /data/{state_marker})\" = state-preserved && test \"$(cat /data/recordings/{archive_marker})\" = archive-preserved",
+                    ])
+
+                    active_id = migrated["registry"]["active_generation_id"]
+                    migrated_pins = tuple(
+                        migrated["generation"].get(key)
+                        for key in ("adapter_set_id", "storage_provider_set_id", "storage_instance_id")
+                    )
+                    # Re-running the same pinned upgrade and recreating the
+                    # container must not stage duplicate generations or rotate pins.
+                    install_candidate()
+                    install.run(install.compose_command(
+                        install_dir / "compose.yaml", "up", "-d", "--no-build", "--force-recreate",
+                        "--wait", "--wait-timeout", "180", "archiver",
+                    ))
+                    restarted = compose_container(install_dir)
+                    final = assert_running_identity(self, restarted, tag, candidate_commit)
+                    self.assertEqual(final["registry"]["active_generation_id"], active_id)
+                    self.assertEqual(
+                        tuple(final["generation"].get(key) for key in (
+                            "adapter_set_id", "storage_provider_set_id", "storage_instance_id",
+                        )), migrated_pins,
+                    )
+                    run_upgrade_archive_fixture(self, restarted, "verify", baseline_pins[1])
+                    assert_authenticated_session(int(candidate_metadata["port"]), owner_cookie)
+                    self.assertEqual(
+                        final["registry"]["active_generation_id"],
+                        generation_snapshot(restarted).get("active_generation_id"),
+                    )
+                    self.assertIsNone(install.read_pending(install_dir / "deployment.pending.json"))
+                    print(
+                        "RC12 -> v0.2 candidate Docker acceptance PASS: "
+                        f"RC12={RC12_COMMIT}; candidate={candidate_commit}; active_generation={active_id}; "
+                        "Owner session, canonical archive fixture, and provider pins survived retry/recreation"
+                    )
+                finally:
+                    for compose_path in (install_dir / "compose.yaml", install_dir / "compose.pending.yaml"):
+                        if compose_path.exists():
+                            install.run(install.compose_command(compose_path, "down", "--remove-orphans"), check=False)
+                    volume_info = docker(["volume", "inspect", "--format={{.Name}}", volume], check=False)
+                    if volume_info.returncode == 0 and volume_info.stdout.strip() == volume:
+                        docker(["volume", "rm", volume])
+                    if archive.exists():
+                        cleanup = docker([
+                            "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+                            "--volume", f"{root}:/acceptance", "alpine:3.21", "-ec",
+                            f"chown -R {os.getuid()}:{os.getgid()} '/acceptance/{archive.name}' && chmod -R u+rwX '/acceptance/{archive.name}'",
+                        ], check=False)
+                        if cleanup.returncode != 0:
+                            raise AssertionError("could not restore ownership of the isolated RC12 archive")
 
 
 class DiagnosticImageLinuxDockerTests(unittest.TestCase):

@@ -842,16 +842,28 @@ func TestExternalProviderChildCrashRecoversThroughCoreOutcomeVerification(t *tes
 			}
 
 			// An outstanding streamed read must not hold Runtime's state lock and
-			// prevent Close from canceling and terminating the exact child.
+			// prevent Close from terminating the exact child. Hold the serialized
+			// operation gate explicitly so Stat is provably queued before Close;
+			// merely starting a goroutine does not establish that ordering.
 			stream, _, err := runtime.ObjectStore().Open(ctx, logicalKey)
 			if err != nil {
 				t.Fatalf("open stream before close-cancellation assertion: %v", err)
 			}
+			runtime.opGate <- struct{}{}
+			gateHeld := true
+			t.Cleanup(func() {
+				if gateHeld {
+					runtime.releaseOperation()
+				}
+			})
+			statStarted := make(chan struct{})
 			blockedCall := make(chan error, 1)
 			go func() {
+				close(statStarted)
 				_, err := runtime.ObjectStore().Stat(context.Background(), logicalKey)
 				blockedCall <- err
 			}()
+			<-statStarted
 			closeDone := make(chan error, 1)
 			go func() { closeDone <- runtime.Close() }()
 			select {
@@ -860,12 +872,17 @@ func TestExternalProviderChildCrashRecoversThroughCoreOutcomeVerification(t *tes
 					t.Fatalf("Runtime.Close failed while canceling streamed provider I/O: %v", err)
 				}
 			case <-time.After(8 * time.Second):
-				t.Fatal("Runtime.Close waited on an in-flight provider operation instead of terminating the child")
+				t.Fatal("Runtime.Close waited on the operation gate instead of terminating the child")
 			}
+			// Runtime.Close must not wait for the operation gate. Release the
+			// test-held gate only after Close has returned, then require the queued
+			// call to observe the closed runtime instead of reaching the provider.
+			runtime.releaseOperation()
+			gateHeld = false
 			select {
 			case err := <-blockedCall:
-				if !errors.Is(err, storageproto.ErrClosed) && !errors.Is(err, context.Canceled) {
-					t.Fatalf("operation queued behind streamed read after Close returned %v; want closed/canceled", err)
+				if err == nil || !errors.Is(err, storageproto.ErrClosed) && !errors.Is(err, context.Canceled) {
+					t.Fatalf("operation queued before Close returned %v; want closed/canceled", err)
 				}
 			case <-time.After(time.Second):
 				t.Fatal("queued provider operation did not observe Runtime.Close cancellation")

@@ -3,6 +3,7 @@ WORKDIR /src
 COPY web/package.json web/package-lock.json ./web/
 RUN npm --prefix web ci
 COPY web ./web
+COPY protocol/authority-v1 ./protocol/authority-v1
 COPY internal/server/static ./internal/server/static
 RUN npm --prefix web run build
 

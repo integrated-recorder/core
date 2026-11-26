@@ -366,4 +366,48 @@ describe('remote archive browser', () => {
     expect(calls.some(path => path.includes('/key-envelope?'))).toBe(false)
     expect(screen.queryByText('복구 문구 또는 복구 파일을 제공하세요.')).not.toBeInTheDocument()
   })
+
+  it('clears playback secrets when the page is hidden and refreshes authorization when visible', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path === '/api/peer-archives/capabilities') return new Response(JSON.stringify(capabilities()), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.includes('/head?')) return new Response(JSON.stringify(head(nodeA)), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.includes('/key-epochs?')) return new Response(JSON.stringify({ node_id: nodeA, archive_id: archiveID, snapshot_id: `snap_${'c'.repeat(64)}`, key_epochs: ['7'] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.includes('/manifest?')) return new Response(JSON.stringify({ replica_manifest_version: 'ir.replica-manifest/1', archive_id: archiveID, snapshot_id: `snap_${'c'.repeat(64)}`, key_epoch: '7', objects: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.includes('/key-envelope?')) return new Response(JSON.stringify({ envelope_version: 'ir.key-envelope/1' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response('{}', { status: 404, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('crypto', { subtle: {} })
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true })
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    const NativeURL = URL
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal('URL', Object.assign(class extends NativeURL {}, { createObjectURL: vi.fn(() => 'blob:hidden-playback'), revokeObjectURL }))
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const dek = new Uint8Array(32).fill(0x7b)
+    vi.mocked(openArchiveDEK).mockResolvedValue(dek)
+    renderBrowser()
+
+    fireEvent.click(await screen.findByRole('button', { name: '스냅샷 목록 불러오기' }))
+    await screen.findByText('스냅샷 5 · 객체 1개')
+    fireEvent.change(screen.getByLabelText('Global Identity 복구 문구'), { target: { value: 'recovery phrase fixture' } })
+    fireEvent.click(screen.getByRole('button', { name: '복호화 재생' }))
+    await screen.findByText('확인된 키 Epoch: 7')
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    fireEvent(document, new Event('visibilitychange'))
+    await waitFor(() => {
+      expect(dek.every(byte => byte === 0)).toBe(true)
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:hidden-playback')
+      expect(screen.getByLabelText('Global Identity 복구 문구')).toHaveValue('')
+      expect(screen.getByRole('alert')).toHaveTextContent('페이지가 숨겨져 재생을 중지하고 복호화 키와 입력한 복구 자료를 지웠습니다.')
+    })
+
+    const capabilityReads = fetchMock.mock.calls.filter(([path]) => String(path) === '/api/peer-archives/capabilities').length
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    fireEvent(document, new Event('visibilitychange'))
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => String(path) === '/api/peer-archives/capabilities').length).toBeGreaterThan(capabilityReads))
+  })
 })

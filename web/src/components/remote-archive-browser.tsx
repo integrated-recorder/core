@@ -14,6 +14,10 @@ import type { PeerArchiveCapabilities, PeerArchiveHead, ReplicaManifest } from '
 
 const maxPeerArchiveHeadFanout = 16
 
+function isDocumentHidden() {
+  return document.visibilityState === 'hidden'
+}
+
 type ArchiveGrant = PeerArchiveCapabilities['capabilities'][number]
 type ResolvedArchiveHead = PeerArchiveHead & { peerIdentityID: string; checkedReplicaCount: number; unavailableReplicaCount: number }
 
@@ -107,6 +111,9 @@ export function RemoteArchiveBrowser() {
   const hlsRef = useRef<{ destroy: () => void } | null>(null)
   const playlistURLRef = useRef('')
   const dekRef = useRef<Uint8Array | null>(null)
+  const playbackAttemptRef = useRef(0)
+  const recoveryKeysRef = useRef<Awaited<ReturnType<typeof deriveRecoveryKeys>> | null>(null)
+  const sessionKeyPairRef = useRef<ReturnType<typeof createSessionDEKKeyPair> | null>(null)
   const playbackScopeRef = useRef<{ identityID: string; nodeID: string; ownerSubjectID: string; archiveID: string; grantHash: string } | null>(null)
   const peerRecoveryScopeRef = useRef<{ identityID: string; nodeID: string; ownerSubjectID: string; archiveID: string; grantHash: string } | null>(null)
   const headRequestRef = useRef(0)
@@ -118,6 +125,7 @@ export function RemoteArchiveBrowser() {
     refetchIntervalInBackground: false,
     retry: false,
   })
+  const refetchCapabilities = capabilities.refetch
   const head = useMutation({
     mutationFn: (input: { sessions: PeerArchiveCapabilities['sessions']; grant: ArchiveGrant }) =>
       resolvePeerArchiveHead(input.sessions, input.grant),
@@ -134,6 +142,7 @@ export function RemoteArchiveBrowser() {
   const canStartPlayback = !capabilities.error && selectedPeerConnected && selectedGrantActive && Boolean(selectedSnapshot && nodeID)
 
   const clearPlayback = useCallback(() => {
+    playbackAttemptRef.current++
     playbackScopeRef.current = null
     hlsRef.current?.destroy()
     hlsRef.current = null
@@ -146,12 +155,42 @@ export function RemoteArchiveBrowser() {
     playlistURLRef.current = ''
     dekRef.current?.fill(0)
     dekRef.current = null
+    recoveryKeysRef.current?.destroy()
+    recoveryKeysRef.current = null
+    sessionKeyPairRef.current?.destroy()
+    sessionKeyPairRef.current = null
     peerRecoveryScopeRef.current = null
     setPeerRecoveryPending(false)
     setPlaybackPlan(null)
     setTrackID('')
     setPlaybackKeyEpoch('')
   }, [])
+
+  useEffect(() => {
+    const clearSensitivePlayback = () => {
+      if (playbackScopeRef.current || dekRef.current || recoveryKeysRef.current || sessionKeyPairRef.current) {
+        clearPlayback()
+        setPlaybackMessage('')
+        setRecoveryPhrase('')
+        setRecoveryFile(null)
+        setPlaybackError(t('identity.remotePlaybackPageHidden'))
+      }
+    }
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        clearSensitivePlayback()
+      } else if (document.visibilityState === 'visible') {
+        void refetchCapabilities()
+      }
+    }
+    const handlePageHide = () => clearSensitivePlayback()
+    document.addEventListener('visibilitychange', handleVisibility)
+    window.addEventListener('pagehide', handlePageHide)
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility)
+      window.removeEventListener('pagehide', handlePageHide)
+    }
+  }, [refetchCapabilities, clearPlayback, t])
 
   useEffect(() => {
     const scope = playbackScopeRef.current
@@ -217,13 +256,36 @@ export function RemoteArchiveBrowser() {
     }
   }, [capabilities.data, capabilities.dataUpdatedAt, capabilities.error, clearPlayback, peerRecoveryPending, playbackPlan, t])
 
+  useEffect(() => {
+    const scope = playbackScopeRef.current
+    if (!scope || !playbackPlan) return
+    const grant = (capabilities.data?.capabilities ?? []).find(item =>
+      item.owner_subject_id === scope.ownerSubjectID && item.archive_id === scope.archiveID && item.grant_hash === scope.grantHash)
+    const remaining = grant ? Date.parse(grant.expires_at) - Date.now() : 0
+    if (remaining <= 0) return
+    const timeout = window.setTimeout(() => {
+      if (playbackScopeRef.current !== scope) return
+      clearPlayback()
+      setRecoveryPhrase('')
+      setRecoveryFile(null)
+      setPlaybackMessage('')
+      setPlaybackError(t('identity.remotePlaybackGrantEnded'))
+    }, remaining)
+    return () => window.clearTimeout(timeout)
+  }, [capabilities.data, clearPlayback, playbackPlan, t])
+
   useEffect(() => () => {
     headRequestRef.current++
+    playbackAttemptRef.current++
     hlsRef.current?.destroy()
     if (videoRef.current) { videoRef.current.pause(); videoRef.current.removeAttribute('src') }
     if (playlistURLRef.current) URL.revokeObjectURL(playlistURLRef.current)
     dekRef.current?.fill(0)
     dekRef.current = null
+    recoveryKeysRef.current?.destroy()
+    recoveryKeysRef.current = null
+    sessionKeyPairRef.current?.destroy()
+    sessionKeyPairRef.current = null
   }, [])
 
   const loadSnapshot = () => {
@@ -273,17 +335,24 @@ export function RemoteArchiveBrowser() {
       .finally(() => { if (requestID === headRequestRef.current) setSnapshotLoading(false) })
   }
 
-  const installPlayback = async (dek: Uint8Array, epoch: string, verifiedManifest?: ReplicaManifest, keySource: 'recovery' | 'passkey' = 'recovery') => {
+  const installPlayback = async (dek: Uint8Array, epoch: string, attemptID: number, verifiedManifest?: ReplicaManifest, keySource: 'recovery' | 'passkey' = 'recovery') => {
+    const assertCurrentAttempt = () => {
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) {
+        throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
+      }
+    }
     const snapshot = selectedSnapshot?.snapshot
     const grant = selectedGrant
     if (!snapshot || !grant || !nodeID) throw new Error(t('identity.remotePlaybackUnavailable'))
     const manifest = verifiedManifest ?? await peerArchivesAPI.manifest(nodeID, grant.owner_subject_id, grant.archive_id, grant.grant_hash, snapshot.snapshot_id, epoch)
+    assertCurrentAttempt()
     const plan = createPeerPlaybackPlan(snapshot, manifest)
     const firstTrack = plan.tracks[0]
     if (!firstTrack) throw new TypeError('remote archive has no playable tracks')
     const video = videoRef.current
     if (!video) throw new Error(t('identity.remotePlaybackUnavailable'))
     const HlsModule = (await import('hls.js')).default
+    assertCurrentAttempt()
     if (!HlsModule.isSupported()) throw new Error(t('identity.remotePlaybackMSEUnsupported'))
     const scope = {
       nodeID,
@@ -331,6 +400,7 @@ export function RemoteArchiveBrowser() {
   const startPlayback = async () => {
     if (!canStartPlayback || !nodeID || !selectedGrant || !selectedSnapshot) return
     clearPlayback()
+    const attemptID = playbackAttemptRef.current
     setPlaybackError('')
     setPlaybackMessage('')
     let entropy: Uint8Array | null = null
@@ -343,6 +413,8 @@ export function RemoteArchiveBrowser() {
         ? await decodeRecoveryFileBlob(recoveryFile)
         : recoveryEntropyFromMnemonic(recoveryPhrase)
       keys = await deriveRecoveryKeys(entropy)
+      recoveryKeysRef.current = keys
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
       entropy.fill(0)
       entropy = null
       const matchingSessions = sessions.filter(item => item.node_id === nodeID)
@@ -353,6 +425,7 @@ export function RemoteArchiveBrowser() {
       }
       const snapshot = selectedSnapshot.snapshot
       const keyEpochResponse = await peerArchivesAPI.keyEpochs(nodeID, selectedGrant.owner_subject_id, selectedGrant.archive_id, selectedGrant.grant_hash, snapshot.snapshot_id)
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
       if (keyEpochResponse.node_id !== nodeID || keyEpochResponse.archive_id !== snapshot.content.archive_id || keyEpochResponse.snapshot_id !== snapshot.snapshot_id ||
         !Array.isArray(keyEpochResponse.key_epochs) || keyEpochResponse.key_epochs.length === 0 || keyEpochResponse.key_epochs.length > 64) {
         throw new Error(t('identity.remotePlaybackNoKeyEpoch'))
@@ -369,6 +442,7 @@ export function RemoteArchiveBrowser() {
           peerArchivesAPI.manifest(nodeID, selectedGrant.owner_subject_id, selectedGrant.archive_id, selectedGrant.grant_hash, snapshot.snapshot_id, candidate),
           peerArchivesAPI.keyEnvelope(nodeID, selectedGrant.owner_subject_id, selectedGrant.archive_id, selectedGrant.grant_hash, snapshot.snapshot_id, candidate),
         ])
+        if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
         if (candidateManifest.snapshot_id !== snapshot.snapshot_id || candidateManifest.archive_id !== snapshot.content.archive_id || candidateManifest.key_epoch !== candidate) {
           throw new TypeError('remote replica manifest binding is invalid')
         }
@@ -380,6 +454,12 @@ export function RemoteArchiveBrowser() {
             signerPublicKey: keys.signingPublicKey,
             recipientPrivateKey: keys.encryptionPrivateKey,
           })
+          if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) {
+            dek.fill(0)
+            dek = null
+            throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
+          }
+          dekRef.current = dek
           manifest = candidateManifest
           epoch = candidate
           break
@@ -389,7 +469,7 @@ export function RemoteArchiveBrowser() {
         }
       }
       if (!manifest || !dek || !epoch) throw new Error(t('identity.remotePlaybackNoKeyEpoch'))
-      await installPlayback(dek, epoch, manifest)
+      await installPlayback(dek, epoch, attemptID, manifest)
       dek = null
       setRecoveryPhrase('')
       setRecoveryFile(null)
@@ -401,13 +481,17 @@ export function RemoteArchiveBrowser() {
       dek = null
     } finally {
       entropy?.fill(0)
-      keys?.destroy()
+      if (keys && recoveryKeysRef.current === keys) {
+        keys.destroy()
+        recoveryKeysRef.current = null
+      }
     }
   }
 
   const startPlaybackWithPasskey = async () => {
     if (!canStartPlayback || !nodeID || !selectedGrant || !selectedSnapshot) return
     clearPlayback()
+    const attemptID = playbackAttemptRef.current
     setPlaybackError('')
     setPlaybackMessage('')
     let dek: Uint8Array | null = null
@@ -416,10 +500,15 @@ export function RemoteArchiveBrowser() {
       if (!window.isSecureContext || !globalThis.crypto?.subtle) throw new Error(t('identity.remotePlaybackNeedsHTTPS'))
       const activeKeyPair = createSessionDEKKeyPair()
       keyPair = activeKeyPair
+      sessionKeyPairRef.current = activeKeyPair
       const options = await globalIdentityAPI.loginOptions(base64UrlBytes(activeKeyPair.publicKey))
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
       const credential = await navigator.credentials.get({ publicKey: webAuthnRequestOptions(options) })
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
       await globalIdentityAPI.loginFinish(serializeAssertionCredential(credential))
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
       const passkeySession = await globalIdentityAPI.session()
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
       if (!passkeySession.authenticated || !passkeySession.identity_id || !passkeySession.global_csrf_token || !passkeySession.playback_key_bound) {
         throw new Error(t('identity.remotePlaybackPasskeyUnavailable'))
       }
@@ -428,6 +517,7 @@ export function RemoteArchiveBrowser() {
       const epochResponse = await globalIdentityAPI.sessionKeyEpochs(
         nodeID, selectedGrant.owner_subject_id, selectedGrant.archive_id, selectedGrant.grant_hash, snapshot.snapshot_id,
       )
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
       if (epochResponse.node_id !== nodeID || epochResponse.archive_id !== snapshot.content.archive_id ||
         epochResponse.snapshot_id !== snapshot.snapshot_id || !Array.isArray(epochResponse.key_epochs) ||
         epochResponse.key_epochs.length === 0 || epochResponse.key_epochs.length > 64) {
@@ -450,6 +540,7 @@ export function RemoteArchiveBrowser() {
           snapshot.snapshot_id, epoch, passkeySession.global_csrf_token,
         ),
       ])
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
       if (manifest.snapshot_id !== snapshot.snapshot_id || manifest.archive_id !== snapshot.content.archive_id || manifest.key_epoch !== epoch) {
         throw new TypeError('remote replica manifest binding is invalid')
       }
@@ -462,7 +553,13 @@ export function RemoteArchiveBrowser() {
         supplierNodeId: nodeID,
       }
       dek = await openSessionDEKEnvelope(envelope, activeKeyPair.privateKey, binding)
-      await installPlayback(dek, epoch, manifest, 'passkey')
+      if (attemptID !== playbackAttemptRef.current || isDocumentHidden()) {
+        dek.fill(0)
+        dek = null
+        throw new Error(t('identity.remotePlaybackAuthorizationUnavailable'))
+      }
+      dekRef.current = dek
+      await installPlayback(dek, epoch, attemptID, manifest, 'passkey')
       dek = null
     } catch (cause) {
       setPlaybackError(cause instanceof Error && cause.message.startsWith('remote archive')
@@ -471,7 +568,10 @@ export function RemoteArchiveBrowser() {
       failedDEK?.fill(0)
       dek = null
     } finally {
-      keyPair?.destroy()
+      if (keyPair && sessionKeyPairRef.current === keyPair) {
+        keyPair.destroy()
+        sessionKeyPairRef.current = null
+      }
     }
   }
 

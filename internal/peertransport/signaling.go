@@ -63,6 +63,91 @@ type EstablishedPeer struct {
 	RemoteIdentityID string
 }
 
+// MonitorConnection watches an already authenticated peer connection. A brief
+// ICE disconnect is recoverable; a persistent disconnect or terminal Pion
+// state ends the session so the owner can perform a fresh authenticated dial.
+func (p *EstablishedPeer) MonitorConnection(ctx context.Context, disconnectedGrace time.Duration) error {
+	if p == nil || p.PeerConnection == nil || ctx == nil || disconnectedGrace <= 0 {
+		return ErrSignalingConfig
+	}
+	return monitorConnectionStates(ctx, p.PeerConnection, disconnectedGrace)
+}
+
+func monitorConnectionStates(ctx context.Context, peer *webrtc.PeerConnection, disconnectedGrace time.Duration) error {
+	states := make(chan webrtc.PeerConnectionState, 8)
+	peer.OnConnectionStateChange(func(next webrtc.PeerConnectionState) {
+		enqueueConnectionState(states, next)
+	})
+	return monitorConnectionStateStream(ctx, peer.ConnectionState(), states, disconnectedGrace)
+}
+
+func enqueueConnectionState(states chan webrtc.PeerConnectionState, next webrtc.PeerConnectionState) {
+	select {
+	case states <- next:
+		return
+	default:
+	}
+	// Connection state is a projection, so retain the newest transition when
+	// the bounded queue fills. This preserves terminal states and prevents a
+	// dropped Connected event from turning a recovered transient disconnect
+	// into a false timeout.
+	select {
+	case <-states:
+	default:
+	}
+	select {
+	case states <- next:
+	default:
+	}
+}
+
+func monitorConnectionStateStream(ctx context.Context, current webrtc.PeerConnectionState, states <-chan webrtc.PeerConnectionState, disconnectedGrace time.Duration) error {
+	var timer *time.Timer
+	var timeout <-chan time.Time
+	startGrace := func() {
+		if timer == nil {
+			timer = time.NewTimer(disconnectedGrace)
+			timeout = timer.C
+		}
+	}
+	stopGrace := func() {
+		if timer != nil {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer = nil
+			timeout = nil
+		}
+	}
+	defer stopGrace()
+	switch current {
+	case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+		return ErrChannelClosed
+	case webrtc.PeerConnectionStateDisconnected:
+		startGrace()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return ErrChannelClosed
+		case next := <-states:
+			switch next {
+			case webrtc.PeerConnectionStateConnected:
+				stopGrace()
+			case webrtc.PeerConnectionStateDisconnected:
+				startGrace()
+			case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+				return ErrChannelClosed
+			}
+		}
+	}
+}
+
 func (p *EstablishedPeer) Close() error {
 	if p == nil {
 		return nil

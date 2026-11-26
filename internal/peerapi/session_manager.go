@@ -36,6 +36,18 @@ type Transport interface {
 	Accept(context.Context) (PeerSession, error)
 }
 
+// peerSessionLifecycle is implemented by real WebRTC sessions. Test and
+// synthetic transports without connection-state information keep the legacy
+// session-lifetime behavior.
+type peerSessionLifecycle interface {
+	MonitorConnection(context.Context, time.Duration) error
+}
+
+// A short ICE disconnect can recover by itself. This grace matches the
+// periodic peer reconciler cadence, after which removing the session permits
+// its next normal, freshly authenticated dial.
+const peerDisconnectedRecoveryGrace = 30 * time.Second
+
 type SignalingTransport struct {
 	Options peertransport.SignalingOptions
 	// ResolveOptions refreshes the local identity head and other short-lived
@@ -93,6 +105,9 @@ func (s establishedSession) ReceiveAuthorizedCommand(ctx context.Context, resolv
 	return s.Data.ReceiveAuthorizedCommand(ctx, resolve, authorizer, replay, identityID, nodeID)
 }
 func (s establishedSession) RemoteIdentityID() string { return s.EstablishedPeer.RemoteIdentityID }
+func (s establishedSession) MonitorConnection(ctx context.Context, grace time.Duration) error {
+	return s.EstablishedPeer.MonitorConnection(ctx, grace)
+}
 
 type managedPeer struct {
 	session   PeerSession
@@ -274,6 +289,7 @@ func (m *SessionManager) Stop() error { return m.stop(false) }
 
 func (m *SessionManager) stop(final bool) error {
 	m.mu.Lock()
+	alreadyClosed := m.closed
 	if final {
 		m.closed = true
 	}
@@ -285,7 +301,7 @@ func (m *SessionManager) stop(final bool) error {
 		}
 		return nil
 	}
-	if m.closed {
+	if alreadyClosed {
 		m.mu.Unlock()
 		return nil
 	}
@@ -380,9 +396,30 @@ func (m *SessionManager) attach(session PeerSession) error {
 	m.mu.Unlock()
 	go func() {
 		defer m.wg.Done()
-		_ = m.service.Serve(ctx, session)
-		cancel()
-		_ = session.Close()
+		serveDone := make(chan struct{})
+		go func() {
+			defer close(serveDone)
+			_ = m.service.Serve(ctx, session)
+		}()
+		if lifecycle, ok := session.(peerSessionLifecycle); ok {
+			monitorDone := make(chan struct{})
+			go func() {
+				defer close(monitorDone)
+				_ = lifecycle.MonitorConnection(ctx, peerDisconnectedRecoveryGrace)
+			}()
+			select {
+			case <-serveDone:
+			case <-monitorDone:
+			}
+			cancel()
+			_ = session.Close()
+			<-serveDone
+			<-monitorDone
+		} else {
+			<-serveDone
+			cancel()
+			_ = session.Close()
+		}
 		m.mu.Lock()
 		if m.peers[nodeID] == managed {
 			delete(m.peers, nodeID)

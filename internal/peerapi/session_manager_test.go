@@ -21,6 +21,41 @@ type managerTestSession struct {
 	one        sync.Once
 }
 
+type managerLifecycleEvent struct {
+	err      error
+	observed chan struct{}
+}
+
+type managerLifecycleSession struct {
+	*managerTestSession
+	events        chan managerLifecycleEvent
+	monitorExited chan struct{}
+}
+
+func newManagerLifecycleSession(nodeID, identityID, sessionID string) *managerLifecycleSession {
+	return &managerLifecycleSession{
+		managerTestSession: newManagerTestSession(nodeID, identityID, sessionID),
+		events:             make(chan managerLifecycleEvent), monitorExited: make(chan struct{}),
+	}
+}
+
+func (s *managerLifecycleSession) MonitorConnection(ctx context.Context, _ time.Duration) error {
+	defer close(s.monitorExited)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case event := <-s.events:
+			if event.observed != nil {
+				close(event.observed)
+			}
+			if event.err != nil {
+				return event.err
+			}
+		}
+	}
+}
+
 func newManagerTestSession(nodeID, identityID, sessionID string) *managerTestSession {
 	return &managerTestSession{nodeID: nodeID, identityID: identityID, sessionID: sessionID, closed: make(chan struct{})}
 }
@@ -134,6 +169,128 @@ func TestSessionManagerConnectsListsAndClosesPeerLifecycle(t *testing.T) {
 	}
 	if err := manager.Start(t.Context()); !errors.Is(err, ErrSessionManagerClosed) {
 		t.Fatalf("Start after Close=%v", err)
+	}
+}
+
+func TestSessionManagerTransientDisconnectKeepsPeerSession(t *testing.T) {
+	session := newManagerLifecycleSession("nd_EEEEEEEEEEEEEEEEEEEEEE", "gi_remote", "session_transient")
+	transport := &managerTestTransport{accepted: make(chan PeerSession, 1), dialed: session}
+	manager, err := NewSessionManager(transport, testPeerService("nd_local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Connect(t.Context(), session.identityID, session.nodeID); err != nil {
+		t.Fatal(err)
+	}
+	observed := make(chan struct{})
+	session.events <- managerLifecycleEvent{observed: observed} // transient disconnect, still within recovery grace
+	<-observed
+	if got := manager.List(); len(got) != 1 || got[0].SessionID != session.sessionID {
+		t.Fatalf("transient disconnect removed session: %+v", got)
+	}
+	select {
+	case <-session.closed:
+		t.Fatal("transient disconnect closed session")
+	default:
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-session.monitorExited:
+	default:
+		t.Fatal("manager Close returned before lifecycle monitor exited")
+	}
+}
+
+func TestSessionManagerPersistentDisconnectRemovesAndAllowsReconnect(t *testing.T) {
+	first := newManagerLifecycleSession("nd_FFFFFFFFFFFFFFFFFFFFFF", "gi_remote", "session_old")
+	transport := &managerTestTransport{accepted: make(chan PeerSession, 1), dialed: first}
+	manager, err := NewSessionManager(transport, testPeerService("nd_local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Connect(t.Context(), first.identityID, first.nodeID); err != nil {
+		t.Fatal(err)
+	}
+	observed := make(chan struct{})
+	first.events <- managerLifecycleEvent{err: peertransport.ErrChannelClosed, observed: observed}
+	<-observed
+	if !waitForPeerSessionAbsent(t, manager, first.nodeID) {
+		t.Fatal("persistent disconnect left stale session registered")
+	}
+	select {
+	case <-first.closed:
+	case <-time.After(time.Second):
+		t.Fatal("persistent disconnect did not close session")
+	}
+	second := newManagerTestSession(first.nodeID, first.identityID, "session_fresh")
+	transport.dialed = second
+	if err := manager.Connect(t.Context(), second.identityID, second.nodeID); err != nil {
+		t.Fatalf("fresh authenticated reconnect: %v", err)
+	}
+	if got := manager.List(); len(got) != 1 || got[0].SessionID != second.sessionID {
+		t.Fatalf("reconnected session=%+v", got)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionManagerTerminalFailureRemovesPeer(t *testing.T) {
+	session := newManagerLifecycleSession("nd_GGGGGGGGGGGGGGGGGGGGGG", "gi_remote", "session_failed")
+	transport := &managerTestTransport{accepted: make(chan PeerSession, 1), dialed: session}
+	manager, err := NewSessionManager(transport, testPeerService("nd_local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Connect(t.Context(), session.identityID, session.nodeID); err != nil {
+		t.Fatal(err)
+	}
+	observed := make(chan struct{})
+	session.events <- managerLifecycleEvent{err: peertransport.ErrChannelClosed, observed: observed}
+	<-observed
+	if !waitForPeerSessionAbsent(t, manager, session.nodeID) {
+		t.Fatal("terminal failure left session registered")
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-session.monitorExited:
+	default:
+		t.Fatal("manager Close returned before lifecycle monitor exited")
+	}
+}
+
+func waitForPeerSessionAbsent(t *testing.T, manager *SessionManager, nodeID string) bool {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		for _, session := range manager.List() {
+			if session.NodeID == nodeID {
+				goto wait
+			}
+		}
+		return true
+	wait:
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			return false
+		}
 	}
 }
 

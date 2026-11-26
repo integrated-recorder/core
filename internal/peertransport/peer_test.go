@@ -42,6 +42,63 @@ func TestICEConfigurationRequiresAuthorizedTURNForRelayOnly(t *testing.T) {
 	}
 }
 
+func TestMonitorConnectionStateStreamAllowsTransientDisconnectRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	states := make(chan webrtc.PeerConnectionState, 2)
+	done := make(chan error, 1)
+	go func() {
+		done <- monitorConnectionStateStream(ctx, webrtc.PeerConnectionStateConnected, states, 20*time.Millisecond)
+	}()
+	states <- webrtc.PeerConnectionStateDisconnected
+	states <- webrtc.PeerConnectionStateConnected
+	select {
+	case err := <-done:
+		t.Fatalf("monitor ended after recovered transient disconnect: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("monitor result after transient recovery and cancellation=%v", err)
+	}
+}
+
+func TestMonitorConnectionStateStreamExpiresPersistentDisconnect(t *testing.T) {
+	states := make(chan webrtc.PeerConnectionState, 1)
+	states <- webrtc.PeerConnectionStateDisconnected
+	err := monitorConnectionStateStream(context.Background(), webrtc.PeerConnectionStateConnected, states, 10*time.Millisecond)
+	if !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("persistent disconnect error=%v, want ErrChannelClosed", err)
+	}
+}
+
+func TestMonitorConnectionStateStreamRejectsTerminalState(t *testing.T) {
+	states := make(chan webrtc.PeerConnectionState, 1)
+	states <- webrtc.PeerConnectionStateFailed
+	err := monitorConnectionStateStream(context.Background(), webrtc.PeerConnectionStateConnected, states, time.Second)
+	if !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("terminal state error=%v, want ErrChannelClosed", err)
+	}
+}
+
+func TestEnqueueConnectionStatePreservesTerminalNotificationWhenBufferFull(t *testing.T) {
+	states := make(chan webrtc.PeerConnectionState, 1)
+	states <- webrtc.PeerConnectionStateConnected
+	enqueueConnectionState(states, webrtc.PeerConnectionStateFailed)
+	if got := <-states; got != webrtc.PeerConnectionStateFailed {
+		t.Fatalf("queued state=%s, want terminal failed state", got)
+	}
+}
+
+func TestEnqueueConnectionStatePreservesLatestRecoveryWhenBufferFull(t *testing.T) {
+	states := make(chan webrtc.PeerConnectionState, 1)
+	states <- webrtc.PeerConnectionStateDisconnected
+	enqueueConnectionState(states, webrtc.PeerConnectionStateConnected)
+	if got := <-states; got != webrtc.PeerConnectionStateConnected {
+		t.Fatalf("queued state=%s, want recovered connected state", got)
+	}
+}
+
 func TestChannelFrameBoundsFollowChannelClass(t *testing.T) {
 	peer, err := NewPeerConnection(ICEConfig{})
 	if err != nil {

@@ -63,4 +63,6 @@ M0 archive snapshot parser fuzz (`bb75220ada2c0df9d7c7af5775719eab73942b75`): ca
 
 M5 crypto envelope parser fuzz (`9ac41abe9564c6df8134200baff130b3d1cdac0a`): 공유 wire vector에서 유효한 key-envelope와 session-DEK envelope seed를 읽고, 두 public parser가 허용한 입력이 identity canonicalizer와 동일한 바이트로 marshal되는지 검증한다. malformed, duplicate-field, trailing-byte seed를 포함했다. 각 parser 2초 fuzz run 통과(각각 29,209 및 16,469 executions); cryptoarchive package normal/race 테스트도 통과했다. 이는 parser no-panic/canonicalization 일관성의 짧은 로컬 검증이며 envelope 서명·수신자 권한 정책, 긴 fuzz soak 또는 독립 구현체 acceptance를 증명하지 않는다.
 
+M3 signaling wire parser fuzz (`3499ac82e118382e7135478d8a38928b5a9dd598`): signed `KindCancel` seed를 만들고 `signalingprotocol.ParseCanonicalMessage`가 허용하는 모든 입력이 `CanonicalMessage`에서 동일한 canonical bytes로 왕복하는지 검사한다. malformed, duplicate-field, trailing-byte 및 추가 JSON value seed를 포함했다. 2초 fuzz campaign(83,760 executions), package normal/race 테스트 통과. 이 검증은 parser shape/canonicalization만 다루며 현재 Identity/Node 권한, replay consumption, TLS signaling 또는 실제 네트워크를 검증하지 않는다.
+
 **Release eligibility는 NO-GO다.** 독립 운영 노드/Discovery, 외부 NAT/TURN, 실제 Docker upgrade, 물리 iPhone Safari 및 독립 보안 검토 같은 필수 acceptance 게이트가 남아 있다. Docker와 실기기 검증은 이 개발 세션에서 실행하지 않는다.

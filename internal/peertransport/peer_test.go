@@ -177,26 +177,41 @@ func TestLocalPeerConnectionUsesBoundedOrderedDataChannel(t *testing.T) {
 		return state, nil
 	}
 	type authResult struct {
+		role    HandshakeRole
 		session *AuthenticatedDataChannel
 		err     error
 	}
 	results := make(chan authResult, 2)
+	// Match the production responder path: install its bounded control inbox
+	// before the initiator can send hello. Pion drops a data-channel message
+	// when no OnMessage handler is registered yet.
+	responderInbox := make(chan []byte, 4)
+	if err := SetBoundedMessageHandler(peerControl, MaxControlFrame, func(message []byte) error {
+		select {
+		case responderInbox <- message:
+			return nil
+		default:
+			return ErrMessageRejected
+		}
+	}); err != nil {
+		t.Fatalf("install responder control inbox: %v", err)
+	}
 	go func() {
 		session, err := AuthenticateDataChannel(ctx, RoleInitiator, control, data, localNode, identityID, head, resolve, nodeidentity.PeerReplayConsumer{NodeStore: localNode})
 		if err == nil {
 			err = session.Send(ctx, []byte("immediate post-auth frame"))
 		}
-		results <- authResult{session: session, err: err}
+		results <- authResult{role: RoleInitiator, session: session, err: err}
 	}()
 	go func() {
-		session, err := AuthenticateDataChannel(ctx, RoleResponder, peerControl, remote, remoteNode, identityID, head, resolve, nodeidentity.PeerReplayConsumer{NodeStore: remoteNode})
-		results <- authResult{session: session, err: err}
+		session, err := authenticateDataChannelWithInbox(ctx, RoleResponder, peerControl, remote, responderInbox, remoteNode, identityID, head, resolve, nodeidentity.PeerReplayConsumer{NodeStore: remoteNode})
+		results <- authResult{role: RoleResponder, session: session, err: err}
 	}()
 	var localSession, remoteSession *AuthenticatedDataChannel
 	for i := 0; i < 2; i++ {
 		result := <-results
 		if result.err != nil {
-			t.Fatalf("authenticated data channel failed: %v", result.err)
+			t.Fatalf("%s authenticated data channel failed: %v", result.role, result.err)
 		}
 		if result.session == nil || result.session.Remote().Kind != authority.PrincipalNode {
 			t.Fatalf("authenticated session/peer missing: %+v", result.session)

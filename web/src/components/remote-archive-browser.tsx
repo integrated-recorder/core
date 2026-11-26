@@ -168,7 +168,8 @@ export function RemoteArchiveBrowser() {
 
   useEffect(() => {
     const clearSensitivePlayback = () => {
-      if (playbackScopeRef.current || dekRef.current || recoveryKeysRef.current || sessionKeyPairRef.current) {
+      const hasPlaybackState = Boolean(playbackScopeRef.current || dekRef.current || recoveryKeysRef.current || sessionKeyPairRef.current)
+      if (hasPlaybackState || recoveryPhrase.length > 0 || recoveryFile !== null) {
         clearPlayback()
         setPlaybackMessage('')
         setRecoveryPhrase('')
@@ -190,7 +191,7 @@ export function RemoteArchiveBrowser() {
       document.removeEventListener('visibilitychange', handleVisibility)
       window.removeEventListener('pagehide', handlePageHide)
     }
-  }, [refetchCapabilities, clearPlayback, t])
+  }, [refetchCapabilities, clearPlayback, recoveryFile, recoveryPhrase, t])
 
   useEffect(() => {
     const scope = playbackScopeRef.current

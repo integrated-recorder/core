@@ -402,12 +402,17 @@ describe('remote archive browser', () => {
       expect(dek.every(byte => byte === 0)).toBe(true)
       expect(revokeObjectURL).toHaveBeenCalledWith('blob:hidden-playback')
       expect(screen.getByLabelText('Global Identity 복구 문구')).toHaveValue('')
-      expect(screen.getByRole('alert')).toHaveTextContent('페이지가 숨겨져 재생을 중지하고 복호화 키와 입력한 복구 자료를 지웠습니다.')
+      expect(screen.getByRole('alert')).toHaveTextContent('페이지가 숨겨져 임시 복호화 키와 입력한 복구 자료를 지웠습니다.')
     })
 
     const capabilityReads = fetchMock.mock.calls.filter(([path]) => String(path) === '/api/peer-archives/capabilities').length
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
     fireEvent(document, new Event('visibilitychange'))
     await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => String(path) === '/api/peer-archives/capabilities').length).toBeGreaterThan(capabilityReads))
+
+    fireEvent.change(screen.getByLabelText('Global Identity 복구 문구'), { target: { value: 'another recovery phrase' } })
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    fireEvent(document, new Event('visibilitychange'))
+    expect(screen.getByLabelText('Global Identity 복구 문구')).toHaveValue('')
   })
 })

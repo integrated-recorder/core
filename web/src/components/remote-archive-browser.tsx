@@ -102,11 +102,13 @@ export function RemoteArchiveBrowser() {
   const [playbackPlan, setPlaybackPlan] = useState<PeerPlaybackPlan | null>(null)
   const [playbackError, setPlaybackError] = useState('')
   const [playbackMessage, setPlaybackMessage] = useState('')
+  const [peerRecoveryPending, setPeerRecoveryPending] = useState(false)
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<{ destroy: () => void } | null>(null)
   const playlistURLRef = useRef('')
   const dekRef = useRef<Uint8Array | null>(null)
   const playbackScopeRef = useRef<{ identityID: string; nodeID: string; ownerSubjectID: string; archiveID: string; grantHash: string } | null>(null)
+  const peerRecoveryScopeRef = useRef<{ identityID: string; nodeID: string; ownerSubjectID: string; archiveID: string; grantHash: string } | null>(null)
   const headRequestRef = useRef(0)
   const capabilities = useQuery({
     queryKey: ['peerArchives', 'capabilities'],
@@ -137,6 +139,8 @@ export function RemoteArchiveBrowser() {
     playlistURLRef.current = ''
     dekRef.current?.fill(0)
     dekRef.current = null
+    peerRecoveryScopeRef.current = null
+    setPeerRecoveryPending(false)
     setPlaybackPlan(null)
     setTrackID('')
     setPlaybackKeyEpoch('')
@@ -144,19 +148,55 @@ export function RemoteArchiveBrowser() {
 
   useEffect(() => {
     const scope = playbackScopeRef.current
-    if (!scope) return
+    if (!scope) {
+      if (peerRecoveryPending) {
+        if (capabilities.error) {
+          setPlaybackError(t('identity.remotePlaybackAuthorizationUnavailable'))
+          return
+        }
+        const pendingScope = peerRecoveryScopeRef.current
+        const peerReturned = Boolean(pendingScope && (capabilities.data?.sessions ?? []).some(session =>
+          session.identity_id === pendingScope.identityID && session.node_id === pendingScope.nodeID))
+        const capabilityStillActive = Boolean(pendingScope && (capabilities.data?.capabilities ?? []).some(grant =>
+          grant.owner_subject_id === pendingScope.ownerSubjectID && grant.archive_id === pendingScope.archiveID &&
+          grant.grant_hash === pendingScope.grantHash && Date.parse(grant.expires_at) > Date.now()))
+        if (!capabilityStillActive) {
+          setPeerRecoveryPending(false)
+          peerRecoveryScopeRef.current = null
+          setPlaybackError(t('identity.remotePlaybackGrantEnded'))
+        } else if (peerReturned) {
+          setPeerRecoveryPending(false)
+          peerRecoveryScopeRef.current = null
+          setPlaybackError('')
+          setPlaybackMessage(t('identity.remotePlaybackPeerReconnected'))
+        }
+      }
+      return
+    }
 
-    const grantStillActive = !capabilities.error && (capabilities.data?.capabilities ?? []).some(grant =>
+    const grantStillActive = (capabilities.data?.capabilities ?? []).some(grant =>
       grant.owner_subject_id === scope.ownerSubjectID && grant.archive_id === scope.archiveID &&
       grant.grant_hash === scope.grantHash && Date.parse(grant.expires_at) > Date.now())
     const peerStillConnected = (capabilities.data?.sessions ?? []).some(session =>
       session.identity_id === scope.identityID && session.node_id === scope.nodeID)
-    if (!grantStillActive || !peerStillConnected) {
+    if (capabilities.error) {
       clearPlayback()
       setPlaybackMessage('')
-      setPlaybackError(t('identity.remotePlaybackAuthorizationEnded'))
+      setPeerRecoveryPending(false)
+      setPlaybackError(t('identity.remotePlaybackAuthorizationUnavailable'))
+    } else if (!grantStillActive) {
+      clearPlayback()
+      setPlaybackMessage('')
+      setPeerRecoveryPending(false)
+      setPlaybackError(t('identity.remotePlaybackGrantEnded'))
+    } else if (!peerStillConnected) {
+      clearPlayback()
+      peerRecoveryScopeRef.current = scope
+      setPeerRecoveryPending(true)
+      setPlaybackMessage('')
+      setPlaybackError(t('identity.remotePlaybackPeerDisconnected'))
     }
-  }, [capabilities.data, capabilities.dataUpdatedAt, capabilities.error, clearPlayback, playbackPlan, t])
+  }, [capabilities.data, capabilities.dataUpdatedAt, capabilities.error, clearPlayback, peerRecoveryPending, playbackPlan, t])
 
   useEffect(() => () => {
     headRequestRef.current++

@@ -272,12 +272,13 @@ describe('remote archive browser', () => {
       expect(load).toHaveBeenCalled()
       expect(revokeObjectURL).toHaveBeenCalledWith('blob:peer-playback')
       expect(dek.every(byte => byte === 0)).toBe(true)
-      expect(screen.getByRole('alert')).toHaveTextContent('아카이브 권한 또는 Node 연결이 만료되거나 변경되어 재생을 중지하고 복호화 키를 지웠습니다.')
+      expect(screen.getByRole('alert')).toHaveTextContent('Recorder 연결이 끊겨 재생을 중지하고 복호화 키를 지웠습니다.')
     })
 
+    queryClient.setQueryData(['peerArchives', 'capabilities'], capabilities())
+    expect(await screen.findByRole('status')).toHaveTextContent('Recorder 연결이 복구됐습니다.')
     const secondDEK = new Uint8Array(32).fill(0x5a)
     vi.mocked(openArchiveDEK).mockResolvedValue(secondDEK)
-    queryClient.setQueryData(['peerArchives', 'capabilities'], capabilities())
     fireEvent.change(screen.getByLabelText('Global Identity 복구 문구'), { target: { value: 'recovery phrase fixture' } })
     fireEvent.click(screen.getByRole('button', { name: '복호화 재생' }))
     expect(await screen.findByText('확인된 키 Epoch: 7')).toBeInTheDocument()
@@ -286,7 +287,7 @@ describe('remote archive browser', () => {
     await waitFor(() => {
       expect(revokeObjectURL).toHaveBeenCalledTimes(2)
       expect(secondDEK.every(byte => byte === 0)).toBe(true)
-      expect(screen.getByRole('alert')).toHaveTextContent('아카이브 권한 또는 Node 연결이 만료되거나 변경되어 재생을 중지하고 복호화 키를 지웠습니다.')
+      expect(screen.getByRole('alert')).toHaveTextContent('아카이브 권한이 만료되거나 철회되어 재생을 중지하고 복호화 키를 지웠습니다.')
     })
   })
 

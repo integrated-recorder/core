@@ -5,7 +5,7 @@ import { globalIdentityAPI, peerArchivesAPI, peerSessionsAPI, recordingsAPI, rep
 import { accountAuthorizationQuery, globalIdentityForkChoicesQuery, globalIdentityQuery, globalIdentityRegistryQuery, globalIdentitySessionQuery, nodeIdentityQuery, ownerAuthoritySubjectsQuery, peerSessionsQuery, qk, replicaLeasesQuery } from '@/api/queries'
 import { useI18n } from '@/i18n/provider'
 import type { TranslationKey } from '@/i18n/catalog'
-import { canonicalIdentityJSON, createRecoveryMaterial, decodeRecoveryFile, deriveRecoveryKeys, recoveryEntropyFromMnemonic, signIdentityGenesis, signIdentitySuccessor, type RecoveryKeyMaterial, type RecoveryMaterial } from '@/identity/recovery'
+import { canonicalIdentityJSON, createRecoveryMaterial, decodeRecoveryFileBlob, deriveRecoveryKeys, recoveryEntropyFromMnemonic, signIdentityGenesis, signIdentitySuccessor, type RecoveryKeyMaterial, type RecoveryMaterial } from '@/identity/recovery'
 import { base64UrlBytes, webAuthnChallenge, webAuthnCreationOptions, webAuthnRequestOptions, serializeAssertionCredential, serializeRegistrationCredential } from '@/identity/webauthn'
 import type { GlobalIdentityForkChoice, GlobalIdentityHistoryBundle, NodeEnrollmentProof, OwnerAuthoritySubject, OwnerSubjectReplicationPolicy, ReplicaInboxOffer, ReplicaLeaseSummary } from '@/types/api'
 import { errorMessage } from '@/lib/errors'
@@ -355,7 +355,7 @@ export function GlobalIdentityPanel() {
 
   const readRecoveryKeys = async (identityID: string): Promise<RecoveryKeyMaterial> => {
     let entropy: Uint8Array
-    if (recoveryFile) entropy = await decodeRecoveryFile(new Uint8Array(await recoveryFile.arrayBuffer()))
+    if (recoveryFile) entropy = await decodeRecoveryFileBlob(recoveryFile)
     else entropy = recoveryEntropyFromMnemonic(recoveryPhrase)
     try {
       const keys = await deriveRecoveryKeys(entropy)

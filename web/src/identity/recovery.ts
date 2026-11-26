@@ -122,6 +122,17 @@ export async function decodeRecoveryFile(file: Uint8Array): Promise<Uint8Array> 
   return Uint8Array.from(file.subarray(RECOVERY_MAGIC.length + 1, body.length))
 }
 
+/** Read a user-provided recovery file and clear its temporary byte buffer. */
+export async function decodeRecoveryFileBlob(file: Blob): Promise<Uint8Array> {
+  if (file.size !== RECOVERY_FILE_BYTES) throw new TypeError('recovery file length is invalid')
+  const encoded = new Uint8Array(await file.arrayBuffer())
+  try {
+    return await decodeRecoveryFile(encoded)
+  } finally {
+    encoded.fill(0)
+  }
+}
+
 async function derive32(entropy: Uint8Array, info: Uint8Array): Promise<Uint8Array> {
   const key = await cryptoAPI().subtle.importKey('raw', entropy, 'HKDF', false, ['deriveBits'])
   const bits = await cryptoAPI().subtle.deriveBits(

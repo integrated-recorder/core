@@ -4,6 +4,7 @@ import { ed25519 } from '@noble/curves/ed25519.js'
 import {
   createRecoveryMaterial,
   decodeRecoveryFile,
+  decodeRecoveryFileBlob,
   deriveRecoveryKeys,
   encodeRecoveryFile,
   recoveryEntropyFromMnemonic,
@@ -38,6 +39,26 @@ describe('global identity offline recovery', () => {
     unsupported[4] = 2
     await expect(decodeRecoveryFile(unsupported)).rejects.toThrow(/version/u)
     await expect(decodeRecoveryFile(file.subarray(0, file.length - 1))).rejects.toThrow(/length/u)
+  })
+
+  it('clears the temporary recovery-file buffer after decoding and after failure', async () => {
+    const encoded = await encodeRecoveryFile(vectorEntropy)
+    const validBacking = encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength)
+    const validFile = { size: encoded.byteLength, arrayBuffer: async () => validBacking } as unknown as Blob
+    expect(await decodeRecoveryFileBlob(validFile)).toEqual(vectorEntropy)
+    expect(new Uint8Array(validBacking).every(value => value === 0)).toBe(true)
+
+    const invalidBackingBytes = Uint8Array.from(encoded)
+    invalidBackingBytes[0] ^= 1
+    const invalidBacking = invalidBackingBytes.buffer
+    const invalidFile = { size: encoded.byteLength, arrayBuffer: async () => invalidBacking } as unknown as Blob
+    await expect(decodeRecoveryFileBlob(invalidFile)).rejects.toThrow()
+    expect(new Uint8Array(invalidBacking).every(value => value === 0)).toBe(true)
+
+    const readOversizedFile = vi.fn(async () => new ArrayBuffer(encoded.byteLength + 1))
+    const oversizedFile = { size: encoded.byteLength + 1, arrayBuffer: readOversizedFile } as unknown as Blob
+    await expect(decodeRecoveryFileBlob(oversizedFile)).rejects.toThrow(/length/u)
+    expect(readOversizedFile).not.toHaveBeenCalled()
   })
 
   it('uses distinct HKDF labels and reproduces the public cross-language key vector', async () => {

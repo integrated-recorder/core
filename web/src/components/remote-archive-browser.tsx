@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { errorMessage } from '@/lib/errors'
 import { useI18n } from '@/i18n/provider'
-import { decodeRecoveryFile, deriveRecoveryKeys, recoveryEntropyFromMnemonic } from '@/identity/recovery'
+import { decodeRecoveryFileBlob, deriveRecoveryKeys, recoveryEntropyFromMnemonic } from '@/identity/recovery'
 import { createSessionDEKKeyPair, openArchiveDEK, openSessionDEKEnvelope, type KeyEnvelope, type SessionDEKBinding } from '@/identity/cryptoarchive'
 import { createPeerArchiveFragmentLoader, createPeerPlaybackPlan, decryptPeerPlaybackObject, type PeerPlaybackPlan } from '@/identity/peer-playback'
 import { serializeAssertionCredential, webAuthnRequestOptions, base64UrlBytes } from '@/identity/webauthn'
@@ -281,7 +281,7 @@ export function RemoteArchiveBrowser() {
       if (!window.isSecureContext || !globalThis.crypto?.subtle) throw new Error(t('identity.remotePlaybackNeedsHTTPS'))
       if (!recoveryFile && !recoveryPhrase.trim()) throw new Error(t('identity.remotePlaybackRecoveryRequired'))
       entropy = recoveryFile
-        ? await decodeRecoveryFile(new Uint8Array(await recoveryFile.arrayBuffer()))
+        ? await decodeRecoveryFileBlob(recoveryFile)
         : recoveryEntropyFromMnemonic(recoveryPhrase)
       keys = await deriveRecoveryKeys(entropy)
       entropy.fill(0)

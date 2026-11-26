@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -211,6 +212,33 @@ func TestAuthorizePeerSessionAllowsCrossIdentityOnlyWithCurrentCapability(t *tes
 	if len(disconnects) != 0 {
 		t.Fatalf("reconciler disconnected a currently authorized cross-identity session: %v", disconnects)
 	}
+
+	// This is unit/reconciler coverage of the authorization and desired-session
+	// boundary. It does not exercise a real Pion transport or manager restart.
+	delete(stateB.CurrentKeys, authority.PrincipalNode+":"+nodeB)
+	if err := authorizePeerSession(identityA, nodeA, identityB, nodeB, resolve, store, now); !errors.Is(err, peerprotocol.ErrCommandDenied) {
+		t.Fatalf("cross-identity session remained authorized after remote Node revocation: %v", err)
+	}
+	if err := reconciler.Reconcile(t.Context()); err != nil {
+		t.Fatalf("reconcile revoked remote Node session: %v", err)
+	}
+	connects, disconnects := peers.results()
+	if len(connects) != 0 || !reflect.DeepEqual(disconnects, []string{nodeB}) {
+		t.Fatalf("revoked remote Node lifecycle connects=%v disconnects=%v", connects, disconnects)
+	}
+	// Model the production manager's successful disconnect by removing the
+	// session from this fake's inventory before the next reconciliation pass.
+	peers.mu.Lock()
+	peers.sessions = nil
+	peers.mu.Unlock()
+	if err := reconciler.Reconcile(t.Context()); err != nil {
+		t.Fatalf("reconcile after revoked remote Node was removed: %v", err)
+	}
+	connects, disconnects = peers.results()
+	if len(connects) != 0 || !reflect.DeepEqual(disconnects, []string{nodeB}) {
+		t.Fatalf("revoked cross-identity Node was reconnected: connects=%v disconnects=%v", connects, disconnects)
+	}
+
 	if err := authorizePeerSession(identityA, nodeA, identityB, deniedNode, resolve, store, now); !errors.Is(err, peerprotocol.ErrCommandDenied) {
 		t.Fatalf("undelegated target Node was accepted: %v", err)
 	}

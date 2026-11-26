@@ -420,7 +420,7 @@ func AcceptIncoming(ctx context.Context, options SignalingOptions) (*Established
 	if err != nil {
 		return nil, fmt.Errorf("receiving negotiated data channels: %w", err)
 	}
-	authResult, err := authenticateDataChannelWithInbox(ctx, RoleResponder, control, data, controlInbox, options.HelloSigner, options.IdentityID, options.IdentityHead, options.PeerIdentityResolver, options.PeerReplay)
+	authResult, err := AuthenticateDataChannelWithInbox(ctx, RoleResponder, control, data, controlInbox, options.HelloSigner, options.IdentityID, options.IdentityHead, options.PeerIdentityResolver, options.PeerReplay)
 	if err != nil {
 		return nil, fmt.Errorf("authenticating responder data channel: %w", err)
 	}

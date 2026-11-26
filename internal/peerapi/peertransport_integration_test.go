@@ -1187,6 +1187,20 @@ func authenticatedPionPair(
 		session *peertransport.AuthenticatedDataChannel
 		err     error
 	}
+	// Match the production signaling responder: install its bounded control
+	// inbox as soon as the channel is available, before the initiator can send
+	// its first authentication frame.
+	targetInbox := make(chan []byte, 4)
+	if err := peertransport.SetBoundedMessageHandler(targetControl, peertransport.MaxControlFrame, func(message []byte) error {
+		select {
+		case targetInbox <- message:
+			return nil
+		default:
+			return peertransport.ErrMessageRejected
+		}
+	}); err != nil {
+		t.Fatalf("install responder control inbox: %v", err)
+	}
 	results := make(chan result, 2)
 	go func() {
 		session, err := peertransport.AuthenticateDataChannel(ctx, peertransport.RoleInitiator, control, data,
@@ -1194,7 +1208,7 @@ func authenticatedPionPair(
 		results <- result{session: session, err: err}
 	}()
 	go func() {
-		session, err := peertransport.AuthenticateDataChannel(ctx, peertransport.RoleResponder, targetControl, targetData,
+		session, err := peertransport.AuthenticateDataChannelWithInbox(ctx, peertransport.RoleResponder, targetControl, targetData, targetInbox,
 			targetNode, targetIdentityID, targetHead, resolve, nodeidentity.PeerReplayConsumer{NodeStore: targetNode})
 		results <- result{session: session, err: err}
 	}()

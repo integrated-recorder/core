@@ -319,6 +319,18 @@ func AuthenticateDataChannel(ctx context.Context, role HandshakeRole, control, d
 	return authenticateDataChannelWithInbox(ctx, role, control, data, nil, signer, identityID, identityHead, resolve, replay)
 }
 
+// AuthenticateDataChannelWithInbox authenticates a channel whose bounded
+// control-message handler was installed before this call. This is required by
+// transports that publish a channel to a peer before authentication begins:
+// Pion drops messages received before OnMessage is registered. The caller must
+// route messages into controlInbox using SetBoundedMessageHandler.
+func AuthenticateDataChannelWithInbox(ctx context.Context, role HandshakeRole, control, data *webrtc.DataChannel, controlInbox chan []byte, signer NodeSigner, identityID, identityHead string, resolve peerprotocol.IdentityResolver, replay peerprotocol.ReplayConsumer) (*AuthenticatedDataChannel, error) {
+	if controlInbox == nil {
+		return nil, ErrConfig
+	}
+	return authenticateDataChannelWithInbox(ctx, role, control, data, controlInbox, signer, identityID, identityHead, resolve, replay)
+}
+
 func authenticateDataChannelWithInbox(ctx context.Context, role HandshakeRole, control, data *webrtc.DataChannel, controlInbox chan []byte, signer NodeSigner, identityID, identityHead string, resolve peerprotocol.IdentityResolver, replay peerprotocol.ReplayConsumer) (*AuthenticatedDataChannel, error) {
 	if ctx == nil || control == nil || data == nil || data.Label() != DataChannelLabel {
 		return nil, ErrConfig

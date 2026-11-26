@@ -445,13 +445,26 @@ func TestLocalPeerConnectionAuthenticatesNodesFromDifferentIdentities(t *testing
 		err     error
 	}
 	results := make(chan result, 2)
+	// Match the production signaling responder: its bounded inbox is installed
+	// before the initiator can send the first authentication frame.
+	remoteInbox := make(chan []byte, 4)
+	if err := SetBoundedMessageHandler(pair.peerControl, MaxControlFrame, func(message []byte) error {
+		select {
+		case remoteInbox <- message:
+			return nil
+		default:
+			return ErrMessageRejected
+		}
+	}); err != nil {
+		t.Fatalf("install responder control inbox: %v", err)
+	}
 	go func() {
 		session, authErr := AuthenticateDataChannel(ctx, RoleInitiator, pair.control, pair.data,
 			localNode, localIdentity.id, localIdentity.head, resolve, nodeidentity.PeerReplayConsumer{NodeStore: localNode})
 		results <- result{session: session, err: authErr}
 	}()
 	go func() {
-		session, authErr := AuthenticateDataChannel(ctx, RoleResponder, pair.peerControl, pair.peerData,
+		session, authErr := AuthenticateDataChannelWithInbox(ctx, RoleResponder, pair.peerControl, pair.peerData, remoteInbox,
 			remoteNode, remoteIdentity.id, remoteIdentity.head, resolve, nodeidentity.PeerReplayConsumer{NodeStore: remoteNode})
 		results <- result{session: session, err: authErr}
 	}()

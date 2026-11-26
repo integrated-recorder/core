@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { webcrypto } from 'node:crypto'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GlobalIdentityPanel } from './global-identity'
-import { deriveRecoveryKeys, recoveryMnemonic } from '@/identity/recovery'
+import { deriveRecoveryKeys, recoveryMnemonic, signIdentityGenesis } from '@/identity/recovery'
 import { capabilityGrantHash } from '@/identity/authority'
 import { recipientKeyId } from '@/identity/cryptoarchive'
 
@@ -14,6 +14,31 @@ vi.mock('@zxing/browser', () => ({
   },
 }))
 
+async function makeForkFixture(keys: Awaited<ReturnType<typeof deriveRecoveryKeys>>) {
+  const previousHash = ''
+  const encode = (signed: ReturnType<typeof signIdentityGenesis>) => ({ canonical_event: Buffer.from(signed.canonicalEvent).toString('base64url'), signature: Buffer.from(signed.signature).toString('base64url') })
+  const first = encode(signIdentityGenesis(keys, 'challenge-one', 'credential-one', new Date('2026-01-01T00:00:00.000Z')))
+  const second = encode(signIdentityGenesis(keys, 'challenge-two', 'credential-two', new Date('2026-01-01T00:00:00.000Z')))
+  const hash = async (entry: { canonical_event: string }) => {
+    const canonical = Buffer.from(entry.canonical_event, 'base64url')
+    const prefix = new TextEncoder().encode('IR/identity-event/v1/hash\0')
+    const bytes = new Uint8Array(prefix.length + canonical.length)
+    bytes.set(prefix); bytes.set(canonical, prefix.length)
+    const digest = new Uint8Array(await webcrypto.subtle.digest('SHA-256', bytes))
+    return `sha256:${[...digest].map(byte => byte.toString(16).padStart(2, '0')).join('')}`
+  }
+  const [firstHead, secondHead, firstDirect, secondDirect] = await Promise.all([hash(first), hash(second), hash(first), hash(second)])
+  const [lower, upper] = [firstDirect, secondDirect].sort()
+  const forkInput = new TextEncoder().encode(`IR/global-identity-fork/v1\0${previousHash}\0${lower}\0${upper}`)
+  const forkDigest = new Uint8Array(await webcrypto.subtle.digest('SHA-256', forkInput))
+  const forkID = `sha256:${[...forkDigest].map(byte => byte.toString(16).padStart(2, '0')).join('')}`
+  return {
+    choice: { fork_id: forkID, previous_event_hash: previousHash, first_head_hash: firstHead, second_head_hash: secondHead, first_sequence: '0', second_sequence: '0' },
+    bundle: { format: 'ir.identity.history/1' as const, identity_id: keys.identityId, events: [first], fork_evidence: [{ previous_event_hash: previousHash, first_event: first, second_event: second, first_branch: [first], second_branch: [second] }] },
+    first, second,
+  }
+}
+
 describe('global identity account panel', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
@@ -23,12 +48,12 @@ describe('global identity account panel', () => {
     const recoveryPhrase = recoveryMnemonic(entropy)
     const recoveryKeys = await deriveRecoveryKeys(entropy.slice())
     const identityID = recoveryKeys.identityId
+    const fixture = await makeForkFixture(recoveryKeys)
     recoveryKeys.destroy()
-
-    const firstHead = `sha256:${'1'.repeat(64)}`
-    const secondHead = `sha256:${'2'.repeat(64)}`
-    const forkID = `sha256:${'3'.repeat(64)}`
-    const previousHash = `sha256:${'4'.repeat(64)}`
+    const firstHead = fixture.choice.first_head_hash
+    const secondHead = fixture.choice.second_head_hash
+    const forkID = fixture.choice.fork_id
+    const previousHash = fixture.choice.previous_event_hash
     let frozen = true
     let resolutionRequest: { canonical_event: string; signature: string } | undefined
     const firstIdentity = {
@@ -38,8 +63,9 @@ describe('global identity account panel', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       let payload: unknown = {}
-      if (path === '/api/global-identity/status') payload = { initialized: true, identity: frozen ? firstIdentity : { ...firstIdentity, sequence: '3', head_hash: `sha256:${'5'.repeat(64)}`, frozen: false } }
-      else if (path === '/api/global-identity/forks') payload = { forks: frozen ? [{ fork_id: forkID, previous_event_hash: previousHash, first_head_hash: firstHead, second_head_hash: secondHead, first_sequence: '2', second_sequence: '2' }] : [] }
+      if (path === '/api/global-identity/status') payload = { initialized: true, identity: frozen ? firstIdentity : { ...firstIdentity, sequence: '1', head_hash: `sha256:${'5'.repeat(64)}`, frozen: false } }
+      else if (path === '/api/global-identity/forks') payload = { forks: frozen ? [fixture.choice] : [] }
+      else if (path === '/api/global-identity/history') payload = fixture.bundle
       else if (path === '/api/global-identity/session') payload = { authenticated: false }
       else if (path === '/api/global-identity/registry') payload = { identities: [] }
       else if (path === '/api/node-identity/status') payload = { created: false, node: null }
@@ -53,7 +79,7 @@ describe('global identity account panel', () => {
       return new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
 
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     queryClient.setQueryData(['user', 'authorization'], { user_id: 'usr_owner', login: 'local-owner', roles: ['owner'], permissions: ['system.settings.manage'] })
@@ -61,13 +87,24 @@ describe('global identity account panel', () => {
 
     const resolveButton = await screen.findByRole('button', { name: '선택한 분기를 서명하고 해결' })
     expect(resolveButton).toBeDisabled()
-    fireEvent.click(screen.getByRole('button', { name: /관찰된 분기 2 · seq 2/u }))
+    const firstTranscript = await screen.findByText('관찰된 분기 1 서명 기록 · 이벤트 1개')
+    const secondTranscript = await screen.findByText('관찰된 분기 2 서명 기록 · 이벤트 1개')
+    fireEvent.click(firstTranscript)
+    fireEvent.click(secondTranscript)
+    await waitFor(() => {
+      expect(document.body.textContent).toContain(fixture.first.canonical_event)
+      expect(document.body.textContent).toContain(fixture.first.signature)
+      expect(document.body.textContent).toContain(fixture.second.canonical_event)
+      expect(document.body.textContent).toContain(fixture.second.signature)
+    })
+    fireEvent.click(screen.getByRole('button', { name: /관찰된 분기 2 · seq 0/u }))
     expect(resolveButton).toBeDisabled()
     fireEvent.change(screen.getByLabelText('24개 복구 단어'), { target: { value: recoveryPhrase } })
     expect(resolveButton).toBeEnabled()
     fireEvent.click(resolveButton)
 
     await waitFor(() => expect(resolutionRequest).toBeDefined())
+    expect(confirm).toHaveBeenCalledWith(`이 서명된 이력 머리값을 권한 기준으로 사용합니까? ${secondHead}`)
     const signedEvent = JSON.parse(Buffer.from(resolutionRequest!.canonical_event, 'base64url').toString('utf8')) as {
       identity_id: string
       sequence: string
@@ -77,7 +114,7 @@ describe('global identity account panel', () => {
     }
     expect(signedEvent).toMatchObject({
       identity_id: identityID,
-      sequence: '3',
+      sequence: '1',
       previous_event_hash: secondHead,
       operation: 'fork_resolve',
       payload: {
@@ -121,8 +158,11 @@ describe('global identity account panel', () => {
     render(<QueryClientProvider client={queryClient}><GlobalIdentityPanel /></QueryClientProvider>)
 
     expect(await screen.findByText('검증된 이력 분기 해결')).toBeInTheDocument()
+    expect(await screen.findByText('양쪽의 완전한 검증 기록을 확인할 수 없습니다. 분기 해결은 사용할 수 없습니다.')).toHaveAttribute('role', 'alert')
     expect(await screen.findByRole('button', { name: /관찰된 분기 1 · seq 2/u })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /관찰된 분기 2 · seq 2/u })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /관찰된 분기 1 · seq 2/u })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /선택한 분기를 서명하고 해결/u })).toBeDisabled()
     const exportButton = await screen.findByRole('button', { name: '공개 신원 이력 다운로드' })
     fireEvent.click(exportButton)
     await waitFor(() => expect(calls).toContain('/api/global-identity/history'))

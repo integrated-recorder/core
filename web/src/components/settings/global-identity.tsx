@@ -62,6 +62,80 @@ function readFileText(file: File): Promise<string> {
   })
 }
 
+type SignedForkBranch = NonNullable<GlobalIdentityHistoryBundle['fork_evidence']>[number]['first_branch']
+type ForkTranscriptEvidence = { first_branch: SignedForkBranch; second_branch: SignedForkBranch; first_head_hash: string; second_head_hash: string }
+
+function decodeBase64URLStrict(value: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) throw new TypeError('signed identity event encoding is invalid')
+  const binary = atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - value.length % 4) % 4))
+  const bytes = Uint8Array.from(binary, character => character.charCodeAt(0))
+  if (bytesToBase64URL(bytes) !== value) throw new TypeError('signed identity event encoding is invalid')
+  return bytes
+}
+
+function decodeSignedEvent(event: { canonical_event: string }): Uint8Array {
+  return decodeBase64URLStrict(event.canonical_event)
+}
+
+async function identityEventHash(event: { canonical_event: string; signature: string }): Promise<string> {
+  const canonical = decodeSignedEvent(event)
+  const domain = new TextEncoder().encode('IR/identity-event/v1/hash\0')
+  const input = new Uint8Array(domain.length + canonical.length)
+  input.set(domain)
+  input.set(canonical, domain.length)
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', input))
+  return `sha256:${[...digest].map(byte => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
+async function matchForkTranscript(bundle: GlobalIdentityHistoryBundle, choice: GlobalIdentityForkChoice, identityID: string): Promise<ForkTranscriptEvidence | null> {
+  if (bundle.format !== 'ir.identity.history/1' || bundle.identity_id !== identityID || !Array.isArray(bundle.fork_evidence)) return null
+  for (const evidence of bundle.fork_evidence) {
+    if (evidence.previous_event_hash !== choice.previous_event_hash) continue
+    const first = evidence.first_branch?.length ? evidence.first_branch : [evidence.first_event]
+    const second = evidence.second_branch?.length ? evidence.second_branch : [evidence.second_event]
+    if (!first.length || !second.length || !first.every(event => event?.canonical_event && event?.signature) || !second.every(event => event?.canonical_event && event?.signature)) continue
+    if (![...first, ...second].every(event => decodeBase64URLStrict(event.signature).length === 64)) continue
+    const [firstHead, secondHead, firstDirect, secondDirect] = await Promise.all([
+      identityEventHash(first[first.length - 1]), identityEventHash(second[second.length - 1]),
+      identityEventHash(first[0]), identityEventHash(second[0]),
+    ])
+    const [lower, upper] = [firstDirect, secondDirect].sort()
+    const forkDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`IR/global-identity-fork/v1\0${evidence.previous_event_hash}\0${lower}\0${upper}`)))
+    const forkID = `sha256:${[...forkDigest].map(byte => byte.toString(16).padStart(2, '0')).join('')}`
+    if (forkID !== choice.fork_id) continue
+    if (firstHead === choice.first_head_hash && secondHead === choice.second_head_hash) return { first_branch: first, second_branch: second, first_head_hash: firstHead, second_head_hash: secondHead }
+    if (firstHead === choice.second_head_hash && secondHead === choice.first_head_hash) return { first_branch: second, second_branch: first, first_head_hash: secondHead, second_head_hash: firstHead }
+    return null
+  }
+  return null
+}
+
+function signedBranchDescription(event: { canonical_event: string }): string {
+  try {
+    const value: unknown = JSON.parse(new TextDecoder().decode(decodeSignedEvent(event)))
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>
+      const operation = typeof record.operation === 'string' ? record.operation : 'event'
+      const sequence = typeof record.sequence === 'string' ? record.sequence : '?'
+      return `seq ${sequence} · ${operation}`
+    }
+  } catch { /* The exact signed bytes remain available below. */ }
+  return 'signed event'
+}
+
+function renderSignedBranch(branch: SignedForkBranch, label: string, t: (key: TranslationKey, values?: Record<string, string | number>) => string) {
+  if (!branch?.length) return null
+  return <details className="rounded border border-border p-2">
+    <summary className="cursor-pointer text-xs font-medium">{t('identity.forkTranscriptSummary', { label, count: branch.length })}</summary>
+    <ol className="mt-2 space-y-2">
+      {branch.map((event, index) => <li key={`${index}-${event.canonical_event}`} className="rounded bg-muted/40 p-2">
+        <p className="mb-1 text-xs font-medium">{signedBranchDescription(event)}</p>
+        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all text-[10px]">{`canonical_event (canonical JSON): ${new TextDecoder().decode(decodeSignedEvent(event))}\ncanonical_event (base64url): ${event.canonical_event}\nsignature (base64url): ${event.signature}`}</pre>
+      </li>)}
+    </ol>
+  </details>
+}
+
 const MAX_NODE_ENROLLMENT_PROOF_BYTES = 16 * 1024
 const MAX_REKEY_TRANSFER_FILE_BYTES = 128 * 1024
 const rekeyPreparationFormat = 'ir.owner-subject-rekey-preparation/1'
@@ -162,6 +236,12 @@ export function GlobalIdentityPanel() {
   const mayReadRecordings = authorization.data?.permissions.includes('recording.read') ?? false
   const status = useQuery({ ...globalIdentityQuery, enabled: mayManage })
   const forkChoices = useQuery({ ...globalIdentityForkChoicesQuery, enabled: mayManage && Boolean(status.data?.identity?.frozen) })
+  const forkHistory = useQuery({
+    queryKey: ['global-identity', 'fork-review-history'],
+    queryFn: globalIdentityAPI.exportHistory,
+    enabled: mayManage && Boolean(status.data?.identity?.frozen),
+    retry: false,
+  })
   const registry = useQuery({ ...globalIdentityRegistryQuery, enabled: mayManage })
   const ownerAuthority = useQuery({ ...ownerAuthoritySubjectsQuery, enabled: mayManage && Boolean(status.data?.identity) })
   const session = useQuery({ ...globalIdentitySessionQuery, enabled: mayManage })
@@ -190,6 +270,35 @@ export function GlobalIdentityPanel() {
   const [enrollmentProofText, setEnrollmentProofText] = useState('')
   const [historyFile, setHistoryFile] = useState<File | null>(null)
   const [forkSelections, setForkSelections] = useState<Record<string, string>>({})
+  const [forkTranscripts, setForkTranscripts] = useState<Record<string, { state: 'loading' | 'ready' | 'unavailable'; first: SignedForkBranch; second: SignedForkBranch; firstHeadHash?: string; secondHeadHash?: string }>>({})
+
+  useEffect(() => {
+    const choices = forkChoices.data?.forks
+    const bundle = forkHistory.data
+    if (!status.data?.identity?.frozen || !choices?.length) {
+      setForkTranscripts({})
+      return
+    }
+    let cancelled = false
+    setForkTranscripts(Object.fromEntries(choices.map(choice => [choice.fork_id, { state: 'loading' as const, first: undefined, second: undefined }])))
+    if (forkHistory.isLoading || forkChoices.isLoading) return () => { cancelled = true }
+    if (!bundle || forkHistory.isError) {
+      setForkTranscripts(Object.fromEntries(choices.map(choice => [choice.fork_id, { state: 'unavailable' as const, first: undefined, second: undefined }])))
+      return () => { cancelled = true }
+    }
+    const identityID = status.data?.identity?.identity_id ?? ''
+    void Promise.all(choices.map(async choice => [choice.fork_id, await matchForkTranscript(bundle, choice, identityID)] as const))
+      .then(results => {
+        if (cancelled) return
+        setForkTranscripts(Object.fromEntries(results.map(([forkID, evidence]) => [forkID, evidence
+          ? { state: 'ready' as const, first: evidence.first_branch, second: evidence.second_branch, firstHeadHash: evidence.first_head_hash, secondHeadHash: evidence.second_head_hash }
+          : { state: 'unavailable' as const, first: undefined, second: undefined }])))
+      })
+      .catch(() => {
+        if (!cancelled) setForkTranscripts(Object.fromEntries(choices.map(choice => [choice.fork_id, { state: 'unavailable' as const, first: undefined, second: undefined }])))
+      })
+    return () => { cancelled = true }
+  }, [forkChoices.data, forkChoices.isLoading, forkHistory.data, forkHistory.isError, forkHistory.isLoading, status.data?.identity?.frozen, status.data?.identity?.identity_id])
   const [registryHistoryFile, setRegistryHistoryFile] = useState<File | null>(null)
   const [confirmedSaved, setConfirmedSaved] = useState(false)
   const [authoritySubjectID, setAuthoritySubjectID] = useState('')
@@ -1214,7 +1323,8 @@ export function GlobalIdentityPanel() {
   const resolveFork = (choice: GlobalIdentityForkChoice) => run(async () => {
     const identity = status.data?.identity
     const selectedHead = forkSelections[choice.fork_id]
-    if (!identity || !selectedHead) throw new Error(t('identity.forkSelectionRequired'))
+    const transcript = forkTranscripts[choice.fork_id]
+    if (!identity || !selectedHead || transcript?.state !== 'ready' || transcript.firstHeadHash !== choice.first_head_hash || transcript.secondHeadHash !== choice.second_head_hash || !transcript.first?.length || !transcript.second?.length || (selectedHead !== choice.first_head_hash && selectedHead !== choice.second_head_hash)) throw new Error(t('identity.forkTranscriptUnavailable'))
     if (!window.confirm(t('identity.forkResolveConfirm', { head: selectedHead }))) return
     const selectedSequence = selectedHead === choice.first_head_hash ? choice.first_sequence : selectedHead === choice.second_head_hash ? choice.second_sequence : ''
     if (!selectedSequence) throw new Error(t('identity.forkSelectionRequired'))
@@ -1381,18 +1491,25 @@ export function GlobalIdentityPanel() {
           <div><p className="text-sm font-medium">{t('identity.forkResolveTitle')}</p><p className="text-xs text-muted-foreground">{t('identity.forkResolveHelp')}</p></div>
           <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => void exportIdentityHistory()}>{t('identity.exportHistory')}</Button>
           {forkChoices.error && <p role="alert" className="text-xs text-destructive">{errorMessage(forkChoices.error)}</p>}
+          {forkHistory.error && <p role="alert" className="text-xs text-destructive">{t('identity.forkTranscriptUnavailable')}</p>}
           {forkChoices.data?.forks.map(choice => {
             const selected = forkSelections[choice.fork_id]
+            const transcript = forkTranscripts[choice.fork_id]
+            const transcriptReady = transcript?.state === 'ready' && transcript.firstHeadHash === choice.first_head_hash && transcript.secondHeadHash === choice.second_head_hash && Boolean(transcript.first?.length && transcript.second?.length)
             return <div key={choice.fork_id} className="space-y-2 rounded border border-border bg-background p-3">
               <p className="break-all font-mono text-xs">{choice.fork_id}</p>
               <p className="break-all text-xs text-muted-foreground">{choice.previous_event_hash || t('identity.forkGenesis')} · {t('identity.forkHeads')}</p>
+              {transcriptReady ? <div className="space-y-2" aria-label={t('identity.forkTranscriptEvidence')}>
+                {renderSignedBranch(transcript.first, t('identity.forkBranchFirst'), t)}
+                {renderSignedBranch(transcript.second, t('identity.forkBranchSecond'), t)}
+              </div> : <p role={transcript?.state === 'unavailable' ? 'alert' : 'status'} className="text-xs text-muted-foreground">{transcript?.state === 'unavailable' ? t('identity.forkTranscriptUnavailable') : t('identity.forkTranscriptLoading')}</p>}
               <div className="grid gap-2 sm:grid-cols-2">
-                {[{ head: choice.first_head_hash, sequence: choice.first_sequence, label: 'identity.forkBranchFirst' }, { head: choice.second_head_hash, sequence: choice.second_sequence, label: 'identity.forkBranchSecond' }].map(branch => <Button key={branch.head} type="button" size="sm" variant="outline" aria-pressed={selected === branch.head} className={selected === branch.head ? 'ring-2 ring-primary' : ''} disabled={pending} onClick={() => setForkSelections(current => ({ ...current, [choice.fork_id]: branch.head }))}>
+                {[{ head: choice.first_head_hash, sequence: choice.first_sequence, label: 'identity.forkBranchFirst' }, { head: choice.second_head_hash, sequence: choice.second_sequence, label: 'identity.forkBranchSecond' }].map(branch => <Button key={branch.head} type="button" size="sm" variant="outline" aria-pressed={selected === branch.head} className={selected === branch.head ? 'ring-2 ring-primary' : ''} disabled={pending || !transcriptReady} onClick={() => setForkSelections(current => ({ ...current, [choice.fork_id]: branch.head }))}>
                   {t(branch.label as TranslationKey)} · seq {branch.sequence}
                 </Button>)}
               </div>
               <p className="break-all font-mono text-xs">{selected || t('identity.forkNoSelection')}</p>
-              <Button type="button" size="sm" variant="outline" disabled={pending || !selected || (!recoveryFile && !recoveryPhrase.trim())} onClick={() => void resolveFork(choice)}>{t('identity.forkResolveApprove')}</Button>
+              <Button type="button" size="sm" variant="outline" disabled={pending || !transcriptReady || !selected || (!recoveryFile && !recoveryPhrase.trim())} onClick={() => void resolveFork(choice)}>{t('identity.forkResolveApprove')}</Button>
             </div>
           })}
           {forkChoices.data?.forks.length === 0 && !forkChoices.isLoading && <p className="text-xs text-muted-foreground">{t('identity.forkNoResolvableChoice')}</p>}

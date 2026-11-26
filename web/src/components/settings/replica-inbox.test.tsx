@@ -9,6 +9,7 @@ describe('replica offer inbox UI', () => {
 
   it('finds scoped pending offers and only fills the explicit import form after selection', async () => {
     const identityID = `gi_${'I'.repeat(22)}`
+    const sourceIdentityID = `gi_${'X'.repeat(22)}`
     const localNodeID = `nd_${'L'.repeat(22)}`
     const sourceNodeID = `nd_${'S'.repeat(22)}`
     const subjectID = `os_${'O'.repeat(22)}`
@@ -18,6 +19,7 @@ describe('replica offer inbox UI', () => {
     const grantHash = `sha256:${'d'.repeat(64)}`
     const offerRequests: string[] = []
     const importRequests: string[] = []
+    let ambiguousPeerSession = false
     const browserWindow = window
     Object.defineProperty(browserWindow, 'isSecureContext', { configurable: true, value: true })
     Object.defineProperty(navigator, 'credentials', { configurable: true, value: {} })
@@ -41,12 +43,15 @@ describe('replica offer inbox UI', () => {
       else if (path === '/api/node-identity/status') payload = { created: true, node: { node_id: localNodeID, public_key: 'AQID' } }
       else if (path === '/api/owner-authority/subjects') payload = {
         subjects: [{
-          subject: { subject_id: subjectID, subject_type: 'person', controller: { kind: 'identity', id: identityID }, controller_policy: 'global_identity_recovery_root/1', policy_epoch: '1', created_at: new Date().toISOString() },
+          subject: { subject_id: subjectID, subject_type: 'person', controller: { kind: 'identity', id: sourceIdentityID }, controller_policy: 'global_identity_recovery_root/1', policy_epoch: '1', created_at: new Date().toISOString() },
           archive_ids: [archiveID], sequence: '2', head_hash: `sha256:${'b'.repeat(64)}`, frozen: false, fork_count: 0,
-          grants: [{ grant_hash: grantHash, subject_id: subjectID, issuer: { kind: 'identity', id: identityID }, audience: { kind: 'node', id: localNodeID }, archive_id: archiveID, snapshot_id: snapshotID, actions: ['archive.replicate'], not_before: new Date(Date.now() - 60_000).toISOString(), expires_at: new Date(Date.now() + 60_000).toISOString(), delegation_depth: '0', policy_epoch: '1', issuer_key_id: 'key', revoked: false }],
+          grants: [{ grant_hash: grantHash, subject_id: subjectID, issuer: { kind: 'identity', id: sourceIdentityID }, audience: { kind: 'node', id: localNodeID }, archive_id: archiveID, snapshot_id: snapshotID, actions: ['archive.replicate'], not_before: new Date(Date.now() - 60_000).toISOString(), expires_at: new Date(Date.now() + 60_000).toISOString(), delegation_depth: '0', policy_epoch: '1', issuer_key_id: 'key', revoked: false }],
         }],
       }
-      else if (path === '/api/peer-sessions') payload = { sessions: [{ identity_id: identityID, node_id: sourceNodeID, connected_at: new Date().toISOString() }] }
+      else if (path === '/api/peer-sessions') payload = { sessions: [
+        { identity_id: sourceIdentityID, node_id: sourceNodeID, connected_at: new Date().toISOString() },
+        ...(ambiguousPeerSession ? [{ identity_id: identityID, node_id: sourceNodeID, connected_at: new Date().toISOString() }] : []),
+      ] }
       else if (path === '/api/replica-leases') payload = { leases: [], tombstones: [] }
       else if (path.startsWith(`/api/peer-archives/${sourceNodeID}/replica-offers?`)) {
         offerRequests.push(path)
@@ -64,7 +69,9 @@ describe('replica offer inbox UI', () => {
     client.setQueryData(['user', 'authorization'], { user_id: 'usr_owner', login: 'owner', roles: ['owner'], permissions: ['system.settings.manage', 'recording.read'] })
     render(<QueryClientProvider client={client}><GlobalIdentityPanel /></QueryClientProvider>)
 
+    await screen.findByRole('option', { name: `${sourceIdentityID} · ${sourceNodeID}` })
     fireEvent.change(await screen.findByLabelText('복제본 원본 Node'), { target: { value: sourceNodeID } })
+    expect(screen.getByLabelText('복제본 원본 Node')).toHaveDisplayValue(`${sourceIdentityID} · ${sourceNodeID}`)
     fireEvent.click(screen.getByRole('button', { name: '선택한 Node에서 대기 중인 Offer 찾기' }))
 
     expect(await screen.findByText(leaseID)).toBeInTheDocument()
@@ -81,5 +88,18 @@ describe('replica offer inbox UI', () => {
       expect(screen.getByLabelText('Offer Lease ID')).toHaveValue(leaseID)
     })
     expect(importRequests).toHaveLength(0)
+    fireEvent.click(screen.getByRole('button', { name: '서명 Offer 확인 및 암호문 가져오기' }))
+    await waitFor(() => expect(importRequests).toHaveLength(1))
+    expect(JSON.parse(importRequests[0])).toMatchObject({
+      source_node_id: sourceNodeID,
+      owner_subject_id: subjectID,
+      grant_hash: grantHash,
+      archive_id: archiveID,
+      snapshot_id: snapshotID,
+      lease_id: leaseID,
+    })
+    ambiguousPeerSession = true
+    await client.invalidateQueries({ queryKey: ['peer-sessions'] })
+    expect(await screen.findByRole('alert')).toHaveTextContent('같은 Node가 둘 이상의 인증 신원으로 연결되어')
   })
 })

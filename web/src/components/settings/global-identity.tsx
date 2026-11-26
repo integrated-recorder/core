@@ -172,6 +172,15 @@ export function GlobalIdentityPanel() {
   const peerTargets = identityNodeIDs.filter(nodeID => nodeID !== localNodeID)
   const ownNodeDelegated = Boolean(localNodeID && identityNodeIDs.includes(localNodeID))
   const peerSessions = useQuery({ ...peerSessionsQuery, enabled: mayManage && Boolean(status.data?.identity && ownNodeDelegated) })
+  const replicaSourceSessionCounts = new Map<string, number>()
+  for (const session of peerSessions.data?.sessions ?? []) {
+    replicaSourceSessionCounts.set(session.node_id, (replicaSourceSessionCounts.get(session.node_id) ?? 0) + 1)
+  }
+  const ambiguousReplicaSourceSessions = [...replicaSourceSessionCounts.values()].some(count => count > 1)
+  const connectedReplicaSources = (peerSessions.data?.sessions ?? []).filter(session => replicaSourceSessionCounts.get(session.node_id) === 1).map(session => ({
+    identityID: session.identity_id,
+    nodeID: session.node_id,
+  }))
   const [recoveryMaterial, setRecoveryMaterial] = useState<RecoveryMaterial | null>(null)
   const [recoveryPhrase, setRecoveryPhrase] = useState('')
   const [recoveryFile, setRecoveryFile] = useState<File | null>(null)
@@ -999,9 +1008,9 @@ export function GlobalIdentityPanel() {
     const archiveID = incomingReplicaArchiveID.trim()
     const snapshotID = incomingReplicaSnapshotID.trim()
     const leaseID = incomingReplicaLeaseID.trim()
-    const subject = controlledSubjects.find(item => item.subject.subject_id === incomingReplicaSubjectID) ?? controlledSubjects[0]
+    const subject = incomingReplicaSubjects.find(item => item.subject.subject_id === incomingReplicaSubjectID) ?? incomingReplicaSubjects[0]
     const grant = subject?.grants.find(item => item.grant_hash === incomingReplicaGrantHash) ?? usableIncomingReplicaGrants[0]
-    if (!identity || identity.frozen || !ownNodeDelegated || !localNodeID || !peerTargets.includes(sourceNodeID) || !archiveID || !snapshotID || !leaseID || !isSecurePasskeyContext() || window.location.protocol !== 'https:') {
+    if (!identity || identity.frozen || !ownNodeDelegated || !localNodeID || !connectedReplicaSources.some(peer => peer.nodeID === sourceNodeID) || !archiveID || !snapshotID || !leaseID || !isSecurePasskeyContext() || window.location.protocol !== 'https:') {
       throw new Error(t('identity.replicaImportPrerequisites'))
     }
     if (!subject || subject.frozen || !grant || grant.revoked || Date.parse(grant.expires_at) <= Date.now() ||
@@ -1023,9 +1032,9 @@ export function GlobalIdentityPanel() {
 
   const findIncomingReplicaOffers = () => run(async () => {
     const sourceNodeID = incomingReplicaSourceNodeID.trim()
-    const subject = controlledSubjects.find(item => item.subject.subject_id === incomingReplicaSubjectID) ?? controlledSubjects[0]
+    const subject = incomingReplicaSubjects.find(item => item.subject.subject_id === incomingReplicaSubjectID) ?? incomingReplicaSubjects[0]
     const archiveID = incomingReplicaArchiveID || subject?.archive_ids[0] || ''
-    if (!identity || identity.frozen || !ownNodeDelegated || !localNodeID || !peerTargets.includes(sourceNodeID) || !subject ||
+    if (!identity || identity.frozen || !ownNodeDelegated || !localNodeID || !connectedReplicaSources.some(peer => peer.nodeID === sourceNodeID) || !subject ||
       !subject.archive_ids.includes(archiveID) || !isSecurePasskeyContext() || window.location.protocol !== 'https:') {
       throw new Error(t('identity.replicaImportPrerequisites'))
     }
@@ -1296,7 +1305,10 @@ export function GlobalIdentityPanel() {
     ? resumableReplicaRetryIntents(currentReplicaRetryScope, replicaState.data?.leases ?? [])
     : []
   const durableRetryLeaseExists = Boolean(replicaRetryIntent && replicaState.data?.leases.some(item => item.lease_id === replicaRetryIntent.leaseID))
-  const selectedIncomingReplicaSubject = controlledSubjects.find(item => item.subject.subject_id === incomingReplicaSubjectID) ?? controlledSubjects[0]
+  const incomingReplicaSubjects = ownerAuthority.data?.subjects.filter(item => !item.frozen && item.subject.controller.kind === 'identity' &&
+    item.archive_ids.length > 0 && item.grants.some(grant => !grant.revoked && Date.parse(grant.expires_at) > Date.now() &&
+      grant.audience.kind === 'node' && grant.audience.id === localNodeID && grant.actions.includes('archive.replicate'))) ?? []
+  const selectedIncomingReplicaSubject = incomingReplicaSubjects.find(item => item.subject.subject_id === incomingReplicaSubjectID) ?? incomingReplicaSubjects[0]
   const selectedIncomingReplicaArchiveID = selectedIncomingReplicaSubject && selectedIncomingReplicaSubject.archive_ids.includes(incomingReplicaArchiveID)
     ? incomingReplicaArchiveID : selectedIncomingReplicaSubject?.archive_ids[0] ?? ''
   const usableIncomingReplicaGrants = selectedIncomingReplicaSubject?.grants.filter(item => !item.revoked && Date.parse(item.expires_at) > Date.now() &&
@@ -1418,8 +1430,9 @@ export function GlobalIdentityPanel() {
           {replicaLease && <p className="break-all text-xs text-muted-foreground">{t('identity.replicaTransferReference', { subject: selectedReplicaSubject?.subject.subject_id ?? '', grant: replicaGrantHash || usableReplicaGrants[0]?.grant_hash || '', archive: replicaLease.archive_id, snapshot: replicaLease.snapshot_id })}</p>}
           <div className="space-y-3 border-t border-border pt-3">
             <div><p className="text-sm font-medium">{t('identity.replicaImportTitle')}</p><p className="text-xs text-muted-foreground">{t('identity.replicaImportHelp')}</p></div>
-            <label className="block space-y-1.5 text-sm">{t('identity.replicaSource')}<select className="w-full rounded-md border border-input bg-background px-3 py-2" value={incomingReplicaSourceNodeID} onChange={event => { setIncomingReplicaSourceNodeID(event.target.value); setIncomingReplicaOffers([]); setIncomingReplicaOffersFetched(false); setIncomingReplicaResult(null) }}><option value="">{t('identity.peerTargetSelect')}</option>{peerTargets.map(id => <option key={id} value={id}>{id}</option>)}</select></label>
-            {controlledSubjects.length > 0 && <label className="block space-y-1.5 text-sm">{t('identity.capabilitySubject')}<select className="w-full rounded-md border border-input bg-background px-3 py-2" value={incomingReplicaSubjectID || controlledSubjects[0].subject.subject_id} onChange={event => { const subject = controlledSubjects.find(item => item.subject.subject_id === event.target.value); setIncomingReplicaSubjectID(event.target.value); setIncomingReplicaArchiveID(subject?.archive_ids[0] ?? ''); setIncomingReplicaOffers([]); setIncomingReplicaOffersFetched(false); setIncomingReplicaGrantHash(''); setIncomingReplicaResult(null) }}>{controlledSubjects.map(item => <option key={item.subject.subject_id} value={item.subject.subject_id}>{item.subject.subject_id}</option>)}</select></label>}
+            <label className="block space-y-1.5 text-sm">{t('identity.replicaSource')}<select className="w-full rounded-md border border-input bg-background px-3 py-2" value={incomingReplicaSourceNodeID} onChange={event => { setIncomingReplicaSourceNodeID(event.target.value); setIncomingReplicaOffers([]); setIncomingReplicaOffersFetched(false); setIncomingReplicaResult(null) }}><option value="">{t('identity.peerTargetSelect')}</option>{connectedReplicaSources.map(peer => <option key={`${peer.identityID}:${peer.nodeID}`} value={peer.nodeID}>{peer.identityID} · {peer.nodeID}</option>)}</select></label>
+            {ambiguousReplicaSourceSessions && <p role="alert" className="text-xs text-amber-700 dark:text-amber-400">{t('identity.replicaSourceAmbiguous')}</p>}
+            {incomingReplicaSubjects.length > 0 && <label className="block space-y-1.5 text-sm">{t('identity.capabilitySubject')}<select className="w-full rounded-md border border-input bg-background px-3 py-2" value={incomingReplicaSubjectID || incomingReplicaSubjects[0].subject.subject_id} onChange={event => { const subject = incomingReplicaSubjects.find(item => item.subject.subject_id === event.target.value); setIncomingReplicaSubjectID(event.target.value); setIncomingReplicaArchiveID(subject?.archive_ids[0] ?? ''); setIncomingReplicaOffers([]); setIncomingReplicaOffersFetched(false); setIncomingReplicaGrantHash(''); setIncomingReplicaResult(null) }}>{incomingReplicaSubjects.map(item => <option key={item.subject.subject_id} value={item.subject.subject_id}>{item.subject.subject_id} · {item.subject.controller.id}</option>)}</select></label>}
             <label className="block space-y-1.5 text-sm">{t('identity.replicaArchiveID')}<select className="w-full rounded-md border border-input bg-background px-3 py-2" value={selectedIncomingReplicaArchiveID} onChange={event => { setIncomingReplicaArchiveID(event.target.value); setIncomingReplicaOffers([]); setIncomingReplicaOffersFetched(false); setIncomingReplicaSnapshotID(''); setIncomingReplicaLeaseID(''); setIncomingReplicaResult(null); setIncomingReplicaGrantHash('') }}><option value="">{t('identity.replicaArchiveSelect')}</option>{(selectedIncomingReplicaSubject?.archive_ids ?? []).map(archiveID => <option key={archiveID} value={archiveID}>{archiveID}</option>)}</select></label>
             <Button type="button" variant="outline" disabled={pending || window.location.protocol !== 'https:' || !incomingReplicaSourceNodeID || !selectedIncomingReplicaArchiveID || !selectedIncomingReplicaSubject} onClick={() => void findIncomingReplicaOffers()}>{t('identity.replicaFindOffers')}</Button>
             {incomingReplicaOffers.length > 0 && <div className="space-y-2" role="list" aria-label={t('identity.replicaPendingOffers')}>{incomingReplicaOffers.map(offer => <div key={offer.lease_id} className="flex flex-col gap-2 rounded-md border border-border p-3 sm:flex-row sm:items-center sm:justify-between" role="listitem"><div className="min-w-0 text-xs"><p className="break-all font-mono">{offer.lease_id}</p><p className="break-all text-muted-foreground">{offer.snapshot_id} · {t('identity.replicaObjectCount', { count: offer.object_count })} · {offer.reserved_bytes} B</p></div><Button type="button" size="sm" variant="outline" onClick={() => { setIncomingReplicaArchiveID(offer.archive_id); setIncomingReplicaSnapshotID(offer.snapshot_id); setIncomingReplicaLeaseID(offer.lease_id); setIncomingReplicaGrantHash(offer.grant_hash); setIncomingReplicaResult(null) }}>{t('identity.replicaSelectOffer')}</Button></div>)}</div>}

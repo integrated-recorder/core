@@ -101,8 +101,11 @@ func (r *replicaTransferReconciler) Reconcile(ctx context.Context, now time.Time
 	activeOffers := make(map[string]string)
 	for _, current := range leases {
 		if current.Status == lease.StatusActive && current.OfferHash != "" {
+			// Source verification survives restarts only while a provider-receipted
+			// renewal (or the original Offer) is committed. A pending renewal is
+			// not durable proof that the other side accepted the extended lease.
 			if _, tombstoned := blockedArchives[current.Offer.Offer.ArchiveID]; !tombstoned &&
-				parseReplicaExpiry(current.Offer.Offer.ExpiresAt).After(now) {
+				replicaLeaseCommittedExpiry(current).After(now) {
 				activeOffers[current.Offer.Offer.LeaseID] = current.OfferHash
 			}
 		}
@@ -119,7 +122,7 @@ func (r *replicaTransferReconciler) Reconcile(ctx context.Context, now time.Time
 			continue
 		}
 		if offer.Actor.Kind != authority.PrincipalNode || offer.Actor.ID == "" || offer.Actor.ID == nodeInfo.NodeID ||
-			offer.Offer.ProviderNodeID != nodeInfo.NodeID || !parseReplicaExpiry(offer.Offer.ExpiresAt).After(now) {
+			offer.Offer.ProviderNodeID != nodeInfo.NodeID || !replicaLeaseCommittedExpiry(current).After(now) {
 			continue
 		}
 		if _, blocked := blockedArchives[offer.Offer.ArchiveID]; blocked {

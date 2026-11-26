@@ -31,9 +31,10 @@ type replicaInboxOfferView struct {
 }
 
 type replicaInboxResponse struct {
-	SourceNodeID string                  `json:"source_node_id"`
-	ArchiveID    string                  `json:"archive_id"`
-	Offers       []replicaInboxOfferView `json:"offers"`
+	SourceIdentityID string                  `json:"source_identity_id"`
+	SourceNodeID     string                  `json:"source_node_id"`
+	ArchiveID        string                  `json:"archive_id"`
+	Offers           []replicaInboxOfferView `json:"offers"`
 }
 
 type replicaInboxScope struct {
@@ -72,7 +73,8 @@ func (s *Server) replicaInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sourceNodeID := r.PathValue("nodeID")
-	if !connectedPeerForIdentity(s.peerSessions.List(), sourceNodeID, localIdentity.IdentityID) {
+	sourceIdentityID, connected := connectedPeerIdentityForNode(s.peerSessions.List(), sourceNodeID)
+	if !connected {
 		writeCodedError(w, http.StatusConflict, "peer_session_not_connected", "The selected source Node has no active authenticated session.")
 		return
 	}
@@ -86,6 +88,12 @@ func (s *Server) replicaInbox(w http.ResponseWriter, r *http.Request) {
 		writeCodedError(w, http.StatusForbidden, "replica_inbox_identity_stale", "Current identity authority is stale or frozen.")
 		return
 	}
+	sourceIdentityState, err := resolve(sourceIdentityID, "", now)
+	if err != nil || sourceIdentityState.IdentityID != sourceIdentityID || sourceIdentityState.Frozen ||
+		sourceIdentityState.HeadHash == "" || !sourceIdentityState.FreshUntil.After(now) {
+		writeCodedError(w, http.StatusForbidden, "replica_inbox_source_identity_stale", "The authenticated source identity is stale or frozen.")
+		return
+	}
 	node, err := s.nodeIdentity.Info()
 	localPublic, decodeErr := base64.RawURLEncoding.DecodeString(node.PublicKey)
 	if err != nil || decodeErr != nil || len(localPublic) != 32 || node.NodeID == "" ||
@@ -97,7 +105,7 @@ func (s *Server) replicaInbox(w http.ResponseWriter, r *http.Request) {
 		writeCodedError(w, http.StatusBadRequest, "replica_inbox_request_invalid", "The source must be a different delegated Node.")
 		return
 	}
-	sourcePublic := identityState.CurrentKeys[authority.PrincipalNode+":"+sourceNodeID]
+	sourcePublic := sourceIdentityState.CurrentKeys[authority.PrincipalNode+":"+sourceNodeID]
 	verifiedSource, sourceErr := identityprotocol.NodeID(sourcePublic)
 	if sourceErr != nil || verifiedSource != sourceNodeID {
 		writeCodedError(w, http.StatusForbidden, "replica_inbox_source_not_delegated", "The source Node is not currently delegated by this identity.")
@@ -105,7 +113,7 @@ func (s *Server) replicaInbox(w http.ResponseWriter, r *http.Request) {
 	}
 	subjectID, archiveID := r.URL.Query().Get("owner_subject_id"), r.URL.Query().Get("archive_id")
 	owner, err := s.ownerAuthority.Snapshot(subjectID, resolve, now)
-	if err != nil || owner.Frozen || owner.Subject.Controller != (authority.Principal{Kind: authority.PrincipalIdentity, ID: localIdentity.IdentityID}) ||
+	if err != nil || owner.Frozen || owner.Subject.Controller != (authority.Principal{Kind: authority.PrincipalIdentity, ID: sourceIdentityID}) ||
 		!archiveClaimed(owner.ArchiveIDs, archiveID) {
 		writeCodedError(w, http.StatusForbidden, "replica_inbox_authority_denied", "The OwnerSubject does not currently control this claimed archive.")
 		return
@@ -149,7 +157,7 @@ func (s *Server) replicaInbox(w http.ResponseWriter, r *http.Request) {
 		scope := scopes[snapshotID]
 		requestScope := peerapi.RequestScope{
 			IdentityID: localIdentity.IdentityID, IdentityHead: identityState.HeadHash, NodeID: node.NodeID,
-			TargetIdentityID: localIdentity.IdentityID, TargetNodeID: sourceNodeID,
+			TargetIdentityID: sourceIdentityID, TargetNodeID: sourceNodeID,
 			OwnerSubjectID: subjectID, ArchiveID: archiveID, SnapshotID: scope.snapshotID,
 			Action: "archive.replicate", GrantChain: scope.chain, Resolve: peerprotocol.IdentityResolver(resolve), Signer: s.nodeIdentity,
 		}
@@ -183,7 +191,7 @@ func (s *Server) replicaInbox(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].LeaseID < result[j].LeaseID })
 	w.Header().Set("Cache-Control", "private, no-store")
-	writeJSON(w, http.StatusOK, replicaInboxResponse{SourceNodeID: sourceNodeID, ArchiveID: archiveID, Offers: result})
+	writeJSON(w, http.StatusOK, replicaInboxResponse{SourceIdentityID: sourceIdentityID, SourceNodeID: sourceNodeID, ArchiveID: archiveID, Offers: result})
 }
 
 func validReplicaOwnerSubjectID(value string) bool {

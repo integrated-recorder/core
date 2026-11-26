@@ -283,7 +283,7 @@ export type ReplicaInboxOffer = {
   object_count: number
   grant_hash: string
 }
-export type ReplicaInbox = { source_node_id: string; archive_id: string; offers: ReplicaInboxOffer[] }
+export type ReplicaInbox = { source_identity_id: string; source_node_id: string; archive_id: string; offers: ReplicaInboxOffer[] }
 export type ReplicaLeaseList = {
   leases: ReplicaLeaseSummary[]
   tombstones: Array<{

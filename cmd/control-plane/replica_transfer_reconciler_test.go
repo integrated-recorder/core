@@ -197,7 +197,8 @@ func TestReplicaTransferReconcilerRetriesActiveLeaseSourceVerificationAfterResta
 	snapshotID := "snap_" + strings.Repeat("c", 64)
 	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
 	identityState, localInfo, sourceID := replicaTransferIdentityFixture(t, identityID, now)
-	item := replicaTransferLeaseFixtureItem("rl_0000000000000000000021", lease.StatusActive, localInfo.NodeID, sourceID, ownerID, archiveID, snapshotID, now.Add(time.Hour))
+	item := replicaTransferLeaseFixtureItem("rl_0000000000000000000021", lease.StatusActive, localInfo.NodeID, sourceID, ownerID, archiveID, snapshotID, now.Add(-time.Hour))
+	item.Renewals = []lease.SignedRenewal{{Renewal: lease.Renewal{ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}}}
 	store := replicaTransferLeaseFixture{items: []lease.Lease{item}}
 	peers := &fakePeerConnectionManager{sessions: []peerapi.SessionInfo{{IdentityID: identityID, NodeID: sourceID}}, connectErr: map[string]error{}}
 	chain := []authority.SignedGrant{{Grant: authority.Grant{

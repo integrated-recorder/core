@@ -19,6 +19,8 @@
 
 ## 실행 증거
 
+현재 추가 M7 보완: 교차 Identity 피어의 복제 Offer 조회 및 명시적 import API를 연결했다. 수신 신원은 요청 본문이 아니라 고유한 인증 peer session에서 얻고, 양쪽 Identity freshness와 Node 위임, 원격 OwnerSubject의 archive claim 및 수신 Node 대상 현재 Capability를 재검증한다. UI는 연결된 신원/Node와 동기화된 OwnerSubject를 선택해 사용자가 직접 Offer를 조회·수락하도록 하고 모호한 중복 세션은 경고하며 숨긴다. 서로 다른 서명 Identity 2개와 Discovery mirror 2개 fixture에서 offer scope, remote Node revocation 및 ambiguous session 거부를 확인했다. 갱신된 Lease의 재시작 source verification이 최초 Offer 만료 뒤에도 provider-receipted 갱신 만료까지 유지되도록 transfer reconciler도 수정했다. 전체 Go short/race, `go vet`, `go build`, 웹 60 files / 290 tests, typecheck, lint, production build 통과. 이는 fixture 및 local product 경로 검증이며 독립 Recorder 네트워크 전송, 실제 import HTTP/UI E2E, 외부 Discovery 운영 acceptance는 미완료이므로 M7은 LOCALLY VERIFIED 범위로만 남는다.
+
 | 검증 | 대상 | 결과 | 증명하지 않는 것 |
 |---|---|---|---|
 | `go test -short -count=1 ./...` | 구현 코드 SHA `0b3f882` | 통과 | race, 외부망, Docker 및 실제 노드 acceptance |

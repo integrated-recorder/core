@@ -404,26 +404,34 @@ func (s *Server) replicaImportScope(w http.ResponseWriter, r *http.Request, requ
 	}
 	now := time.Now().UTC()
 	identityState, err := resolve(localIdentity.IdentityID, "", now)
-	if err != nil || identityState.IdentityID != localIdentity.IdentityID || identityState.Frozen || identityState.HeadHash == "" {
+	if err != nil || identityState.IdentityID != localIdentity.IdentityID || identityState.Frozen || identityState.HeadHash == "" || !identityState.FreshUntil.After(now) {
 		writeCodedError(w, http.StatusForbidden, "replica_import_node_unauthorized", "Current identity authority is not fresh enough to authorize this import.")
 		return peerapi.RequestScope{}, false
 	}
 	localPublic, localDecodeErr := base64.RawURLEncoding.DecodeString(node.PublicKey)
-	sourcePublic := identityState.CurrentKeys[authority.PrincipalNode+":"+request.SourceNodeID]
-	sourceNodeID, sourceKeyErr := identityprotocol.NodeID(sourcePublic)
-	if err != nil || localDecodeErr != nil || sourceKeyErr != nil || sourceNodeID != request.SourceNodeID ||
-		identityState.IdentityID != localIdentity.IdentityID || identityState.Frozen || identityState.HeadHash == "" ||
-		!equalPeerPublicKey(identityState.CurrentKeys[authority.PrincipalNode+":"+node.NodeID], localPublic) {
-		writeCodedError(w, http.StatusForbidden, "replica_import_node_unauthorized", "Both Nodes must be current members of the same unfrozen identity.")
+	sourceIdentityID, connected := connectedPeerIdentityForNode(s.peerSessions.List(), request.SourceNodeID)
+	if !connected {
+		writeCodedError(w, http.StatusConflict, "peer_session_not_connected", "The replica source has no unique active authenticated peer session.")
 		return peerapi.RequestScope{}, false
 	}
-	if !connectedPeerForIdentity(s.peerSessions.List(), request.SourceNodeID, localIdentity.IdentityID) {
-		writeCodedError(w, http.StatusConflict, "peer_session_not_connected", "The replica source has no active authenticated peer session.")
+	sourceIdentityState, sourceResolveErr := resolve(sourceIdentityID, "", now)
+	if sourceResolveErr != nil || sourceIdentityState.IdentityID != sourceIdentityID || sourceIdentityState.Frozen ||
+		sourceIdentityState.HeadHash == "" || !sourceIdentityState.FreshUntil.After(now) {
+		writeCodedError(w, http.StatusForbidden, "replica_import_source_identity_stale", "The authenticated source identity is stale or frozen.")
+		return peerapi.RequestScope{}, false
+	}
+	sourcePublic := sourceIdentityState.CurrentKeys[authority.PrincipalNode+":"+request.SourceNodeID]
+	verifiedSourceNodeID, sourceKeyErr := identityprotocol.NodeID(sourcePublic)
+	if localDecodeErr != nil || sourceKeyErr != nil || verifiedSourceNodeID != request.SourceNodeID ||
+		identityState.IdentityID != localIdentity.IdentityID || identityState.Frozen || identityState.HeadHash == "" ||
+		!equalPeerPublicKey(identityState.CurrentKeys[authority.PrincipalNode+":"+node.NodeID], localPublic) {
+		writeCodedError(w, http.StatusForbidden, "replica_import_node_unauthorized", "The local and source Nodes must be current members of their respective unfrozen identities.")
 		return peerapi.RequestScope{}, false
 	}
 	ownerState, err := s.ownerAuthority.Snapshot(request.OwnerSubjectID, resolve, now)
-	if err != nil || ownerState.Frozen || ownerState.Subject.Controller.Kind != authority.PrincipalIdentity || ownerState.Subject.Controller.ID != localIdentity.IdentityID {
-		writeCodedError(w, http.StatusForbidden, "replica_import_denied", "The OwnerSubject is unavailable, frozen, or not controlled by this identity.")
+	if err != nil || ownerState.Frozen || ownerState.Subject.Controller != (authority.Principal{Kind: authority.PrincipalIdentity, ID: sourceIdentityID}) ||
+		!archiveClaimed(ownerState.ArchiveIDs, request.ArchiveID) {
+		writeCodedError(w, http.StatusForbidden, "replica_import_denied", "The OwnerSubject is unavailable, frozen, or not controlled by the authenticated source identity.")
 		return peerapi.RequestScope{}, false
 	}
 	chain, exists := ownerState.Grants[request.GrantHash]
@@ -441,7 +449,7 @@ func (s *Server) replicaImportScope(w http.ResponseWriter, r *http.Request, requ
 	}
 	return peerapi.RequestScope{
 		IdentityID: localIdentity.IdentityID, IdentityHead: identityState.HeadHash, NodeID: node.NodeID,
-		TargetIdentityID: localIdentity.IdentityID, TargetNodeID: request.SourceNodeID,
+		TargetIdentityID: sourceIdentityID, TargetNodeID: request.SourceNodeID,
 		OwnerSubjectID: request.OwnerSubjectID, ArchiveID: request.ArchiveID, SnapshotID: request.SnapshotID,
 		Action: "archive.replicate", GrantChain: chain, Resolve: peerprotocol.IdentityResolver(resolve), Signer: s.nodeIdentity,
 	}, true
